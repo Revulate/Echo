@@ -1,3 +1,14 @@
+<#
+.SYNOPSIS
+Guard: every Echo-owned native GPUI window must open through
+components::ui::open_native_window, which installs the shared, bounded URI
+image cache at the window root.
+
+.DESCRIPTION
+Scans src/ for window-opening calls and compares them with this script's
+explicit caller list; update that list in the same change that adds or moves a
+window. -SelfTest first proves the scanner against built-in fixtures.
+#>
 [CmdletBinding()]
 param(
     [switch]$SelfTest
@@ -54,8 +65,8 @@ $expectedCurrentCallers = @(
     "main.rs",
     "components/chat/channel_popup.rs",
     "components/debug_popup.rs",
-    "components/overlay/overlay_window.rs",
-    "components/overlays/emote_picker_popout.rs",
+    "components/streamer_overlay/window.rs",
+    "components/overlays/emote_picker/popout.rs",
     "components/overlays/media_inspector.rs",
     "components/overlays/user_card_popout.rs",
     "components/settings/settings_popout.rs"

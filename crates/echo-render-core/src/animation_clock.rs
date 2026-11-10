@@ -21,8 +21,8 @@ static ANIMATION_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// `ANIMATION_EPOCH`. `0` is the sentinel for "never updated" (the epoch itself
 /// reads as ~0ns, which is harmless: the first tick will always advance).
 ///
-/// PERF: An `AtomicU64` replaces the previous `RwLock<Option<Instant>>` so the
-/// per-tick read+write on the hot waker path is lock-free.
+/// An `AtomicU64` keeps the per-tick read and write on the waker path
+/// lock-free.
 static LAST_ANIMATION_UPDATE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Current animation interval (dynamically updated by scheduler)
@@ -35,7 +35,7 @@ static ANIMATION_ENABLED: AtomicBool = AtomicBool::new(true);
 // FPS-Based Adaptive Throttling (Lock-Free)
 // ============================================================================
 
-/// PERF: Lock-free frame time ring buffer (8 samples sufficient for FPS estimation)
+/// Lock-free ring of recent frame times; eight samples are enough to estimate FPS.
 /// Uses atomic operations instead of RwLock to eliminate contention
 static FRAME_TIME_0: AtomicU64 = AtomicU64::new(16667);
 static FRAME_TIME_1: AtomicU64 = AtomicU64::new(16667);
@@ -56,7 +56,7 @@ static FRAME_TIME_WRITE_INDEX: AtomicU64 = AtomicU64::new(0);
 /// Target FPS below which we start throttling off-screen emotes
 const TARGET_FPS_THRESHOLD: f32 = 50.0;
 
-/// PERF: Cached FPS value to avoid recomputing every call
+/// Cached FPS value to avoid recomputing every call
 /// Stored as u32 bits (use f32::from_bits/to_bits for conversion)
 static CACHED_FPS_BITS: AtomicU32 = AtomicU32::new(0x42700000); // 60.0f32.to_bits()
 
@@ -84,7 +84,7 @@ pub fn visible_animation_count() -> usize {
 }
 
 /// Calculate current FPS from recent frame times
-/// PERF: Lock-free with time-based caching (100ms minimum between recalculations)
+/// Lock-free with time-based caching (100ms minimum between recalculations)
 pub fn current_fps() -> f32 {
     let current_frame = ANIMATION_FRAME.load(Ordering::Relaxed);
     let cached_frame = CACHED_FPS_FRAME.load(Ordering::Relaxed);

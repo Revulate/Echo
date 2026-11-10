@@ -1,6 +1,6 @@
 //! Visible-only semantics for the chat canvas, retained with its element state.
 
-use super::super::*;
+use super::*;
 use crate::backend::HighlightType;
 use crate::components::ui::accessibility::{claim_chat_announcement, clipped_accessible_bounds};
 use std::sync::Weak;
@@ -167,7 +167,7 @@ fn message_label(message: &ChatMessage, show_timestamp: bool) -> String {
         return date.to_owned();
     }
     let mut label = if show_timestamp {
-        let mut timestamp = super::super::super::layout::get_cached_timestamp(message.timestamp);
+        let mut timestamp = super::super::layout::get_cached_timestamp(message.timestamp);
         timestamp.push(' ');
         timestamp
     } else {

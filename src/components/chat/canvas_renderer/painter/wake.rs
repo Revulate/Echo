@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How long a message stays emphasized after opening it from search results.
+const SEARCH_RESULT_FOCUS_DURATION: std::time::Duration = std::time::Duration::from_millis(1600);
+
 /// Image-load waker ticks (50 ms each) between re-requests of unserved visible
 /// images while their load state does not change.
 const IMAGE_LOAD_REREQUEST_TICKS: u16 = 10;
@@ -109,39 +112,6 @@ impl CanvasMessageList {
         false
     }
 
-    pub(super) fn schedule_tooltip_delay_wake(&mut self, cx: &mut Context<Self>) {
-        let Some(delay) = self.interaction_state.tooltip.remaining_delay() else {
-            return;
-        };
-        if delay.is_zero() {
-            return;
-        }
-
-        self.wake_state.tooltip_delay_wake_generation = self
-            .wake_state
-            .tooltip_delay_wake_generation
-            .wrapping_add(1);
-        let generation = self.wake_state.tooltip_delay_wake_generation;
-
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-
-            let _ = this.update(cx, |this, cx| {
-                if this.wake_state.tooltip_delay_wake_generation != generation {
-                    return;
-                }
-
-                let became_visible = this.interaction_state.tooltip.poll_delay_visibility();
-                let overlay_visible = this.sync_global_tooltip_overlay_from_state();
-                if became_visible || overlay_visible {
-                    crate::backend::metrics::record_ui_notify_source("canvas.tooltip_delay");
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
     /// Repaint at `deadline`, when the loader next accepts a retry of a
     /// visible failed image, so an idle view still retries it. The loader's
     /// retry budget bounds the chain: an exhausted URL has no deadline.
@@ -180,9 +150,7 @@ impl CanvasMessageList {
 
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(
-                    SEARCH_RESULT_FOCUS_DURATION_MS,
-                ))
+                .timer(SEARCH_RESULT_FOCUS_DURATION)
                 .await;
 
             let _ = this.update(cx, |this, cx| {
@@ -269,9 +237,9 @@ impl CanvasMessageList {
                     let presented = window.frame_stage_statistics().frames_presented;
                     if presented != this.wake_state.last_observed_present_count {
                         this.wake_state.last_observed_present_count = presented;
-                        crate::fps_profiler::record_frame_presented();
+                        crate::diagnostics::fps_profiler::record_frame_presented();
                     }
-                    if crate::fps_profiler::canvas_paint_stalled() {
+                    if crate::diagnostics::fps_profiler::canvas_paint_stalled() {
                         this.wake_state.animation_waker_due = None;
                         // The window is shown, so the stall may only mean every
                         // visible animation held its frame for over a second
@@ -320,7 +288,7 @@ impl CanvasMessageList {
                         // Patched frames replace renders, which are what
                         // otherwise release evicted frames from the atlas.
                         crate::utils::drain_render_image_drops_coalesced(window, cx);
-                        crate::fps_profiler::sample_frame_stages(window);
+                        crate::diagnostics::fps_profiler::sample_frame_stages(window);
                         return WakerStep::Tick(next_delay);
                     }
                     this.wake_state.animation_only_frame_pending = true;
@@ -660,9 +628,8 @@ impl CanvasMessageList {
 /// Whether animation frames may be patched into the presented frame.
 /// `ECHO_ANIMATION_PATCH=0` repaints every frame change instead.
 fn animation_patching_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("ECHO_ANIMATION_PATCH").map_or(true, |value| value.trim() != "0")
-    });
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| echo_core::env::flag_or("ECHO_ANIMATION_PATCH", true));
     *ENABLED
 }
 

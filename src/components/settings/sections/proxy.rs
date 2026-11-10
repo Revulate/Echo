@@ -211,7 +211,7 @@ pub fn render_proxy_section<T: 'static>(
                                         .child(
                                             div()
                                                 .text_size(px(
-                                                    crate::components::settings::widgets::SettingsMetrics::CALM_LABEL_TEXT,
+                                                    crate::components::settings::widgets::SettingsMetrics::ROW_LABEL_TEXT,
                                                 ))
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(colors::text_primary())
@@ -221,7 +221,7 @@ pub fn render_proxy_section<T: 'static>(
                                             label.child(
                                                 div()
                                                     .text_size(px(
-                                                        crate::components::settings::widgets::SettingsMetrics::CALM_HELPER_TEXT,
+                                                        crate::components::settings::widgets::SettingsMetrics::ROW_HELPER_TEXT,
                                                     ))
                                                     .text_color(colors::text_secondary())
                                                     .child("Modified"),
@@ -231,7 +231,7 @@ pub fn render_proxy_section<T: 'static>(
                                 .child(
                                     div()
                                         .text_size(px(
-                                            crate::components::settings::widgets::SettingsMetrics::CALM_HELPER_TEXT,
+                                            crate::components::settings::widgets::SettingsMetrics::ROW_HELPER_TEXT,
                                         ))
                                         .text_color(colors::text_secondary())
                                         .whitespace_normal()

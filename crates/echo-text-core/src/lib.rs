@@ -1,4 +1,5 @@
-//! GPUI-free emoji and text-similarity logic shared by Echo and verification tools.
+//! GPUI-free text logic shared by Echo and verification tools: emoji detection
+//! and image URLs, message similarity, and timestamp formatting.
 
 pub mod emoji;
 pub mod similarity;

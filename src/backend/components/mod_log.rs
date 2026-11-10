@@ -29,67 +29,35 @@ pub struct ModAction {
     pub channel: String,
     pub details: String,
     pub timestamp: i64,
+    /// Length of a timeout, when the source reported one.
+    pub timeout_secs: Option<u64>,
+    /// Streamer mode replaced the user, channel and details with placeholders.
+    pub masked: bool,
 }
 
-/// Parse a system message into a mod action (if applicable)
-pub fn parse_mod_action(
-    _id: &str,
-    text: &str,
-    author_name: &str,
-    channel: &str,
-    timestamp: i64,
-) -> Option<ModAction> {
-    if text.contains("permanently banned") {
-        return Some(ModAction {
-            action_type: ModActionType::Ban,
-            username: author_name.to_string(),
-            channel: channel.to_string(),
-            details: text.to_string(),
+impl ModAction {
+    pub fn new(
+        action_type: ModActionType,
+        username: impl Into<String>,
+        channel: impl Into<String>,
+        details: impl Into<String>,
+        timestamp: i64,
+    ) -> Self {
+        Self {
+            action_type,
+            username: username.into(),
+            channel: channel.into(),
+            details: details.into(),
             timestamp,
-        });
+            timeout_secs: None,
+            masked: false,
+        }
     }
 
-    if text.contains("was unbanned") {
-        return Some(ModAction {
-            action_type: ModActionType::Unban,
-            username: author_name.to_string(),
-            channel: channel.to_string(),
-            details: text.to_string(),
-            timestamp,
-        });
+    pub fn with_timeout_secs(mut self, timeout_secs: Option<u64>) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
     }
-
-    if text.contains("timed out") {
-        return Some(ModAction {
-            action_type: ModActionType::Timeout,
-            username: author_name.to_string(),
-            channel: channel.to_string(),
-            details: text.to_string(),
-            timestamp,
-        });
-    }
-
-    if text.contains("Message deleted") || text.contains("was deleted") {
-        return Some(ModAction {
-            action_type: ModActionType::Delete,
-            username: author_name.to_string(),
-            channel: channel.to_string(),
-            details: text.to_string(),
-            timestamp,
-        });
-    }
-
-    if text.contains("Chat was cleared") {
-        return Some(ModAction {
-            action_type: ModActionType::Clear,
-            username: "moderator".to_string(),
-            channel: channel.to_string(),
-            details: text.to_string(),
-            timestamp,
-        });
-    }
-
-    None
 }
 
 /// Global mod action store
@@ -120,19 +88,38 @@ pub fn record_local_mod_action(
     channel: impl Into<String>,
     details: impl Into<String>,
 ) {
-    add_mod_action(ModAction {
+    add_mod_action(ModAction::new(
         action_type,
-        username: username.into(),
-        channel: channel.into(),
-        details: details.into(),
-        timestamp: Utc::now().timestamp_millis(),
-    });
+        username,
+        channel,
+        details,
+        Utc::now().timestamp_millis(),
+    ));
+}
+
+/// [`record_local_mod_action`] for a timeout of known length.
+pub fn record_local_timeout(
+    username: impl Into<String>,
+    channel: impl Into<String>,
+    details: impl Into<String>,
+    timeout_secs: u64,
+) {
+    add_mod_action(
+        ModAction::new(
+            ModActionType::Timeout,
+            username,
+            channel,
+            details,
+            Utc::now().timestamp_millis(),
+        )
+        .with_timeout_secs(Some(timeout_secs)),
+    );
 }
 
 /// Best-effort current ban state for a user, derived from the most recent
 /// recorded Ban/Unban/Timeout action for them (the store is newest-first and
 /// fed by both CLEARCHAT system messages and locally issued commands).
-/// Timeouts count as banned while their parsed duration is still running.
+/// Timeouts count as banned while their recorded length is still running.
 /// The store holds only the last 100 actions, so this is a heuristic, not
 /// ground truth — unknown users default to "not banned".
 pub fn is_user_likely_banned(channel: &str, username: &str) -> bool {
@@ -148,19 +135,13 @@ pub fn is_user_likely_banned(channel: &str, username: &str) -> bool {
             ModActionType::Ban => return true,
             ModActionType::Unban => return false,
             ModActionType::Timeout => {
-                let seconds = action
-                    .details
-                    .split_whitespace()
-                    .find_map(|token| token.parse::<i64>().ok());
-                return match seconds {
-                    Some(seconds) => {
-                        now_ms
-                            < action
-                                .timestamp
-                                .saturating_add(seconds.saturating_mul(1000))
-                    }
-                    None => false,
-                };
+                return action.timeout_secs.is_some_and(|seconds| {
+                    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+                    now_ms
+                        < action
+                            .timestamp
+                            .saturating_add(seconds.saturating_mul(1000))
+                });
             }
             _ => continue,
         }
@@ -185,6 +166,7 @@ fn sanitize_mod_action(mut action: ModAction) -> ModAction {
     if !crate::backend::streamer_mode::should_hide_mod_actions() {
         return action;
     }
+    action.masked = true;
 
     match action.action_type {
         ModActionType::Ban => {

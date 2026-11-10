@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+Compare two cache snapshot JSON artifacts.
+
+Records before/after cache inventory deltas only; it is not an app performance
+comparison. compare-cache-snapshots.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -14,75 +21,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "value"
-    }
-
-    return $slug
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Read-Snapshot {
     param(

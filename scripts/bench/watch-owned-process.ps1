@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Watchdog: after a delay, close (then kill) a process only if its id and start
+time still match the process the caller launched.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]

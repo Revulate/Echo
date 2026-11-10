@@ -125,7 +125,7 @@ pub fn get_room_state(channel: &str) -> Option<RoomState> {
 /// Install deterministic ROOMSTATE only for Echo's opt-in native UI harness.
 /// Ordinary runtime callers cannot mutate this store through this path.
 pub(crate) fn set_room_state_for_benchmark(channel: &str, state: RoomState) -> bool {
-    if !crate::benchmark_ui_fixture::disposable_workspace_enabled() {
+    if !crate::bench::ui_fixture::disposable_workspace_enabled() {
         return false;
     }
 
@@ -241,12 +241,12 @@ pub(crate) fn record_confirmed_send(account: &str, channel: &str) {
     let slow = get_room_state(channel).and_then(|state| state.slow_mode);
     let fallback_exempt = crate::backend::settings::get_username_lowercase()
         .eq_ignore_ascii_case(channel)
-        || super::connection::get_self_state(channel).is_some_and(|(_, badges)| {
-            badges.iter().any(|badge| {
-                crate::backend::badges::is_moderator_badge_key(badge)
-                    || crate::backend::badges::badge_key_matches(badge, "broadcaster")
-                    || crate::backend::badges::badge_key_matches(badge, "vip")
-            })
+        || super::connection::get_self_state(channel).is_some_and(|state| {
+            state.moderates()
+                || state
+                    .badges
+                    .iter()
+                    .any(|badge| crate::backend::badges::badge_key_matches(badge, "vip"))
         });
     let changed = {
         let mut store = SEND_ELIGIBILITY.write_or_recover();

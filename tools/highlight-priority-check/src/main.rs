@@ -1,19 +1,9 @@
+//! Contract: PRIVMSG highlight precedence in `src/backend/highlight_priority.rs`
+//! (account mention, filters, phrases, users, replies, badges, first-message and
+//! returning-chatter signals).
+
 mod models {
-    // Local stub mirroring the variant shapes of src/backend/models.rs
-    // HighlightType that `select_privmsg_highlight` can return or accept via the
-    // `configured_highlight` / `configured_badge_highlight` passthrough fields.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum HighlightType {
-        Mention,
-        User { username: String },
-        ParticipatedReply { username: String },
-        Badge { badge: String },
-        HighlightedMessage,
-        FirstMessage,
-        ReturningChatter,
-        BitsBadge,
-        Phrase { pattern: String },
-    }
+    pub use echo_core::message::HighlightType;
 }
 
 // Crate-root stub for the settings lookup that highlight_priority.rs calls via
@@ -43,6 +33,7 @@ fn kind(highlight: Option<HighlightType>) -> String {
         Some(HighlightType::BitsBadge) => "bits".to_string(),
         Some(HighlightType::FirstMessage) => "first-message".to_string(),
         Some(HighlightType::ReturningChatter) => "returning-chatter".to_string(),
+        Some(other) => panic!("PRIVMSG highlight selection returned {other:?}"),
         None => "none".to_string(),
     }
 }

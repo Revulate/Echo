@@ -53,12 +53,12 @@ static POPUP_HEADER_SNAPSHOTS: LazyLock<Mutex<HashMap<String, ChannelPopupHeader
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn is_ui_fixture_popup(channel: &str) -> bool {
-    crate::benchmark_ui_fixture::is_enabled()
+    crate::bench::ui_fixture::is_enabled()
         && matches!(
             channel,
-            crate::benchmark_ui_fixture::OFFLINE_CHANNEL
-                | crate::benchmark_ui_fixture::LIVE_CHANNEL
-                | crate::benchmark_ui_fixture::HIGHLIGHT_LIVE_CHANNEL
+            crate::bench::ui_fixture::OFFLINE_CHANNEL
+                | crate::bench::ui_fixture::LIVE_CHANNEL
+                | crate::bench::ui_fixture::HIGHLIGHT_LIVE_CHANNEL
         )
 }
 
@@ -67,9 +67,9 @@ pub fn ui_fixture_popup_snapshot(channel: &str) -> Option<ChannelPopupHeaderSnap
         return None;
     }
     POPUP_HEADER_SNAPSHOTS
-        .lock()
-        .ok()
-        .and_then(|snapshots| snapshots.get(channel).cloned())
+        .lock_or_recover()
+        .get(channel)
+        .cloned()
 }
 
 pub fn ui_fixture_popup_is_open(channel: &str) -> bool {
@@ -215,9 +215,9 @@ pub fn open_channel_popup(channel: String, app_state: Entity<AppState>, cx: &mut
                 }
 
                 if is_ui_fixture_popup(&close_channel) {
-                    if let Ok(mut snapshots) = POPUP_HEADER_SNAPSHOTS.lock() {
-                        snapshots.remove(&close_channel);
-                    }
+                    POPUP_HEADER_SNAPSHOTS
+                        .lock_or_recover()
+                        .remove(&close_channel);
                 } else if !backend::is_shutdown_started() {
                     backend::settings::set_chat_popup_window_open(&close_channel, false);
                     close_app_state.update(cx, |state, cx| {
@@ -540,19 +540,14 @@ impl ChannelPopup {
         window_active: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (control, alt, shift, platform) = if window_active {
-            (
-                modifiers.control,
-                modifiers.alt,
-                modifiers.shift,
-                modifiers.platform,
-            )
+        let held = if window_active {
+            modifiers
         } else {
-            (false, false, false, false)
+            Modifiers::default()
         };
         let canvas_list = self.chat_view.read(cx).canvas_list.clone();
         canvas_list.update(cx, |list, cx| {
-            let changed = list.set_chat_pause_modifiers(control, alt, shift, platform);
+            let changed = list.set_chat_pause_modifiers(held);
             if changed {
                 crate::backend::metrics::record_ui_notify_source(
                     "channel_popup.chat_pause.modifier",
@@ -636,9 +631,9 @@ impl Render for ChannelPopup {
                 overlap_safe: (!header_layout.is_expanded() || header_height >= 68.0)
                     && message_height + header_height + input_area_height <= height + 0.5,
             };
-            if let Ok(mut snapshots) = POPUP_HEADER_SNAPSHOTS.lock() {
-                snapshots.insert(self.channel.clone(), snapshot);
-            }
+            POPUP_HEADER_SNAPSHOTS
+                .lock_or_recover()
+                .insert(self.channel.clone(), snapshot);
         }
 
         div()
@@ -809,5 +804,6 @@ fn push_popup_send_blocked_toast(channel: &str, error: &str) {
 fn popup_send_readiness_error(channel: &str) -> Option<String> {
     backend::irc::ensure_authenticated_send_ready()
         .err()
+        .map(String::from)
         .or_else(|| backend::irc::ensure_channel_send_ready(channel).err())
 }

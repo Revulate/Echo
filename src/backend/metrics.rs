@@ -186,8 +186,8 @@ pub struct LayoutMetricsSummary {
 ///
 /// Enable with `ECHO_PERF_MONITOR=1` when you need diagnostics.
 pub fn init() {
-    let env_enabled = std::env::var("ECHO_PERF_MONITOR").is_ok();
-    let profiler_enabled = crate::fps_profiler::is_enabled();
+    let env_enabled = echo_core::env::flag("ECHO_PERF_MONITOR");
+    let profiler_enabled = crate::diagnostics::fps_profiler::is_enabled();
     let enabled = env_enabled || profiler_enabled;
     METRICS_ENABLED.store(enabled, Ordering::Relaxed);
     if enabled {
@@ -203,7 +203,7 @@ pub fn init() {
 /// Returns true when runtime metrics collection is enabled.
 #[inline]
 pub fn is_enabled() -> bool {
-    METRICS_ENABLED.load(Ordering::Relaxed) || crate::fps_profiler::is_enabled()
+    METRICS_ENABLED.load(Ordering::Relaxed) || crate::diagnostics::fps_profiler::is_enabled()
 }
 
 /// Get metrics summary
@@ -599,7 +599,7 @@ pub struct MemoryStats {
 }
 
 /// Get memory usage statistics for message storage
-/// PERF: Uses DashMap iter - lock-free per shard
+/// Iterates the map one shard at a time.
 pub fn get_memory_stats() -> MemoryStats {
     use super::irc::CHAT_MESSAGES;
 

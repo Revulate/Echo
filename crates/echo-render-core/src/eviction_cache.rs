@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 
 /// LRU cache wrapper that tracks evicted keys for efficient secondary index cleanup.
 ///
-/// PERF: Instead of scanning the entire secondary index to find orphaned entries,
+/// Instead of scanning the entire secondary index to find orphaned entries,
 /// we record evicted keys as they happen and process them in O(k) time where
 /// k = number of evictions since last cleanup (vs O(n*m) full scan).
 ///
@@ -31,7 +31,7 @@ where
     /// Underlying LRU cache
     inner: LruCache<K, V>,
     /// Keys evicted since last drain (bounded by cache capacity)
-    /// PERF: Pre-allocated to cache capacity to avoid reallocation
+    /// Pre-allocated to cache capacity to avoid reallocation
     evicted_keys: Vec<K>,
 }
 
@@ -43,7 +43,7 @@ where
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             inner: LruCache::new(capacity),
-            // PERF: Small initial allocation — evictions trickle in one at a time.
+            // Small initial allocation — evictions trickle in one at a time.
             // Vec grows on demand if a burst occurs (rare).
             evicted_keys: Vec::with_capacity(capacity.get().min(64)),
         }
@@ -51,7 +51,7 @@ where
 
     /// Put a key-value pair into the cache, tracking any eviction
     ///
-    /// PERF: O(1) amortized - same as LruCache::put() plus potential vec push
+    /// O(1) amortized - same as LruCache::put() plus potential vec push
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
         // Check if we're at capacity and will evict
         if self.inner.len() >= self.inner.cap().get() {
@@ -102,7 +102,7 @@ where
 
     /// Drain evicted keys since last drain
     ///
-    /// PERF: O(k) where k = evictions since last call
+    /// O(k) where k = evictions since last call
     /// Returns an iterator over evicted keys, clearing the internal buffer
     #[inline]
     pub fn drain_evictions(&mut self) -> impl Iterator<Item = K> + '_ {
@@ -132,8 +132,8 @@ where
 
     /// Resize the cache capacity
     ///
-    /// PERF: When reducing capacity, evicts LRU entries and records them for cleanup
-    /// PERF: When increasing capacity, no evictions occur
+    /// When reducing capacity, evicts LRU entries and records them for cleanup
+    /// When increasing capacity, no evictions occur
     pub fn resize(&mut self, new_capacity: NonZeroUsize) {
         // If shrinking, record evicted entries
         let current_size = self.inner.len();

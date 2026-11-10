@@ -80,23 +80,38 @@ impl ElementRenderPlan {
 /// half strength, as the 7TV extension does.
 const DELETED_ROW_OPACITY: f32 = 0.5;
 
-/// Render a single message at an absolute Y position (relative to viewport)
-/// PERF: #[inline] for hot-path function called per-visible-message per-frame
-/// PERF: Takes Arc<CanvasMessageLayout> to avoid deep clone (500-2000 bytes) per message per frame
+/// Frame-wide inputs shared by every row rendered through the element fallback.
+pub(super) struct FallbackRowFrame<'a> {
+    pub(super) selection: &'a SelectionState,
+    pub(super) container_width: f32,
+    /// Background of alternate (zebra) rows, when that setting is on.
+    pub(super) alternate_bg: Option<Hsla>,
+    pub(super) animation_slots: &'a Rc<RefCell<PaintedAnimationSlots>>,
+    pub(super) slot_owner: u64,
+}
+
+/// Render one visible row as GPUI elements at its viewport position, for rows
+/// the direct canvas cannot paint (see [`ElementRenderPlan`]).
 #[inline]
 pub(super) fn render_message_at_position(
-    layout: Arc<CanvasMessageLayout>,
+    frame: &FallbackRowFrame<'_>,
+    row: &VisibleRenderRow,
     element_render_plan: &ElementRenderPlan,
-    selection: &SelectionState,
-    message_index: usize,
-    container_width: f32,
-    y_position: f32,
     search_focused: bool,
-    alternate_row_bg: Option<Hsla>,
-    is_deleted: bool,
-    animation_slots: Rc<RefCell<PaintedAnimationSlots>>,
-    slot_owner: u64,
 ) -> impl IntoElement + use<> {
+    let layout = Arc::clone(&row.layout);
+    let selection = frame.selection;
+    let message_index = row.message_index;
+    let container_width = frame.container_width;
+    let y_position = row.viewport_y;
+    let alternate_row_bg = if row.is_alternate_row {
+        frame.alternate_bg
+    } else {
+        None
+    };
+    let is_deleted = row.is_deleted;
+    let animation_slots = Rc::clone(frame.animation_slots);
+    let slot_owner = frame.slot_owner;
     let selection_ranges =
         selection.get_ranges_for_message(message_index, layout.source_char_len());
 
@@ -194,7 +209,6 @@ fn image_element_fallback_reasons(url: &str, is_animated: bool) -> u8 {
 }
 
 /// Render a single layout segment
-/// PERF: #[inline] for hot-path function called per-segment per-message per-frame
 #[inline]
 fn render_segment(segment: &LayoutSegment, layout: &CanvasMessageLayout) -> AnyElement {
     match segment {
@@ -332,7 +346,6 @@ fn render_segment(segment: &LayoutSegment, layout: &CanvasMessageLayout) -> AnyE
 }
 
 /// Render a text segment
-/// PERF: #[inline] for hot-path function called per-text-segment per-frame
 #[inline]
 fn render_text_segment(
     data: &ShapedLineData,

@@ -1,3 +1,6 @@
+//! Contract: which sound plays for each highlight type and Twitch event, and which
+//! events raise desktop notifications, in `src/backend/sound_events.rs`.
+
 mod components {
     pub mod event_notification {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,52 +33,7 @@ mod backend {
 }
 
 mod models {
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum HighlightType {
-        Whisper,
-        Mention,
-        User {
-            username: String,
-        },
-        ParticipatedReply {
-            username: String,
-        },
-        Badge {
-            badge: String,
-        },
-        HighlightedMessage,
-        FirstMessage,
-        ReturningChatter,
-        Subscription,
-        Raid,
-        BitsBadge,
-        Announcement {
-            color: Option<String>,
-        },
-        WatchStreak,
-        Phrase {
-            pattern: String,
-        },
-        CustomPhrase {
-            pattern: String,
-            color: Option<String>,
-        },
-        CustomUser {
-            username: String,
-            color: Option<String>,
-        },
-        CustomBadge {
-            badge: String,
-            color: Option<String>,
-        },
-        SelfMessage,
-        Elevated,
-        ChannelPointRedeem {
-            reward_id: String,
-            reward_title: String,
-            reward_cost: u32,
-        },
-    }
+    pub use echo_core::message::HighlightType;
 }
 
 mod sounds {

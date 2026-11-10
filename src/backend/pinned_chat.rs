@@ -161,7 +161,7 @@ pub fn get_cached(channel: &str) -> Option<Arc<PinnedChatMessage>> {
 /// is cached as a quiet absence for a longer backoff; viewing chat must not
 /// produce error toasts or repeatedly probe unavailable moderation authority.
 pub fn queue_refresh(channel: &str) {
-    if crate::benchmark_ui_fixture::is_enabled() {
+    if crate::bench::ui_fixture::is_enabled() {
         return;
     }
     let Some(channel) = normalize_channel(channel) else {
@@ -290,7 +290,7 @@ impl Drop for PinnedChatInFlightGuard {
 }
 
 fn normalize_channel(channel: &str) -> Option<String> {
-    let channel = channel.trim().trim_start_matches('#').to_ascii_lowercase();
+    let channel = echo_core::channel_identity::normalize_channel_key(channel.trim());
     (!channel.is_empty()).then_some(channel)
 }
 

@@ -222,6 +222,98 @@ pub struct HotkeyMatchContext {
     pub has_user_card: bool,
 }
 
+/// Every built-in action, in declaration order.
+pub const ALL_ACTIONS: &[HotkeyAction] = &[
+    HotkeyAction::ToggleSettings,
+    HotkeyAction::ToggleAccountSwitcher,
+    HotkeyAction::ToggleNotifications,
+    HotkeyAction::ToggleSearch,
+    HotkeyAction::ToggleGlobalSearch,
+    HotkeyAction::ToggleWhispers,
+    HotkeyAction::ToggleMentions,
+    HotkeyAction::NewTab,
+    HotkeyAction::NewSplit,
+    HotkeyAction::NextTab,
+    HotkeyAction::PrevTab,
+    HotkeyAction::CloseSplit,
+    HotkeyAction::CloseTab,
+    HotkeyAction::MoveTabLeft,
+    HotkeyAction::MoveTabRight,
+    HotkeyAction::OpenTabMenu,
+    HotkeyAction::RenameTab,
+    HotkeyAction::SelectTab1,
+    HotkeyAction::SelectTab2,
+    HotkeyAction::SelectTab3,
+    HotkeyAction::SelectTab4,
+    HotkeyAction::SelectTab5,
+    HotkeyAction::SelectTab6,
+    HotkeyAction::SelectTab7,
+    HotkeyAction::SelectTab8,
+    HotkeyAction::SelectTab9,
+    HotkeyAction::PopupActiveSplit,
+    HotkeyAction::PopupActiveTab,
+    HotkeyAction::ZoomIn,
+    HotkeyAction::ZoomOut,
+    HotkeyAction::ResetZoom,
+    HotkeyAction::ToggleTabBarVisibility,
+    HotkeyAction::ToggleLiveTabsOnly,
+    HotkeyAction::ToggleSidebar,
+    HotkeyAction::ChangeChannel,
+    HotkeyAction::FocusInput,
+    HotkeyAction::SendMessage,
+    HotkeyAction::SendMessageKeepInput,
+    HotkeyAction::OpenEmotePicker,
+    HotkeyAction::ClearChat,
+    HotkeyAction::CopyMessage,
+    HotkeyAction::CreateClip,
+    HotkeyAction::OpenChannelInBrowser,
+    HotkeyAction::OpenChannelInStreamlink,
+    HotkeyAction::OpenChannelInCustomPlayer,
+    HotkeyAction::OpenModViewInBrowser,
+    HotkeyAction::OpenViewerList,
+    HotkeyAction::ScrollUp,
+    HotkeyAction::ScrollDown,
+    HotkeyAction::ScrollToTop,
+    HotkeyAction::ScrollToBottom,
+    HotkeyAction::ReconnectActiveChannel,
+    HotkeyAction::EnableHighlightSounds,
+    HotkeyAction::DisableHighlightSounds,
+    HotkeyAction::ToggleHighlightSounds,
+    HotkeyAction::OpenSubscriptionPage,
+    HotkeyAction::FocusSplitLeft,
+    HotkeyAction::FocusSplitRight,
+    HotkeyAction::FocusSplitUp,
+    HotkeyAction::FocusSplitDown,
+    HotkeyAction::SearchPreviousResult,
+    HotkeyAction::SearchNextResult,
+    HotkeyAction::SearchOpenSelectedResult,
+    HotkeyAction::SearchPreviousPage,
+    HotkeyAction::SearchNextPage,
+    HotkeyAction::SearchFirstResult,
+    HotkeyAction::SearchLastResult,
+    HotkeyAction::SearchClearQuery,
+    HotkeyAction::ToggleModMode,
+    HotkeyAction::ToggleModLog,
+    HotkeyAction::QuickTimeout30s,
+    HotkeyAction::QuickTimeout10m,
+    HotkeyAction::QuickBan,
+    HotkeyAction::ClearMentions,
+    HotkeyAction::MarkWhispersRead,
+    HotkeyAction::CloseThreadViewer,
+    HotkeyAction::ReloadEmotes,
+    HotkeyAction::ToggleFullscreen,
+    HotkeyAction::OpenDebugPopup,
+    HotkeyAction::ToggleCheatSheet,
+    HotkeyAction::ToggleMetrics,
+    HotkeyAction::ToggleStreamerOverlay,
+    HotkeyAction::ReopenClosedSplit,
+    HotkeyAction::ReopenClosedTab,
+    HotkeyAction::ToggleLocalR9K,
+    HotkeyAction::QuickSwitcher,
+    HotkeyAction::ToggleTransparency,
+    HotkeyAction::ToggleAlwaysOnTop,
+];
+
 pub const NAVIGATION_ACTIONS: &[HotkeyAction] = &[
     HotkeyAction::ToggleSettings,
     HotkeyAction::ToggleAccountSwitcher,
@@ -581,20 +673,122 @@ impl HotkeyAction {
         }
     }
 
-    /// Convert to string for serialization
-    #[allow(clippy::inherent_to_string)] // Intentional - not implementing Display
-    #[allow(clippy::wrong_self_convention)] // self is fine for Copy type
-    pub fn to_string(&self) -> String {
-        serde_json::to_string(self)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string()
+    /// The persisted settings key: the variant name in camelCase, exactly as
+    /// serde writes this enum.
+    pub fn as_str(&self) -> &'static str {
+        use HotkeyAction::*;
+        match self {
+            ToggleSettings => "toggleSettings",
+            ToggleAccountSwitcher => "toggleAccountSwitcher",
+            ToggleNotifications => "toggleNotifications",
+            ToggleSearch => "toggleSearch",
+            ToggleGlobalSearch => "toggleGlobalSearch",
+            ToggleWhispers => "toggleWhispers",
+            ToggleMentions => "toggleMentions",
+            NewTab => "newTab",
+            NewSplit => "newSplit",
+            NextTab => "nextTab",
+            PrevTab => "prevTab",
+            CloseSplit => "closeSplit",
+            CloseTab => "closeTab",
+            MoveTabLeft => "moveTabLeft",
+            MoveTabRight => "moveTabRight",
+            OpenTabMenu => "openTabMenu",
+            RenameTab => "renameTab",
+            SelectTab1 => "selectTab1",
+            SelectTab2 => "selectTab2",
+            SelectTab3 => "selectTab3",
+            SelectTab4 => "selectTab4",
+            SelectTab5 => "selectTab5",
+            SelectTab6 => "selectTab6",
+            SelectTab7 => "selectTab7",
+            SelectTab8 => "selectTab8",
+            SelectTab9 => "selectTab9",
+            PopupActiveSplit => "popupActiveSplit",
+            PopupActiveTab => "popupActiveTab",
+            ZoomIn => "zoomIn",
+            ZoomOut => "zoomOut",
+            ResetZoom => "resetZoom",
+            ToggleTabBarVisibility => "toggleTabBarVisibility",
+            ToggleLiveTabsOnly => "toggleLiveTabsOnly",
+            ToggleSidebar => "toggleSidebar",
+            ChangeChannel => "changeChannel",
+            FocusInput => "focusInput",
+            SendMessage => "sendMessage",
+            SendMessageKeepInput => "sendMessageKeepInput",
+            OpenEmotePicker => "openEmotePicker",
+            ClearChat => "clearChat",
+            CopyMessage => "copyMessage",
+            CreateClip => "createClip",
+            OpenChannelInBrowser => "openChannelInBrowser",
+            OpenChannelInStreamlink => "openChannelInStreamlink",
+            OpenChannelInCustomPlayer => "openChannelInCustomPlayer",
+            OpenModViewInBrowser => "openModViewInBrowser",
+            OpenViewerList => "openViewerList",
+            ScrollUp => "scrollUp",
+            ScrollDown => "scrollDown",
+            ScrollToTop => "scrollToTop",
+            ScrollToBottom => "scrollToBottom",
+            ReconnectActiveChannel => "reconnectActiveChannel",
+            EnableHighlightSounds => "enableHighlightSounds",
+            DisableHighlightSounds => "disableHighlightSounds",
+            ToggleHighlightSounds => "toggleHighlightSounds",
+            OpenSubscriptionPage => "openSubscriptionPage",
+            FocusSplitLeft => "focusSplitLeft",
+            FocusSplitRight => "focusSplitRight",
+            FocusSplitUp => "focusSplitUp",
+            FocusSplitDown => "focusSplitDown",
+            SearchPreviousResult => "searchPreviousResult",
+            SearchNextResult => "searchNextResult",
+            SearchOpenSelectedResult => "searchOpenSelectedResult",
+            SearchPreviousPage => "searchPreviousPage",
+            SearchNextPage => "searchNextPage",
+            SearchFirstResult => "searchFirstResult",
+            SearchLastResult => "searchLastResult",
+            SearchClearQuery => "searchClearQuery",
+            ToggleModMode => "toggleModMode",
+            ToggleModLog => "toggleModLog",
+            QuickTimeout30s => "quickTimeout30s",
+            QuickTimeout10m => "quickTimeout10m",
+            QuickBan => "quickBan",
+            ClearMentions => "clearMentions",
+            MarkWhispersRead => "markWhispersRead",
+            CloseThreadViewer => "closeThreadViewer",
+            ReloadEmotes => "reloadEmotes",
+            ToggleFullscreen => "toggleFullscreen",
+            OpenDebugPopup => "openDebugPopup",
+            ToggleCheatSheet => "toggleCheatSheet",
+            ToggleMetrics => "toggleMetrics",
+            ToggleStreamerOverlay => "toggleStreamerOverlay",
+            ReopenClosedSplit => "reopenClosedSplit",
+            ReopenClosedTab => "reopenClosedTab",
+            ToggleLocalR9K => "toggleLocalR9K",
+            QuickSwitcher => "quickSwitcher",
+            ToggleTransparency => "toggleTransparency",
+            ToggleAlwaysOnTop => "toggleAlwaysOnTop",
+        }
     }
+}
 
-    /// Parse from string
-    #[allow(clippy::should_implement_trait)] // Intentional - infallible Option API, not std::str::FromStr
-    pub fn from_str(s: &str) -> Option<Self> {
-        serde_json::from_str(&format!("\"{}\"", s)).ok()
+impl std::fmt::Display for HotkeyAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A settings key that names no built-in hotkey action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownHotkeyAction;
+
+impl std::str::FromStr for HotkeyAction {
+    type Err = UnknownHotkeyAction;
+
+    fn from_str(key: &str) -> Result<Self, Self::Err> {
+        ALL_ACTIONS
+            .iter()
+            .copied()
+            .find(|action| action.as_str() == key)
+            .ok_or(UnknownHotkeyAction)
     }
 }
 
@@ -683,319 +877,126 @@ impl HotkeyBinding {
 // Default Bindings
 // ============================================================================
 
-/// Get the default bindings for all actions
+/// Get the default bindings, keyed by [`HotkeyAction::as_str`].
+///
+/// Actions listed with `UNBOUND` have an empty binding: they appear in the
+/// settings UI as unassigned. Actions missing from the table have no entry.
 pub fn default_hotkeys() -> HashMap<String, HotkeyBinding> {
     use HotkeyAction::*;
-    let mut map = HashMap::new();
+    /// `(ctrl, shift, alt)`
+    type Mods = (bool, bool, bool);
+    const NONE: Mods = (false, false, false);
+    const CTRL: Mods = (true, false, false);
+    const SHIFT: Mods = (false, true, false);
+    const ALT: Mods = (false, false, true);
+    const CTRL_SHIFT: Mods = (true, true, false);
+    const CTRL_ALT: Mods = (true, false, true);
+    const CTRL_SHIFT_ALT: Mods = (true, true, true);
+    const UNBOUND: &str = "";
+    const DEFAULTS: &[(HotkeyAction, &str, Mods)] = &[
+        // Navigation
+        (ToggleSettings, "p", CTRL),
+        (ToggleAccountSwitcher, "a", CTRL_ALT),
+        (ToggleNotifications, UNBOUND, NONE),
+        (ToggleSearch, "f", CTRL),
+        (ToggleGlobalSearch, "f", CTRL_SHIFT),
+        // Ctrl+Shift+W closes the tab, so Whispers has no default.
+        (ToggleWhispers, UNBOUND, NONE),
+        (ToggleMentions, "m", CTRL_SHIFT),
+        (NewTab, "t", CTRL_SHIFT),
+        (NewSplit, "t", CTRL),
+        (NextTab, "tab", CTRL),
+        (PrevTab, "tab", CTRL_SHIFT),
+        // Ctrl+W closes the split and Ctrl+Shift+W closes the tab.
+        (CloseSplit, "w", CTRL),
+        (CloseTab, "w", CTRL_SHIFT),
+        (MoveTabLeft, "pageup", CTRL_SHIFT),
+        (MoveTabRight, "pagedown", CTRL_SHIFT),
+        (OpenTabMenu, "f10", SHIFT),
+        (RenameTab, "f2", NONE),
+        (SelectTab1, "1", CTRL),
+        (SelectTab2, "2", CTRL),
+        (SelectTab3, "3", CTRL),
+        (SelectTab4, "4", CTRL),
+        (SelectTab5, "5", CTRL),
+        (SelectTab6, "6", CTRL),
+        (SelectTab7, "7", CTRL),
+        (SelectTab8, "8", CTRL),
+        (SelectTab9, "9", CTRL),
+        (PopupActiveSplit, "n", CTRL),
+        (PopupActiveTab, "n", CTRL_SHIFT),
+        (ZoomIn, "=", CTRL),
+        (ZoomOut, "-", CTRL),
+        (ResetZoom, "0", CTRL),
+        (ToggleTabBarVisibility, "l", CTRL_SHIFT_ALT),
+        (ToggleLiveTabsOnly, "l", CTRL_SHIFT),
+        (ToggleSidebar, "b", CTRL),
+        // Chat
+        (ChangeChannel, "r", CTRL),
+        (FocusInput, UNBOUND, NONE),
+        (SendMessage, "enter", NONE),
+        (SendMessageKeepInput, "enter", CTRL),
+        (OpenEmotePicker, "e", CTRL),
+        (ClearChat, "l", CTRL),
+        (CopyMessage, "c", CTRL),
+        (CreateClip, "x", ALT),
+        (OpenChannelInBrowser, UNBOUND, NONE),
+        (OpenChannelInStreamlink, UNBOUND, NONE),
+        (OpenChannelInCustomPlayer, UNBOUND, NONE),
+        (OpenModViewInBrowser, UNBOUND, NONE),
+        (OpenViewerList, UNBOUND, NONE),
+        (ScrollUp, "pageup", NONE),
+        (ScrollDown, "pagedown", NONE),
+        (ScrollToTop, "home", CTRL),
+        (ScrollToBottom, "end", CTRL),
+        (ReconnectActiveChannel, "f5", CTRL),
+        (EnableHighlightSounds, UNBOUND, NONE),
+        (DisableHighlightSounds, UNBOUND, NONE),
+        (ToggleHighlightSounds, UNBOUND, NONE),
+        (OpenSubscriptionPage, UNBOUND, NONE),
+        (FocusSplitLeft, "left", ALT),
+        (FocusSplitRight, "right", ALT),
+        (FocusSplitUp, "up", ALT),
+        (FocusSplitDown, "down", ALT),
+        // Search
+        (SearchPreviousResult, "up", NONE),
+        (SearchNextResult, "down", NONE),
+        (SearchOpenSelectedResult, "enter", NONE),
+        (SearchPreviousPage, "pageup", NONE),
+        (SearchNextPage, "pagedown", NONE),
+        (SearchFirstResult, "home", NONE),
+        (SearchLastResult, "end", NONE),
+        (SearchClearQuery, "u", CTRL),
+        // Moderation
+        (ToggleModMode, "m", CTRL),
+        (ToggleModLog, UNBOUND, NONE),
+        (QuickTimeout30s, UNBOUND, NONE),
+        (QuickTimeout10m, UNBOUND, NONE),
+        (QuickBan, UNBOUND, NONE),
+        // Other
+        (ReloadEmotes, "f5", NONE),
+        (ToggleFullscreen, "f11", NONE),
+        (OpenDebugPopup, "f10", NONE),
+        (ToggleCheatSheet, "/", CTRL),
+        (ToggleMetrics, "p", CTRL_SHIFT),
+        (ToggleStreamerOverlay, "n", CTRL_ALT),
+        (ReopenClosedSplit, "g", CTRL),
+        (ReopenClosedTab, "g", CTRL_SHIFT),
+        (ToggleLocalR9K, "h", CTRL),
+        (QuickSwitcher, "k", CTRL),
+        (ToggleTransparency, UNBOUND, NONE),
+        (ToggleAlwaysOnTop, "a", CTRL_SHIFT),
+    ];
 
-    // Navigation
-    map.insert(
-        ToggleSettings.to_string(),
-        HotkeyBinding::new("p", true, false, false),
-    );
-    map.insert(
-        ToggleAccountSwitcher.to_string(),
-        HotkeyBinding::new("a", true, false, true),
-    );
-    map.insert(ToggleNotifications.to_string(), HotkeyBinding::default());
-    map.insert(
-        ToggleSearch.to_string(),
-        HotkeyBinding::new("f", true, false, false),
-    );
-    map.insert(
-        ToggleGlobalSearch.to_string(),
-        HotkeyBinding::new("f", true, true, false),
-    );
-    // Ctrl+Shift+W closes the tab, so Whispers has no default.
-    map.insert(ToggleWhispers.to_string(), HotkeyBinding::default());
-    map.insert(
-        ToggleMentions.to_string(),
-        HotkeyBinding::new("m", true, true, false),
-    );
-    map.insert(
-        NewTab.to_string(),
-        HotkeyBinding::new("t", true, true, false),
-    );
-    map.insert(
-        NewSplit.to_string(),
-        HotkeyBinding::new("t", true, false, false),
-    );
-    map.insert(
-        NextTab.to_string(),
-        HotkeyBinding::new("tab", true, false, false),
-    );
-    map.insert(
-        PrevTab.to_string(),
-        HotkeyBinding::new("tab", true, true, false),
-    );
-    // Ctrl+W closes the split and Ctrl+Shift+W closes the tab.
-    map.insert(
-        CloseSplit.to_string(),
-        HotkeyBinding::new("w", true, false, false),
-    );
-    map.insert(
-        CloseTab.to_string(),
-        HotkeyBinding::new("w", true, true, false),
-    );
-    map.insert(
-        MoveTabLeft.to_string(),
-        HotkeyBinding::new("pageup", true, true, false),
-    );
-    map.insert(
-        MoveTabRight.to_string(),
-        HotkeyBinding::new("pagedown", true, true, false),
-    );
-    map.insert(
-        OpenTabMenu.to_string(),
-        HotkeyBinding::new("f10", false, true, false),
-    );
-    map.insert(
-        RenameTab.to_string(),
-        HotkeyBinding::new("f2", false, false, false),
-    );
-    map.insert(
-        SelectTab1.to_string(),
-        HotkeyBinding::new("1", true, false, false),
-    );
-    map.insert(
-        SelectTab2.to_string(),
-        HotkeyBinding::new("2", true, false, false),
-    );
-    map.insert(
-        SelectTab3.to_string(),
-        HotkeyBinding::new("3", true, false, false),
-    );
-    map.insert(
-        SelectTab4.to_string(),
-        HotkeyBinding::new("4", true, false, false),
-    );
-    map.insert(
-        SelectTab5.to_string(),
-        HotkeyBinding::new("5", true, false, false),
-    );
-    map.insert(
-        SelectTab6.to_string(),
-        HotkeyBinding::new("6", true, false, false),
-    );
-    map.insert(
-        SelectTab7.to_string(),
-        HotkeyBinding::new("7", true, false, false),
-    );
-    map.insert(
-        SelectTab8.to_string(),
-        HotkeyBinding::new("8", true, false, false),
-    );
-    map.insert(
-        SelectTab9.to_string(),
-        HotkeyBinding::new("9", true, false, false),
-    );
-    map.insert(
-        PopupActiveSplit.to_string(),
-        HotkeyBinding::new("n", true, false, false),
-    );
-    map.insert(
-        PopupActiveTab.to_string(),
-        HotkeyBinding::new("n", true, true, false),
-    );
-    map.insert(
-        ZoomIn.to_string(),
-        HotkeyBinding::new("=", true, false, false),
-    );
-    map.insert(
-        ZoomOut.to_string(),
-        HotkeyBinding::new("-", true, false, false),
-    );
-    map.insert(
-        ResetZoom.to_string(),
-        HotkeyBinding::new("0", true, false, false),
-    );
-    map.insert(
-        ToggleTabBarVisibility.to_string(),
-        HotkeyBinding::new("l", true, true, true),
-    );
-    map.insert(
-        ToggleLiveTabsOnly.to_string(),
-        HotkeyBinding::new("l", true, true, false),
-    );
-    map.insert(
-        ToggleSidebar.to_string(),
-        HotkeyBinding::new("b", true, false, false),
-    );
-
-    // Chat
-    map.insert(
-        ChangeChannel.to_string(),
-        HotkeyBinding::new("r", true, false, false),
-    );
-    map.insert(FocusInput.to_string(), HotkeyBinding::default());
-    map.insert(
-        SendMessage.to_string(),
-        HotkeyBinding::new("enter", false, false, false),
-    );
-    map.insert(
-        SendMessageKeepInput.to_string(),
-        HotkeyBinding::new("enter", true, false, false),
-    );
-    map.insert(
-        OpenEmotePicker.to_string(),
-        HotkeyBinding::new("e", true, false, false),
-    );
-    map.insert(
-        ClearChat.to_string(),
-        HotkeyBinding::new("l", true, false, false),
-    );
-    map.insert(
-        CopyMessage.to_string(),
-        HotkeyBinding::new("c", true, false, false),
-    );
-    map.insert(
-        CreateClip.to_string(),
-        HotkeyBinding::new("x", false, false, true),
-    );
-    map.insert(OpenChannelInBrowser.to_string(), HotkeyBinding::default());
-    map.insert(
-        OpenChannelInStreamlink.to_string(),
-        HotkeyBinding::default(),
-    );
-    map.insert(
-        OpenChannelInCustomPlayer.to_string(),
-        HotkeyBinding::default(),
-    );
-    map.insert(OpenModViewInBrowser.to_string(), HotkeyBinding::default());
-    map.insert(OpenViewerList.to_string(), HotkeyBinding::default());
-    map.insert(
-        ScrollUp.to_string(),
-        HotkeyBinding::new("pageup", false, false, false),
-    );
-    map.insert(
-        ScrollDown.to_string(),
-        HotkeyBinding::new("pagedown", false, false, false),
-    );
-    map.insert(
-        ScrollToTop.to_string(),
-        HotkeyBinding::new("home", true, false, false),
-    );
-    map.insert(
-        ScrollToBottom.to_string(),
-        HotkeyBinding::new("end", true, false, false),
-    );
-    map.insert(
-        ReconnectActiveChannel.to_string(),
-        HotkeyBinding::new("f5", true, false, false),
-    );
-    map.insert(EnableHighlightSounds.to_string(), HotkeyBinding::default());
-    map.insert(DisableHighlightSounds.to_string(), HotkeyBinding::default());
-    map.insert(ToggleHighlightSounds.to_string(), HotkeyBinding::default());
-    map.insert(OpenSubscriptionPage.to_string(), HotkeyBinding::default());
-    map.insert(
-        FocusSplitLeft.to_string(),
-        HotkeyBinding::new("left", false, false, true),
-    );
-    map.insert(
-        FocusSplitRight.to_string(),
-        HotkeyBinding::new("right", false, false, true),
-    );
-    map.insert(
-        FocusSplitUp.to_string(),
-        HotkeyBinding::new("up", false, false, true),
-    );
-    map.insert(
-        FocusSplitDown.to_string(),
-        HotkeyBinding::new("down", false, false, true),
-    );
-
-    // Search
-    map.insert(
-        SearchPreviousResult.to_string(),
-        HotkeyBinding::new("up", false, false, false),
-    );
-    map.insert(
-        SearchNextResult.to_string(),
-        HotkeyBinding::new("down", false, false, false),
-    );
-    map.insert(
-        SearchOpenSelectedResult.to_string(),
-        HotkeyBinding::new("enter", false, false, false),
-    );
-    map.insert(
-        SearchPreviousPage.to_string(),
-        HotkeyBinding::new("pageup", false, false, false),
-    );
-    map.insert(
-        SearchNextPage.to_string(),
-        HotkeyBinding::new("pagedown", false, false, false),
-    );
-    map.insert(
-        SearchFirstResult.to_string(),
-        HotkeyBinding::new("home", false, false, false),
-    );
-    map.insert(
-        SearchLastResult.to_string(),
-        HotkeyBinding::new("end", false, false, false),
-    );
-    map.insert(
-        SearchClearQuery.to_string(),
-        HotkeyBinding::new("u", true, false, false),
-    );
-
-    // Moderation
-    map.insert(
-        ToggleModMode.to_string(),
-        HotkeyBinding::new("m", true, false, false),
-    );
-    map.insert(ToggleModLog.to_string(), HotkeyBinding::default());
-    map.insert(QuickTimeout30s.to_string(), HotkeyBinding::default());
-    map.insert(QuickTimeout10m.to_string(), HotkeyBinding::default());
-    map.insert(QuickBan.to_string(), HotkeyBinding::default());
-
-    // Other
-    map.insert(
-        ReloadEmotes.to_string(),
-        HotkeyBinding::new("f5", false, false, false),
-    );
-    map.insert(
-        ToggleFullscreen.to_string(),
-        HotkeyBinding::new("f11", false, false, false),
-    );
-    map.insert(
-        OpenDebugPopup.to_string(),
-        HotkeyBinding::new("f10", false, false, false),
-    );
-    map.insert(
-        ToggleCheatSheet.to_string(),
-        HotkeyBinding::new("/", true, false, false),
-    );
-    map.insert(
-        ToggleMetrics.to_string(),
-        HotkeyBinding::new("p", true, true, false), // Ctrl+Shift+P for performance
-    );
-    map.insert(
-        ToggleStreamerOverlay.to_string(),
-        HotkeyBinding::new("n", true, false, true), // Ctrl+Alt+N for overlay
-    );
-    map.insert(
-        ReopenClosedSplit.to_string(),
-        HotkeyBinding::new("g", true, false, false), // Ctrl+G reopens last closed split
-    );
-    map.insert(
-        ReopenClosedTab.to_string(),
-        HotkeyBinding::new("g", true, true, false),
-    );
-    map.insert(
-        ToggleLocalR9K.to_string(),
-        HotkeyBinding::new("h", true, false, false), // Ctrl+H toggles local R9K
-    );
-    map.insert(
-        QuickSwitcher.to_string(),
-        HotkeyBinding::new("k", true, false, false), // Ctrl+K for quick switcher
-    );
-    map.insert(ToggleTransparency.to_string(), HotkeyBinding::default());
-    map.insert(
-        ToggleAlwaysOnTop.to_string(),
-        HotkeyBinding::new("a", true, true, false),
-    );
-
-    map
+    DEFAULTS
+        .iter()
+        .map(|&(action, key, (ctrl, shift, alt))| {
+            (
+                action.to_string(),
+                HotkeyBinding::new(key, ctrl, shift, alt),
+            )
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -1011,7 +1012,27 @@ mod tests {
         let action = HotkeyAction::ToggleSettings;
         let s = action.to_string();
         assert_eq!(s, "toggleSettings");
-        assert_eq!(HotkeyAction::from_str(&s), Some(action));
+        assert_eq!(s.parse(), Ok(action));
+    }
+
+    #[test]
+    fn action_keys_match_serde_names() {
+        let categories: usize = [
+            NAVIGATION_ACTIONS,
+            CHAT_ACTIONS,
+            SEARCH_ACTIONS,
+            MODERATION_ACTIONS,
+            OTHER_ACTIONS,
+        ]
+        .iter()
+        .map(|actions| actions.len())
+        .sum();
+        assert_eq!(ALL_ACTIONS.len(), categories);
+        for action in ALL_ACTIONS {
+            let serde_name = serde_json::to_string(action).unwrap();
+            assert_eq!(serde_name.trim_matches('"'), action.as_str());
+            assert_eq!(action.as_str().parse(), Ok(*action));
+        }
     }
 
     #[test]
@@ -1033,9 +1054,7 @@ mod tests {
     fn default_hotkeys_have_no_scope_conflicts() {
         let defaults: Vec<(HotkeyAction, String)> = default_hotkeys()
             .into_iter()
-            .filter_map(|(name, binding)| {
-                Some((HotkeyAction::from_str(&name)?, binding.conflict_key()?))
-            })
+            .filter_map(|(name, binding)| Some((name.parse().ok()?, binding.conflict_key()?)))
             .collect();
         for (index, (action, key)) in defaults.iter().enumerate() {
             for (other, other_key) in &defaults[index + 1..] {

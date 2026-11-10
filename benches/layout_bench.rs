@@ -12,22 +12,34 @@ use echo_gpui::backend::emotes::EmoteSender;
 use echo_gpui::backend::models::{ChatMessage, HighlightType, MessageFlags, ReplyInfo};
 use echo_gpui::backend::slots::compute_structure_hash;
 use echo_gpui::backend::slots::parser::{parse_emotes_tag, parse_to_slots};
-use echo_gpui::components::chat::canvas_renderer::height_tree::HeightTree;
 use echo_gpui::components::chat::canvas_renderer::layout::{ImageType, LayoutSegment};
 use echo_gpui::components::chat::canvas_renderer::text_shaping::build_message_layout;
 use echo_gpui::components::chat::scroll_map::compute_scroll_markers;
+use echo_render_core::height_tree::HeightTree;
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// Optional message traits a fixture varies; the default is a plain row.
+#[derive(Default)]
+struct MessageTraits<'a> {
+    twitch_emotes_tag: Option<&'a str>,
+    highlight_type: Option<HighlightType>,
+    is_first_message: bool,
+    with_reply: bool,
+}
 
 fn make_chat_message(
     id: usize,
     content: &str,
     channel: &str,
-    twitch_emotes_tag: Option<&str>,
-    highlight_type: Option<HighlightType>,
-    is_first_message: bool,
-    with_reply: bool,
+    traits: MessageTraits<'_>,
 ) -> ChatMessage {
+    let MessageTraits {
+        twitch_emotes_tag,
+        highlight_type,
+        is_first_message,
+        with_reply,
+    } = traits;
     let twitch_emotes = twitch_emotes_tag.map(parse_emotes_tag).unwrap_or_default();
     let slots = parse_to_slots(content, channel, EmoteSender::NONE, &twitch_emotes);
     let structure_hash = compute_structure_hash(&slots);
@@ -94,10 +106,7 @@ fn make_badged_chat_message(id: usize, badge_count: usize) -> ChatMessage {
         id,
         "hello chat, this production-shaped badge fixture still exercises wrapping and username geometry",
         "badge-bench",
-        None,
-        None,
-        false,
-        false,
+        MessageTraits::default(),
     );
     message.badges = BENCH_BADGES[..badge_count]
         .iter()
@@ -130,29 +139,29 @@ fn bench_build_message_layout(c: &mut Criterion) {
         1,
         "hello @bench check https://example.com 😀 this is a realistic twitch line with wrapping",
         "whisper",
-        None,
-        None,
-        false,
-        false,
+        MessageTraits::default(),
     );
     let reply = make_chat_message(
         2,
         "this is a reply with more content to force wrapping and extra shaping work across lines",
         "whisper",
-        None,
-        Some(HighlightType::Mention),
-        false,
-        true,
+        MessageTraits {
+            highlight_type: Some(HighlightType::Mention),
+            with_reply: true,
+            ..MessageTraits::default()
+        },
     );
     let (dense_content, dense_tag) = make_dense_twitch_emote_fixture(18);
     let emote_dense = make_chat_message(
         3,
         &dense_content,
         "whisper",
-        Some(&dense_tag),
-        Some(HighlightType::Subscription),
-        true,
-        false,
+        MessageTraits {
+            twitch_emotes_tag: Some(&dense_tag),
+            highlight_type: Some(HighlightType::Subscription),
+            is_first_message: true,
+            ..MessageTraits::default()
+        },
     );
 
     let mut group = c.benchmark_group("layout_build");
@@ -306,7 +315,14 @@ fn bench_scroll_marker_compute(c: &mut Criterion) {
             "normal chat line without mention"
         };
         messages.push(std::sync::Arc::new(make_chat_message(
-            i, content, "whisper", None, highlight, is_first, false,
+            i,
+            content,
+            "whisper",
+            MessageTraits {
+                highlight_type: highlight,
+                is_first_message: is_first,
+                ..MessageTraits::default()
+            },
         )));
     }
 

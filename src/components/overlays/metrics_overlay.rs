@@ -133,13 +133,13 @@ impl MetricsOverlay {
             0.0
         };
 
-        let profiler_stats = crate::fps_profiler::get_stats();
-        let canvas_cpu_ms = crate::fps_profiler::canvas_cpu_ms();
-        let frame_jank_count = crate::fps_profiler::frame_jank_count();
-        let gpu_ms = crate::fps_profiler::gpu_ms();
-        let gpu_sample_count = crate::fps_profiler::gpu_sample_count();
-        let present_latency_ms = crate::fps_profiler::present_latency_ms();
-        let gpui_frame_durations = crate::fps_profiler::gpui_frame_duration_stats();
+        let profiler_stats = crate::diagnostics::fps_profiler::get_stats();
+        let canvas_cpu_ms = crate::diagnostics::fps_profiler::canvas_cpu_ms();
+        let frame_jank_count = crate::diagnostics::fps_profiler::frame_jank_count();
+        let gpu_ms = crate::diagnostics::fps_profiler::gpu_ms();
+        let gpu_sample_count = crate::diagnostics::fps_profiler::gpu_sample_count();
+        let present_latency_ms = crate::diagnostics::fps_profiler::present_latency_ms();
+        let gpui_frame_durations = crate::diagnostics::fps_profiler::gpui_frame_duration_stats();
 
         let total_memory_mb = cache_stats.memory_used as f64 / (1024.0 * 1024.0);
         let frame_memory_mb = cache_stats.frame_memory as f64 / (1024.0 * 1024.0);
@@ -180,7 +180,7 @@ impl MetricsOverlay {
             ),
             metric_row(
                 "Frame jank",
-                if crate::fps_profiler::is_enabled() {
+                if crate::diagnostics::fps_profiler::is_enabled() {
                     format!("{}", frame_jank_count)
                 } else {
                     "n/a (profiler off)".to_string()

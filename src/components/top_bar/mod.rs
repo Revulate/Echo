@@ -1,11 +1,12 @@
 //! Top bar component for Echo
 //!
 //! Contains the titlebar, window controls, and account switcher.
-//! Extracted from app.rs to reduce monolith size.
 
 use crate::backend::hotkeys::HotkeyAction;
 use crate::components::auth::render_profile_avatar;
+use crate::components::common::count_label::capped_count_label;
 use crate::components::logo::render_logo;
+use crate::components::overlays::traits::OverlayPointerIsolation;
 use crate::components::overlays::{
     clear_global_tooltip, clear_global_tooltip_if_source_in_window, show_hotkey_hint_tooltip,
     show_text_tooltip,
@@ -540,12 +541,12 @@ impl TopBarView {
     ) -> bool {
         let (connection_status, activity_open) = {
             let state = self.app_state.read(cx);
-            (state.connection_status.clone(), state.activity_open())
+            (state.connection_status, state.activity_open())
         };
         self.cache.connection.observe(&connection_status);
         let show_connection_chip =
             !matches!(connection_status, backend::ConnectionStatus::Connected)
-                && !crate::benchmark_profile::network_lanes_suppressed()
+                && !crate::bench::network_lanes_suppressed()
                 && !backend::irc::get_desired_channels().is_empty();
         let cached = self.cache.snapshot();
 
@@ -874,11 +875,7 @@ impl Render for TopBarView {
                                                         .text_size(px(FontSize::XS))
                                                         .font_weight(FontWeight::SEMIBOLD)
                                                         .text_color(colors::accent_text())
-                                                        .child(if activity_count > 99 {
-                                                            "99+".to_string()
-                                                        } else {
-                                                            activity_count.to_string()
-                                                        }),
+                                                        .child(capped_count_label(activity_count)),
                                                 ),
                                         )
                                     })
@@ -1245,12 +1242,7 @@ pub fn render_account_dropdown(
         .left_0()
         .right_0()
         .bottom_0()
-        .occlude()
-        .on_mouse_move(|_, _, cx| cx.stop_propagation())
-        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-        .on_scroll(|_, _, cx| cx.stop_propagation())
+        .block_overlay_pointer_passthrough()
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -1260,8 +1252,6 @@ pub fn render_account_dropdown(
                 cx.stop_propagation();
             }),
         )
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
         .child(
             menu_panel()
                 .absolute()

@@ -60,7 +60,7 @@ static CACHED_MODE: AtomicU64 = AtomicU64::new(0);
 static MODE_CACHE_TIME_MS: AtomicU64 = AtomicU64::new(0);
 
 /// How long to cache the mode calculation (ms)
-/// PERF: Avoid recalculating mode every poll cycle.
+/// Avoid recalculating mode every poll cycle.
 /// Kept at one 60fps frame so Animating-mode recognition does not lag by up to a
 /// full 50ms after animations become visible (which would otherwise stall the
 /// first animation frame). The cache is invalidated immediately on activity, so
@@ -122,6 +122,17 @@ impl RenderMode {
             RenderMode::FocusedIdle => Duration::from_millis(100),
             RenderMode::DeepIdle => Duration::from_millis(500),
             RenderMode::TrueIdle => Duration::from_millis(1000),
+        }
+    }
+
+    /// How often `EchoApp`'s pending-UI task drains its queues in this mode.
+    /// It never needs frame cadence, so its fastest rate is 50 ms.
+    pub fn pending_ui_interval(&self) -> Duration {
+        match self {
+            RenderMode::Interactive | RenderMode::Animating => Duration::from_millis(50),
+            RenderMode::FocusedIdle => Duration::from_millis(100),
+            RenderMode::DeepIdle => Duration::from_millis(250),
+            RenderMode::TrueIdle => Duration::from_millis(500),
         }
     }
 
@@ -235,7 +246,7 @@ fn is_deep_idle_at(now: u64) -> bool {
 
 #[inline]
 fn canvas_cpu_allows_fast_idle() -> bool {
-    let canvas_cpu_ms = crate::fps_profiler::canvas_cpu_ms();
+    let canvas_cpu_ms = crate::diagnostics::fps_profiler::canvas_cpu_ms();
     if canvas_cpu_ms > 0.0 && canvas_cpu_ms <= LOW_CANVAS_CPU_IDLE_THRESHOLD_MS {
         let next = LOW_CANVAS_CPU_IDLE_STREAK
             .fetch_add(1, Ordering::Relaxed)
@@ -275,7 +286,8 @@ pub fn current_mode() -> RenderMode {
     let now = crate::utils::unix_now_ms();
     if is_in_keep_alive_at(now) {
         RenderMode::Interactive
-    } else if image_cache::has_visible_animations() && !crate::fps_profiler::canvas_paint_stalled()
+    } else if image_cache::has_visible_animations()
+        && !crate::diagnostics::fps_profiler::canvas_paint_stalled()
     {
         RenderMode::Animating
     } else if is_true_idle_at(now) {
@@ -293,7 +305,7 @@ pub fn current_mode() -> RenderMode {
 
 /// Get current render mode with caching to avoid recalculation overhead
 ///
-/// PERF: Mode calculation involves several atomic loads and time comparisons.
+/// Mode calculation involves several atomic loads and time comparisons.
 /// This cached version reuses the result for up to MODE_CACHE_DURATION_MS.
 /// Safe to call frequently from polling loops.
 pub fn current_mode_cached() -> RenderMode {

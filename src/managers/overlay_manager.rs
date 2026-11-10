@@ -1,4 +1,4 @@
-//! Overlay Manager - Extracted from app.rs monolith
+//! Overlay Manager
 //!
 //! Handles:
 //! - Modal lifecycle (settings, login, search, mod log)
@@ -19,7 +19,6 @@ use crate::components::tabs::TabBarRenderer;
 use crate::components::ui::menu::MenuNav;
 use crate::managers::split_layout_manager::PathKey;
 use gpui::*;
-use std::collections::HashMap;
 
 /// Overlay layers for the escape stack.
 /// Escape dismisses the most recently opened layer that is still open;
@@ -76,7 +75,6 @@ pub struct OverlayManager {
     pub account_switcher_open: bool,
 
     pub open_settings_dropdown: Option<(PathKey, String)>,
-    pub split_settings_open: HashMap<PathKey, bool>,
 
     pub shown_reauth_toast: bool,
 
@@ -137,7 +135,6 @@ impl OverlayManager {
             metrics_overlay,
             account_switcher_open: false,
             open_settings_dropdown: None,
-            split_settings_open: HashMap::new(),
             shown_reauth_toast: false,
             menu_focus: cx.focus_handle(),
             menu_nav: MenuNav::default(),
@@ -245,7 +242,7 @@ impl OverlayManager {
             overlay.toggle();
         });
         let is_open = self.metrics_overlay.read(cx).is_open();
-        crate::fps_profiler::set_dashboard_enabled(is_open);
+        crate::diagnostics::fps_profiler::set_dashboard_enabled(is_open);
         if is_open {
             self.push_escape_layer(EscapeLayer::Metrics);
         } else {
@@ -262,15 +259,7 @@ impl OverlayManager {
 
     pub fn open_chatter_list(&mut self, state: ChatterListState, cx: &mut Context<Self>) {
         self.chatter_list.update(cx, |list, cx| {
-            list.open_loaded(
-                state.channel,
-                state.chatters,
-                state.total_count,
-                state.source,
-                state.login_sorted,
-                state.is_loading,
-                cx,
-            );
+            list.open_loaded(state, cx);
         });
         self.push_escape_layer(EscapeLayer::ChatterList);
     }
@@ -380,21 +369,15 @@ impl OverlayManager {
         self.menu_nav.reset();
         if self.open_settings_dropdown.as_ref().map(|(p, _)| p) == Some(&path_key) {
             self.open_settings_dropdown = None;
-            self.split_settings_open.remove(&path_key);
             self.remove_escape_layer(EscapeLayer::SplitMenu);
         } else {
-            if let Some((old_key, _)) = self.open_settings_dropdown.take() {
-                self.split_settings_open.remove(&old_key);
-            }
-            self.open_settings_dropdown = Some((path_key.clone(), channel));
-            self.split_settings_open.insert(path_key, true);
+            self.open_settings_dropdown = Some((path_key, channel));
             self.push_escape_layer(EscapeLayer::SplitMenu);
         }
     }
 
     pub fn close_all_split_settings(&mut self) {
         self.open_settings_dropdown = None;
-        self.split_settings_open.clear();
         self.remove_escape_layer(EscapeLayer::SplitMenu);
     }
 
@@ -427,10 +410,9 @@ impl OverlayManager {
     }
 
     pub fn is_split_settings_open(&self, path_key: PathKey) -> bool {
-        self.split_settings_open
-            .get(&path_key)
-            .copied()
-            .unwrap_or(false)
+        self.open_settings_dropdown
+            .as_ref()
+            .is_some_and(|(open, _)| *open == path_key)
     }
 
     /// Whether an in-window overlay that owns keyboard text input is open.
@@ -514,7 +496,7 @@ impl OverlayManager {
                 self.metrics_overlay.update(cx, |overlay, _| {
                     overlay.state.is_open = false;
                 });
-                crate::fps_profiler::set_dashboard_enabled(false);
+                crate::diagnostics::fps_profiler::set_dashboard_enabled(false);
             }
             EscapeLayer::ChatterList => {
                 self.chatter_list.update(cx, |list, _| {

@@ -13,7 +13,6 @@
 //! - `events`: Polling, EventSub, embeds, metrics
 //! - `chatterino_import`: Import from Chatterino preview, staging and backups
 //! - `followed_live`: Followed channels that are live, for Live now lists
-#![allow(clippy::type_complexity)]
 
 mod auth;
 mod chat;
@@ -55,7 +54,7 @@ pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
         .enable_all()
         .build()
         .unwrap_or_else(|error| {
-            tracing::error!("Failed to create global backend runtime: {error}");
+            crate::log_app!(error, "Failed to create global backend runtime: {error}");
             std::process::abort();
         })
 });
@@ -93,7 +92,11 @@ where
                 } else {
                     "Unknown panic".to_string()
                 };
-                tracing::error!("block_on_safe: background thread panicked: {}", panic_msg);
+                crate::log_app!(
+                    error,
+                    "block_on_safe: background thread panicked: {}",
+                    panic_msg
+                );
                 Err(format!("Background task panicked: {}", panic_msg))
             }
         }
@@ -102,10 +105,9 @@ where
     }
 }
 
-/// Cached converted emote categories per channel
-/// Key: channel_login (lowercase)
-/// Generation-tagged category snapshot. The layout generation covers provider
-/// visibility and picker display settings that do not advance emote versions.
+/// One channel's converted emote categories, tagged with the emote and layout
+/// versions they were built from. The layout version covers provider visibility
+/// and picker display settings that do not advance emote versions.
 pub(crate) struct CachedEmoteCategories {
     pub(crate) channel_version: u32,
     pub(crate) global_version: u32,
@@ -125,7 +127,8 @@ pub fn cleanup_emote_category_cache(active_channels: &std::collections::HashSet<
     EMOTE_CATEGORY_CACHE.retain(|channel, _| active_channels.contains(channel));
     let removed = before - EMOTE_CATEGORY_CACHE.len();
     if removed > 0 {
-        tracing::debug!(
+        crate::log_app!(
+            debug,
             removed = removed,
             remaining = EMOTE_CATEGORY_CACHE.len(),
             "Cleaned up emote category cache"

@@ -311,35 +311,6 @@ impl Default for BudgetManager {
     }
 }
 
-/// High- and low-water marks for cache eviction.
-pub struct EvictionThresholds {
-    /// Start eviction when usage reaches this percentage.
-    pub high_water: f64,
-    /// Target usage after eviction.
-    pub low_water: f64,
-}
-
-impl Default for EvictionThresholds {
-    fn default() -> Self {
-        Self {
-            high_water: 90.0,
-            low_water: 70.0,
-        }
-    }
-}
-
-impl EvictionThresholds {
-    /// Check whether eviction should be triggered.
-    pub fn should_evict(&self, usage_percent: f64) -> bool {
-        usage_percent >= self.high_water
-    }
-
-    /// Get the target usage after eviction.
-    pub fn target_percent(&self) -> f64 {
-        self.low_water
-    }
-}
-
 /// Pre-warmed total system memory in bytes.
 ///
 /// Populated at startup (before the first frame) by the prewarm thread in
@@ -371,17 +342,12 @@ pub fn prewarmed_total_memory_bytes() -> u64 {
 ///    - ≤ 8 GB:  72 MB
 ///    - ≤16 GB: 112 MB
 ///    - >16 GB: 192 MB
-pub fn default_total_budget_bytes_public() -> usize {
-    default_total_budget_bytes()
-}
-
-fn default_total_budget_bytes() -> usize {
+pub fn default_total_budget_bytes() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
         // Check the preferred name first, then the legacy name.
-        let env_override = std::env::var("ECHO_MEDIA_CACHE_MB")
-            .ok()
-            .or_else(|| std::env::var("ECHO_CACHE_BUDGET_MB").ok())
+        let env_override = echo_core::env::value("ECHO_MEDIA_CACHE_MB")
+            .or_else(|| echo_core::env::value("ECHO_CACHE_BUDGET_MB"))
             .and_then(|v| v.parse::<usize>().ok())
             .map(|mb| mb.clamp(32, 4096));
 
@@ -412,9 +378,7 @@ fn default_total_budget_bytes() -> usize {
 fn default_picker_total_budget_bytes(base_total: usize) -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        if let Some(mb) = std::env::var("ECHO_PICKER_CACHE_BUDGET_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        if let Some(mb) = echo_core::env::parsed::<usize>("ECHO_PICKER_CACHE_BUDGET_MB")
             .map(|mb| mb.clamp(64, 4096))
         {
             return (mb * 1024 * 1024).max(base_total);
@@ -484,13 +448,5 @@ mod tests {
 
         assert_eq!(budget.total_usage(), 50);
         assert!((budget.usage_percent() - 50.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_eviction_thresholds() {
-        let thresholds = EvictionThresholds::default();
-        assert!(!thresholds.should_evict(80.0));
-        assert!(thresholds.should_evict(90.0));
-        assert!(thresholds.should_evict(95.0));
     }
 }

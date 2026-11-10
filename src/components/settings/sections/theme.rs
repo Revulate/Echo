@@ -656,7 +656,7 @@ struct HighlightPreviewMetrics {
 }
 
 fn highlight_preview_metrics() -> HighlightPreviewMetrics {
-    let font_scale = get_font_scale();
+    let font_scale = settings::get_font_scale();
     let emote_scale = settings::get_emote_scale();
     let badge_scale = settings::get_badge_scale();
     let chat_density = settings::get_chat_density();
@@ -780,11 +780,6 @@ pub(super) fn render_highlight_preview() -> impl IntoElement {
             .into_any_element(),
         ],
     )
-}
-
-/// Current font scale from backend
-fn get_font_scale() -> f32 {
-    settings::get_font_scale()
 }
 
 /// Current tab overflow mode from backend

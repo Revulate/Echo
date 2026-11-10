@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+Record Echo executable identity metadata.
+
+Records a baseline identity only; it is not a benchmark measurement.
+record-echo-baseline.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [string]$RunDir = "",
@@ -17,138 +24,17 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function Resolve-ExecutablePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (Test-Path $Path) {
-        return (Resolve-Path $Path).Path
-    }
-
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-        return $command.Source
-    }
-
-    throw "ExecutablePath '$Path' was not found as a file or executable command."
-}
-
-function Invoke-GitValue {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot,
-
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments
-    )
-
-    $output = & git -C $RepoRoot @Arguments 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        return $null
-    }
-
-    return (($output | Out-String).Trim())
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $args = @{
-        Scenario = $Scenario
-        EchoPath = $ExecutablePath
-        EchoBuildType = $BuildType
-        Notes = $Notes
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-        $args.OutputRoot = $OutputRoot
-    }
-
-    $output = & $initializer @args
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 $repoRoot = Resolve-RepoRoot
-$scenarioDir = Initialize-RunDirectory -RepoRoot $repoRoot
-$resolvedExecutable = Resolve-ExecutablePath -Path $ExecutablePath
+$scenarioDir = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $Scenario
+    OutputRoot = $OutputRoot
+    EchoPath = $ExecutablePath
+    EchoBuildType = $BuildType
+    Notes = $Notes
+}
+$resolvedExecutable = Resolve-ExecutablePath -Path $ExecutablePath -Label "ExecutablePath"
 $fileItem = Get-Item -LiteralPath $resolvedExecutable
 $fileHash = Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedExecutable
 $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($resolvedExecutable)

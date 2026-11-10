@@ -168,7 +168,7 @@ fn refresh_if_due() {
 }
 
 fn signed_in() -> bool {
-    !crate::benchmark_ui_fixture::is_enabled()
+    !crate::bench::ui_fixture::is_enabled()
         && !crate::backend::irc::is_anonymous_mode()
         && crate::backend::bridge::is_authenticated()
 }

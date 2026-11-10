@@ -2,8 +2,6 @@
 //!
 //! Manages text content, cursor position, selection, and undo/redo history.
 
-#![allow(clippy::type_complexity)]
-
 use gpui::{
     App, Bounds, CaretAffinity, ClipboardItem, Context, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
@@ -56,6 +54,20 @@ struct HistoryEntry {
     selection: Option<Range<usize>>,
 }
 
+/// Exact single-line glyph layout and canvas bounds published by Input's
+/// prepaint pass.
+struct PointerLayout {
+    /// Canvas bounds shifted left by the scroll offset, so they start where
+    /// the text starts.
+    bounds: Bounds<Pixels>,
+    line: ShapedLine,
+    /// The text `line` was shaped from.
+    text: String,
+    text_run: TextRun,
+    font_size: Pixels,
+    line_height: Pixels,
+}
+
 /// The core state for a text input field
 pub struct InputState {
     /// Focus handle for this input
@@ -85,14 +97,9 @@ pub struct InputState {
     redo_stack: Vec<HistoryEntry>,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
-    /// Exact single-line glyph layout and canvas bounds published by Input's
-    /// prepaint pass for click/drag cursor hit-testing.
-    pointer_bounds: Option<Bounds<Pixels>>,
-    pointer_layout: Option<ShapedLine>,
-    pointer_text: Option<String>,
-    pointer_text_run: Option<TextRun>,
-    pointer_font_size: Option<Pixels>,
-    pointer_line_height: Option<Pixels>,
+    /// The line Input's last prepaint shaped, for pointer hit-testing and
+    /// IME caret bounds.
+    pointer_layout: Option<PointerLayout>,
     pointer_selection_anchor: Option<usize>,
     /// How far the text is scrolled left so the caret stays inside the box.
     scroll_x: Pixels,
@@ -164,12 +171,7 @@ impl InputState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             _subscriptions,
-            pointer_bounds: None,
             pointer_layout: None,
-            pointer_text: None,
-            pointer_text_run: None,
-            pointer_font_size: None,
-            pointer_line_height: None,
             pointer_selection_anchor: None,
             scroll_x: px(0.0),
             spell_check_ranges: Vec::new(),
@@ -247,12 +249,14 @@ impl InputState {
         font_size: Pixels,
         line_height: Pixels,
     ) {
-        self.pointer_bounds = Some(bounds);
-        self.pointer_layout = Some(layout);
-        self.pointer_text = Some(text.to_owned());
-        self.pointer_text_run = Some(text_run.clone());
-        self.pointer_font_size = Some(font_size);
-        self.pointer_line_height = Some(line_height);
+        self.pointer_layout = Some(PointerLayout {
+            bounds,
+            line: layout,
+            text: text.to_owned(),
+            text_run: text_run.clone(),
+            font_size,
+            line_height,
+        });
     }
 
     fn canonical_affinity_for_index(&self, index: usize) -> CaretAffinity {
@@ -275,10 +279,8 @@ impl InputState {
         if self.text.is_empty() {
             return Some((0, CaretAffinity::Trailing));
         }
-        let (Some(bounds), Some(layout)) = (self.pointer_bounds, self.pointer_layout.as_ref())
-        else {
-            return None;
-        };
+        let pointer = self.pointer_layout.as_ref()?;
+        let (bounds, layout) = (pointer.bounds, &pointer.line);
         if layout.has_bidi_runs && !layout.bidi_geometry_complete {
             return None;
         }
@@ -418,7 +420,7 @@ impl InputState {
         value: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !crate::benchmark_ui_fixture::is_enabled() {
+        if !crate::bench::ui_fixture::is_enabled() {
             return false;
         }
         self.text.clear();
@@ -1189,17 +1191,15 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let (Some(text_run), Some(font_size), Some(line_height)) = (
-            self.pointer_text_run.as_ref(),
-            self.pointer_font_size,
-            self.pointer_line_height,
-        ) else {
+        let Some(pointer) = self.pointer_layout.as_ref() else {
             return Some(element_bounds);
         };
-        let layout = if self.pointer_text.as_deref() == Some(self.text.as_str()) {
-            self.pointer_layout.clone()?
+        let line_height = pointer.line_height;
+        let layout = if pointer.text == self.text {
+            pointer.line.clone()
         } else {
-            let mut text_run = text_run.clone();
+            let font_size = pointer.font_size;
+            let mut text_run = pointer.text_run.clone();
             text_run.len = self.text.len();
             _window
                 .text_system()

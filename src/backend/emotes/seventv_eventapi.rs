@@ -223,8 +223,10 @@ static RESTART_QUEUED: AtomicBool = AtomicBool::new(false);
 /// Whether the dev replay worker has already been started.
 static REPLAY_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// emote_set_id -> channel_login mapping (populated at runtime)
-static SET_TO_CHANNEL: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
+/// `ECHO_7TV_EVENTAPI_REPLAY_ONLY`: replay fixtures without the live websocket.
+fn replay_only() -> bool {
+    echo_core::env::flag("ECHO_7TV_EVENTAPI_REPLAY_ONLY")
+}
 
 /// emote_set_id -> all channel owners. Multiple active channels can share one
 /// 7TV set, and every owner needs dispatch refreshes.
@@ -252,9 +254,9 @@ static USER_TO_CHANNELS: LazyLock<DashMap<String, HashSet<String>>> = LazyLock::
 
 /// Queue of subscription changes to apply on the live connection (drained at
 /// connect and by the connection's 250ms tick). A std Mutex so any thread or
-/// runtime can push synchronously — the previous tokio Mutex forced pushes
-/// through a spawn on the caller's runtime, which silently dropped commands
-/// when a short-lived fetch runtime shut down before the task ran.
+/// runtime can push synchronously: an async lock would need a task on the
+/// caller's runtime, and a short-lived fetch runtime can shut down before
+/// that task runs, dropping the command.
 static PENDING_SUBSCRIPTIONS: LazyLock<std::sync::Mutex<Vec<SubscriptionCommand>>> =
     LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
@@ -660,35 +662,7 @@ pub fn start_seventv_event_api() {
         );
     }
 
-    let spawn_result = std::thread::Builder::new()
-        .name("7tv-eventapi".into())
-        .spawn(|| {
-            struct RunningGuard;
-            impl Drop for RunningGuard {
-                fn drop(&mut self) {
-                    RUNNING.store(false, Ordering::SeqCst);
-                }
-            }
-            let _guard = RunningGuard;
-
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    crate::log_emotes!(error, "Failed to create 7TV EventAPI runtime: {}", e);
-                    return;
-                }
-            };
-
-            rt.block_on(run_supervisor());
-        });
-
-    if let Err(e) = spawn_result {
-        RUNNING.store(false, Ordering::SeqCst);
-        crate::log_emotes!(error, "Failed to spawn 7TV EventAPI thread: {}", e);
-    }
+    super::spawn_runtime_thread("7tv-eventapi", &RUNNING, run_supervisor);
 }
 
 pub fn shutdown() {
@@ -725,7 +699,7 @@ fn restart(reason: &'static str) {
         return;
     }
 
-    if std::env::var_os("ECHO_7TV_EVENTAPI_REPLAY_ONLY").is_some() {
+    if replay_only() {
         crate::log_emotes!(
             debug,
             reason,
@@ -795,7 +769,7 @@ pub fn subscribe_channel_set(channel_login: &str, set_id: &str) {
         return;
     }
 
-    let channel = channel_login.to_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     let set = set_id.to_string();
 
     if let Some(old_set) = CHANNEL_TO_SET.insert(channel.clone(), set.clone())
@@ -832,7 +806,7 @@ pub fn subscribe_channel_set(channel_login: &str, set_id: &str) {
 /// emote-set and user subscriptions even when Echo believes they are active,
 /// and restart a stopped EventAPI client.
 pub(crate) fn resubscribe_channel(channel_login: &str) {
-    let channel = channel_login.trim_start_matches('#').to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     let set_id = CHANNEL_TO_SET
         .get(&channel)
         .map(|set_id| set_id.clone())
@@ -857,15 +831,13 @@ pub(crate) fn resubscribe_channel(channel_login: &str) {
         DIAGNOSTICS.lock_or_recover().connected
     );
     FORCED_RESUBSCRIBES.lock_or_recover().extend(keys);
-    if !RUNNING.load(Ordering::SeqCst)
-        && std::env::var_os("ECHO_7TV_EVENTAPI_REPLAY_ONLY").is_none()
-    {
+    if !RUNNING.load(Ordering::SeqCst) && !replay_only() {
         start_seventv_event_api();
     }
 }
 
 pub(crate) fn clear_channel_set_subscription(channel_login: &str) {
-    let channel = channel_login.to_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     if let Some((_, set_id)) = CHANNEL_TO_SET.remove(&channel) {
         remove_set_channel_mapping(&set_id, &channel);
         if !set_is_desired(&set_id) {
@@ -877,7 +849,7 @@ pub(crate) fn clear_channel_set_subscription(channel_login: &str) {
 }
 
 fn remove_channel_set_owner_if_matches(channel_login: &str, set_id: &str) -> bool {
-    let channel = channel_login.to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     let removed = CHANNEL_TO_SET
         .remove_if(&channel, |_, current| current == set_id)
         .is_some();
@@ -918,7 +890,7 @@ fn retain_channel_user_subscription_without_set(
     mut details: SevenTvChannelSubscription,
     allowed_set_ids: &[&str],
 ) -> bool {
-    let channel = channel_login.to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     if let Some(existing) = CHANNEL_DETAILS.get(&channel) {
         let identity_matches = existing.user_id == details.user_id
             && existing.connection_index == details.connection_index;
@@ -949,7 +921,7 @@ pub(crate) fn retire_terminal_channel_fetch(
     set_id: &str,
     details: Option<SevenTvChannelSubscription>,
 ) -> bool {
-    let channel = channel_login.to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     if ACTIVE_SET_REFRESH_TARGETS
         .get(&channel)
         .is_some_and(|target| target.value() != set_id)
@@ -984,7 +956,7 @@ fn retire_terminal_active_set(
     terminal_set_id: &str,
     details: SevenTvChannelSubscription,
 ) -> bool {
-    let channel = channel_login.to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     if !active_set_refresh_is_current(&channel, terminal_set_id)
         || CHANNEL_TO_SET.get(&channel).is_some_and(|current| {
             current.value() != old_set_id && current.value() != terminal_set_id
@@ -1037,7 +1009,7 @@ pub(crate) fn subscribe_channel_details(channel_login: &str, details: SevenTvCha
         return;
     }
 
-    let channel = channel_login.to_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
 
     if let Some(old_details) = CHANNEL_DETAILS.insert(channel.clone(), details.clone())
         && old_details.user_id != details.user_id
@@ -1107,7 +1079,7 @@ pub fn subscribe_global_set(set_id: &str) {
 
 /// Remove all EventAPI ownership for a channel that is no longer active.
 pub fn unsubscribe_channel(channel_login: &str) {
-    let channel = channel_login.to_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
 
     if let Some((_, details)) = CHANNEL_DETAILS.remove(&channel) {
         remove_user_channel_mapping(&details.user_id, &channel);
@@ -1161,7 +1133,7 @@ pub(crate) fn diagnostics() -> EventApiDiagnostics {
 /// authoritative registry is fully subscribed. Disconnects, queued subscription
 /// changes, and active-set transitions fall back to short polling automatically.
 pub(crate) fn channel_updates_are_live(channel_login: &str) -> bool {
-    let channel = channel_login.trim_start_matches('#').to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     if channel.is_empty()
         || !CHANNEL_TO_SET.contains_key(&channel)
         || ACTIVE_SET_REFRESH_TARGETS.contains_key(&channel)
@@ -1254,16 +1226,16 @@ pub(crate) fn ownership_snapshot() -> EventApiOwnershipSnapshot {
 }
 
 pub fn start_eventapi_replay_from_env() -> bool {
-    let Some(path) = std::env::var_os("ECHO_7TV_EVENTAPI_REPLAY").map(PathBuf::from) else {
+    let Some(path) = echo_core::env::value("ECHO_7TV_EVENTAPI_REPLAY").map(PathBuf::from) else {
         return false;
     };
 
-    let replay_only = std::env::var_os("ECHO_7TV_EVENTAPI_REPLAY_ONLY").is_some();
+    let replay_only = replay_only();
     if REPLAY_RUNNING.swap(true, Ordering::SeqCst) {
         return replay_only;
     }
 
-    if let Ok(mappings) = std::env::var("ECHO_7TV_EVENTAPI_REPLAY_MAPPINGS") {
+    if let Some(mappings) = echo_core::env::value("ECHO_7TV_EVENTAPI_REPLAY_MAPPINGS") {
         let mut applied = 0usize;
         for mapping in mappings
             .split([',', ';'])
@@ -1286,9 +1258,9 @@ pub fn start_eventapi_replay_from_env() -> bool {
             "7TV EventAPI replay: applied {} set/channel mapping(s)",
             applied
         );
-    } else if let (Ok(set_id), Ok(channel)) = (
-        std::env::var("ECHO_7TV_EVENTAPI_REPLAY_SET_ID"),
-        std::env::var("ECHO_7TV_EVENTAPI_REPLAY_CHANNEL"),
+    } else if let (Some(set_id), Some(channel)) = (
+        echo_core::env::value("ECHO_7TV_EVENTAPI_REPLAY_SET_ID"),
+        echo_core::env::value("ECHO_7TV_EVENTAPI_REPLAY_CHANNEL"),
     ) {
         apply_replay_mapping(&set_id, &channel);
     } else {
@@ -1298,10 +1270,8 @@ pub fn start_eventapi_replay_from_env() -> bool {
         );
     }
 
-    let delay_ms = std::env::var("ECHO_7TV_EVENTAPI_REPLAY_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1500);
+    let delay_ms =
+        echo_core::env::parsed::<u64>("ECHO_7TV_EVENTAPI_REPLAY_DELAY_MS").unwrap_or(1500);
 
     let spawn_result = std::thread::Builder::new()
         .name("7tv-eventapi-replay".into())
@@ -1350,11 +1320,9 @@ fn apply_replay_mapping(set_id: &str, channel: &str) {
         return;
     }
 
-    if let Ok(user_id) = std::env::var("ECHO_7TV_EVENTAPI_REPLAY_USER_ID") {
-        let connection_index = std::env::var("ECHO_7TV_EVENTAPI_REPLAY_CONNECTION_INDEX")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
+    if let Some(user_id) = echo_core::env::value("ECHO_7TV_EVENTAPI_REPLAY_USER_ID") {
+        let connection_index =
+            echo_core::env::parsed("ECHO_7TV_EVENTAPI_REPLAY_CONNECTION_INDEX").unwrap_or(0);
         subscribe_channel_details(
             channel,
             SevenTvChannelSubscription {
@@ -1372,11 +1340,6 @@ fn apply_replay_mapping(set_id: &str, channel: &str) {
 fn desired_subscriptions() -> Vec<SubscriptionKey> {
     let mut subscriptions = HashSet::new();
     for entry in SET_TO_CHANNELS.iter() {
-        if !entry.key().is_empty() {
-            subscriptions.insert(SubscriptionKey::emote_set(entry.key().clone()));
-        }
-    }
-    for entry in SET_TO_CHANNEL.iter() {
         if !entry.key().is_empty() {
             subscriptions.insert(SubscriptionKey::emote_set(entry.key().clone()));
         }
@@ -1418,7 +1381,7 @@ pub(crate) fn subscribe_channel_entitlements(channel_login: &str, twitch_channel
     if twitch_channel_id.is_empty() || crate::backend::irc::is_channel_closed(channel_login) {
         return;
     }
-    let channel = channel_login.trim_start_matches('#').to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel_login);
     if CHANNEL_ENTITLEMENT_IDS
         .get(&channel)
         .is_some_and(|current| current.value() == twitch_channel_id)
@@ -1437,14 +1400,11 @@ fn set_is_desired(set_id: &str) -> bool {
     SET_TO_CHANNELS
         .get(set_id)
         .is_some_and(|entry| !entry.value().is_empty())
-        || SET_TO_CHANNEL
-            .get(set_id)
-            .is_some_and(|entry| !entry.value().is_empty())
         || CHANNEL_TO_SET.iter().any(|entry| entry.value() == set_id)
 }
 
 fn channel_maps_to_set(channel: &str, set_id: &str) -> bool {
-    let channel = channel.to_ascii_lowercase();
+    let channel = super::normalize_channel_key(channel);
     if channel == GLOBAL_SET_CHANNEL {
         return GLOBAL_SET_OWNER.lock_or_recover().as_deref() == Some(set_id);
     }
@@ -1489,11 +1449,6 @@ fn schedule_authoritative_reconcile_after_session_loss() {
 
     for entry in SET_TO_CHANNELS.iter() {
         if entry.value().contains(GLOBAL_SET_CHANNEL) {
-            targets.insert((entry.key().clone(), GLOBAL_SET_CHANNEL.to_string(), true));
-        }
-    }
-    for entry in SET_TO_CHANNEL.iter() {
-        if entry.value() == GLOBAL_SET_CHANNEL {
             targets.insert((entry.key().clone(), GLOBAL_SET_CHANNEL.to_string(), true));
         }
     }
@@ -1578,7 +1533,7 @@ async fn reconcile_channel_assignment_after_session_loss(
         return;
     };
 
-    super::invalidate_7tv_fetch_cache_for_event(Some(&channel), false);
+    super::invalidate_seventv_fetch_cache_for_event(Some(&channel), false);
     match super::EMOTE_CACHE
         .refresh_channel_emotes(&channel_id, &channel)
         .await
@@ -1653,16 +1608,15 @@ fn user_is_desired(user_id: &str) -> bool {
 }
 
 fn get_channels_for_set(set_id: &str) -> Vec<String> {
-    if let Some(owners) = SET_TO_CHANNELS.get(set_id) {
-        return owners
-            .iter()
-            .filter(|channel| !channel.is_empty())
-            .cloned()
-            .collect();
-    }
-    SET_TO_CHANNEL
+    SET_TO_CHANNELS
         .get(set_id)
-        .map(|entry| vec![entry.value().clone()])
+        .map(|owners| {
+            owners
+                .iter()
+                .filter(|channel| !channel.is_empty())
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1682,7 +1636,6 @@ fn get_channels_for_user(user_id: &str) -> Vec<String> {
 fn add_set_channel_mapping(set_id: &str, channel: &str) {
     let mut owners = SET_TO_CHANNELS.entry(set_id.to_string()).or_default();
     owners.insert(channel.to_string());
-    SET_TO_CHANNEL.insert(set_id.to_string(), channel.to_string());
 }
 
 fn add_user_channel_mapping(user_id: &str, channel: &str) {
@@ -1691,33 +1644,10 @@ fn add_user_channel_mapping(user_id: &str, channel: &str) {
 }
 
 fn remove_set_channel_mapping(set_id: &str, channel: &str) {
-    let (remove_set, replacement) = {
-        match SET_TO_CHANNELS.get_mut(set_id) {
-            Some(mut owners) => {
-                owners.remove(channel);
-                if owners.is_empty() {
-                    (true, None)
-                } else {
-                    (false, owners.iter().next().cloned())
-                }
-            }
-            _ => (false, None),
-        }
-    };
-
-    if remove_set {
-        SET_TO_CHANNELS.remove(set_id);
-        SET_TO_CHANNEL.remove(set_id);
-    } else if let Some(replacement) = replacement {
-        SET_TO_CHANNEL.insert(set_id.to_string(), replacement);
-    } else {
-        let maps_to_channel = SET_TO_CHANNEL
-            .get(set_id)
-            .is_some_and(|entry| entry.value() == channel);
-        if maps_to_channel {
-            SET_TO_CHANNEL.remove(set_id);
-        }
-    }
+    SET_TO_CHANNELS.remove_if_mut(set_id, |_, owners| {
+        owners.remove(channel);
+        owners.is_empty()
+    });
 }
 
 fn remove_user_channel_mapping(user_id: &str, channel: &str) {
@@ -2862,10 +2792,10 @@ async fn run_active_set_refresh(
     new_set_id: String,
     actor: Option<String>,
 ) {
-    super::invalidate_7tv_fetch_cache_for_event(Some(&channel), false);
+    super::invalidate_seventv_fetch_cache_for_event(Some(&channel), false);
     let mut attempt = 0;
     let fetch_result = loop {
-        let result = super::fetch_7tv_emote_set_by_id(&new_set_id, Some(&channel)).await;
+        let result = super::fetch_seventv_emote_set_by_id(&new_set_id, Some(&channel)).await;
         let retry_delay = SET_FETCH_RETRY_DELAYS_SECS.get(attempt);
         match (&result, retry_delay) {
             (Err(err), Some(delay)) if active_set_refresh_is_current(&channel, &new_set_id) => {
@@ -2903,7 +2833,7 @@ async fn run_active_set_refresh(
 
             let applied_set_id = emote_set_id.unwrap_or_else(|| new_set_id.clone());
             let count =
-                super::apply_7tv_channel_emote_rows(&channel, emotes, &applied_set_id).await;
+                super::apply_seventv_channel_emote_rows(&channel, emotes, &applied_set_id).await;
             if !active_set_refresh_is_current(&channel, &new_set_id) {
                 crate::backend::metrics::record_emote_event(
                     "7tv.user_update.active_set.stale_after_apply",
@@ -2960,9 +2890,10 @@ async fn run_active_set_refresh(
                 } else {
                     old_set_id.as_str()
                 };
-                let removed = super::clear_7tv_channel_emote_rows_if_set(&channel, applied_set_id)
-                    .await
-                    .unwrap_or(0);
+                let removed =
+                    super::clear_seventv_channel_emote_rows_if_set(&channel, applied_set_id)
+                        .await
+                        .unwrap_or(0);
                 clear_active_set_refresh_target(&channel, &new_set_id);
                 crate::backend::metrics::record_emote_event(
                     "7tv.user_update.active_set.terminal_cleared",
@@ -3078,7 +3009,7 @@ async fn run_active_set_clear(
         clear_active_set_refresh_target(&channel, "");
         return;
     }
-    let removed = super::clear_7tv_channel_emote_rows_if_set(&channel, &old_set_id)
+    let removed = super::clear_seventv_channel_emote_rows_if_set(&channel, &old_set_id)
         .await
         .unwrap_or(0);
     clear_active_set_refresh_target(&channel, "");
@@ -3201,7 +3132,7 @@ async fn replay_eventapi_value(value: serde_json::Value) {
             op::DISPATCH => {
                 handle_dispatch(&msg.d).await;
             }
-            op::HELLO if std::env::var_os("ECHO_7TV_EVENTAPI_REPLAY_ONLY").is_some() => {
+            op::HELLO if replay_only() => {
                 replay_message_through_handler(&value, msg.op).await;
             }
             op::HELLO => {
@@ -3210,9 +3141,7 @@ async fn replay_eventapi_value(value: serde_json::Value) {
             op::HEARTBEAT => {
                 crate::log_emotes!(debug, "7TV EventAPI replay: HEARTBEAT fixture observed");
             }
-            op::RECONNECT | op::ERROR | op::END_OF_STREAM
-                if std::env::var_os("ECHO_7TV_EVENTAPI_REPLAY_ONLY").is_some() =>
-            {
+            op::RECONNECT | op::ERROR | op::END_OF_STREAM if replay_only() => {
                 replay_message_through_handler(&value, msg.op).await;
             }
             op::RECONNECT | op::ERROR | op::END_OF_STREAM => {
@@ -3279,7 +3208,7 @@ fn log_dispatch_changes(
             changes.summary.added += 1;
             crate::backend::metrics::record_emote_event("7tv.dispatch.added");
             if let Some(value) = dispatch_new_value(item) {
-                match super::seven_tv_dispatch_emote(value, patch_channel) {
+                match super::seventv_dispatch_emote(value, patch_channel) {
                     Some(emote) => changes.patch.added.push(emote),
                     None => changes.requires_full_refresh = true,
                 }
@@ -3346,7 +3275,7 @@ fn log_dispatch_changes(
             changes.summary.updated += 1;
             let old_identity = extract_old_emote_identity(item);
             if let Some(value) = dispatch_new_value(item) {
-                match super::seven_tv_dispatch_emote(value, patch_channel) {
+                match super::seventv_dispatch_emote(value, patch_channel) {
                     Some(emote) => changes.patch.updated.push(super::SevenTvEmoteUpdate {
                         old: old_identity,
                         emote,
@@ -3541,7 +3470,7 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                 continue;
             }
 
-            super::invalidate_7tv_fetch_cache_for_event(
+            super::invalidate_seventv_fetch_cache_for_event(
                 (!refresh.is_global).then_some(refresh.channel.as_str()),
                 refresh.is_global,
             );
@@ -3566,11 +3495,11 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                     continue;
                 }
                 let patch_result = if refresh.is_global {
-                    super::apply_7tv_global_emote_patch(refresh.patch.clone()).await
+                    super::apply_seventv_global_emote_patch(refresh.patch.clone()).await
                 } else if is_personal {
-                    super::apply_7tv_user_emote_patch(refresh.patch.clone()).await
+                    super::apply_seventv_user_emote_patch(refresh.patch.clone()).await
                 } else {
-                    super::apply_7tv_channel_emote_patch(&refresh.channel, refresh.patch.clone())
+                    super::apply_seventv_channel_emote_patch(&refresh.channel, refresh.patch.clone())
                         .await
                 };
 
@@ -3636,7 +3565,7 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
             );
 
             let emote_channel = (!refresh.is_global).then_some(refresh.channel.as_str());
-            match super::fetch_7tv_emote_set_by_id(&refresh.set_id, emote_channel).await {
+            match super::fetch_seventv_emote_set_by_id(&refresh.set_id, emote_channel).await {
                 Ok(super::SevenTvExactSetFetchOutcome::Present {
                     emotes,
                     emote_set_id,
@@ -3658,11 +3587,11 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                     let applied_set_id =
                         emote_set_id.unwrap_or_else(|| refresh.set_id.clone());
                     let count = if refresh.is_global {
-                        super::apply_7tv_global_emote_set(emotes).await
+                        super::apply_seventv_global_emote_set(emotes).await
                     } else if is_personal {
-                        super::apply_7tv_user_emote_set(emotes).await
+                        super::apply_seventv_user_emote_set(emotes).await
                     } else {
-                        super::apply_7tv_channel_emote_rows(
+                        super::apply_seventv_channel_emote_rows(
                             &refresh.channel,
                             emotes,
                             &applied_set_id,
@@ -3699,11 +3628,11 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                     }
 
                     let removed = if refresh.is_global {
-                        super::clear_7tv_global_emote_set_if_matches(&refresh.set_id).await
+                        super::clear_seventv_global_emote_set_if_matches(&refresh.set_id).await
                     } else if is_personal {
-                        Some(super::apply_7tv_user_emote_set(Vec::new()).await)
+                        Some(super::apply_seventv_user_emote_set(Vec::new()).await)
                     } else {
-                        super::clear_7tv_channel_emote_rows_if_set(
+                        super::clear_seventv_channel_emote_rows_if_set(
                             &refresh.channel,
                             &refresh.set_id,
                         )

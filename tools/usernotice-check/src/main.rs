@@ -1,3 +1,7 @@
+//! Contract: USERNOTICE classification in `src/backend/usernotice_core.rs`: event
+//! labels, subscription and watch-streak detection, highlight kinds and the
+//! system-message slots.
+
 mod backend {
     pub mod slots {
         use std::sync::Arc;
@@ -19,8 +23,7 @@ mod backend {
 #[path = "../../../src/backend/usernotice_core.rs"]
 mod usernotice_core;
 
-use std::hint::black_box;
-use std::time::Instant;
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 use usernotice_core::{UsernoticeHighlightKind, UsernoticeTags};
 
 fn main() {
@@ -140,41 +143,8 @@ fn main() {
 
     assert_eq!(usernotice_core::highlight_kind(&tags("ritual")), None);
 
-    let fixtures = [
-        tags("sub"),
-        tags("giftpaidupgrade"),
-        tags("communitypayforward"),
-        tags("raid"),
-        tags("announcement"),
-        tags("bitsbadgetier"),
-        watch,
-    ];
-    let iterations = 1_000_000usize;
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for index in 0..iterations {
-        let item = &fixtures[index % fixtures.len()];
-        if usernotice_core::is_subscription_usernotice(black_box(&item.msg_id)) {
-            checksum = checksum.wrapping_add(1);
-        }
-        if usernotice_core::is_watch_streak_usernotice(black_box(item)) {
-            checksum = checksum.wrapping_add(3);
-        }
-        if usernotice_core::highlight_kind(black_box(item)).is_some() {
-            checksum = checksum.wrapping_add(7);
-        }
-        checksum = checksum.wrapping_add(usernotice_core::event_type_label(&item.msg_id).len());
-    }
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / iterations as f64;
-    let units_per_second = iterations as f64 / elapsed.as_secs_f64();
-
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows();
-    println!(
-        "classify,usernotice_highlight_kind,{},{:.2},{:.0},{}",
-        iterations, ns_per_unit, units_per_second, checksum
-    );
 }
 
 fn print_smoke_rows() {
@@ -207,7 +177,7 @@ fn print_smoke_rows() {
         ),
         ("usernotice_label_unknown", "unknown", "notice"),
     ] {
-        print_fixture(
+        assert_fixture(
             name,
             usernotice_core::event_type_label(msg_id),
             expected_label,
@@ -226,12 +196,12 @@ fn print_smoke_rows() {
         ("usernotice_ritual_no_highlight", "ritual", "none"),
     ] {
         let actual = highlight_name(usernotice_core::highlight_kind(&tags(msg_id)));
-        print_fixture(name, actual, expected);
+        assert_fixture(name, actual, expected);
     }
 
     let mut ritual = tags("ritual");
     ritual.ritual_name = Some("watch-streak".to_string());
-    print_fixture(
+    assert_fixture(
         "usernotice_watch_streak_ritual_name",
         bool_text(usernotice_core::is_watch_streak_usernotice(&ritual)),
         "true",
@@ -239,7 +209,7 @@ fn print_smoke_rows() {
 
     let mut months = tags("ritual");
     months.watch_streak_months = Some(3);
-    print_fixture(
+    assert_fixture(
         "usernotice_watch_streak_months",
         bool_text(usernotice_core::is_watch_streak_usernotice(&months)),
         "true",
@@ -247,31 +217,26 @@ fn print_smoke_rows() {
 
     let mut flag = tags("ritual");
     flag.watch_streak = Some("true".to_string());
-    print_fixture(
+    assert_fixture(
         "usernotice_watch_streak_flag",
         bool_text(usernotice_core::is_watch_streak_usernotice(&flag)),
         "true",
     );
 
-    print_fixture(
+    assert_fixture(
         "usernotice_watch_streak_msg_id",
         bool_text(usernotice_core::is_watch_streak_usernotice(&tags(
             "watch-streak",
         ))),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "usernotice_watchstreak_msg_id",
         bool_text(usernotice_core::is_watch_streak_usernotice(&tags(
             "watchstreak",
         ))),
         "true",
     );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
 }
 
 fn highlight_name(kind: Option<UsernoticeHighlightKind>) -> &'static str {
@@ -283,10 +248,6 @@ fn highlight_name(kind: Option<UsernoticeHighlightKind>) -> &'static str {
         Some(UsernoticeHighlightKind::WatchStreak) => "watch streak",
         None => "none",
     }
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 fn tags(msg_id: &str) -> UsernoticeTags {

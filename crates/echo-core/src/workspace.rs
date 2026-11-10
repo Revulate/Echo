@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 // ============================================================================
-// Placeholder Utilities (module-level, no struct needed)
+// Placeholder utilities
 // ============================================================================
 
 /// Prefix for placeholder channels
@@ -29,7 +29,7 @@ pub fn is_placeholder(channel: &str) -> bool {
 }
 
 // ============================================================================
-// 2x2 grid blocks
+// Ratios and divider geometry
 // ============================================================================
 
 /// Two band ratios closer than this describe the same divider position.
@@ -39,8 +39,8 @@ pub fn is_placeholder(channel: &str) -> bool {
 /// tolerance the rotation would silently discard an adjustment the user made.
 const GRID_RATIO_EPSILON: f32 = 0.004;
 
-/// Ratio clamp used by [`SplitNode::adjust_ratio`], reused so a derived ratio
-/// can never land somewhere a drag could not have put it.
+/// Bounds for a divider ratio derived from other ratios rather than dragged,
+/// so a rotated 2x2 block never collapses a pane to nothing.
 const RATIO_MIN: f32 = 0.1;
 const RATIO_MAX: f32 = 0.9;
 
@@ -224,33 +224,35 @@ impl SplitNode {
     }
 
     /// Get the SplitId at a given path
-    pub fn get_split_id_at_path(&self, path: &[usize]) -> Option<SplitId> {
-        if path.is_empty() {
-            return self.split_id();
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => None,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                children.get(idx)?.get_split_id_at_path(&path[1..])
-            }
-        }
+    pub fn split_id_at_path(&self, path: &[usize]) -> Option<SplitId> {
+        self.node_at_path(path)?.split_id()
     }
 
-    /// Borrow the node at a given path.
-    pub fn get_node_at_path(&self, path: &[usize]) -> Option<&SplitNode> {
-        if path.is_empty() {
-            return Some(self);
+    /// Borrow the node at a given path. Every `*_at_path` accessor walks the
+    /// tree through this or [`Self::node_at_path_mut`]: each path element
+    /// indexes the children of a split, and a path that runs into a leaf or
+    /// past the last child resolves to `None`.
+    pub fn node_at_path(&self, path: &[usize]) -> Option<&SplitNode> {
+        let mut node = self;
+        for &idx in path {
+            let SplitNode::Split { children, .. } = node else {
+                return None;
+            };
+            node = children.get(idx)?;
         }
+        Some(node)
+    }
 
-        match self {
-            SplitNode::Leaf { .. } => None,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                children.get(idx)?.get_node_at_path(&path[1..])
-            }
+    /// Mutably borrow the node at a given path.
+    pub fn node_at_path_mut(&mut self, path: &[usize]) -> Option<&mut SplitNode> {
+        let mut node = self;
+        for &idx in path {
+            let SplitNode::Split { children, .. } = node else {
+                return None;
+            };
+            node = children.get_mut(idx)?;
         }
+        Some(node)
     }
 
     /// Return the left-most leaf SplitId in this subtree.
@@ -415,85 +417,47 @@ impl SplitNode {
 
     /// Replace the channel at `path` (for placeholders) with a concrete channel.
     pub fn replace_channel_at_path(&mut self, path: &[usize], channel: String) -> bool {
-        if path.is_empty() {
-            if let SplitNode::Leaf {
-                channel: leaf_channel,
-                ..
-            } = self
-            {
-                *leaf_channel = channel;
-                return true;
-            }
+        let Some(SplitNode::Leaf {
+            channel: leaf_channel,
+            ..
+        }) = self.node_at_path_mut(path)
+        else {
             return false;
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                if idx >= children.len() {
-                    return false;
-                }
-                children[idx].replace_channel_at_path(&path[1..], channel)
-            }
-        }
+        };
+        *leaf_channel = channel;
+        true
     }
 
     /// Return whether the leaf at `path` has its channel header collapsed.
     pub fn header_collapsed_at_path(&self, path: &[usize]) -> Option<bool> {
-        if path.is_empty() {
-            return match self {
-                SplitNode::Leaf {
-                    header_collapsed, ..
-                } => Some(*header_collapsed),
-                SplitNode::Split { .. } => None,
-            };
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => None,
-            SplitNode::Split { children, .. } => {
-                children.get(path[0])?.header_collapsed_at_path(&path[1..])
-            }
+        match self.node_at_path(path)? {
+            SplitNode::Leaf {
+                header_collapsed, ..
+            } => Some(*header_collapsed),
+            SplitNode::Split { .. } => None,
         }
     }
 
     /// Set the persisted channel-header visibility for exactly one leaf.
     pub fn set_header_collapsed_at_path(&mut self, path: &[usize], collapsed: bool) -> bool {
-        if path.is_empty() {
-            if let SplitNode::Leaf {
-                header_collapsed, ..
-            } = self
-                && *header_collapsed != collapsed
-            {
-                *header_collapsed = collapsed;
-                return true;
-            }
+        let Some(SplitNode::Leaf {
+            header_collapsed, ..
+        }) = self.node_at_path_mut(path)
+        else {
+            return false;
+        };
+        if *header_collapsed == collapsed {
             return false;
         }
-
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => children
-                .get_mut(path[0])
-                .is_some_and(|child| child.set_header_collapsed_at_path(&path[1..], collapsed)),
-        }
+        *header_collapsed = collapsed;
+        true
     }
 
     /// The deleted-message mode this pane overrides the global setting with.
     pub fn deleted_mode_at_path(&self, path: &[usize]) -> Option<DeletedMessageMode> {
-        if path.is_empty() {
-            return match self {
-                SplitNode::Leaf { deleted_mode, .. } => *deleted_mode,
-                SplitNode::Split { .. } => None,
-            };
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => None,
-            SplitNode::Split { children, .. } => {
-                children.get(path[0])?.deleted_mode_at_path(&path[1..])
-            }
+        match self.node_at_path(path)? {
+            SplitNode::Leaf { deleted_mode, .. } => *deleted_mode,
+            SplitNode::Split { .. } => None,
         }
     }
 
@@ -503,22 +467,14 @@ impl SplitNode {
         path: &[usize],
         mode: Option<DeletedMessageMode>,
     ) -> bool {
-        if path.is_empty() {
-            if let SplitNode::Leaf { deleted_mode, .. } = self
-                && *deleted_mode != mode
-            {
-                *deleted_mode = mode;
-                return true;
-            }
+        let Some(SplitNode::Leaf { deleted_mode, .. }) = self.node_at_path_mut(path) else {
+            return false;
+        };
+        if *deleted_mode == mode {
             return false;
         }
-
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => children
-                .get_mut(path[0])
-                .is_some_and(|child| child.set_deleted_mode_at_path(&path[1..], mode)),
-        }
+        *deleted_mode = mode;
+        true
     }
 
     /// Remove a node at the provided path. Collapses single-child splits.
@@ -629,69 +585,6 @@ impl SplitNode {
         }
     }
 
-    /// Adjust the ratio between child at idx and idx+1
-    ///
-    /// Returns true only when the stored ratios actually moved. A divider held
-    /// against its clamp keeps producing pointer moves whose clamped result is
-    /// the current ratio; reporting those as adjustments repaints the window
-    /// root at pointer rate for an unchanged layout.
-    pub fn adjust_ratio(&mut self, path: &[usize], child_idx: usize, delta: f32) -> bool {
-        if path.is_empty() {
-            // We're at the target split node
-            if let SplitNode::Split {
-                ratios, children, ..
-            } = self
-            {
-                // Make sure we have valid indices
-                if child_idx >= children.len().saturating_sub(1) {
-                    return false;
-                }
-
-                if !delta.is_finite() {
-                    return false;
-                }
-
-                let mut effective: Vec<_> = effective_ratios(ratios, children.len()).collect();
-                let current_left = effective[child_idx];
-                let pair_budget = current_left + effective[child_idx + 1];
-                let pair_min = pair_budget * RATIO_MIN;
-                let pair_max = pair_budget * RATIO_MAX;
-                let new_ratio_left = (current_left + delta).clamp(pair_min, pair_max);
-                let actual_delta = new_ratio_left - current_left;
-                let ratios_changed = ratios.len() != effective.len()
-                    || ratios
-                        .iter()
-                        .zip(&effective)
-                        .any(|(stored, effective)| stored != effective);
-                if actual_delta == 0.0 && !ratios_changed {
-                    // Already at the clamp (or a sub-epsilon delta): nothing to
-                    // apply, and the ratios were normalized by the change that
-                    // put them here.
-                    return false;
-                }
-
-                effective[child_idx] = new_ratio_left;
-                effective[child_idx + 1] = pair_budget - new_ratio_left;
-                *ratios = effective;
-
-                return true;
-            }
-            return false;
-        }
-
-        // Navigate deeper
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                if idx >= children.len() {
-                    return false;
-                }
-                children[idx].adjust_ratio(&path[1..], child_idx, delta)
-            }
-        }
-    }
-
     /// Ratios for this split after applying per-child minimum pixel extents.
     ///
     /// When the available extent can satisfy every minimum, unconstrained
@@ -790,7 +683,7 @@ impl SplitNode {
             return None;
         }
 
-        let SplitNode::Split { children, .. } = self.get_node_at_path(path)? else {
+        let SplitNode::Split { children, .. } = self.node_at_path(path)? else {
             return None;
         };
         if minimums.len() != children.len() || child_idx >= children.len().saturating_sub(1) {
@@ -798,7 +691,7 @@ impl SplitNode {
         }
 
         let effective = self
-            .get_node_at_path(path)?
+            .node_at_path(path)?
             .ratios_with_minimums(extent, minimums);
         let left = *effective.get(child_idx)?;
         let right = *effective.get(child_idx + 1)?;
@@ -861,7 +754,7 @@ impl SplitNode {
             }
             let Some(SplitNode::Split {
                 children, ratios, ..
-            }) = self.get_node_at_path(path)
+            }) = self.node_at_path(path)
             else {
                 return false;
             };
@@ -886,34 +779,25 @@ impl SplitNode {
         }
         .clamp(bounds.minimum, bounds.maximum);
 
-        self.adjust_ratio_with_minimums(
+        self.adjust_ratio(
             path,
             child_idx,
             (target - bounds.value) * bounds.pair_ratio,
             extent,
             minimums,
-        )
+        ) != 0.0
     }
 
-    /// Adjust one divider while preserving per-child minimum pixel extents.
+    /// Move the divider between children `child_idx` and `child_idx + 1` of
+    /// the split at `path` by `delta` (a fraction of the split), keeping every
+    /// child at or above its minimum pixel extent.
     ///
     /// `extent` and `minimums` describe the split node identified by `path`.
-    /// The stored ratios are replaced with the current painted geometry only
-    /// after a divider actually moves, avoiding persistence churn while every
-    /// child is pinned at its minimum.
-    pub fn adjust_ratio_with_minimums(
-        &mut self,
-        path: &[usize],
-        child_idx: usize,
-        delta: f32,
-        extent: f32,
-        minimums: &[f32],
-    ) -> bool {
-        self.adjust_ratio_with_minimums_applied(path, child_idx, delta, extent, minimums) != 0.0
-    }
-
-    /// Returns the applied ratio delta so pointer tracking can retain unapplied movement at a clamp.
-    pub fn adjust_ratio_with_minimums_applied(
+    /// Returns the ratio delta actually applied, so pointer tracking can retain
+    /// the movement a clamp swallowed. The stored ratios are replaced with the
+    /// current painted geometry only after the divider actually moves, so a
+    /// divider held against its clamp neither churns persistence nor repaints.
+    pub fn adjust_ratio(
         &mut self,
         path: &[usize],
         child_idx: usize,
@@ -931,23 +815,10 @@ impl SplitNode {
             return 0.0;
         }
 
-        if !path.is_empty() {
-            let SplitNode::Split { children, .. } = self else {
-                return 0.0;
-            };
-            let Some(child) = children.get_mut(path[0]) else {
-                return 0.0;
-            };
-            return child.adjust_ratio_with_minimums_applied(
-                &path[1..],
-                child_idx,
-                delta,
-                extent,
-                minimums,
-            );
-        }
-
-        let child_count = match self {
+        let Some(node) = self.node_at_path_mut(path) else {
+            return 0.0;
+        };
+        let child_count = match node {
             SplitNode::Split { children, .. } => children.len(),
             SplitNode::Leaf { .. } => return 0.0,
         };
@@ -958,7 +829,7 @@ impl SplitNode {
             return 0.0;
         }
 
-        let mut effective = self.ratios_with_minimums(extent, minimums);
+        let mut effective = node.ratios_with_minimums(extent, minimums);
         let current_left = effective[child_idx];
         let pair_budget = current_left + effective[child_idx + 1];
         let lower = minimums[child_idx] / extent;
@@ -973,7 +844,7 @@ impl SplitNode {
 
         effective[child_idx] = new_left;
         effective[child_idx + 1] = pair_budget - new_left;
-        let SplitNode::Split { ratios, .. } = self else {
+        let SplitNode::Split { ratios, .. } = node else {
             unreachable!("split node was checked above");
         };
         *ratios = effective;
@@ -1132,88 +1003,43 @@ impl SplitNode {
 
     /// [`Self::transpose_2x2`] for the node at `path`.
     pub fn transpose_2x2_at_path(&mut self, path: &[usize]) -> bool {
-        if path.is_empty() {
-            return self.transpose_2x2();
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                if idx >= children.len() {
-                    return false;
-                }
-                children[idx].transpose_2x2_at_path(&path[1..])
-            }
-        }
+        self.node_at_path_mut(path)
+            .is_some_and(SplitNode::transpose_2x2)
     }
 
     /// Replace the node at `path` wholesale, keeping the tree shape.
     pub fn set_node_at_path(&mut self, path: &[usize], node: SplitNode) -> bool {
-        if path.is_empty() {
-            *self = node;
-            return true;
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                if idx >= children.len() {
-                    return false;
-                }
-                children[idx].set_node_at_path(&path[1..], node)
-            }
-        }
+        let Some(target) = self.node_at_path_mut(path) else {
+            return false;
+        };
+        *target = node;
+        true
     }
 
     /// Give every child of the split at `path` an equal share. A double click
     /// on a resize handle triggers this.
     pub fn reset_ratios(&mut self, path: &[usize]) -> bool {
-        if path.is_empty() {
-            let SplitNode::Split {
-                children, ratios, ..
-            } = self
-            else {
-                return false;
-            };
-            let share = 1.0 / children.len().max(1) as f32;
-            *ratios = vec![share; children.len()];
-            return true;
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                if idx >= children.len() {
-                    return false;
-                }
-                children[idx].reset_ratios(&path[1..])
-            }
-        }
+        let Some(SplitNode::Split {
+            children, ratios, ..
+        }) = self.node_at_path_mut(path)
+        else {
+            return false;
+        };
+        let share = 1.0 / children.len().max(1) as f32;
+        *ratios = vec![share; children.len()];
+        true
     }
 
     /// Get the channel name at the given path (only for leaf nodes)
-    pub fn get_channel_at_path(&self, path: &[usize]) -> Option<String> {
-        self.get_channel_ref_at_path(path).map(ToOwned::to_owned)
+    pub fn channel_at_path(&self, path: &[usize]) -> Option<String> {
+        self.channel_ref_at_path(path).map(ToOwned::to_owned)
     }
 
     /// Borrow the channel name at the given path (only for leaf nodes).
-    pub fn get_channel_ref_at_path(&self, path: &[usize]) -> Option<&str> {
-        if path.is_empty() {
-            if let SplitNode::Leaf { channel, .. } = self {
-                return Some(channel.as_str());
-            }
-            return None;
-        }
-
-        match self {
-            SplitNode::Leaf { .. } => None,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                children.get(idx)?.get_channel_ref_at_path(&path[1..])
-            }
+    pub fn channel_ref_at_path(&self, path: &[usize]) -> Option<&str> {
+        match self.node_at_path(path)? {
+            SplitNode::Leaf { channel, .. } => Some(channel.as_str()),
+            SplitNode::Split { .. } => None,
         }
     }
 
@@ -1302,31 +1128,18 @@ impl SplitNode {
         };
         let insert_first = matches!(direction, AddSplitDirection::Left | AddSplitDirection::Top);
 
-        if path.is_empty() {
-            // Wrap this node in a new split
-            let existing = std::mem::replace(self, SplitNode::leaf(String::new()));
-
-            let (first, second) = if insert_first {
-                (new_node, existing)
-            } else {
-                (existing, new_node)
-            };
-
-            *self = SplitNode::split(orientation, vec![first, second], vec![0.5, 0.5]);
-            return true;
-        }
-
-        // Navigate to parent
-        match self {
-            SplitNode::Leaf { .. } => false,
-            SplitNode::Split { children, .. } => {
-                let idx = path[0];
-                if idx >= children.len() {
-                    return false;
-                }
-                children[idx].insert_node_relative(&path[1..], direction, new_node)
-            }
-        }
+        let Some(target) = self.node_at_path_mut(path) else {
+            return false;
+        };
+        // Wrap the target in a new split.
+        let existing = std::mem::replace(target, SplitNode::leaf(String::new()));
+        let (first, second) = if insert_first {
+            (new_node, existing)
+        } else {
+            (existing, new_node)
+        };
+        *target = SplitNode::split(orientation, vec![first, second], vec![0.5, 0.5]);
+        true
     }
 }
 
@@ -1550,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_channel_at_path() {
+    fn test_channel_at_path() {
         let split = SplitNode::split(
             SplitOrientation::Horizontal,
             vec![
@@ -1560,10 +1373,10 @@ mod tests {
             vec![0.5, 0.5],
         );
 
-        assert_eq!(split.get_channel_at_path(&[0]), Some("xqc".to_string()));
-        assert_eq!(split.get_channel_at_path(&[1]), Some("forsen".to_string()));
-        assert_eq!(split.get_channel_at_path(&[2]), None);
-        assert_eq!(split.get_channel_at_path(&[]), None); // Split node, not leaf
+        assert_eq!(split.channel_at_path(&[0]), Some("xqc".to_string()));
+        assert_eq!(split.channel_at_path(&[1]), Some("forsen".to_string()));
+        assert_eq!(split.channel_at_path(&[2]), None);
+        assert_eq!(split.channel_at_path(&[]), None); // Split node, not leaf
     }
 
     #[test]
@@ -1645,8 +1458,8 @@ mod tests {
             ratios: vec![0.5, 0.5],
         };
 
-        let success = split.adjust_ratio(&[], 0, 0.2);
-        assert!(success);
+        let applied = split.adjust_ratio(&[], 0, 0.2, 100.0, &[0.0, 0.0]);
+        assert!((applied - 0.2).abs() < 0.0001);
 
         if let SplitNode::Split { ratios, .. } = &split {
             assert!((ratios[0] - 0.7).abs() < 0.01);
@@ -1654,58 +1467,6 @@ mod tests {
             let sum: f32 = ratios.iter().sum();
             assert!((sum - 1.0).abs() < 0.01, "Ratios should sum to ~1.0");
         }
-    }
-
-    #[test]
-    fn test_adjust_ratio_clamping() {
-        let mut split = SplitNode::Split {
-            split_id: None,
-            orientation: SplitOrientation::Horizontal,
-            children: vec![
-                SplitNode::leaf("a".to_string()),
-                SplitNode::leaf("b".to_string()),
-            ],
-            ratios: vec![0.5, 0.5],
-        };
-
-        // Try to adjust beyond bounds
-        split.adjust_ratio(&[], 0, 1.0);
-
-        if let SplitNode::Split { ratios, .. } = &split {
-            // Should be clamped to 0.9 max
-            assert!(ratios[0] <= 0.9);
-            assert!(ratios[1] >= 0.1);
-        }
-    }
-
-    #[test]
-    fn test_adjust_ratio_keeps_multi_child_pair_valid() {
-        let mut split = SplitNode::Split {
-            split_id: None,
-            orientation: SplitOrientation::Horizontal,
-            children: vec![
-                SplitNode::leaf("a".to_string()),
-                SplitNode::leaf("b".to_string()),
-                SplitNode::leaf("c".to_string()),
-            ],
-            ratios: vec![0.33, 0.33, 0.34],
-        };
-
-        assert!(split.adjust_ratio(&[], 0, 0.8));
-
-        let SplitNode::Split { ratios, .. } = &split else {
-            panic!("expected split");
-        };
-        assert!(ratios.iter().all(|ratio| ratio.is_finite() && *ratio > 0.0));
-        assert!((ratios[0] + ratios[1] - 0.66).abs() < 0.01);
-        assert!(ratios[1] >= 0.066 - f32::EPSILON);
-
-        let clamped = ratios.clone();
-        assert!(!split.adjust_ratio(&[], 0, 0.8));
-        let SplitNode::Split { ratios, .. } = &split else {
-            panic!("expected split");
-        };
-        assert_eq!(ratios, &clamped);
     }
 
     #[test]
@@ -1764,14 +1525,17 @@ mod tests {
             ratios: vec![0.5, 0.3, 0.2],
         };
 
-        assert!(split.adjust_ratio_with_minimums(&[], 0, 0.8, 100.0, &[30.0, 20.0, 10.0]));
+        assert!(split.adjust_ratio(&[], 0, 0.8, 100.0, &[30.0, 20.0, 10.0]) != 0.0);
         let SplitNode::Split { ratios, .. } = &split else {
             panic!("expected split");
         };
         assert!((ratios[0] - 0.6).abs() < f32::EPSILON);
         assert!((ratios[1] - 0.2).abs() < f32::EPSILON);
         assert_eq!(ratios[2], 0.2);
-        assert!(!split.adjust_ratio_with_minimums(&[], 0, 0.1, 100.0, &[30.0, 20.0, 10.0]));
+        assert_eq!(
+            split.adjust_ratio(&[], 0, 0.1, 100.0, &[30.0, 20.0, 10.0]),
+            0.0
+        );
     }
 
     #[test]
@@ -1888,13 +1652,8 @@ mod tests {
         );
         let mut anchor = 200.0;
         for (pointer, expected_divider) in [(100.0, 120.0), (101.0, 120.0), (121.0, 121.0)] {
-            let applied = split.adjust_ratio_with_minimums_applied(
-                &[],
-                0,
-                (pointer - anchor) / 400.0,
-                400.0,
-                &[120.0, 120.0],
-            );
+            let applied =
+                split.adjust_ratio(&[], 0, (pointer - anchor) / 400.0, 400.0, &[120.0, 120.0]);
             anchor += applied * 400.0;
             assert!((anchor - expected_divider).abs() < 0.0001);
             let shown = split.ratios_with_minimums(400.0, &[120.0, 120.0]);

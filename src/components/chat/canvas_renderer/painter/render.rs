@@ -1,15 +1,14 @@
 //! CanvasMessageList GPUI render implementation.
 
 use super::*;
-#[path = "accessibility.rs"]
-mod accessibility;
+
 impl Render for CanvasMessageList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let canvas_cpu_start = std::time::Instant::now();
         let metrics_enabled = crate::backend::metrics::is_enabled();
         let render_log_enabled = crate::log::enabled("perf_render");
         let render_timing_enabled = metrics_enabled || render_log_enabled;
-        crate::alloc_profile::reset_frame_counters();
+        crate::diagnostics::alloc_profile::reset_frame_counters();
         let mut render_trace = CanvasRenderTraceGuard::enter(
             &self.channel_id,
             self.message_model.messages.len(),
@@ -109,8 +108,7 @@ impl Render for CanvasMessageList {
             && animation_only_frame_pending
             && self.wake_state.has_visible_animations_last_frame;
 
-        let (layout_time, async_poll_time, completed_async_layouts) = if visible_row_reuse_fast_path
-        {
+        let layout_time = if visible_row_reuse_fast_path {
             if animation_visible_row_fast_path {
                 crate::backend::metrics::record_emote_event("canvas.animation_visible_rows_reused");
                 self.render_perf_frame_stats.animation_visible_row_reuse += 1;
@@ -124,7 +122,7 @@ impl Render for CanvasMessageList {
                 crate::backend::metrics::record_emote_event("canvas.stable_visible_rows_reused");
                 self.render_perf_frame_stats.stable_visible_row_reuse += 1;
             }
-            (std::time::Duration::ZERO, std::time::Duration::ZERO, 0usize)
+            std::time::Duration::ZERO
         } else {
             let layout_start = RenderTimer::start(render_timing_enabled);
             self.update_layouts(window);
@@ -135,20 +133,22 @@ impl Render for CanvasMessageList {
                 self.message_model.messages.len(),
             );
 
-            (layout_time, std::time::Duration::ZERO, 0usize)
+            layout_time
         };
 
-        crate::fps_profiler::record_phase("layout", layout_time);
+        crate::diagnostics::fps_profiler::record_phase("layout", layout_time);
 
-        crate::fps_profiler::record_frame_classification(if animation_visible_row_fast_path {
-            crate::fps_profiler::FrameClass::AnimationOnly
-        } else if scroll_visible_row_fast_path {
-            crate::fps_profiler::FrameClass::ScrollTranslate
-        } else if stable_visible_row_fast_path {
-            crate::fps_profiler::FrameClass::StableReuse
-        } else {
-            crate::fps_profiler::FrameClass::FullRebuild
-        });
+        crate::diagnostics::fps_profiler::record_frame_classification(
+            if animation_visible_row_fast_path {
+                crate::diagnostics::fps_profiler::FrameClass::AnimationOnly
+            } else if scroll_visible_row_fast_path {
+                crate::diagnostics::fps_profiler::FrameClass::ScrollTranslate
+            } else if stable_visible_row_fast_path {
+                crate::diagnostics::fps_profiler::FrameClass::StableReuse
+            } else {
+                crate::diagnostics::fps_profiler::FrameClass::FullRebuild
+            },
+        );
 
         let animation_census_owner = cx.entity_id().as_u64();
         self.wake_state.animation_census_owner = Some(animation_census_owner);
@@ -203,7 +203,7 @@ impl Render for CanvasMessageList {
 
         let list_id = self.cached_element_id.clone();
 
-        let visible_scan_start = RenderTimer::start(crate::fps_profiler::is_enabled());
+        let visible_scan_start = RenderTimer::start(crate::diagnostics::fps_profiler::is_enabled());
         let visible_rows_result = self.update_visible_rows_for_render_frame(
             start_idx,
             end_idx,
@@ -212,7 +212,10 @@ impl Render for CanvasMessageList {
             scroll_visible_row_fast_path,
             window,
         );
-        crate::fps_profiler::record_phase("visible_scan", visible_scan_start.elapsed());
+        crate::diagnostics::fps_profiler::record_phase(
+            "visible_scan",
+            visible_scan_start.elapsed(),
+        );
         needs_notify |= visible_rows_result.needs_notify;
 
         let hitbox_start = RenderTimer::start(metrics_enabled);
@@ -323,21 +326,16 @@ impl Render for CanvasMessageList {
                         fallback_rows_animate |= element_render_plan.has_loading_animation();
                         self.viewport_state.render_element_buffer.push(
                             render_message_at_position(
-                                Arc::clone(&row.layout),
-                                &element_render_plan,
-                                &self.interaction_state.selection,
-                                row.message_index,
-                                container_width,
-                                row.viewport_y,
-                                false,
-                                if row.is_alternate_row {
-                                    frame_alternate_bg
-                                } else {
-                                    None
+                                &FallbackRowFrame {
+                                    selection: &self.interaction_state.selection,
+                                    container_width,
+                                    alternate_bg: frame_alternate_bg,
+                                    animation_slots: &self.viewport_state.painted_animation_slots,
+                                    slot_owner: animation_slot_owner,
                                 },
-                                row.is_deleted,
-                                Rc::clone(&self.viewport_state.painted_animation_slots),
-                                animation_slot_owner,
+                                row,
+                                &element_render_plan,
+                                false,
                             )
                             .into_any_element(),
                         );
@@ -439,21 +437,18 @@ impl Render for CanvasMessageList {
                             fallback_rows_animate |= element_render_plan.has_loading_animation();
                             self.viewport_state.render_element_buffer.push(
                                 render_message_at_position(
-                                    Arc::clone(&row.layout),
-                                    &element_render_plan,
-                                    &self.interaction_state.selection,
-                                    row.message_index,
-                                    container_width,
-                                    row.viewport_y,
-                                    is_search_focus,
-                                    if row.is_alternate_row {
-                                        frame_alternate_bg
-                                    } else {
-                                        None
+                                    &FallbackRowFrame {
+                                        selection: &self.interaction_state.selection,
+                                        container_width,
+                                        alternate_bg: frame_alternate_bg,
+                                        animation_slots: &self
+                                            .viewport_state
+                                            .painted_animation_slots,
+                                        slot_owner: animation_slot_owner,
                                     },
-                                    row.is_deleted,
-                                    Rc::clone(&self.viewport_state.painted_animation_slots),
-                                    animation_slot_owner,
+                                    row,
+                                    &element_render_plan,
+                                    is_search_focus,
                                 )
                                 .into_any_element(),
                             );
@@ -505,7 +500,7 @@ impl Render for CanvasMessageList {
         };
         self.viewport_state.fallback_rows_animate = fallback_rows_animate;
         let paint_prep_time = paint_prep_start.elapsed();
-        crate::fps_profiler::record_phase("paint_prep", paint_prep_time);
+        crate::diagnostics::fps_profiler::record_phase("paint_prep", paint_prep_time);
 
         let direct_animation_metadata_start = RenderTimer::start(metrics_enabled);
         let want_signature = !animation_visible_row_fast_path;
@@ -567,12 +562,7 @@ impl Render for CanvasMessageList {
                     }
 
                     this.scroll_controller.state.mouse_hovering_viewport = hovering;
-                    let _ = this.set_chat_pause_modifiers(
-                        modifiers.control,
-                        modifiers.alt,
-                        modifiers.shift,
-                        modifiers.platform,
-                    );
+                    let _ = this.set_chat_pause_modifiers(modifiers);
                     if hovering {
                         this.refresh_chat_hover_pause(cx);
                     } else {
@@ -615,12 +605,7 @@ impl Render for CanvasMessageList {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 let modifiers = window.modifiers();
-                let modifier_changed = this.set_chat_pause_modifiers(
-                    modifiers.control,
-                    modifiers.alt,
-                    modifiers.shift,
-                    modifiers.platform,
-                );
+                let modifier_changed = this.set_chat_pause_modifiers(modifiers);
                 this.refresh_chat_hover_pause(cx);
                 this.on_mouse_move(event.position, event.dragging(), window.window_handle(), cx);
                 if modifier_changed {
@@ -758,7 +743,7 @@ impl Render for CanvasMessageList {
             end_idx.saturating_sub(start_idx),
         );
 
-        if *RENDER_TRACE_ENABLED || crate::fps_profiler::is_enabled() {
+        if *RENDER_TRACE_ENABLED || crate::diagnostics::fps_profiler::is_enabled() {
             let visible_row_count = self.viewport_state.visible_render_rows.len();
             if visible_row_count > 0 {
                 const PER_MESSAGE_PAINT_BUDGET_MS: f64 = 0.1;
@@ -779,11 +764,7 @@ impl Render for CanvasMessageList {
                         budget_ms,
                         visible = visible_row_count,
                         layout_frame = did_layout_this_frame,
-                        "canvas per-message budget exceeded: {:.3}ms/msg > {:.3}ms (visible={}, layout_frame={})",
-                        per_message_elem_ms,
-                        budget_ms,
-                        visible_row_count,
-                        did_layout_this_frame
+                        "canvas per-message budget exceeded"
                     );
                 }
             }
@@ -802,22 +783,15 @@ impl Render for CanvasMessageList {
                 elem_ms = elem_build_time.as_millis(),
                 msg_count = self.message_model.messages.len(),
                 visible = end_idx - start_idx,
-                "{} layout={}ms elem={}ms msgs={} vis={}",
-                self.channel_id,
-                layout_time.as_millis(),
-                elem_build_time.as_millis(),
-                self.message_model.messages.len(),
-                end_idx - start_idx
+                "canvas render timing"
             );
         }
 
         self.flush_render_perf_aggregate_if_due(
             layout_time,
-            async_poll_time,
             elem_build_time,
             self.viewport_state.visible_render_rows.len(),
             end_idx.saturating_sub(start_idx),
-            completed_async_layouts,
         );
 
         if self.wake_state.has_visible_animations_last_frame {
@@ -867,11 +841,13 @@ impl Render for CanvasMessageList {
 
         render_trace.finish();
 
-        crate::alloc_profile::record_frame_snapshot();
+        crate::diagnostics::alloc_profile::record_frame_snapshot();
 
-        crate::fps_profiler::record_canvas_cpu_nanos(canvas_cpu_start.elapsed().as_nanos() as u64);
+        crate::diagnostics::fps_profiler::record_canvas_cpu_nanos(
+            canvas_cpu_start.elapsed().as_nanos() as u64,
+        );
 
-        crate::fps_profiler::disable_secondary_window_gpu_timing(window);
+        crate::diagnostics::fps_profiler::disable_secondary_window_gpu_timing(window);
 
         accessibility::AccessibleChat::new(container, cx.entity(), stable_visible_row_fast_path)
     }

@@ -39,6 +39,18 @@ use std::{
     sync::{LazyLock, Mutex, MutexGuard},
 };
 
+mod timestamp_builder;
+pub(super) use timestamp_builder::reset_timestamp_builder_after_settings_replace;
+use timestamp_builder::{
+    commit_timestamp_tokens, handle_timestamp_builder_key, render_timestamp_builder,
+    timestamp_builder_snapshot, timestamp_literal_input,
+};
+mod configuration;
+pub(super) use configuration::reset_settings_import_editor_after_settings_replace;
+use configuration::{
+    render_configuration_actions, settings_import_editor_snapshot, update_settings_import_editor,
+};
+
 const ACCOUNT_SIGN_IN: SettingDescriptor = SettingDescriptor {
     id: "account.sign-in",
     label: "Twitch account",
@@ -526,7 +538,7 @@ pub const ADVANCED_DEVELOPER_MODE_SETTINGS: &[SettingDescriptor] = &[SettingDesc
 }];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GeneralSettingsField {
+enum PlayerPathField {
     BrowserPath,
     CustomPlayerPath,
     StreamlinkPath,
@@ -535,7 +547,7 @@ enum GeneralSettingsField {
 }
 
 #[derive(Clone, Default)]
-struct GeneralSettingsEditor {
+struct PlayerPathsEditor {
     browser_path_mode: bool,
     browser_path: String,
     browser_status: Option<String>,
@@ -552,20 +564,20 @@ struct GeneralSettingsEditor {
     streamlink_extra_args: String,
     streamlink_extra_args_status: Option<String>,
     streamlink_extra_args_status_is_error: bool,
-    focused: Option<GeneralSettingsField>,
+    focused: Option<PlayerPathField>,
     dirty: [bool; 5],
 }
 
-static GENERAL_SETTINGS_EDITOR: LazyLock<EditorState<GeneralSettingsEditor>> =
-    LazyLock::new(|| EditorState::new("player paths", GeneralSettingsEditor::default()));
+static PLAYER_PATHS_EDITOR: LazyLock<EditorState<PlayerPathsEditor>> =
+    LazyLock::new(|| EditorState::new("player paths", PlayerPathsEditor::default()));
 
-struct GeneralSettingsInputs {
+struct PlayerPathInputs {
     fields: [Option<Entity<InputState>>; 5],
     subscriptions: [Option<Subscription>; 5],
 }
 
 thread_local! {
-    static GENERAL_SETTINGS_INPUTS: RefCell<HashMap<EntityId, GeneralSettingsInputs>> = RefCell::new(HashMap::new());
+    static PLAYER_PATH_INPUTS: RefCell<HashMap<EntityId, PlayerPathInputs>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, Default)]
@@ -1313,11 +1325,8 @@ pub fn render_chat_reading_more<T: 'static>(
                                 USERNAME_RIGHT_CLICK.label,
                                 Some("Choose the action used when no modifier is held."),
                                 settings_select(USERNAME_RIGHT_CLICK.control_id, USERNAME_RIGHT_CLICK.label, &behavior_options, right_click.settings_value(), &right_click_select, cx, |value, cx| {
-                                    let behavior = match value.as_str() {
-                                        "reply" => UsernameRightClickBehavior::Reply,
-                                        "ignore" => UsernameRightClickBehavior::Ignore,
-                                        _ => UsernameRightClickBehavior::Mention,
-                                    };
+                                    let behavior = UsernameRightClickBehavior::from_settings_value(&value)
+                                        .unwrap_or(UsernameRightClickBehavior::Mention);
                                     crate::backend::settings::set_username_right_click_behavior(behavior);
                                     cx.notify();
                                 }),
@@ -1339,11 +1348,8 @@ pub fn render_chat_reading_more<T: 'static>(
                                 USERNAME_RIGHT_CLICK_MODIFIER_ACTION.label,
                                 Some("Choose the alternate action used with exactly the selected modifier."),
                                 settings_select(USERNAME_RIGHT_CLICK_MODIFIER_ACTION.control_id, USERNAME_RIGHT_CLICK_MODIFIER_ACTION.label, &behavior_options, modifier_action.settings_value(), &modifier_action_select, cx, |value, cx| {
-                                    let behavior = match value.as_str() {
-                                        "mention" => UsernameRightClickBehavior::Mention,
-                                        "ignore" => UsernameRightClickBehavior::Ignore,
-                                        _ => UsernameRightClickBehavior::Reply,
-                                    };
+                                    let behavior = UsernameRightClickBehavior::from_settings_value(&value)
+                                        .unwrap_or(UsernameRightClickBehavior::Reply);
                                     crate::backend::settings::set_username_right_click_modifier_behavior(behavior);
                                     cx.notify();
                                 }),
@@ -1623,7 +1629,7 @@ pub fn render_connections_section<T: 'static>(
     let streamlink_path = crate::backend::settings::get_streamlink_path().unwrap_or_default();
     let streamlink_custom_quality = crate::backend::settings::get_streamlink_custom_quality();
     let streamlink_extra_args = crate::backend::settings::get_streamlink_extra_args();
-    let editor = synced_general_settings_editor(
+    let editor = synced_player_paths_editor(
         &browser_path,
         &custom_player_path,
         &streamlink_path,
@@ -1645,22 +1651,22 @@ pub fn render_connections_section<T: 'static>(
     let streamlink_quality = crate::backend::settings::get_streamlink_quality();
     let mut visible_fields = Vec::new();
     if browser_editor_visible {
-        visible_fields.push(GeneralSettingsField::BrowserPath);
+        visible_fields.push(PlayerPathField::BrowserPath);
     }
     if players_editor.is_expanded() {
         visible_fields.extend([
-            GeneralSettingsField::CustomPlayerPath,
-            GeneralSettingsField::StreamlinkPath,
-            GeneralSettingsField::StreamlinkExtraArgs,
+            PlayerPathField::CustomPlayerPath,
+            PlayerPathField::StreamlinkPath,
+            PlayerPathField::StreamlinkExtraArgs,
         ]);
         if streamlink_quality == StreamlinkQuality::Custom || players_editor.is_search_revealed() {
-            visible_fields.push(GeneralSettingsField::StreamlinkCustomQuality);
+            visible_fields.push(PlayerPathField::StreamlinkCustomQuality);
         }
     }
     if visible_fields.is_empty() {
-        release_general_settings_inputs_for_host(cx.entity_id());
+        release_player_path_inputs_for_host(cx.entity_id());
     } else {
-        ensure_general_settings_inputs(&editor.draft, &visible_fields, window, cx);
+        ensure_player_path_inputs(&editor.draft, &visible_fields, window, cx);
     }
 
     SettingsPage::new(SettingsSectionId::Connections)
@@ -2679,87 +2685,87 @@ fn render_overlay_settings<T: 'static>(
         ))
 }
 
-fn general_field_index(field: GeneralSettingsField) -> usize {
+fn player_path_field_index(field: PlayerPathField) -> usize {
     match field {
-        GeneralSettingsField::BrowserPath => 0,
-        GeneralSettingsField::CustomPlayerPath => 1,
-        GeneralSettingsField::StreamlinkPath => 2,
-        GeneralSettingsField::StreamlinkCustomQuality => 3,
-        GeneralSettingsField::StreamlinkExtraArgs => 4,
+        PlayerPathField::BrowserPath => 0,
+        PlayerPathField::CustomPlayerPath => 1,
+        PlayerPathField::StreamlinkPath => 2,
+        PlayerPathField::StreamlinkCustomQuality => 3,
+        PlayerPathField::StreamlinkExtraArgs => 4,
     }
 }
 
-fn general_field_from_index(index: usize) -> GeneralSettingsField {
+fn player_path_field_from_index(index: usize) -> PlayerPathField {
     match index {
-        0 => GeneralSettingsField::BrowserPath,
-        1 => GeneralSettingsField::CustomPlayerPath,
-        2 => GeneralSettingsField::StreamlinkPath,
-        3 => GeneralSettingsField::StreamlinkCustomQuality,
-        _ => GeneralSettingsField::StreamlinkExtraArgs,
+        0 => PlayerPathField::BrowserPath,
+        1 => PlayerPathField::CustomPlayerPath,
+        2 => PlayerPathField::StreamlinkPath,
+        3 => PlayerPathField::StreamlinkCustomQuality,
+        _ => PlayerPathField::StreamlinkExtraArgs,
     }
 }
 
-fn general_field_value(editor: &GeneralSettingsEditor, field: GeneralSettingsField) -> &str {
+fn player_path_field_value(editor: &PlayerPathsEditor, field: PlayerPathField) -> &str {
     match field {
-        GeneralSettingsField::BrowserPath => &editor.browser_path,
-        GeneralSettingsField::CustomPlayerPath => &editor.custom_player_path,
-        GeneralSettingsField::StreamlinkPath => &editor.streamlink_path,
-        GeneralSettingsField::StreamlinkCustomQuality => &editor.streamlink_custom_quality,
-        GeneralSettingsField::StreamlinkExtraArgs => &editor.streamlink_extra_args,
+        PlayerPathField::BrowserPath => &editor.browser_path,
+        PlayerPathField::CustomPlayerPath => &editor.custom_player_path,
+        PlayerPathField::StreamlinkPath => &editor.streamlink_path,
+        PlayerPathField::StreamlinkCustomQuality => &editor.streamlink_custom_quality,
+        PlayerPathField::StreamlinkExtraArgs => &editor.streamlink_extra_args,
     }
 }
 
-fn general_field_authority(field: GeneralSettingsField) -> String {
+fn player_path_field_authority(field: PlayerPathField) -> String {
     match field {
-        GeneralSettingsField::BrowserPath => {
+        PlayerPathField::BrowserPath => {
             crate::backend::settings::get_browser_path().unwrap_or_default()
         }
-        GeneralSettingsField::CustomPlayerPath => {
+        PlayerPathField::CustomPlayerPath => {
             crate::backend::settings::get_custom_player_path().unwrap_or_default()
         }
-        GeneralSettingsField::StreamlinkPath => {
+        PlayerPathField::StreamlinkPath => {
             crate::backend::settings::get_streamlink_path().unwrap_or_default()
         }
-        GeneralSettingsField::StreamlinkCustomQuality => {
+        PlayerPathField::StreamlinkCustomQuality => {
             crate::backend::settings::get_streamlink_custom_quality()
         }
-        GeneralSettingsField::StreamlinkExtraArgs => {
+        PlayerPathField::StreamlinkExtraArgs => {
             crate::backend::settings::get_streamlink_extra_args()
         }
     }
 }
 
-pub(crate) fn release_general_settings_inputs_for_host(owner: EntityId) {
-    let removed = GENERAL_SETTINGS_INPUTS
+pub(crate) fn release_player_path_inputs_for_host(owner: EntityId) {
+    let removed = PLAYER_PATH_INPUTS
         .try_with(|inputs| inputs.borrow_mut().remove(&owner))
         .ok()
         .flatten();
     drop(removed);
 }
 
-fn general_field_input<T: 'static>(
-    field: GeneralSettingsField,
+fn player_path_field_input<T: 'static>(
+    field: PlayerPathField,
     cx: &Context<T>,
 ) -> Option<Entity<InputState>> {
     let owner = cx.entity_id();
-    GENERAL_SETTINGS_INPUTS.with(|inputs| {
+    PLAYER_PATH_INPUTS.with(|inputs| {
         inputs
             .borrow()
             .get(&owner)
-            .and_then(|inputs| inputs.fields[general_field_index(field)].clone())
+            .and_then(|inputs| inputs.fields[player_path_field_index(field)].clone())
     })
 }
 
-fn sync_general_field_input<T: 'static>(
-    field: GeneralSettingsField,
-    editor: &GeneralSettingsEditor,
+fn sync_player_path_field_input<T: 'static>(
+    field: PlayerPathField,
+    editor: &PlayerPathsEditor,
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let Some(input) = general_field_input(field, cx) else {
+    let Some(input) = player_path_field_input(field, cx) else {
         return;
     };
-    let text = crate::components::ui::input::normalize_single_line_text(general_field_value(
+    let text = crate::components::ui::input::normalize_single_line_text(player_path_field_value(
         editor, field,
     ));
     if input.read(cx).value() != text {
@@ -2767,9 +2773,9 @@ fn sync_general_field_input<T: 'static>(
     }
 }
 
-fn ensure_general_settings_inputs<T: 'static>(
-    editor: &GeneralSettingsEditor,
-    visible_fields: &[GeneralSettingsField],
+fn ensure_player_path_inputs<T: 'static>(
+    editor: &PlayerPathsEditor,
+    visible_fields: &[PlayerPathField],
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
@@ -2777,15 +2783,15 @@ fn ensure_general_settings_inputs<T: 'static>(
     let wanted: [bool; 5] = std::array::from_fn(|index| {
         visible_fields
             .iter()
-            .any(|field| general_field_index(*field) == index)
+            .any(|field| player_path_field_index(*field) == index)
     });
-    let mut cached = GENERAL_SETTINGS_INPUTS
+    let mut cached = PLAYER_PATH_INPUTS
         .with(|inputs| inputs.borrow_mut().remove(&owner))
-        .unwrap_or_else(|| GeneralSettingsInputs {
+        .unwrap_or_else(|| PlayerPathInputs {
             fields: std::array::from_fn(|_| None),
             subscriptions: std::array::from_fn(|_| None),
         });
-    let mut make_input = |field: GeneralSettingsField,
+    let mut make_input = |field: PlayerPathField,
                           placeholder: &'static str,
                           value: String,
                           cx: &mut Context<T>| {
@@ -2798,27 +2804,27 @@ fn ensure_general_settings_inputs<T: 'static>(
             &input,
             window,
             move |_this, input, event: &InputEvent, window, cx| {
-                let authority = general_field_authority(field);
+                let authority = player_path_field_authority(field);
                 match event {
                     InputEvent::Focus => {
-                        update_general_settings_editor(|editor| editor.focused = Some(field));
+                        update_player_paths_editor(|editor| editor.focused = Some(field));
                     }
                     InputEvent::Change => {
                         let raw = input.read(cx).value().to_string();
-                        let value = match normalize_general_editor_text(field, &raw) {
+                        let value = match normalize_player_path_editor_text(field, &raw) {
                             Ok(value) => value,
                             Err(message) => {
-                                let snapshot = general_settings_editor_snapshot();
+                                let snapshot = player_paths_editor_snapshot();
                                 input.update(cx, |input, cx| {
                                     input.set_value(
-                                        general_field_value(&snapshot.draft, field).to_string(),
+                                        player_path_field_value(&snapshot.draft, field).to_string(),
                                         window,
                                         cx,
                                     );
                                 });
-                                update_general_settings_editor(|editor| {
+                                update_player_paths_editor(|editor| {
                                     let (_, status, status_is_error) =
-                                        general_editor_field_parts(editor, field);
+                                        player_path_editor_field_parts(editor, field);
                                     *status = Some(message.to_string());
                                     *status_is_error = true;
                                 });
@@ -2830,34 +2836,34 @@ fn ensure_general_settings_inputs<T: 'static>(
                             input
                                 .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
                         }
-                        let snapshot = general_settings_editor_snapshot();
+                        let snapshot = player_paths_editor_snapshot();
                         if crate::components::ui::input::normalize_single_line_text(
-                            general_field_value(&snapshot.draft, field),
+                            player_path_field_value(&snapshot.draft, field),
                         ) == value
                         {
                             return;
                         }
-                        update_general_settings_editor(|editor| {
-                            editor.dirty[general_field_index(field)] = value != authority;
+                        update_player_paths_editor(|editor| {
+                            editor.dirty[player_path_field_index(field)] = value != authority;
                             let (target, status, status_is_error) =
-                                general_editor_field_parts(editor, field);
+                                player_path_editor_field_parts(editor, field);
                             *target = value.clone();
                             *status = None;
                             *status_is_error = false;
                         });
                     }
                     InputEvent::PressEnter => {
-                        let snapshot = general_settings_editor_snapshot();
-                        if snapshot.draft.dirty[general_field_index(field)] {
-                            save_general_settings_field(snapshot.generation, field);
+                        let snapshot = player_paths_editor_snapshot();
+                        if snapshot.draft.dirty[player_path_field_index(field)] {
+                            save_player_path_field(snapshot.generation, field);
                         }
                     }
                     InputEvent::Blur => {
-                        let snapshot = general_settings_editor_snapshot();
-                        if snapshot.draft.dirty[general_field_index(field)] {
-                            save_general_settings_field(snapshot.generation, field);
+                        let snapshot = player_paths_editor_snapshot();
+                        if snapshot.draft.dirty[player_path_field_index(field)] {
+                            save_player_path_field(snapshot.generation, field);
                         }
-                        update_general_settings_editor(|editor| {
+                        update_player_paths_editor(|editor| {
                             if editor.focused == Some(field) {
                                 editor.focused = None;
                             }
@@ -2876,21 +2882,19 @@ fn ensure_general_settings_inputs<T: 'static>(
             continue;
         }
         if cached.fields[index].is_none() {
-            let field = general_field_from_index(index);
+            let field = player_path_field_from_index(index);
             let (placeholder, value) = match field {
-                GeneralSettingsField::BrowserPath => {
-                    ("Browser executable", editor.browser_path.clone())
-                }
-                GeneralSettingsField::CustomPlayerPath => {
+                PlayerPathField::BrowserPath => ("Browser executable", editor.browser_path.clone()),
+                PlayerPathField::CustomPlayerPath => {
                     ("Player executable", editor.custom_player_path.clone())
                 }
-                GeneralSettingsField::StreamlinkPath => {
+                PlayerPathField::StreamlinkPath => {
                     ("streamlink from PATH", editor.streamlink_path.clone())
                 }
-                GeneralSettingsField::StreamlinkCustomQuality => {
+                PlayerPathField::StreamlinkCustomQuality => {
                     ("Custom quality", editor.streamlink_custom_quality.clone())
                 }
-                GeneralSettingsField::StreamlinkExtraArgs => {
+                PlayerPathField::StreamlinkExtraArgs => {
                     ("No extra arguments", editor.streamlink_extra_args.clone())
                 }
             };
@@ -2899,16 +2903,16 @@ fn ensure_general_settings_inputs<T: 'static>(
             cached.subscriptions[index] = Some(subscription);
         }
     }
-    GENERAL_SETTINGS_INPUTS.with(|entries| {
+    PLAYER_PATH_INPUTS.with(|entries| {
         entries.borrow_mut().insert(owner, cached);
     });
     for field in visible_fields {
-        sync_general_field_input(*field, editor, window, cx);
+        sync_player_path_field_input(*field, editor, window, cx);
     }
 }
 
 fn render_general_input<T: 'static>(
-    field: GeneralSettingsField,
+    field: PlayerPathField,
     label: &'static str,
     _window: &mut Window,
     cx: &mut Context<T>,
@@ -2918,13 +2922,13 @@ fn render_general_input<T: 'static>(
         .min_w_0()
         .h(px(SettingsMetrics::INPUT_MIN_HEIGHT))
         .font_family("monospace")
-        .when_some(general_field_input(field, cx), |element, input| {
+        .when_some(player_path_field_input(field, cx), |element, input| {
             element
                 .capture_action(cx.listener(move |_this, _: &Escape, window, cx| {
-                    revert_general_editor_field(field);
-                    sync_general_field_input(
+                    revert_player_path_editor_field(field);
+                    sync_player_path_field_input(
                         field,
-                        &general_settings_editor_snapshot().draft,
+                        &player_paths_editor_snapshot().draft,
                         window,
                         cx,
                     );
@@ -2935,16 +2939,16 @@ fn render_general_input<T: 'static>(
         })
 }
 
-fn general_editor_summary(
-    editor: &EditorSnapshot<GeneralSettingsEditor>,
-    fields: &[GeneralSettingsField],
+fn player_path_editor_summary(
+    editor: &EditorSnapshot<PlayerPathsEditor>,
+    fields: &[PlayerPathField],
     plain: &str,
 ) -> String {
     if editor.needs_review {
         format!("Needs review · {plain}")
     } else if fields
         .iter()
-        .any(|field| editor.draft.dirty[general_field_index(*field)])
+        .any(|field| editor.draft.dirty[player_path_field_index(*field)])
     {
         format!("Unsaved draft · {plain}")
     } else {
@@ -2953,7 +2957,7 @@ fn general_editor_summary(
 }
 
 fn render_links_surface<T: 'static>(
-    editor: EditorSnapshot<GeneralSettingsEditor>,
+    editor: EditorSnapshot<PlayerPathsEditor>,
     more: &crate::components::settings::widgets::SettingsDisclosureState,
     mode_select: &SettingsSelectState,
     stacked: bool,
@@ -2967,9 +2971,9 @@ fn render_links_surface<T: 'static>(
     let custom_browser = editor.draft.browser_path_mode || !editor.draft.browser_path.is_empty();
     let browser_path_modified =
         crate::backend::settings::get_browser_path() != defaults.browser_path;
-    let more_summary = general_editor_summary(
+    let more_summary = player_path_editor_summary(
         &editor,
-        &[GeneralSettingsField::BrowserPath],
+        &[PlayerPathField::BrowserPath],
         "Private windows, browser, and trusted domains",
     );
     settings_group(
@@ -3070,11 +3074,11 @@ fn render_links_surface<T: 'static>(
                                         mode_select,
                                         cx,
                                         |value, cx| {
-                                            update_general_settings_editor(|editor| {
+                                            update_player_paths_editor(|editor| {
                                                 editor.browser_path_mode = value == "custom";
                                                 if value == "system" {
                                                     editor.browser_path.clear();
-                                                    editor.dirty[general_field_index(GeneralSettingsField::BrowserPath)] = false;
+                                                    editor.dirty[player_path_field_index(PlayerPathField::BrowserPath)] = false;
                                                 }
                                             });
                                             if value == "system" {
@@ -3089,7 +3093,7 @@ fn render_links_surface<T: 'static>(
                                         apply_general_authoritative_update(|editor| {
                                             editor.browser_path.clear();
                                             editor.browser_path_mode = false;
-                                            editor.dirty[general_field_index(GeneralSettingsField::BrowserPath)] = false;
+                                            editor.dirty[player_path_field_index(PlayerPathField::BrowserPath)] = false;
                                         });
                                         cx.notify();
                                     })),
@@ -3134,7 +3138,7 @@ fn render_links_surface<T: 'static>(
 }
 
 fn render_browser_editor<T: 'static>(
-    editor: EditorSnapshot<GeneralSettingsEditor>,
+    editor: EditorSnapshot<PlayerPathsEditor>,
     _stacked: bool,
     window: &mut Window,
     cx: &mut Context<T>,
@@ -3153,13 +3157,13 @@ fn render_browser_editor<T: 'static>(
                 .gap_2()
                 .child(
                     div()
-                        .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(colors::text_primary())
                         .child(BROWSER_PATH.label),
                 )
                 .child(render_general_input(
-                    GeneralSettingsField::BrowserPath,
+                    PlayerPathField::BrowserPath,
                     BROWSER_PATH.label,
                     window,
                     cx,
@@ -3175,7 +3179,7 @@ fn render_browser_editor<T: 'static>(
                             false,
                             cx,
                             move |cx| {
-                                let generation = general_settings_editor_snapshot().generation;
+                                let generation = player_paths_editor_snapshot().generation;
                                 apply_browser_path_save(generation);
                                 cx.notify();
                             },
@@ -3187,8 +3191,8 @@ fn render_browser_editor<T: 'static>(
                             cx,
                             |cx| {
                                 if let Some(text) = crate::utils::read_text(cx) {
-                                    paste_general_editor_field(
-                                        GeneralSettingsField::BrowserPath,
+                                    paste_player_path_editor_field(
+                                        PlayerPathField::BrowserPath,
                                         text,
                                     );
                                 }
@@ -3201,7 +3205,7 @@ fn render_browser_editor<T: 'static>(
                             false,
                             cx,
                             |cx| {
-                                clear_general_editor_field(GeneralSettingsField::BrowserPath);
+                                clear_player_path_editor_field(PlayerPathField::BrowserPath);
                                 cx.notify();
                             },
                         )),
@@ -3223,7 +3227,7 @@ fn render_browser_editor<T: 'static>(
 }
 
 fn render_players_surface<T: 'static>(
-    editor: EditorSnapshot<GeneralSettingsEditor>,
+    editor: EditorSnapshot<PlayerPathsEditor>,
     state: &crate::components::settings::widgets::SettingsDisclosureState,
     quality_select: &SettingsSelectState,
     stacked: bool,
@@ -3232,13 +3236,13 @@ fn render_players_surface<T: 'static>(
 ) -> impl IntoElement + use<T> {
     let use_custom_player = crate::backend::settings::get_use_custom_player();
     let streamlink_quality = crate::backend::settings::get_streamlink_quality();
-    let summary = general_editor_summary(
+    let summary = player_path_editor_summary(
         &editor,
         &[
-            GeneralSettingsField::CustomPlayerPath,
-            GeneralSettingsField::StreamlinkPath,
-            GeneralSettingsField::StreamlinkCustomQuality,
-            GeneralSettingsField::StreamlinkExtraArgs,
+            PlayerPathField::CustomPlayerPath,
+            PlayerPathField::StreamlinkPath,
+            PlayerPathField::StreamlinkCustomQuality,
+            PlayerPathField::StreamlinkExtraArgs,
         ],
         "Player and Streamlink paths",
     );
@@ -3265,7 +3269,7 @@ fn render_players_surface<T: 'static>(
                         .flex_col()
                         .gap_3()
                         .when(editor.needs_review, |body| {
-                            body.child(render_general_editor_recovery_status())
+                            body.child(render_player_path_editor_recovery_status())
                         })
                         .child(setting_target(
                             USE_CUSTOM_PLAYER,
@@ -3301,7 +3305,7 @@ fn render_players_surface<T: 'static>(
                         ))
                         .child(render_player_text_editor(
                             CUSTOM_PLAYER_PATH,
-                            GeneralSettingsField::CustomPlayerPath,
+                            PlayerPathField::CustomPlayerPath,
                             editor.clone(),
                             "Optional command or executable path.",
                             "Save player",
@@ -3313,7 +3317,7 @@ fn render_players_surface<T: 'static>(
                         ))
                         .child(render_player_text_editor(
                             STREAMLINK_PATH,
-                            GeneralSettingsField::StreamlinkPath,
+                            PlayerPathField::StreamlinkPath,
                             editor.clone(),
                             "Optional command or executable used by /streamlink.",
                             "Save Streamlink",
@@ -3344,7 +3348,7 @@ fn render_players_surface<T: 'static>(
                                 })
                                 .child(render_player_text_editor(
                                     STREAMLINK_CUSTOM_QUALITY,
-                                    GeneralSettingsField::StreamlinkCustomQuality,
+                                    PlayerPathField::StreamlinkCustomQuality,
                                     editor.clone(),
                                     "Quality argument used when Custom is selected.",
                                     "Save quality",
@@ -3358,7 +3362,7 @@ fn render_players_surface<T: 'static>(
                         )
                         .child(render_player_text_editor(
                             STREAMLINK_EXTRA_ARGS,
-                            GeneralSettingsField::StreamlinkExtraArgs,
+                            PlayerPathField::StreamlinkExtraArgs,
                             editor,
                             "Quoted arguments appended after the quality.",
                             "Save arguments",
@@ -3377,8 +3381,8 @@ fn render_players_surface<T: 'static>(
 #[allow(clippy::too_many_arguments)]
 fn render_player_text_editor<T: 'static>(
     descriptor: SettingDescriptor,
-    field: GeneralSettingsField,
-    editor: EditorSnapshot<GeneralSettingsEditor>,
+    field: PlayerPathField,
+    editor: EditorSnapshot<PlayerPathsEditor>,
     help: &'static str,
     save_label: &'static str,
     paste_label: &'static str,
@@ -3388,47 +3392,45 @@ fn render_player_text_editor<T: 'static>(
     cx: &mut Context<T>,
 ) -> impl IntoElement + use<T> {
     let (status, status_is_error) = match field {
-        GeneralSettingsField::BrowserPath => (
+        PlayerPathField::BrowserPath => (
             editor.draft.browser_status.clone(),
             editor.draft.browser_status_is_error,
         ),
-        GeneralSettingsField::CustomPlayerPath => (
+        PlayerPathField::CustomPlayerPath => (
             editor.draft.custom_player_status.clone(),
             editor.draft.custom_player_status_is_error,
         ),
-        GeneralSettingsField::StreamlinkPath => (
+        PlayerPathField::StreamlinkPath => (
             editor.draft.streamlink_status.clone(),
             editor.draft.streamlink_status_is_error,
         ),
-        GeneralSettingsField::StreamlinkCustomQuality => (
+        PlayerPathField::StreamlinkCustomQuality => (
             editor.draft.streamlink_custom_quality_status.clone(),
             editor.draft.streamlink_custom_quality_status_is_error,
         ),
-        GeneralSettingsField::StreamlinkExtraArgs => (
+        PlayerPathField::StreamlinkExtraArgs => (
             editor.draft.streamlink_extra_args_status.clone(),
             editor.draft.streamlink_extra_args_status_is_error,
         ),
     };
     let default_value = match field {
-        GeneralSettingsField::BrowserPath => {
+        PlayerPathField::BrowserPath => {
             settings_defaults().browser_path.clone().unwrap_or_default()
         }
-        GeneralSettingsField::CustomPlayerPath => settings_defaults()
+        PlayerPathField::CustomPlayerPath => settings_defaults()
             .custom_player_path
             .clone()
             .unwrap_or_default(),
-        GeneralSettingsField::StreamlinkPath => settings_defaults()
+        PlayerPathField::StreamlinkPath => settings_defaults()
             .streamlink_path
             .clone()
             .unwrap_or_default(),
-        GeneralSettingsField::StreamlinkCustomQuality => {
+        PlayerPathField::StreamlinkCustomQuality => {
             settings_defaults().streamlink_custom_quality.clone()
         }
-        GeneralSettingsField::StreamlinkExtraArgs => {
-            settings_defaults().streamlink_extra_args.clone()
-        }
+        PlayerPathField::StreamlinkExtraArgs => settings_defaults().streamlink_extra_args.clone(),
     };
-    let modified = general_field_value(&editor.draft, field) != default_value;
+    let modified = player_path_field_value(&editor.draft, field) != default_value;
     setting_target(
         descriptor,
         settings_group_contents(
@@ -3443,7 +3445,7 @@ fn render_player_text_editor<T: 'static>(
                 .gap_2()
                 .child(
                     div()
-                        .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(colors::text_primary())
                         .child(descriptor.label),
@@ -3466,8 +3468,8 @@ fn render_player_text_editor<T: 'static>(
                             false,
                             cx,
                             move |cx| {
-                                let generation = general_settings_editor_snapshot().generation;
-                                save_general_settings_field(generation, field);
+                                let generation = player_paths_editor_snapshot().generation;
+                                save_player_path_field(generation, field);
                                 cx.notify();
                             },
                         ))
@@ -3479,7 +3481,7 @@ fn render_player_text_editor<T: 'static>(
                                 cx,
                                 move |cx| {
                                     if let Some(text) = crate::utils::read_text(cx) {
-                                        paste_general_editor_field(field, text);
+                                        paste_player_path_editor_field(field, text);
                                     }
                                     cx.notify();
                                 },
@@ -3491,7 +3493,7 @@ fn render_player_text_editor<T: 'static>(
                             false,
                             cx,
                             move |cx| {
-                                clear_general_editor_field(field);
+                                clear_player_path_editor_field(field);
                                 cx.notify();
                             },
                         ))
@@ -3501,7 +3503,7 @@ fn render_player_text_editor<T: 'static>(
                                 descriptor.label,
                                 cx,
                                 move |cx| {
-                                    reset_general_editor_field(field);
+                                    reset_player_path_editor_field(field);
                                     cx.notify();
                                 },
                             ))
@@ -3579,12 +3581,12 @@ fn render_streamlink_quality_row<T: 'static>(
     )
 }
 
-fn normalize_general_editor_text(
-    field: GeneralSettingsField,
+fn normalize_player_path_editor_text(
+    field: PlayerPathField,
     text: &str,
 ) -> Result<String, &'static str> {
     match field {
-        GeneralSettingsField::StreamlinkExtraArgs => Ok(text
+        PlayerPathField::StreamlinkExtraArgs => Ok(text
             .replace("\r\n", " ")
             .replace(['\r', '\n'], " ")
             .to_string()),
@@ -3595,20 +3597,20 @@ fn normalize_general_editor_text(
 
 #[cfg(test)]
 mod player_input_text_tests {
-    use super::{GeneralSettingsField, normalize_general_editor_text};
+    use super::{PlayerPathField, normalize_player_path_editor_text};
     use core::prelude::v1::test;
 
     #[test]
     fn typing_keeps_spaces_until_checked_save() {
         assert_eq!(
-            normalize_general_editor_text(
-                GeneralSettingsField::StreamlinkExtraArgs,
+            normalize_player_path_editor_text(
+                PlayerPathField::StreamlinkExtraArgs,
                 "--retry-streams "
             ),
             Ok("--retry-streams ".to_string())
         );
         assert_eq!(
-            normalize_general_editor_text(GeneralSettingsField::CustomPlayerPath, "C:\\Program "),
+            normalize_player_path_editor_text(PlayerPathField::CustomPlayerPath, "C:\\Program "),
             Ok("C:\\Program ".to_string())
         );
     }
@@ -3616,12 +3618,12 @@ mod player_input_text_tests {
     #[test]
     fn paths_reject_multiline_paste_but_arguments_keep_a_separator() {
         assert_eq!(
-            normalize_general_editor_text(GeneralSettingsField::StreamlinkPath, "one\ntwo"),
+            normalize_player_path_editor_text(PlayerPathField::StreamlinkPath, "one\ntwo"),
             Err("This path must be one line.")
         );
         assert_eq!(
-            normalize_general_editor_text(
-                GeneralSettingsField::StreamlinkExtraArgs,
+            normalize_player_path_editor_text(
+                PlayerPathField::StreamlinkExtraArgs,
                 "--retry-streams 5\r\n--player-args x",
             ),
             Ok("--retry-streams 5 --player-args x".to_string())
@@ -3629,125 +3631,117 @@ mod player_input_text_tests {
     }
 }
 
-fn set_general_editor_field_text(field: GeneralSettingsField, text: String) {
-    let value = normalize_general_editor_text(field, &text)
+fn set_player_path_editor_field_text(field: PlayerPathField, text: String) {
+    let value = normalize_player_path_editor_text(field, &text)
         .unwrap_or_else(|_| single_line_text(&text).trim().to_string());
-    let authority = general_field_authority(field);
-    update_general_settings_editor(|editor| {
-        editor.dirty[general_field_index(field)] = value != authority;
-        let (target, status, status_is_error) = general_editor_field_parts(editor, field);
+    let authority = player_path_field_authority(field);
+    update_player_paths_editor(|editor| {
+        editor.dirty[player_path_field_index(field)] = value != authority;
+        let (target, status, status_is_error) = player_path_editor_field_parts(editor, field);
         *target = value;
         *status = None;
         *status_is_error = false;
     });
 }
 
-fn paste_general_editor_field(field: GeneralSettingsField, text: String) {
-    let value = match normalize_general_editor_text(field, &text) {
+fn paste_player_path_editor_field(field: PlayerPathField, text: String) {
+    let value = match normalize_player_path_editor_text(field, &text) {
         Ok(value) => value,
         Err(message) => {
-            update_general_settings_editor(|editor| {
-                let (_, status, status_is_error) = general_editor_field_parts(editor, field);
+            update_player_paths_editor(|editor| {
+                let (_, status, status_is_error) = player_path_editor_field_parts(editor, field);
                 *status = Some(message.to_string());
                 *status_is_error = true;
             });
             return;
         }
     };
-    set_general_editor_field_text(field, value);
-    let snapshot = general_settings_editor_snapshot();
-    if snapshot.draft.dirty[general_field_index(field)] {
-        save_general_settings_field(snapshot.generation, field);
+    set_player_path_editor_field_text(field, value);
+    let snapshot = player_paths_editor_snapshot();
+    if snapshot.draft.dirty[player_path_field_index(field)] {
+        save_player_path_field(snapshot.generation, field);
     }
 }
 
-fn revert_general_editor_field(field: GeneralSettingsField) {
-    let authority = general_field_authority(field);
+fn revert_player_path_editor_field(field: PlayerPathField) {
+    let authority = player_path_field_authority(field);
     apply_general_authoritative_update(|editor| {
-        let (target, status, status_is_error) = general_editor_field_parts(editor, field);
+        let (target, status, status_is_error) = player_path_editor_field_parts(editor, field);
         *target = authority;
         *status = None;
         *status_is_error = false;
-        editor.dirty[general_field_index(field)] = false;
+        editor.dirty[player_path_field_index(field)] = false;
         if editor.focused == Some(field) {
             editor.focused = None;
         }
     });
 }
 
-fn clear_general_editor_field(field: GeneralSettingsField) {
+fn clear_player_path_editor_field(field: PlayerPathField) {
     match field {
-        GeneralSettingsField::BrowserPath => crate::backend::settings::set_browser_path(None),
-        GeneralSettingsField::CustomPlayerPath => {
-            crate::backend::settings::set_custom_player_path(None)
-        }
-        GeneralSettingsField::StreamlinkPath => crate::backend::settings::set_streamlink_path(None),
-        GeneralSettingsField::StreamlinkCustomQuality => {
+        PlayerPathField::BrowserPath => crate::backend::settings::set_browser_path(None),
+        PlayerPathField::CustomPlayerPath => crate::backend::settings::set_custom_player_path(None),
+        PlayerPathField::StreamlinkPath => crate::backend::settings::set_streamlink_path(None),
+        PlayerPathField::StreamlinkCustomQuality => {
             crate::backend::settings::set_streamlink_custom_quality(String::new())
         }
-        GeneralSettingsField::StreamlinkExtraArgs => {
+        PlayerPathField::StreamlinkExtraArgs => {
             crate::backend::settings::set_streamlink_extra_args(String::new())
         }
     }
     apply_general_authoritative_update(|editor| {
-        let (target, status, status_is_error) = general_editor_field_parts(editor, field);
+        let (target, status, status_is_error) = player_path_editor_field_parts(editor, field);
         target.clear();
         *status = Some(
             match field {
-                GeneralSettingsField::BrowserPath => {
-                    "Using automatic private-window browser selection"
-                }
-                GeneralSettingsField::CustomPlayerPath => "No custom player executable configured",
-                GeneralSettingsField::StreamlinkPath => "Using streamlink from PATH",
-                GeneralSettingsField::StreamlinkCustomQuality => {
-                    "Custom quality will fall back to best"
-                }
-                GeneralSettingsField::StreamlinkExtraArgs => "No Streamlink extra arguments",
+                PlayerPathField::BrowserPath => "Using automatic private-window browser selection",
+                PlayerPathField::CustomPlayerPath => "No custom player executable configured",
+                PlayerPathField::StreamlinkPath => "Using streamlink from PATH",
+                PlayerPathField::StreamlinkCustomQuality => "Custom quality will fall back to best",
+                PlayerPathField::StreamlinkExtraArgs => "No Streamlink extra arguments",
             }
             .to_string(),
         );
         *status_is_error = false;
-        editor.dirty[general_field_index(field)] = false;
+        editor.dirty[player_path_field_index(field)] = false;
         editor.focused = None;
-        if field == GeneralSettingsField::BrowserPath {
+        if field == PlayerPathField::BrowserPath {
             editor.browser_path_mode = false;
         }
     });
 }
 
-fn reset_general_editor_field(field: GeneralSettingsField) {
+fn reset_player_path_editor_field(field: PlayerPathField) {
     match field {
-        GeneralSettingsField::BrowserPath => crate::backend::settings::set_browser_path(None),
-        GeneralSettingsField::CustomPlayerPath => {
-            crate::backend::settings::set_custom_player_path(None)
-        }
-        GeneralSettingsField::StreamlinkPath => crate::backend::settings::set_streamlink_path(None),
-        GeneralSettingsField::StreamlinkCustomQuality => {
+        PlayerPathField::BrowserPath => crate::backend::settings::set_browser_path(None),
+        PlayerPathField::CustomPlayerPath => crate::backend::settings::set_custom_player_path(None),
+        PlayerPathField::StreamlinkPath => crate::backend::settings::set_streamlink_path(None),
+        PlayerPathField::StreamlinkCustomQuality => {
             crate::backend::settings::set_streamlink_custom_quality(
                 settings_defaults().streamlink_custom_quality.clone(),
             )
         }
-        GeneralSettingsField::StreamlinkExtraArgs => {
+        PlayerPathField::StreamlinkExtraArgs => {
             crate::backend::settings::set_streamlink_extra_args(
                 settings_defaults().streamlink_extra_args.clone(),
             )
         }
     }
-    let authority = general_field_authority(field);
+    let authority = player_path_field_authority(field);
     apply_general_authoritative_update(|editor| {
-        let (target, status, status_is_error) = general_editor_field_parts(editor, field);
+        let (target, status, status_is_error) = player_path_editor_field_parts(editor, field);
         *target = authority;
         *status = None;
         *status_is_error = false;
-        editor.dirty[general_field_index(field)] = false;
+        editor.dirty[player_path_field_index(field)] = false;
         editor.focused = None;
-        if field == GeneralSettingsField::BrowserPath {
+        if field == PlayerPathField::BrowserPath {
             editor.browser_path_mode = false;
         }
     });
 }
 
-fn render_general_editor_recovery_status() -> impl IntoElement {
+fn render_player_path_editor_recovery_status() -> impl IntoElement {
     div()
         .text_xs()
         .text_color(colors::signal_red())
@@ -3766,1501 +3760,26 @@ fn streamlink_quality_key(quality: StreamlinkQuality) -> &'static str {
     }
 }
 
-/// Transient, settings-only state for the timestamp token builder.
-///
-/// Global for the same reason as [`GENERAL_SETTINGS_EDITOR`]: the section
-/// renderers are free functions shared by the settings modal and the native
-/// popout, so there is no per-surface entity to hang editing state on. Only
-/// editing affordances live here; the pattern itself is persisted settings.
-#[derive(Default)]
-struct TimestampBuilderState {
-    /// Chip whose property editor is expanded.
-    selected: Option<usize>,
-    /// Whether the grouped "Add a piece" menu is open.
-    add_menu_open: bool,
-    /// Whether the custom-separator field owns settings text input.
-    literal_focused: bool,
-    /// Draft text for the custom separator.
-    literal_draft: String,
-    /// Last add/reorder/validation message.
-    status: Option<String>,
-    status_is_error: bool,
-    /// Whether a preview refresh timer is already in flight.
-    preview_pending: bool,
-    /// Formatter generation the in-flight timer was armed for.
-    preview_generation: u64,
-}
-
-static TIMESTAMP_BUILDER: LazyLock<Mutex<TimestampBuilderState>> =
-    LazyLock::new(|| Mutex::new(TimestampBuilderState::default()));
-
-fn recovered_timestamp_builder_state() -> TimestampBuilderState {
-    TimestampBuilderState {
-        status: Some(
-            "Timestamp builder state was reset after an internal editor error. Select or edit a piece again."
-                .to_string(),
-        ),
-        status_is_error: true,
-        ..TimestampBuilderState::default()
-    }
-}
-
-fn lock_timestamp_builder_state(
-    mutex: &Mutex<TimestampBuilderState>,
-) -> (MutexGuard<'_, TimestampBuilderState>, bool) {
-    match mutex.lock() {
-        Ok(state) => (state, false),
-        Err(poisoned) => {
-            let mut state = poisoned.into_inner();
-            *state = recovered_timestamp_builder_state();
-            mutex.clear_poison();
-            crate::log_ui!(warn, "Reset poisoned timestamp builder state");
-            (state, true)
-        }
-    }
-}
-
-fn update_timestamp_builder(update: impl FnOnce(&mut TimestampBuilderState)) -> bool {
-    let (mut state, recovered) = lock_timestamp_builder_state(&TIMESTAMP_BUILDER);
-    if recovered {
-        return false;
-    }
-    update(&mut state);
-    true
-}
-
-fn apply_timestamp_builder_authoritative(update: impl FnOnce(&mut TimestampBuilderState)) {
-    let (mut state, _) = lock_timestamp_builder_state(&TIMESTAMP_BUILDER);
-    update(&mut state);
-}
-
-pub(super) fn reset_timestamp_builder_after_settings_replace() {
-    let (mut state, _) = lock_timestamp_builder_state(&TIMESTAMP_BUILDER);
-    *state = TimestampBuilderState {
-        status: Some("Timestamp builder reset after settings were replaced".to_string()),
-        ..TimestampBuilderState::default()
-    };
-}
-
-/// One render pass's view of the builder's transient state.
-#[derive(Default)]
-struct TimestampBuilderView {
-    selected: Option<usize>,
-    add_menu_open: bool,
-    literal_focused: bool,
-    literal_draft: String,
-    status: Option<String>,
-    status_is_error: bool,
-}
-
-/// Snapshot the builder's transient state, releasing the lock before render.
-fn timestamp_builder_snapshot() -> TimestampBuilderView {
-    let (state, _) = lock_timestamp_builder_state(&TIMESTAMP_BUILDER);
-    TimestampBuilderView {
-        selected: state.selected,
-        add_menu_open: state.add_menu_open,
-        literal_focused: state.literal_focused,
-        literal_draft: state.literal_draft.clone(),
-        status: state.status.clone(),
-        status_is_error: state.status_is_error,
-    }
-}
-
-/// Persist an edited token list, keeping the builder's selection in sync.
-///
-/// Validation lives in the backend so the settings UI can never persist a
-/// pattern the compiled formatter would have to guess about; a rejection is
-/// surfaced as inline status text instead of silently doing nothing.
-fn commit_timestamp_tokens<T: 'static>(
-    tokens: Vec<TimestampToken>,
-    select: Option<usize>,
-    cx: &mut Context<T>,
-) {
-    let pattern = TimestampPattern {
-        version: TIMESTAMP_PATTERN_VERSION,
-        tokens,
-    };
-    match crate::backend::settings::set_message_timestamp_pattern(pattern) {
-        Ok(()) => {
-            apply_timestamp_builder_authoritative(|state| {
-                state.selected = select;
-                state.status = None;
-                state.status_is_error = false;
-            });
-        }
-        Err(err) => {
-            apply_timestamp_builder_authoritative(|state| {
-                state.status = Some(err.message().to_string());
-                state.status_is_error = true;
-            });
-        }
-    }
-    cx.notify();
-}
-
-/// Keep the live preview fresh without adding a per-frame wakeup.
-///
-/// Exactly one timer may be in flight, and it is only re-armed while the
-/// builder is actually rendering. Closing Settings or hiding timestamps
-/// therefore stops the loop after at most one more tick. Millisecond patterns
-/// are capped at 10 Hz by [`TimestampResolution::preview_interval_ms`].
-fn arm_timestamp_preview_refresh<T: 'static>(
-    resolution: TimestampResolution,
-    generation: u64,
-    cx: &mut Context<T>,
-) {
-    let should_arm = {
-        let (mut state, _) = lock_timestamp_builder_state(&TIMESTAMP_BUILDER);
-        mark_timestamp_preview_pending(&mut state, generation)
-    };
-    if !should_arm {
-        return;
-    }
-
-    let interval = std::time::Duration::from_millis(resolution.preview_interval_ms());
-    cx.spawn(async move |this, cx| {
-        cx.background_executor().timer(interval).await;
-        finish_timestamp_preview_timer(generation);
-        let _ = this.update(cx, |_this, cx| {
-            crate::backend::metrics::record_ui_notify_source("settings.timestamp.preview");
-            cx.notify();
-        });
-    })
-    .detach();
-}
-
-fn mark_timestamp_preview_pending(state: &mut TimestampBuilderState, generation: u64) -> bool {
-    if state.preview_pending && state.preview_generation == generation {
-        return false;
-    }
-    state.preview_pending = true;
-    state.preview_generation = generation;
-    true
-}
-
-fn finish_timestamp_preview_timer(generation: u64) {
-    let (mut state, recovered) = lock_timestamp_builder_state(&TIMESTAMP_BUILDER);
-    if !recovered {
-        finish_timestamp_preview_timer_state(&mut state, generation);
-    }
-}
-
-fn finish_timestamp_preview_timer_state(state: &mut TimestampBuilderState, generation: u64) {
-    if state.preview_pending && state.preview_generation == generation {
-        state.preview_pending = false;
-    }
-}
-
-#[cfg(test)]
-mod timestamp_builder_state_tests {
-    use super::*;
-    use core::prelude::v1::test;
-
-    #[test]
-    fn recovery_discards_transient_builder_state() {
-        let recovered = recovered_timestamp_builder_state();
-
-        assert!(recovered.selected.is_none());
-        assert!(!recovered.add_menu_open);
-        assert!(!recovered.literal_focused);
-        assert!(recovered.literal_draft.is_empty());
-        assert!(recovered.status_is_error);
-        assert!(recovered.status.is_some());
-        assert!(!recovered.preview_pending);
-        assert_eq!(recovered.preview_generation, 0);
-    }
-
-    #[test]
-    fn preview_timer_is_single_flight_per_generation() {
-        let mut state = TimestampBuilderState::default();
-
-        assert!(mark_timestamp_preview_pending(&mut state, 7));
-        assert!(!mark_timestamp_preview_pending(&mut state, 7));
-        assert!(mark_timestamp_preview_pending(&mut state, 8));
-        assert!(state.preview_pending);
-        assert_eq!(state.preview_generation, 8);
-    }
-
-    #[test]
-    fn prior_generation_timer_cannot_finish_current_timer() {
-        let mut state = TimestampBuilderState {
-            preview_pending: true,
-            preview_generation: 8,
-            ..TimestampBuilderState::default()
-        };
-
-        finish_timestamp_preview_timer_state(&mut state, 7);
-        assert!(state.preview_pending);
-
-        finish_timestamp_preview_timer_state(&mut state, 8);
-        assert!(!state.preview_pending);
-    }
-}
-
-/// Route key input to the timestamp builder. Returns whether it consumed one.
-///
-/// Left/Right reorder the selected chip and Delete removes it, matching the
-/// pointer affordances on the chip itself. Keys typed in the custom-separator
-/// field belong to that text input.
-fn handle_timestamp_builder_key<T: 'static>(event: &KeyDownEvent, cx: &mut Context<T>) -> bool {
-    let view = timestamp_builder_snapshot();
-
-    if view.literal_focused {
-        return false;
-    }
-
-    if view.add_menu_open && event.keystroke.key == "escape" {
-        update_timestamp_builder(|state| {
-            state.add_menu_open = false;
-            state.literal_focused = false;
-        });
-        return true;
-    }
-
-    let Some(index) = view.selected else {
-        return false;
-    };
-    let pattern = crate::backend::settings::get_message_timestamp_pattern();
-    if index >= pattern.tokens.len() {
-        update_timestamp_builder(|state| state.selected = None);
-        return true;
-    }
-
-    match event.keystroke.key.as_str() {
-        "left" if index > 0 => {
-            let mut tokens = pattern.tokens;
-            tokens.swap(index, index - 1);
-            commit_timestamp_tokens(tokens, Some(index - 1), cx);
-            true
-        }
-        "right" if index + 1 < pattern.tokens.len() => {
-            let mut tokens = pattern.tokens;
-            tokens.swap(index, index + 1);
-            commit_timestamp_tokens(tokens, Some(index + 1), cx);
-            true
-        }
-        "delete" | "backspace" if pattern.tokens.len() > 1 => {
-            let mut tokens = pattern.tokens;
-            tokens.remove(index);
-            commit_timestamp_tokens(tokens, None, cx);
-            true
-        }
-        "escape" => {
-            update_timestamp_builder(|state| state.selected = None);
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Append draft text, enforcing the visible-character limit up front so the
-/// field can never hold something the backend would reject on submit.
-fn push_timestamp_literal_draft(state: &mut TimestampBuilderState, text: &str) {
-    for ch in text.chars() {
-        if state.literal_draft.chars().count() >= MAX_TIMESTAMP_LITERAL_CHARS {
-            break;
-        }
-        state.literal_draft.push(ch);
-    }
-    state.status = None;
-    state.status_is_error = false;
-}
-
-fn render_timestamp_builder<T: 'static>(
-    pattern: TimestampPattern,
-    literal_preset_select: SettingsSelectState,
-    literal_input: DraftField<T>,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let formatter = crate::backend::settings::message_timestamp_formatter();
-    let preview = crate::utils::timestamp::format_message_timestamp_with_formatter(
-        chrono::Local::now().timestamp_millis(),
-        formatter.clone(),
-    )
-    .unwrap_or_else(|| "--:--".to_string());
-    arm_timestamp_preview_refresh(formatter.resolution, formatter.generation, cx);
-
-    let TimestampBuilderView {
-        selected,
-        add_menu_open,
-        literal_draft,
-        status,
-        status_is_error,
-        ..
-    } = timestamp_builder_snapshot();
-    let selected = selected.filter(|index| *index < pattern.tokens.len());
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(render_timestamp_preview(&preview))
-        .child(render_timestamp_chips(&pattern, selected, cx))
-        .when_some(selected, |el, index| {
-            el.child(render_timestamp_token_properties(
-                &pattern,
-                index,
-                &literal_preset_select,
-                cx,
-            ))
-        })
-        .child(render_timestamp_add_menu(
-            &pattern,
-            add_menu_open,
-            &literal_draft,
-            literal_input,
-            cx,
-        ))
-        .when_some(status, |el, message| {
-            el.child(
-                div()
-                    .text_xs()
-                    .text_color(if status_is_error {
-                        colors::error()
-                    } else {
-                        colors::text_muted()
-                    })
-                    .child(message),
-            )
-        })
-        .child(
-            div()
-                .flex()
-                .child(render_button("Reset timestamp format", false, cx, |cx| {
-                    commit_timestamp_tokens(TimestampPattern::default().tokens, None, cx);
-                })),
-        )
-}
-
-fn render_timestamp_preview(preview: &str) -> impl IntoElement + use<> {
-    div()
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .text_xs()
-                .text_color(colors::text_muted())
-                .child("Preview"),
-        )
-        .child(
-            div()
-                .px_2()
-                .py_1()
-                .rounded(Radii::sm())
-                .bg(colors::bg_surface())
-                .border_1()
-                .border_color(colors::border())
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors::text_primary())
-                .child(preview.to_string()),
-        )
-}
-
-/// Ordered chips with per-chip reorder and remove affordances.
-fn render_timestamp_chips<T: 'static>(
-    pattern: &TimestampPattern,
-    selected: Option<usize>,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let tokens = pattern.tokens.clone();
-    let count = tokens.len();
-    let names: Vec<String> = tokens.iter().map(TimestampToken::accessible_name).collect();
-
-    div()
-        .w_full()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_1()
-        .children(tokens.iter().enumerate().map(|(index, token)| {
-            let is_selected = selected == Some(index);
-            let tokens_for_left = tokens.clone();
-            let tokens_for_right = tokens.clone();
-            let tokens_for_remove = tokens.clone();
-            let move_left = (index > 0).then(|| {
-                render_timestamp_chip_action(
-                    format!("timestamp-chip-left-{index}"),
-                    "\u{25c0}",
-                    format!(
-                        "Move {} before {}",
-                        names[index],
-                        names[index.saturating_sub(1)]
-                    ),
-                    cx,
-                    move |cx| {
-                        let mut tokens = tokens_for_left.clone();
-                        tokens.swap(index, index - 1);
-                        commit_timestamp_tokens(tokens, Some(index - 1), cx);
-                    },
-                )
-            });
-            let move_right = (index + 1 < count).then(|| {
-                render_timestamp_chip_action(
-                    format!("timestamp-chip-right-{index}"),
-                    "\u{25b6}",
-                    format!("Move {} after {}", names[index], names[index + 1]),
-                    cx,
-                    move |cx| {
-                        let mut tokens = tokens_for_right.clone();
-                        tokens.swap(index, index + 1);
-                        commit_timestamp_tokens(tokens, Some(index + 1), cx);
-                    },
-                )
-            });
-            let remove = (count > 1).then(|| {
-                render_timestamp_chip_action(
-                    format!("timestamp-chip-remove-{index}"),
-                    "\u{2715}",
-                    format!("Remove {}", names[index]),
-                    cx,
-                    move |cx| {
-                        let mut tokens = tokens_for_remove.clone();
-                        tokens.remove(index);
-                        commit_timestamp_tokens(tokens, None, cx);
-                    },
-                )
-            });
-
-            div()
-                .id(SharedString::from(format!("timestamp-chip-{index}")))
-                .role(Role::Button)
-                .map(|control| {
-                    crate::components::settings::widgets::settings_keyboard_control(control, cx)
-                })
-                .a11y_synthetic_children(crate::components::ui::accessibility::apply_description)
-                .aria_label(SharedString::from(names[index].clone()))
-                .aria_selected(is_selected)
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl_2()
-                .pr_1()
-                .py_0p5()
-                .min_h(px(28.0))
-                .rounded(Radii::sm())
-                .bg(if is_selected {
-                    colors::bg_hover()
-                } else {
-                    colors::bg_surface()
-                })
-                .border_1()
-                .border_color(if is_selected {
-                    colors::accent()
-                } else {
-                    colors::border()
-                })
-                .cursor_pointer()
-                .on_activate(cx.listener(move |_this, _event, _window, cx| {
-                    update_timestamp_builder(|state| {
-                        state.selected = if state.selected == Some(index) {
-                            None
-                        } else {
-                            Some(index)
-                        };
-                    });
-                    cx.notify();
-                }))
-                .on_a11y_action(AccessibleAction::Click, {
-                    let entity = cx.entity();
-                    move |_, _, app| {
-                        entity.update(app, |_, cx| {
-                            update_timestamp_builder(|state| {
-                                state.selected = if state.selected == Some(index) {
-                                    None
-                                } else {
-                                    Some(index)
-                                };
-                            });
-                            cx.notify();
-                        })
-                    }
-                })
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(colors::text_primary())
-                        .child(token.chip_label()),
-                )
-                .when_some(move_left, |el, action| el.child(action))
-                .when_some(move_right, |el, action| el.child(action))
-                .when_some(remove, |el, action| el.child(action))
-        }))
-}
-
-/// One 20px glyph button inside a chip, carrying its own accessible label.
-fn render_timestamp_chip_action<T: 'static, F: Fn(&mut Context<T>) + 'static>(
-    id: String,
-    glyph: &'static str,
-    label: String,
-    cx: &mut Context<T>,
-    on_click: F,
-) -> impl IntoElement + use<T, F> {
-    let on_click = std::rc::Rc::new(on_click);
-    let pointer = on_click.clone();
-    let entity = cx.entity();
-    div()
-        .id(SharedString::from(id))
-        .role(Role::Button)
-        .map(|control| crate::components::settings::widgets::settings_keyboard_control(control, cx))
-        .a11y_synthetic_children(crate::components::ui::accessibility::apply_description)
-        .aria_label(SharedString::from(label))
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(20.0))
-        .h(px(20.0))
-        .rounded(Radii::sm())
-        .cursor_pointer()
-        .text_xs()
-        .text_color(colors::text_muted())
-        .hover(|s| {
-            s.bg(colors::hover_surface())
-                .text_color(colors::text_primary())
-        })
-        .on_activate(cx.listener(move |_this, _event, _window, cx| {
-            cx.stop_propagation();
-            pointer(cx);
-        }))
-        .on_a11y_action(AccessibleAction::Click, move |_, _, app| {
-            entity.update(app, |_, cx| on_click(cx));
-        })
-        .child(glyph)
-}
-
-/// Property editor for the selected chip.
-fn render_timestamp_token_properties<T: 'static>(
-    pattern: &TimestampPattern,
-    index: usize,
-    literal_preset_select: &SettingsSelectState,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let tokens = pattern.tokens.clone();
-    let token = tokens[index].clone();
-
-    let body = match token {
-        TimestampToken::Hour24 { padded } | TimestampToken::Hour12 { padded } => {
-            let twelve_hour = matches!(tokens[index], TimestampToken::Hour12 { .. });
-            let tokens_for_change = tokens.clone();
-            select_buttons(
-                "timestamp-hour-padding",
-                &[
-                    SelectOption::new("compact", "9"),
-                    SelectOption::new("padded", "09"),
-                ],
-                if padded { "padded" } else { "compact" },
-                cx,
-                move |value, cx| {
-                    let mut tokens = tokens_for_change.clone();
-                    let padded = value == "padded";
-                    tokens[index] = if twelve_hour {
-                        TimestampToken::Hour12 { padded }
-                    } else {
-                        TimestampToken::Hour24 { padded }
-                    };
-                    commit_timestamp_tokens(tokens, Some(index), cx);
-                },
-            )
-            .into_any_element()
-        }
-        TimestampToken::Meridiem { uppercase } => {
-            let tokens_for_change = tokens.clone();
-            select_buttons(
-                "timestamp-meridiem-case",
-                &[
-                    SelectOption::new("lower", "am/pm"),
-                    SelectOption::new("upper", "AM/PM"),
-                ],
-                if uppercase { "upper" } else { "lower" },
-                cx,
-                move |value, cx| {
-                    let mut tokens = tokens_for_change.clone();
-                    tokens[index] = TimestampToken::Meridiem {
-                        uppercase: value == "upper",
-                    };
-                    commit_timestamp_tokens(tokens, Some(index), cx);
-                },
-            )
-            .into_any_element()
-        }
-        TimestampToken::Fraction { digits } => {
-            let tokens_for_change = tokens.clone();
-            select_buttons(
-                "timestamp-fraction-digits",
-                &[
-                    SelectOption::new("1", "1 digit"),
-                    SelectOption::new("2", "2 digits"),
-                    SelectOption::new("3", "3 digits"),
-                ],
-                &digits.to_string(),
-                cx,
-                move |value, cx| {
-                    let mut tokens = tokens_for_change.clone();
-                    tokens[index] = TimestampToken::Fraction {
-                        digits: value.parse().unwrap_or(3),
-                    };
-                    commit_timestamp_tokens(tokens, Some(index), cx);
-                },
-            )
-            .into_any_element()
-        }
-        TimestampToken::Literal { ref text } => {
-            let tokens_for_change = tokens.clone();
-            let options: Vec<SelectOption> = TIMESTAMP_LITERAL_PRESETS
-                .iter()
-                .map(|(value, label)| SelectOption::new(*value, *label))
-                .collect();
-            let current = text.clone();
-            div()
-                .on_key_down(cx.listener(|_this, event: &KeyDownEvent, _window, cx| {
-                    if matches!(
-                        event.keystroke.key.as_str(),
-                        "left" | "right" | "backspace" | "delete"
-                    ) {
-                        cx.stop_propagation();
-                    }
-                }))
-                .child(settings_select(
-                    "timestamp-literal-preset",
-                    "Separator preset",
-                    &options,
-                    &current,
-                    literal_preset_select,
-                    cx,
-                    move |value, cx| {
-                        let mut tokens = tokens_for_change.clone();
-                        tokens[index] = TimestampToken::literal(&value);
-                        commit_timestamp_tokens(tokens, Some(index), cx);
-                    },
-                ))
-                .into_any_element()
-        }
-        TimestampToken::Minute | TimestampToken::Second => div()
-            .text_xs()
-            .text_color(colors::text_muted())
-            .child("This piece has no options.")
-            .into_any_element(),
-    };
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_2()
-        .rounded(Radii::sm())
-        .bg(colors::bg_surface())
-        .border_1()
-        .border_color(colors::border())
-        .child(
-            div()
-                .text_xs()
-                .text_color(colors::text_muted())
-                .child(format!("{} options", tokens[index].accessible_name())),
-        )
-        .child(body)
-}
-
-/// Grouped add menu. Entries that would produce an invalid pattern are
-/// rendered disabled with their reason, so the menu can never offer an
-/// addition the backend would reject.
-fn render_timestamp_add_menu<T: 'static>(
-    pattern: &TimestampPattern,
-    is_open: bool,
-    literal_draft: &str,
-    literal_input: DraftField<T>,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let time_pieces: Vec<TimestampToken> = vec![
-        TimestampToken::Hour24 { padded: false },
-        TimestampToken::Hour12 { padded: false },
-        TimestampToken::Minute,
-        TimestampToken::Second,
-        TimestampToken::Meridiem { uppercase: false },
-    ];
-    let separators: Vec<TimestampToken> = TIMESTAMP_LITERAL_PRESETS
-        .iter()
-        .map(|(value, _)| TimestampToken::literal(value))
-        .collect();
-    let separator_labels: Vec<&str> = TIMESTAMP_LITERAL_PRESETS
-        .iter()
-        .map(|(_, label)| *label)
-        .collect();
-    let advanced: Vec<TimestampToken> = vec![
-        TimestampToken::Fraction { digits: 1 },
-        TimestampToken::Fraction { digits: 2 },
-        TimestampToken::Fraction { digits: 3 },
-    ];
-    let advanced_labels = ["Fraction 1 digit", "Fraction 2 digits", "Fraction 3 digits"];
-    let draft = literal_draft.to_string();
-    let draft_for_add = draft.clone();
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .id("timestamp-add-menu-toggle")
-                .role(Role::Button)
-                .map(|control| {
-                    crate::components::settings::widgets::settings_keyboard_control(control, cx)
-                })
-                .a11y_synthetic_children(crate::components::ui::accessibility::apply_description)
-                .aria_label("Add a timestamp piece")
-                .aria_expanded(is_open)
-                .flex()
-                .items_center()
-                .justify_center()
-                .self_start()
-                .px_2()
-                .min_h(px(28.0))
-                .rounded(Radii::sm())
-                .bg(colors::bg_surface())
-                .border_1()
-                .border_color(colors::border())
-                .cursor_pointer()
-                .hover(|s| s.bg(colors::bg_hover()))
-                .text_xs()
-                .text_color(colors::interactive_foreground())
-                .tab_index(0)
-                .on_accessible_activate(cx.listener(move |_this, _event, _window, cx| {
-                    update_timestamp_builder(|state| {
-                        state.add_menu_open = !state.add_menu_open;
-                        if !state.add_menu_open {
-                            state.literal_focused = false;
-                        }
-                    });
-                    cx.notify();
-                }))
-                .child(if is_open { "Close" } else { "Add a piece" }),
-        )
-        .when(is_open, |el| {
-            el.child(
-                menu_panel()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_2()
-                    .child(render_timestamp_add_group(
-                        "Time pieces",
-                        pattern,
-                        &time_pieces,
-                        &time_pieces
-                            .iter()
-                            .map(|token| token.kind().label().to_string())
-                            .collect::<Vec<_>>(),
-                        "time",
-                        cx,
-                    ))
-                    .child(render_timestamp_add_group(
-                        "Separators",
-                        pattern,
-                        &separators,
-                        &separator_labels
-                            .iter()
-                            .map(|label| (*label).to_string())
-                            .collect::<Vec<_>>(),
-                        "separator",
-                        cx,
-                    ))
-                    .child(render_timestamp_add_group(
-                        "Advanced",
-                        pattern,
-                        &advanced,
-                        &advanced_labels
-                            .iter()
-                            .map(|label| (*label).to_string())
-                            .collect::<Vec<_>>(),
-                        "advanced",
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(colors::text_secondary())
-                                    .child("Custom separator"),
-                            )
-                            .child(literal_input.render(cx))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_1()
-                                    .child(render_button("Paste separator", false, cx, |cx| {
-                                        let pasted =
-                                            crate::utils::read_text(cx).unwrap_or_default();
-                                        update_timestamp_builder(|state| {
-                                            state.literal_draft.clear();
-                                            push_timestamp_literal_draft(state, &pasted);
-                                        });
-                                        cx.notify();
-                                    }))
-                                    .child(render_button("Add separator", false, cx, move |cx| {
-                                        add_custom_timestamp_literal(&draft_for_add, cx);
-                                    })),
-                            ),
-                    ),
-            )
-        })
-}
-
-/// One labeled group of add-menu entries.
-fn render_timestamp_add_group<T: 'static>(
-    title: &str,
-    pattern: &TimestampPattern,
-    tokens: &[TimestampToken],
-    labels: &[String],
-    id_prefix: &str,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let entries: Vec<(TimestampToken, String, Option<&'static str>)> = tokens
-        .iter()
-        .enumerate()
-        .map(|(position, token)| {
-            let reason = pattern.can_append(token).err().map(|err| err.message());
-            (
-                token.clone(),
-                labels
-                    .get(position)
-                    .cloned()
-                    .unwrap_or_else(|| token.kind().label().to_string()),
-                reason,
-            )
-        })
-        .collect();
-    let prefix = id_prefix.to_string();
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors::text_secondary())
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_1()
-                .children(entries.into_iter().enumerate().map(
-                    |(position, (token, label, reason))| {
-                        let disabled = reason.is_some();
-                        let mut element = div()
-                            .id(SharedString::from(format!(
-                                "timestamp-add-{prefix}-{position}"
-                            )))
-                            .role(Role::Button)
-                            .map(|control| {
-                                crate::components::settings::widgets::settings_keyboard_control_if_enabled(
-                                    control, !disabled, cx,
-                                )
-                            })
-                            .a11y_synthetic_children(
-                                crate::components::ui::accessibility::apply_description,
-                            )
-                            .aria_label(SharedString::from(format!("Add {label}")))
-                            .flex()
-                            .items_center()
-                            .px_2()
-                            .min_h(px(28.0))
-                            .rounded(Radii::sm())
-                            .bg(colors::bg_elevated())
-                            .border_1()
-                            .border_color(colors::border())
-                            .text_xs()
-                            .text_color(if disabled {
-                                colors::text_muted()
-                            } else {
-                                colors::interactive_foreground()
-                            })
-                            .child(label);
-
-                        if let Some(reason) = reason {
-                            element = element
-                                .aria_description(SharedString::from(reason))
-                                .disabled_button();
-                        } else {
-                            element = element
-                                .cursor_pointer()
-                                .hover(button_hover)
-                                .on_accessible_activate(cx.listener(
-                                    move |_this, _event, _window, cx| {
-                                        let mut tokens =
-                                        crate::backend::settings::get_message_timestamp_pattern()
-                                            .tokens;
-                                        tokens.push(token.clone());
-                                        let select = tokens.len() - 1;
-                                        commit_timestamp_tokens(tokens, Some(select), cx);
-                                    },
-                                ));
-                        }
-                        element
-                    },
-                )),
-        )
-}
-
-/// Validate and append a custom separator from the builder's draft field.
-fn timestamp_literal_input<T: 'static>(draft: &str) -> DraftInput<T> {
-    DraftInput::new(
-        "timestamp-custom-literal",
-        draft,
-        "Type or paste up to 8 characters",
-    )
-    .label("Custom separator")
-    .on_focus(|_cx| {
-        update_timestamp_builder(|state| state.literal_focused = true);
-    })
-    .on_blur(|_cx| {
-        update_timestamp_builder(|state| state.literal_focused = false);
-    })
-    .on_change(|text, _cx| {
-        update_timestamp_builder(|state| {
-            state.literal_draft.clear();
-            push_timestamp_literal_draft(state, &text);
-        });
-    })
-    .on_enter(|cx| {
-        let draft = timestamp_builder_snapshot().literal_draft;
-        add_custom_timestamp_literal(&draft, cx);
-    })
-    .on_escape(|_window, _cx| {
-        update_timestamp_builder(|state| state.literal_draft.clear());
-    })
-}
-
-fn add_custom_timestamp_literal<T: 'static>(draft: &str, cx: &mut Context<T>) {
-    if let Err(err) = validate_timestamp_literal(draft) {
-        update_timestamp_builder(|state| {
-            state.status = Some(err.message().to_string());
-            state.status_is_error = true;
-        });
-        cx.notify();
-        return;
-    }
-
-    let mut tokens = crate::backend::settings::get_message_timestamp_pattern().tokens;
-    tokens.push(TimestampToken::literal(draft));
-    let select = tokens.len() - 1;
-    commit_timestamp_tokens(tokens, Some(select), cx);
-    update_timestamp_builder(|state| {
-        state.literal_draft.clear();
-        state.literal_focused = false;
-    });
-}
-
-fn render_configuration_actions<T: 'static>(
-    settings_path: std::path::PathBuf,
-    ui: &mut SettingsPageUi,
-    window: &mut Window,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let path_label = settings_path.display().to_string();
-    let path_for_copy = path_label.clone();
-    let path_for_open = settings_path.clone();
-    let settings_dir = SETTINGS_DIR_PATH.clone();
-    let settings_dir_label = settings_dir.display().to_string();
-    let backups_dir = SETTINGS_BACKUPS_DIR_PATH.clone();
-    let backups_dir_label = backups_dir.display().to_string();
-    let stacked = ui.stacked;
-    let files_disclosure = ui.disclosure("advanced-configuration-files", cx);
-    let editor = settings_import_editor_snapshot();
-    let import_disclosure = ui.disclosure("advanced-settings-import", cx);
-    let summary = settings_import_summary(&editor);
-    if !import_disclosure.is_expanded() && editor.draft.focused {
-        SETTINGS_IMPORT_EDITOR.sync_and_snapshot(recovered_settings_import_editor, |editor| {
-            editor.focused = false;
-            false
-        });
-    }
-    let escape_focus = import_disclosure.clone();
-    let chatterino_import = super::chatterino_import::render_chatterino_import(ui, cx);
-    div()
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(px(SettingsMetrics::GROUP_GAP))
-        .child(settings_group(
-            "advanced-configuration",
-            "Configuration",
-            true,
-            div()
-                .flex()
-                .flex_col()
-                .child(setting_target(
-                    SETTINGS_EXPORT,
-                    crate::components::settings::widgets::setting_compact_row(
-                        SETTINGS_EXPORT.id,
-                        SETTINGS_EXPORT.label,
-                        Some("Copy a settings snapshot with secrets removed."),
-                        quiet_action_button(
-                            SETTINGS_EXPORT.control_id,
-                            "Export",
-                            false,
-                            cx,
-                            |cx| {
-                                match crate::backend::settings::export_settings_to_json() {
-                                    Ok(json) => {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(json));
-                                        set_settings_import_status(
-                                            "Exported settings JSON and copied it to the clipboard"
-                                                .to_string(),
-                                            false,
-                                        );
-                                    }
-                                    Err(error) => {
-                                        set_settings_import_status(error, true);
-                                    }
-                                }
-                                cx.notify();
-                            },
-                        )
-                        .aria_label("Export settings JSON to clipboard"),
-                        false,
-                        None,
-                        ui.stacked,
-                    ),
-                ))
-                .child(settings_summary_disclosure(
-                    "advanced-configuration-files",
-                    "Files and folders",
-                    "Settings and backups",
-                    &files_disclosure,
-                    cx,
-                    move |cx| {
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(setting_target(
-                                SETTINGS_FILE,
-                                crate::components::settings::widgets::settings_path_row(
-                                    SETTINGS_FILE.id,
-                                    SETTINGS_FILE.label,
-                                    &path_label,
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .child(
-                                            quiet_action_button(
-                                                "configuration-copy-file-path",
-                                                "Copy",
-                                                false,
-                                                cx,
-                                                move |cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(
-                                                            path_for_copy.clone(),
-                                                        ),
-                                                    );
-                                                    cx.notify();
-                                                },
-                                            )
-                                            .aria_label("Copy settings file path"),
-                                        )
-                                        .child(
-                                            quiet_action_button(
-                                                "configuration-open-file",
-                                                "Open",
-                                                false,
-                                                cx,
-                                                move |cx| {
-                                                    open_configuration_path(
-                                                        path_for_open.clone(),
-                                                        "Could not open settings file",
-                                                    );
-                                                    cx.notify();
-                                                },
-                                            )
-                                            .aria_label("Open settings file"),
-                                        ),
-                                    stacked,
-                                ),
-                            ))
-                            .child(crate::components::settings::widgets::settings_path_row(
-                                "advanced-config-folder",
-                                "Settings folder",
-                                &settings_dir_label,
-                                quiet_action_button(
-                                    "configuration-open-folder",
-                                    "Open",
-                                    false,
-                                    cx,
-                                    move |cx| {
-                                        open_configuration_path(
-                                            settings_dir.clone(),
-                                            "Could not open settings folder",
-                                        );
-                                        cx.notify();
-                                    },
-                                )
-                                .aria_label("Open settings folder"),
-                                stacked,
-                            ))
-                            .child(crate::components::settings::widgets::settings_path_row(
-                                "advanced-backups-folder",
-                                "Backups folder",
-                                &backups_dir_label,
-                                quiet_action_button(
-                                    "configuration-open-backups",
-                                    "Open",
-                                    false,
-                                    cx,
-                                    move |cx| {
-                                        if let Err(error) = std::fs::create_dir_all(&backups_dir) {
-                                            backend::push_ui_action(
-                                                backend::UiAction::ShowWarningToast {
-                                                    message:
-                                                        "Could not create settings backups folder"
-                                                            .to_string(),
-                                                    detail: Some(error.to_string()),
-                                                },
-                                            );
-                                        } else {
-                                            open_configuration_path(
-                                                backups_dir.clone(),
-                                                "Could not open settings backups folder",
-                                            );
-                                        }
-                                        cx.notify();
-                                    },
-                                )
-                                .aria_label("Open settings backups folder"),
-                                stacked,
-                            ))
-                    },
-                )),
-        ))
-        .child(settings_group(
-            "advanced-import-settings",
-            "Import settings JSON",
-            false,
-            setting_target(
-                SETTINGS_IMPORT,
-                settings_summary_disclosure(
-                    "advanced-settings-import",
-                    SETTINGS_IMPORT.label,
-                    &summary,
-                    &import_disclosure,
-                    cx,
-                    move |cx| {
-                        div().w_full().min_w_0().child(render_settings_import_panel(
-                            editor,
-                            escape_focus,
-                            window,
-                            cx,
-                        ))
-                    },
-                ),
-            ),
-        ))
-        .child(chatterino_import)
-}
-
-fn set_settings_import_status(status: String, error: bool) {
-    SETTINGS_IMPORT_EDITOR.sync_and_snapshot(recovered_settings_import_editor, |editor| {
-        editor.status = Some(status);
-        editor.status_is_error = error;
-        false
-    });
-}
-
-fn open_configuration_path(path: std::path::PathBuf, message: &'static str) {
-    crate::utils::open_path(path, move |result| {
-        if let Err(error) = result {
-            backend::push_ui_action(backend::UiAction::ShowWarningToast {
-                message: message.to_string(),
-                detail: Some(error.to_string()),
-            });
-        }
-    });
-}
-
-fn settings_import_summary(editor: &EditorSnapshot<SettingsImportEditor>) -> String {
-    if editor.needs_review {
-        "Needs review".to_string()
-    } else if !editor.draft.json.trim().is_empty() {
-        "Unsaved draft".to_string()
-    } else if editor.draft.status_is_error {
-        "Import/export failed; open for details".to_string()
-    } else {
-        editor
-            .draft
-            .status
-            .clone()
-            .unwrap_or_else(|| "Restore an Echo settings snapshot".to_string())
-    }
-}
-
-fn render_settings_import_panel<T: 'static>(
-    editor: EditorSnapshot<SettingsImportEditor>,
-    escape_focus: crate::components::settings::widgets::SettingsDisclosureState,
-    window: &mut Window,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T> {
-    let editor_generation = editor.generation;
-    let editor_needs_review = editor.needs_review;
-    let editor = editor.draft;
-    let json_input = DraftInput::new(
-        SETTINGS_IMPORT.control_id,
-        &editor.json,
-        "Paste an Echo settings JSON snapshot",
-    )
-    .label("Settings JSON snapshot")
-    .monospace(true)
-    .on_focus(|_cx| set_settings_import_focused(true))
-    .on_blur(|_cx| set_settings_import_focused(false))
-    .on_change(|text, _cx| {
-        update_settings_import_editor(|editor| {
-            editor.json = text;
-            editor.status = None;
-            editor.status_is_error = false;
-        });
-    })
-    .on_escape(move |window, cx| {
-        set_settings_import_focused(false);
-        escape_focus.focus_trigger(window, cx);
-    })
-    .prepare(window, cx);
-    let status_is_error = editor.status_is_error || editor_needs_review;
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors::text_primary())
-                .child("Settings snapshot"),
-        )
-        .child(json_input.render(cx))
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .child(quiet_action_button(
-                    "configuration-import-json",
-                    "Import",
-                    false,
-                    cx,
-                    move |cx| {
-                        if let Some(editor) = prepare_settings_import(editor_generation) {
-                            match crate::backend::settings::import_settings_from_json(&editor.json)
-                            {
-                                Ok(result) => {
-                                    super::reset_migrated_editor_drafts_after_settings_replace();
-                                    let mut message = result
-                                        .backup_path
-                                        .map(|path| {
-                                            format!(
-                                                "Imported settings; previous file backed up to {}",
-                                                path.display()
-                                            )
-                                        })
-                                        .unwrap_or_else(|| "Imported settings".to_string());
-                                    if !result.skipped_launch_settings.is_empty() {
-                                        message.push_str(&format!(
-                                        ". For safety these sensitive settings were not imported \
-                                         and keep their current values: {}",
-                                        result.skipped_launch_settings.join(", ")
-                                    ));
-                                    }
-                                    SETTINGS_IMPORT_EDITOR.replace_from_authority(
-                                        SettingsImportEditor {
-                                            status: Some(message),
-                                            ..SettingsImportEditor::default()
-                                        },
-                                    );
-                                }
-                                Err(error) => {
-                                    update_settings_import_editor(|editor| {
-                                        editor.status = Some(error);
-                                        editor.status_is_error = true;
-                                    });
-                                }
-                            }
-                        }
-                        cx.notify();
-                    },
-                ))
-                .child(quiet_action_button(
-                    "configuration-clear-json",
-                    "Clear",
-                    false,
-                    cx,
-                    |cx| {
-                        SETTINGS_IMPORT_EDITOR
-                            .replace_from_authority(SettingsImportEditor::default());
-                        cx.notify();
-                    },
-                ))
-                .when_some(editor.status, |row, status| {
-                    row.child(
-                        div()
-                            .text_xs()
-                            .text_color(if status_is_error {
-                                colors::signal_red()
-                            } else {
-                                colors::text_muted()
-                            })
-                            .child(status),
-                    )
-                }),
-        )
-}
-
-fn set_settings_import_focused(focused: bool) {
-    SETTINGS_IMPORT_EDITOR.sync_and_snapshot(recovered_settings_import_editor, |editor| {
-        editor.focused = focused;
-        false
-    });
-}
-
-fn recovered_settings_import_editor(_previous: &SettingsImportEditor) -> SettingsImportEditor {
-    SettingsImportEditor {
-        status: Some(
-            "Settings import draft was reset after an internal editor error. Paste or export JSON again before importing."
-                .to_string(),
-        ),
-        status_is_error: true,
-        ..SettingsImportEditor::default()
-    }
-}
-
-fn settings_import_editor_snapshot() -> EditorSnapshot<SettingsImportEditor> {
-    SETTINGS_IMPORT_EDITOR.snapshot_or_reset(recovered_settings_import_editor)
-}
-
-fn prepare_settings_import(expected_generation: u64) -> Option<SettingsImportEditor> {
-    SETTINGS_IMPORT_EDITOR.prepare_ready(expected_generation, recovered_settings_import_editor)
-}
-
-fn update_settings_import_editor(update: impl FnOnce(&mut SettingsImportEditor)) -> bool {
-    matches!(
-        SETTINGS_IMPORT_EDITOR.apply_user_edit(recovered_settings_import_editor, update),
-        crate::components::settings::editor_state::EditorEditResult::Applied
-    )
-}
-
-pub(super) fn reset_settings_import_editor_after_settings_replace() {
-    SETTINGS_IMPORT_EDITOR.replace_from_authority(SettingsImportEditor {
-        status: Some("Settings import draft reset after settings were replaced".to_string()),
-        ..SettingsImportEditor::default()
-    });
-}
-
-#[cfg(test)]
-mod settings_import_editor_tests {
-    use super::*;
-    use core::prelude::v1::test;
-
-    #[test]
-    fn import_summary_distinguishes_recovery_drafts_and_failure() {
-        let mut snapshot = EditorSnapshot {
-            draft: SettingsImportEditor::default(),
-            generation: 0,
-            needs_review: false,
-        };
-        assert_eq!(
-            settings_import_summary(&snapshot),
-            "Restore an Echo settings snapshot"
-        );
-        snapshot.draft.json = "{ partial".to_string();
-        assert_eq!(settings_import_summary(&snapshot), "Unsaved draft");
-        snapshot.needs_review = true;
-        assert_eq!(settings_import_summary(&snapshot), "Needs review");
-        snapshot.needs_review = false;
-        snapshot.draft.json.clear();
-        snapshot.draft.status_is_error = true;
-        snapshot.draft.status = Some("private error details".to_string());
-        assert_eq!(
-            settings_import_summary(&snapshot),
-            "Import/export failed; open for details"
-        );
-    }
-
-    #[test]
-    fn recovery_discards_unsaved_json_and_focus() {
-        let previous = SettingsImportEditor {
-            json: "{ partial".to_string(),
-            status: Some("old".to_string()),
-            status_is_error: false,
-            focused: true,
-        };
-
-        let recovered = recovered_settings_import_editor(&previous);
-        assert!(recovered.json.is_empty());
-        assert!(!recovered.focused);
-        assert!(recovered.status_is_error);
-        assert!(recovered.status.is_some());
-    }
-
-    #[test]
-    fn general_editor_baseline_restores_every_authoritative_value() {
-        let editor = general_settings_editor_from_values(
-            "browser".to_string(),
-            "player".to_string(),
-            "streamlink".to_string(),
-            "720p".to_string(),
-            "--player mpv".to_string(),
-        );
-
-        assert_eq!(editor.browser_path, "browser");
-        assert_eq!(editor.custom_player_path, "player");
-        assert_eq!(editor.streamlink_path, "streamlink");
-        assert_eq!(editor.streamlink_custom_quality, "720p");
-        assert_eq!(editor.streamlink_extra_args, "--player mpv");
-        assert!(editor.focused.is_none());
-    }
-}
-
-fn general_settings_editor_from_values(
+fn player_paths_editor_from_values(
     browser_path: String,
     custom_player_path: String,
     streamlink_path: String,
     streamlink_custom_quality: String,
     streamlink_extra_args: String,
-) -> GeneralSettingsEditor {
-    GeneralSettingsEditor {
+) -> PlayerPathsEditor {
+    PlayerPathsEditor {
         browser_path_mode: !browser_path.is_empty(),
         browser_path,
         custom_player_path,
         streamlink_path,
         streamlink_custom_quality,
         streamlink_extra_args,
-        ..GeneralSettingsEditor::default()
+        ..PlayerPathsEditor::default()
     }
 }
 
-fn recovered_general_settings_editor(_previous: &GeneralSettingsEditor) -> GeneralSettingsEditor {
-    general_settings_editor_from_values(
+fn recovered_player_paths_editor(_previous: &PlayerPathsEditor) -> PlayerPathsEditor {
+    player_paths_editor_from_values(
         crate::backend::settings::get_browser_path().unwrap_or_default(),
         crate::backend::settings::get_custom_player_path().unwrap_or_default(),
         crate::backend::settings::get_streamlink_path().unwrap_or_default(),
@@ -5269,20 +3788,20 @@ fn recovered_general_settings_editor(_previous: &GeneralSettingsEditor) -> Gener
     )
 }
 
-fn general_settings_editor_snapshot() -> EditorSnapshot<GeneralSettingsEditor> {
-    GENERAL_SETTINGS_EDITOR.snapshot_or_reset(recovered_general_settings_editor)
+fn player_paths_editor_snapshot() -> EditorSnapshot<PlayerPathsEditor> {
+    PLAYER_PATHS_EDITOR.snapshot_or_reset(recovered_player_paths_editor)
 }
 
-fn synced_general_settings_editor(
+fn synced_player_paths_editor(
     browser_path: &str,
     custom_player_path: &str,
     streamlink_path: &str,
     streamlink_custom_quality: &str,
     streamlink_extra_args: &str,
-) -> EditorSnapshot<GeneralSettingsEditor> {
-    GENERAL_SETTINGS_EDITOR.sync_and_snapshot(
+) -> EditorSnapshot<PlayerPathsEditor> {
+    PLAYER_PATHS_EDITOR.sync_and_snapshot(
         |_| {
-            general_settings_editor_from_values(
+            player_paths_editor_from_values(
                 browser_path.to_string(),
                 custom_player_path.to_string(),
                 streamlink_path.to_string(),
@@ -5292,32 +3811,32 @@ fn synced_general_settings_editor(
         },
         |editor| {
             let mut changed = false;
-            if !editor.dirty[general_field_index(GeneralSettingsField::BrowserPath)]
+            if !editor.dirty[player_path_field_index(PlayerPathField::BrowserPath)]
                 && editor.browser_path != browser_path
             {
                 editor.browser_path = browser_path.to_string();
                 editor.browser_path_mode = !browser_path.is_empty();
                 changed = true;
             }
-            if !editor.dirty[general_field_index(GeneralSettingsField::CustomPlayerPath)]
+            if !editor.dirty[player_path_field_index(PlayerPathField::CustomPlayerPath)]
                 && editor.custom_player_path != custom_player_path
             {
                 editor.custom_player_path = custom_player_path.to_string();
                 changed = true;
             }
-            if !editor.dirty[general_field_index(GeneralSettingsField::StreamlinkPath)]
+            if !editor.dirty[player_path_field_index(PlayerPathField::StreamlinkPath)]
                 && editor.streamlink_path != streamlink_path
             {
                 editor.streamlink_path = streamlink_path.to_string();
                 changed = true;
             }
-            if !editor.dirty[general_field_index(GeneralSettingsField::StreamlinkCustomQuality)]
+            if !editor.dirty[player_path_field_index(PlayerPathField::StreamlinkCustomQuality)]
                 && editor.streamlink_custom_quality != streamlink_custom_quality
             {
                 editor.streamlink_custom_quality = streamlink_custom_quality.to_string();
                 changed = true;
             }
-            if !editor.dirty[general_field_index(GeneralSettingsField::StreamlinkExtraArgs)]
+            if !editor.dirty[player_path_field_index(PlayerPathField::StreamlinkExtraArgs)]
                 && editor.streamlink_extra_args != streamlink_extra_args
             {
                 editor.streamlink_extra_args = streamlink_extra_args.to_string();
@@ -5328,26 +3847,26 @@ fn synced_general_settings_editor(
     )
 }
 
-fn prepare_general_settings_editor(expected_generation: u64) -> Option<GeneralSettingsEditor> {
-    GENERAL_SETTINGS_EDITOR.prepare_ready(expected_generation, recovered_general_settings_editor)
+fn prepare_player_paths_editor(expected_generation: u64) -> Option<PlayerPathsEditor> {
+    PLAYER_PATHS_EDITOR.prepare_ready(expected_generation, recovered_player_paths_editor)
 }
 
-fn update_general_settings_editor(update: impl FnOnce(&mut GeneralSettingsEditor)) -> bool {
+fn update_player_paths_editor(update: impl FnOnce(&mut PlayerPathsEditor)) -> bool {
     matches!(
-        GENERAL_SETTINGS_EDITOR.apply_user_edit(recovered_general_settings_editor, update),
+        PLAYER_PATHS_EDITOR.apply_user_edit(recovered_player_paths_editor, update),
         crate::components::settings::editor_state::EditorEditResult::Applied
     )
 }
 
-fn apply_general_authoritative_update(update: impl FnOnce(&mut GeneralSettingsEditor)) {
-    GENERAL_SETTINGS_EDITOR.apply_authoritative_update(recovered_general_settings_editor, update);
+fn apply_general_authoritative_update(update: impl FnOnce(&mut PlayerPathsEditor)) {
+    PLAYER_PATHS_EDITOR.apply_authoritative_update(recovered_player_paths_editor, update);
 }
 
-pub(super) fn reset_general_settings_editor_after_settings_replace() {
-    let mut editor = recovered_general_settings_editor(&GeneralSettingsEditor::default());
+pub(super) fn reset_player_paths_editor_after_settings_replace() {
+    let mut editor = recovered_player_paths_editor(&PlayerPathsEditor::default());
     editor.browser_status =
         Some("Player/path drafts reset after settings were replaced".to_string());
-    GENERAL_SETTINGS_EDITOR.replace_from_authority(editor);
+    PLAYER_PATHS_EDITOR.replace_from_authority(editor);
 }
 
 fn optional_path_value(value: &str) -> Option<String> {
@@ -5360,13 +3879,13 @@ fn optional_path_value(value: &str) -> Option<String> {
 }
 
 fn save_browser_path_setting(value: &str) -> Result<Option<String>, String> {
-    let value = normalize_general_editor_text(GeneralSettingsField::BrowserPath, value)
+    let value = normalize_player_path_editor_text(PlayerPathField::BrowserPath, value)
         .map_err(str::to_string)?;
     crate::backend::settings::set_browser_path_checked(optional_path_value(&value))
 }
 
 fn apply_browser_path_save(expected_generation: u64) {
-    let Some(editor) = prepare_general_settings_editor(expected_generation) else {
+    let Some(editor) = prepare_player_paths_editor(expected_generation) else {
         return;
     };
     match save_browser_path_setting(&editor.browser_path) {
@@ -5380,7 +3899,7 @@ fn apply_browser_path_save(expected_generation: u64) {
             });
             editor.browser_status_is_error = false;
             editor.focused = None;
-            editor.dirty[general_field_index(GeneralSettingsField::BrowserPath)] = false;
+            editor.dirty[player_path_field_index(PlayerPathField::BrowserPath)] = false;
         }),
         Err(error) => apply_general_authoritative_update(|editor| {
             editor.browser_status = Some(error);
@@ -5390,13 +3909,13 @@ fn apply_browser_path_save(expected_generation: u64) {
 }
 
 fn save_custom_player_path_setting(value: &str) -> Result<Option<String>, String> {
-    let value = normalize_general_editor_text(GeneralSettingsField::CustomPlayerPath, value)
+    let value = normalize_player_path_editor_text(PlayerPathField::CustomPlayerPath, value)
         .map_err(str::to_string)?;
     crate::backend::settings::set_custom_player_path_checked(optional_path_value(&value))
 }
 
 fn apply_custom_player_path_save(expected_generation: u64) {
-    let Some(editor) = prepare_general_settings_editor(expected_generation) else {
+    let Some(editor) = prepare_player_paths_editor(expected_generation) else {
         return;
     };
     match save_custom_player_path_setting(&editor.custom_player_path) {
@@ -5409,7 +3928,7 @@ fn apply_custom_player_path_save(expected_generation: u64) {
             });
             editor.custom_player_status_is_error = false;
             editor.focused = None;
-            editor.dirty[general_field_index(GeneralSettingsField::CustomPlayerPath)] = false;
+            editor.dirty[player_path_field_index(PlayerPathField::CustomPlayerPath)] = false;
         }),
         Err(error) => apply_general_authoritative_update(|editor| {
             editor.custom_player_status = Some(error);
@@ -5419,13 +3938,13 @@ fn apply_custom_player_path_save(expected_generation: u64) {
 }
 
 fn save_streamlink_path_setting(value: &str) -> Result<Option<String>, String> {
-    let value = normalize_general_editor_text(GeneralSettingsField::StreamlinkPath, value)
+    let value = normalize_player_path_editor_text(PlayerPathField::StreamlinkPath, value)
         .map_err(str::to_string)?;
     crate::backend::settings::set_streamlink_path_checked(optional_path_value(&value))
 }
 
 fn apply_streamlink_path_save(expected_generation: u64) {
-    let Some(editor) = prepare_general_settings_editor(expected_generation) else {
+    let Some(editor) = prepare_player_paths_editor(expected_generation) else {
         return;
     };
     match save_streamlink_path_setting(&editor.streamlink_path) {
@@ -5438,7 +3957,7 @@ fn apply_streamlink_path_save(expected_generation: u64) {
             });
             editor.streamlink_status_is_error = false;
             editor.focused = None;
-            editor.dirty[general_field_index(GeneralSettingsField::StreamlinkPath)] = false;
+            editor.dirty[player_path_field_index(PlayerPathField::StreamlinkPath)] = false;
         }),
         Err(error) => apply_general_authoritative_update(|editor| {
             editor.streamlink_status = Some(error);
@@ -5454,7 +3973,7 @@ fn save_streamlink_custom_quality_setting(value: &str) -> String {
 }
 
 fn apply_streamlink_custom_quality_save(expected_generation: u64) {
-    let Some(editor) = prepare_general_settings_editor(expected_generation) else {
+    let Some(editor) = prepare_player_paths_editor(expected_generation) else {
         return;
     };
     let quality = save_streamlink_custom_quality_setting(&editor.streamlink_custom_quality);
@@ -5468,12 +3987,12 @@ fn apply_streamlink_custom_quality_save(expected_generation: u64) {
             });
         editor.streamlink_custom_quality_status_is_error = false;
         editor.focused = None;
-        editor.dirty[general_field_index(GeneralSettingsField::StreamlinkCustomQuality)] = false;
+        editor.dirty[player_path_field_index(PlayerPathField::StreamlinkCustomQuality)] = false;
     });
 }
 
 fn save_streamlink_extra_args_setting(value: &str) -> Result<String, String> {
-    let args = normalize_general_editor_text(GeneralSettingsField::StreamlinkExtraArgs, value)
+    let args = normalize_player_path_editor_text(PlayerPathField::StreamlinkExtraArgs, value)
         .map_err(str::to_string)?;
     crate::backend::commands::validate_streamlink_extra_args(&args)?;
     crate::backend::settings::set_streamlink_extra_args(args.clone());
@@ -5481,7 +4000,7 @@ fn save_streamlink_extra_args_setting(value: &str) -> Result<String, String> {
 }
 
 fn apply_streamlink_extra_args_save(expected_generation: u64) {
-    let Some(editor) = prepare_general_settings_editor(expected_generation) else {
+    let Some(editor) = prepare_player_paths_editor(expected_generation) else {
         return;
     };
     match save_streamlink_extra_args_setting(&editor.streamlink_extra_args) {
@@ -5495,7 +4014,7 @@ fn apply_streamlink_extra_args_save(expected_generation: u64) {
                 });
             editor.streamlink_extra_args_status_is_error = false;
             editor.focused = None;
-            editor.dirty[general_field_index(GeneralSettingsField::StreamlinkExtraArgs)] = false;
+            editor.dirty[player_path_field_index(PlayerPathField::StreamlinkExtraArgs)] = false;
         }),
         Err(error) => apply_general_authoritative_update(|editor| {
             editor.streamlink_extra_args_status = Some(error);
@@ -5504,32 +4023,32 @@ fn apply_streamlink_extra_args_save(expected_generation: u64) {
     }
 }
 
-fn general_editor_field_parts(
-    editor: &mut GeneralSettingsEditor,
-    field: GeneralSettingsField,
+fn player_path_editor_field_parts(
+    editor: &mut PlayerPathsEditor,
+    field: PlayerPathField,
 ) -> (&mut String, &mut Option<String>, &mut bool) {
     match field {
-        GeneralSettingsField::BrowserPath => (
+        PlayerPathField::BrowserPath => (
             &mut editor.browser_path,
             &mut editor.browser_status,
             &mut editor.browser_status_is_error,
         ),
-        GeneralSettingsField::CustomPlayerPath => (
+        PlayerPathField::CustomPlayerPath => (
             &mut editor.custom_player_path,
             &mut editor.custom_player_status,
             &mut editor.custom_player_status_is_error,
         ),
-        GeneralSettingsField::StreamlinkPath => (
+        PlayerPathField::StreamlinkPath => (
             &mut editor.streamlink_path,
             &mut editor.streamlink_status,
             &mut editor.streamlink_status_is_error,
         ),
-        GeneralSettingsField::StreamlinkCustomQuality => (
+        PlayerPathField::StreamlinkCustomQuality => (
             &mut editor.streamlink_custom_quality,
             &mut editor.streamlink_custom_quality_status,
             &mut editor.streamlink_custom_quality_status_is_error,
         ),
-        GeneralSettingsField::StreamlinkExtraArgs => (
+        PlayerPathField::StreamlinkExtraArgs => (
             &mut editor.streamlink_extra_args,
             &mut editor.streamlink_extra_args_status,
             &mut editor.streamlink_extra_args_status_is_error,
@@ -5537,14 +4056,14 @@ fn general_editor_field_parts(
     }
 }
 
-fn save_general_settings_field(generation: u64, field: GeneralSettingsField) {
+fn save_player_path_field(generation: u64, field: PlayerPathField) {
     match field {
-        GeneralSettingsField::BrowserPath => apply_browser_path_save(generation),
-        GeneralSettingsField::CustomPlayerPath => apply_custom_player_path_save(generation),
-        GeneralSettingsField::StreamlinkPath => apply_streamlink_path_save(generation),
-        GeneralSettingsField::StreamlinkCustomQuality => {
+        PlayerPathField::BrowserPath => apply_browser_path_save(generation),
+        PlayerPathField::CustomPlayerPath => apply_custom_player_path_save(generation),
+        PlayerPathField::StreamlinkPath => apply_streamlink_path_save(generation),
+        PlayerPathField::StreamlinkCustomQuality => {
             apply_streamlink_custom_quality_save(generation);
         }
-        GeneralSettingsField::StreamlinkExtraArgs => apply_streamlink_extra_args_save(generation),
+        PlayerPathField::StreamlinkExtraArgs => apply_streamlink_extra_args_save(generation),
     }
 }

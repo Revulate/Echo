@@ -108,7 +108,7 @@ fn build_cosmetics_http_client() -> reqwest::Client {
         .read_timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap_or_else(|error| {
-            tracing::error!("Failed to create 7TV cosmetics HTTP client: {error}");
+            crate::log_net!(error, "Failed to create 7TV cosmetics HTTP client: {error}");
             http::timed_client(TOTAL)
         })
 }

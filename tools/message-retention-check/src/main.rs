@@ -1,3 +1,7 @@
+//! Contract: per-channel message retention in `src/state/message_retention.rs`:
+//! active and inactive capacities match `src/config.rs` and each retention class
+//! plans the expected trim.
+
 mod config {
     pub const MAX_CACHED_MESSAGES: usize = 1_000;
     pub const MAX_INACTIVE_CACHED_MESSAGES: usize = 1_000;

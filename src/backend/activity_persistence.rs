@@ -118,7 +118,9 @@ pub(crate) fn mark_dirty() {
 
 /// Called while the visibility transaction is held before private Activity
 /// stores are cleared for an account switch or logout.
-pub(crate) fn retire_account_visibility_commit_held() {
+pub(crate) fn retire_account_visibility_commit_held(
+    commit: &crate::backend::blocked_users::VisibilityCommit,
+) {
     let owner = STATE
         .lock_or_recover()
         .loaded
@@ -128,16 +130,18 @@ pub(crate) fn retire_account_visibility_commit_held() {
     let snapshot = owner.and_then(|owner_user_id| {
         valid_owner(&owner_user_id).then(|| {
             let (whisper_threads, last_received_sender) =
-                crate::backend::whispers::snapshot_activity_visibility_commit_held();
+                crate::backend::whispers::snapshot_activity_visibility_commit_held(commit);
             RawSnapshot {
                 owner_user_id,
-                mentions: crate::backend::irc::activity_mentions_snapshot_visibility_commit_held(),
+                mentions: crate::backend::irc::activity_mentions_snapshot_visibility_commit_held(
+                    commit,
+                ),
                 whisper_threads,
                 last_received_sender,
             }
         })
     });
-    crate::backend::irc::clear_activity_mentions_visibility_commit_held();
+    crate::backend::irc::clear_activity_mentions_visibility_commit_held(commit);
     if let Some(snapshot) = snapshot {
         queue_snapshot(Arc::new(snapshot));
     }
@@ -153,7 +157,7 @@ pub(crate) fn hydrate_current_account() {
     };
     {
         let visibility_commit = crate::backend::blocked_users::visibility_commit_guard();
-        let current = capture_current_session_visibility_commit_held();
+        let current = capture_current_session_visibility_commit_held(&visibility_commit);
         let state = STATE.lock_or_recover();
         if current
             .as_ref()
@@ -196,7 +200,8 @@ pub(crate) fn hydrate_current_account() {
         });
 
     let visibility_commit = crate::backend::blocked_users::visibility_commit_guard();
-    let Some((current_owner, current_epoch)) = capture_current_session_visibility_commit_held()
+    let Some((current_owner, current_epoch)) =
+        capture_current_session_visibility_commit_held(&visibility_commit)
     else {
         return;
     };
@@ -206,8 +211,12 @@ pub(crate) fn hydrate_current_account() {
 
     let sanitized = restored.as_ref().is_some_and(|restored| restored.sanitized);
     if let Some(restored) = restored {
-        crate::backend::irc::restore_activity_mentions_visibility_commit_held(restored.mentions);
+        crate::backend::irc::restore_activity_mentions_visibility_commit_held(
+            &visibility_commit,
+            restored.mentions,
+        );
         crate::backend::whispers::restore_activity_visibility_commit_held(
+            &visibility_commit,
             restored.whisper_threads,
             restored.last_received_sender,
         );
@@ -252,32 +261,36 @@ pub(crate) fn flush(timeout: Duration) -> bool {
 
 fn capture_current_session() -> Option<(String, u64)> {
     let visibility_commit = crate::backend::blocked_users::visibility_commit_guard();
-    let result = capture_current_session_visibility_commit_held();
+    let result = capture_current_session_visibility_commit_held(&visibility_commit);
     drop(visibility_commit);
     result
 }
 
-fn capture_current_session_visibility_commit_held() -> Option<(String, u64)> {
+fn capture_current_session_visibility_commit_held(
+    commit: &crate::backend::blocked_users::VisibilityCommit,
+) -> Option<(String, u64)> {
     let session = crate::backend::blocked_users::capture_active_session().ok()?;
     let owner_user_id = session.owner_user_id().trim().to_string();
     valid_owner(&owner_user_id).then_some((
         owner_user_id,
-        crate::backend::blocked_users::current_auth_epoch_visibility_commit_held(),
+        crate::backend::blocked_users::current_auth_epoch_visibility_commit_held(commit),
     ))
 }
 
 fn capture_live_snapshot() -> Option<Arc<RawSnapshot>> {
     let visibility_commit = crate::backend::blocked_users::visibility_commit_guard();
-    let current = capture_current_session_visibility_commit_held();
+    let current = capture_current_session_visibility_commit_held(&visibility_commit);
     let snapshot = current.and_then(|(owner_user_id, auth_epoch)| {
         let state = STATE.lock_or_recover();
         let current_owner = state.loaded.as_ref().filter(|loaded| {
             loaded.owner_user_id == owner_user_id && loaded.auth_epoch == auth_epoch
         })?;
         let _ = current_owner;
-        let mentions = crate::backend::irc::activity_mentions_snapshot_visibility_commit_held();
+        let mentions = crate::backend::irc::activity_mentions_snapshot_visibility_commit_held(
+            &visibility_commit,
+        );
         let (whisper_threads, last_received_sender) =
-            crate::backend::whispers::snapshot_activity_visibility_commit_held();
+            crate::backend::whispers::snapshot_activity_visibility_commit_held(&visibility_commit);
         Some(Arc::new(RawSnapshot {
             owner_user_id,
             mentions,
@@ -461,7 +474,7 @@ fn activity_path(owner_user_id: &str) -> Option<PathBuf> {
         return None;
     }
     Some(
-        crate::benchmark_profile::config_root()?
+        crate::storage_roots::config_root()?
             .join("activity")
             .join(format!("account-{owner_user_id}.json")),
     )

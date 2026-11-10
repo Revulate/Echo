@@ -16,7 +16,7 @@ use echo_render_core::eviction_cache::EvictionTrackingCache;
 use super::layout::{CanvasMessageLayout, LayoutCacheKey, LayoutSegment};
 use crate::ports;
 
-/// PERF: Selection ranges type - typically 0-2 ranges per message
+/// Selection ranges type - typically 0-2 ranges per message
 /// Using SmallVec avoids heap allocation for common single-selection cases
 pub type SelectionRanges = SmallVec<[Range<usize>; 2]>;
 
@@ -36,7 +36,7 @@ pub struct SelectionState {
 }
 
 /// A point in the selection (message + character position)
-/// PERF: Uses Arc<str> for message_id to avoid String allocation on every mouse move
+/// Uses Arc<str> for message_id to avoid String allocation on every mouse move
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectionPoint {
     /// Message ID (SharedString for cheap clone)
@@ -151,8 +151,8 @@ impl SelectionState {
     }
 
     /// Get the selected text from layouts
-    /// PERF: Uses Arc<CanvasMessageLayout> to avoid cloning large structs
-    /// PERF: O(k) where k = selected messages - uses stored indices instead of linear scans
+    /// Uses Arc<CanvasMessageLayout> to avoid cloning large structs
+    /// O(k) where k = selected messages - uses stored indices instead of linear scans
     pub fn get_selected_text(
         &self,
         layouts: &EvictionTrackingCache<LayoutCacheKey, Arc<CanvasMessageLayout>>,
@@ -188,7 +188,7 @@ impl SelectionState {
 
         let mut result = String::new();
 
-        // PERF: Use stored indices directly (O(1) instead of 2 linear scans)
+        // Use stored indices directly (O(1) instead of 2 linear scans)
         let start_order_idx = start.message_index;
         let end_order_idx = end.message_index;
 
@@ -249,8 +249,8 @@ impl SelectionState {
 
     /// Get character ranges to highlight for a specific message
     ///
-    /// PERF: O(1) - uses pre-stored message indices instead of linear scans.
-    /// PERF: Returns SmallVec<[Range; 2]> to avoid heap allocation (selections are typically 0-1 ranges)
+    /// O(1) - uses pre-stored message indices instead of linear scans.
+    /// Returns SmallVec<[Range; 2]> to avoid heap allocation (selections are typically 0-1 ranges)
     /// The message_index parameter is the caller-known index of this message
     /// in the visible message order.
     pub fn get_ranges_for_message(
@@ -263,7 +263,7 @@ impl SelectionState {
             None => return SmallVec::new(),
         };
 
-        // PERF: Use stored indices directly (O(1) instead of 3 linear scans)
+        // Use stored indices directly (O(1) instead of 3 linear scans)
         let start_idx = start.message_index;
         let end_idx = end.message_index;
         let msg_idx = message_index;
@@ -311,7 +311,7 @@ impl SelectionState {
     }
 
     /// Copy selected text to clipboard
-    /// PERF: Uses Arc<CanvasMessageLayout> to avoid cloning large structs
+    /// Uses Arc<CanvasMessageLayout> to avoid cloning large structs
     pub fn copy_to_clipboard(
         &self,
         layouts: &EvictionTrackingCache<LayoutCacheKey, Arc<CanvasMessageLayout>>,

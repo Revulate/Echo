@@ -115,9 +115,9 @@ The binary is written to `target\dist\echo.exe`.
 
 ### Linux
 
-Install the native build dependencies; [docs/LINUX_DEVELOPMENT.md](docs/LINUX_DEVELOPMENT.md)
-lists the packages for Arch and Debian/Ubuntu, and `make linux-deps` checks
-that they are present. Then:
+Install the native build dependencies: `./scripts/check-linux-build-deps.sh`
+(or `make linux-deps`) checks for them and prints the packages to install on
+Arch and Debian/Ubuntu. Then:
 
 ```sh
 ./scripts/setup-gpui-fork.sh
@@ -132,7 +132,10 @@ desktop launcher):
 make install
 ```
 
-`make uninstall` removes it again.
+`make uninstall` removes it again. [docs/LINUX_DESKTOP.md](docs/LINUX_DESKTOP.md)
+covers desktop behavior on Linux (KDE Plasma notes, notifications, where
+settings live), and [docs/LINUX_DEVELOPMENT.md](docs/LINUX_DEVELOPMENT.md)
+the build and test harness.
 
 ## Contributing
 
@@ -141,8 +144,8 @@ proportional validation, commit-message convention) and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for an overview of the code. Linux
 is the authoritative test platform: `./scripts/test-linux.sh quick` runs the
 main test suite. On Windows, use `cargo check -p echo_gpui --bins` and
-`cargo clippy --workspace --bins`, and don't run `cargo test` for the root
-crate.
+`cargo lint` (Clippy, the same gate CI runs), and don't run `cargo test` for
+the root crate.
 
 ## License
 

@@ -335,7 +335,7 @@ impl ChatBackend {
     }
 
     /// Process observer events using reactive methods (emits events + notifies)
-    /// PERF: Batches consecutive NewMessage events to reduce cx.notify() calls
+    /// Batches consecutive NewMessage events to reduce cx.notify() calls
     fn process_observer_events_reactive(
         state: &mut ChatState,
         observer: &ChatStateObserver,

@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Run two Echo executables in an interleaved sequence (ABBA by default), sample
+each run's CPU and memory with sample-process.ps1 and write a comparison.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -38,30 +43,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function ConvertTo-Slug {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    $slug = ($Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-").Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) { return "variant" }
-    return $slug
-}
-
-function Get-JsonProperty {
-    param([Parameter(Mandatory = $true)][object]$Object, [Parameter(Mandatory = $true)][string]$Name)
-    if ($Object -is [System.Collections.IDictionary]) {
-        if ($Object.Contains($Name)) { return $Object[$Name] }
-        return $null
-    }
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) { return $null }
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param([Parameter(Mandatory = $true)][psobject]$Object, [Parameter(Mandatory = $true)][string]$Name, [object]$Value)
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) { $property.Value = $Value } else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Get-Median {
     param([object[]]$Values)
@@ -125,8 +107,8 @@ $sampler = Join-Path $scriptRoot "sample-process.ps1"
 $initializer = Join-Path $scriptRoot "new-benchmark-run.ps1"
 $baseline = (Resolve-Path $BaselinePath).Path
 $candidate = (Resolve-Path $CandidatePath).Path
-$baselineSlug = ConvertTo-Slug $BaselineLabel
-$candidateSlug = ConvertTo-Slug $CandidateLabel
+$baselineSlug = ConvertTo-Slug $BaselineLabel -Fallback "variant"
+$candidateSlug = ConvertTo-Slug $CandidateLabel -Fallback "variant"
 if ($baselineSlug -eq $candidateSlug) { throw "BaselineLabel and CandidateLabel must produce different slugs." }
 if (-not $Sequence.Contains("A") -or -not $Sequence.Contains("B")) {
     throw "Sequence must contain at least one baseline run (A) and one candidate run (B)."

@@ -34,5 +34,8 @@ pub mod resolver {
     }
 }
 
+// `resolve_render_units` needs `MessageSlot` and `SlotResolver` to compile; the
+// check feeds already-resolved slots to `group_resolved_slots` instead.
 #[path = "../../../../src/backend/slots/render_units.rs"]
+#[allow(dead_code)]
 pub mod render_units;

@@ -114,7 +114,7 @@ impl CanvasMessageList {
     }
 
     /// Cache a layout and maintain the secondary width index (convenience wrapper)
-    /// PERF: Wraps layout in Arc for O(1) cache insertion
+    /// Wraps layout in Arc for O(1) cache insertion
     /// Also inserts into global cache for cross-split sharing (60-80% memory savings)
     pub(in crate::components::chat::canvas_renderer) fn cache_layout(
         &mut self,
@@ -165,8 +165,8 @@ impl CanvasMessageList {
     }
 
     /// Get a layout from cache, checking local cache first then global cache.
-    /// PERF: Global cache allows cross-split sharing (60-80% memory savings)
-    /// PERF: Local cache provides fast access for recently used layouts
+    /// The global cache shares layouts between splits showing the same channel.
+    /// The local cache gives fast access to recently used layouts.
     /// Note: Updates LRU on local cache hit; increments per-source hit counters.
     pub(super) fn get_cached_layout(
         &mut self,
@@ -187,7 +187,7 @@ impl CanvasMessageList {
     }
 
     /// Peek at a layout from cache without updating LRU
-    /// PERF: Use this for read-only operations like selection
+    /// Use this for read-only operations like selection
     pub(in crate::components::chat::canvas_renderer) fn peek_cached_layout(
         &self,
         key: &LayoutCacheKey,
@@ -204,7 +204,7 @@ impl CanvasMessageList {
         None
     }
 
-    /// PERF: Clean up orphaned entries in cached_width_index using eviction tracking
+    /// Clean up orphaned entries in cached_width_index using eviction tracking
     /// O(k) where k = evictions since last cleanup (vs O(n*m) full scan)
     pub(super) fn cleanup_width_index(&mut self) {
         let evicted: SmallVec<[LayoutCacheKey; 4]> =

@@ -1,20 +1,14 @@
-//! Global shared layout cache for memory optimization
+//! Process-wide layout cache shared by every split.
 //!
-//! This module provides a centralized layout cache that is shared across all split panes,
-//! reducing memory usage by 60-80% compared to per-split caches when showing the same
-//! channel in multiple splits.
+//! Splits showing the same channel at the same width share one stored layout;
+//! different widths are cached side by side under the composite key
+//! (message id, quantized width, timestamp visibility). Capacity is tiered by
+//! system RAM (see `global_cache_capacity`), and layouts of evicted messages
+//! are reclaimed by the maintenance slot.
 //!
-//! ## Architecture
-//!
-//! Previously: 4 splits × 2500 entries = 10,000 cached layouts (potential)
-//! Now: 1 global cache, RAM-tiered capacity (see `global_cache_capacity`),
-//! with evicted-message layouts reclaimed by the maintenance slot.
-//!
-//! Benefits:
-//! - Same channel in multiple splits at same width: single layout stored
-//! - Different widths still cached with composite key (message_id + quantized_width)
-//! - Thread-safe with DashMap for concurrent access from multiple splits
-//! - LRU eviction via parking_lot mutex (deferred from hot path)
+//! Lookups go through a `DashMap` (sharded locks) so splits and layout workers
+//! read concurrently; LRU bookkeeping sits behind a separate mutex and is
+//! deferred off the lookup path.
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -368,7 +362,7 @@ impl GlobalLayoutCache {
 
     /// Insert a layout into the cache
     /// If cache is at capacity, triggers frequency/recency/cost-aware eviction
-    /// PERF: Accepts Arc to avoid deep-cloning CanvasMessageLayout (500-2000 bytes)
+    /// Accepts an `Arc` so the layout is shared rather than deep-cloned.
     pub fn insert(&self, key: LayoutCacheKey, layout: Arc<CanvasMessageLayout>) {
         let cost_weight = cost_weight_for(&layout);
 
@@ -604,7 +598,7 @@ pub fn peek_layout(key: &LayoutCacheKey) -> Option<Arc<CanvasMessageLayout>> {
 }
 
 /// Insert a layout into the global cache
-/// PERF: Accepts Arc to avoid deep-cloning CanvasMessageLayout (500-2000 bytes)
+/// Accepts an `Arc` so the layout is shared rather than deep-cloned.
 pub fn insert_layout(key: LayoutCacheKey, layout: Arc<CanvasMessageLayout>) {
     GLOBAL_LAYOUT_CACHE.insert(key, layout);
 }

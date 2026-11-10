@@ -90,13 +90,11 @@ pub struct EchoUriImageCache {
 
 impl EchoUriImageCache {
     fn new() -> Self {
-        let requested = std::env::var("ECHO_GPUI_URI_CACHE_MB")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
+        let requested = echo_core::env::parsed::<usize>("ECHO_GPUI_URI_CACHE_MB")
             .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or_else(|| super::budget::default_total_budget_bytes_public() / 4);
-        let shared_ceiling = (super::budget::default_total_budget_bytes_public() / 4)
-            .clamp(16 * 1024 * 1024, MAX_BYTES);
+            .unwrap_or_else(|| super::budget::default_total_budget_bytes() / 4);
+        let shared_ceiling =
+            (super::budget::default_total_budget_bytes() / 4).clamp(16 * 1024 * 1024, MAX_BYTES);
         Self {
             entries: HashMap::new(),
             visible: HashMap::new(),

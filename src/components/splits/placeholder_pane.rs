@@ -20,7 +20,7 @@ impl EchoApp {
         let tab = self.app_state.read(cx).active_tab();
         let path = tab.split_path_for_id(split_id)?;
         tab.layout
-            .get_channel_at_path(&path)
+            .channel_at_path(&path)
             .filter(|channel| crate::state::is_placeholder(channel))?;
         Some(path)
     }
@@ -48,9 +48,9 @@ impl EchoApp {
             })?
         };
         let subscription = cx.subscribe(&input, move |this, _input, event, cx| {
-            if this.channel_chooser_path(split_id, cx).is_none() {
+            let Some(path) = this.channel_chooser_path(split_id, cx) else {
                 return;
-            }
+            };
             match event {
                 InputEvent::PressEnter => this.submit_channel_chooser(split_id, cx),
                 InputEvent::Change => {
@@ -65,7 +65,6 @@ impl EchoApp {
                 }
                 InputEvent::Focus => {
                     followed_live::refresh_if_stale();
-                    let path = this.channel_chooser_path(split_id, cx).unwrap();
                     if this.split_layout.read(cx).get_active_split_path() != path {
                         this.set_active_split(path, cx);
                     }
@@ -167,6 +166,83 @@ impl EchoApp {
         };
         self.switch_to_open_channel(&login, cx)
     }
+
+    /// Chooser keys handled before the input sees them: swallow held Enter,
+    /// Escape restores a pending channel change or leaves the chooser, and
+    /// plain Up/Down move the suggestion highlight. IME composition passes
+    /// through untouched.
+    fn handle_channel_chooser_key_down(
+        &mut self,
+        split_id: SplitId,
+        input: &Entity<InputState>,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if input.read(cx).marked_range().is_some() {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let modifiers = &event.keystroke.modifiers;
+        if key == "enter" && event.is_held {
+            cx.stop_propagation();
+        } else if key == "escape" {
+            if self.restore_pending_channel_change(split_id, cx) {
+                self.focus_input(window, cx);
+            } else {
+                self.chat_input_renderer.update(cx, |renderer, _| {
+                    renderer.input_manager.focused_placeholder = None;
+                });
+                window.focus(&self.focus_handle(cx), cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+        } else if matches!(key, "up" | "down")
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.shift
+        {
+            self.chat_input_renderer.update(cx, |renderer, _| {
+                if let Some(chooser) = renderer.input_manager.placeholder_inputs.get_mut(&split_id)
+                {
+                    step_chooser_selection(chooser, key == "up");
+                }
+            });
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+}
+
+/// Move the chooser highlight one row, wrapping at either end, and scroll the
+/// newly highlighted row into view.
+fn step_chooser_selection(chooser: &mut PlaceholderInput, up: bool) {
+    let count = chooser.suggestions.len();
+    if count == 0 {
+        return;
+    }
+    let index = match (chooser.selected, up) {
+        (Some(index), true) => (index + count - 1) % count,
+        (Some(index), false) => (index + 1) % count,
+        (None, true) => count - 1,
+        (None, false) => 0,
+    };
+    chooser.selected = Some(index);
+    let recent = chooser
+        .suggestions
+        .iter()
+        .take_while(|row| matches!(row, ChannelSuggestion::Recent(_)))
+        .count();
+    match index.checked_sub(recent) {
+        None => chooser.scroll.scroll_to_item(index),
+        // Live rows sit in the Live now group, below its header.
+        Some(pos) => crate::components::overlays::scroll_grouped_row_into_view(
+            &chooser.scroll,
+            &chooser.live_scroll,
+            pos + 1,
+        ),
+    }
 }
 
 fn local_channel_suggestions(
@@ -208,7 +284,7 @@ const CHOOSER_LIVE_ROWS: usize = 8;
 fn chooser_live_rows(query: &str, streamer_mode: bool) -> ChooserLiveRows {
     // Fixture panes keep their recorded baselines, and an anonymous user
     // would otherwise carry a sign-in line in every empty split.
-    if crate::benchmark_ui_fixture::is_enabled() {
+    if crate::bench::ui_fixture::is_enabled() {
         return ChooserLiveRows::default();
     }
     let snapshot = followed_live::snapshot();
@@ -260,6 +336,15 @@ fn live_now_header() -> Div {
         .child("Live now")
 }
 
+/// A bare leaf of the pane's exact size, for a split that has nothing to show.
+fn empty_pane(pane_width: f32, pane_height: f32) -> AnyElement {
+    div()
+        .w(px(pane_width))
+        .h(px(pane_height))
+        .flex_shrink_0()
+        .into_any_element()
+}
+
 /// Exact leaf sizes prevent empty panes from squeezing their siblings.
 pub fn render_placeholder_pane(
     app: &mut EchoApp,
@@ -276,13 +361,9 @@ pub fn render_placeholder_pane(
         .read(cx)
         .active_tab()
         .layout
-        .get_split_id_at_path(&path)
+        .split_id_at_path(&path)
     else {
-        return div()
-            .w(px(pane_width))
-            .h(px(pane_height))
-            .flex_shrink_0()
-            .into_any_element();
+        return empty_pane(pane_width, pane_height);
     };
     let is_active_split = app.split_layout.read(cx).get_active_split_path() == path;
     let header_collapsed = matches!(
@@ -290,7 +371,7 @@ pub fn render_placeholder_pane(
             .read(cx)
             .active_tab()
             .layout
-            .get_node_at_path(&path),
+            .node_at_path(&path),
         Some(SplitNode::Leaf {
             header_collapsed: true,
             ..
@@ -305,9 +386,9 @@ pub fn render_placeholder_pane(
     if created {
         followed_live::refresh_if_stale();
     }
-    let input = app
-        .ensure_channel_chooser(split_id, Some(window), cx)
-        .unwrap();
+    let Some(input) = app.ensure_channel_chooser(split_id, Some(window), cx) else {
+        return empty_pane(pane_width, pane_height);
+    };
     let focus = input.read(cx).focus_handle().clone();
     if created
         && is_active_split
@@ -330,18 +411,19 @@ pub fn render_placeholder_pane(
     };
     let streamer_mode = crate::backend::streamer_mode::is_streamer_mode_active_cached();
     let live_key = (followed_live::version(), current.clone(), streamer_mode);
-    let live = app.chat_input_renderer.update(cx, |renderer, _| {
+    let Some(live) = app.chat_input_renderer.update(cx, |renderer, _| {
         let chooser = renderer
             .input_manager
             .placeholder_inputs
-            .get_mut(&split_id)
-            .unwrap();
+            .get_mut(&split_id)?;
         if chooser.live.key.as_ref() != Some(&live_key) {
             chooser.live = chooser_live_rows(&current, streamer_mode);
             chooser.live.key = Some(live_key);
         }
-        chooser.live.clone()
-    });
+        Some(chooser.live.clone())
+    }) else {
+        return empty_pane(pane_width, pane_height);
+    };
     let hide_viewer_count = crate::backend::streamer_mode::should_hide_viewer_count();
     let more_hint = echo_core::followed_live::more_hint(live.more);
     // A live channel is listed once, under Live now.
@@ -352,7 +434,6 @@ pub fn render_placeholder_pane(
         .collect();
     let suggestions =
         local_channel_suggestions(app, &current, |login| live_logins.contains(login), cx);
-    let recent_count = suggestions.len();
     let rows: Vec<ChannelSuggestion> = suggestions
         .iter()
         .cloned()
@@ -363,13 +444,12 @@ pub fn render_placeholder_pane(
                 .map(|stream| ChannelSuggestion::Live(stream.login.clone())),
         )
         .collect();
-    let (selected, suggestions_scroll, live_scroll) =
+    let Some((selected, suggestions_scroll, live_scroll)) =
         app.chat_input_renderer.update(cx, |renderer, _| {
             let chooser = renderer
                 .input_manager
                 .placeholder_inputs
-                .get_mut(&split_id)
-                .unwrap();
+                .get_mut(&split_id)?;
             if chooser.query != current {
                 chooser.selected = None;
                 chooser.scroll.scroll_to_item(0);
@@ -383,12 +463,15 @@ pub fn render_placeholder_pane(
             }
             chooser.query.clone_from(&current);
             chooser.suggestions.clone_from(&rows);
-            (
+            Some((
                 chooser.selected,
                 chooser.scroll.clone(),
                 chooser.live_scroll.clone(),
-            )
-        });
+            ))
+        })
+    else {
+        return empty_pane(pane_width, pane_height);
+    };
     let open_elsewhere: Vec<bool> = {
         let app_state = app.app_state.read(cx);
         live.rows
@@ -398,8 +481,8 @@ pub fn render_placeholder_pane(
             })
             .collect()
     };
-    crate::benchmark_ui_fixture::publish_feedback_channel_chooser(
-        crate::benchmark_ui_fixture::FeedbackChannelChooserSnapshot {
+    crate::bench::ui_fixture::publish_feedback_channel_chooser(
+        crate::bench::ui_fixture::FeedbackChannelChooserSnapshot {
             split_id: split_id.as_u64(),
             input_focused: focus.is_focused(window),
             query_empty: is_empty,
@@ -487,79 +570,13 @@ pub fn render_placeholder_pane(
                                 .w_full()
                                 .capture_key_down(cx.listener(
                                     move |this, event: &KeyDownEvent, window, cx| {
-                                        if keyboard_input.read(cx).marked_range().is_some() {
-                                            return;
-                                        }
-                                        if event.keystroke.key == "enter" && event.is_held {
-                                            cx.stop_propagation();
-                                        } else if event.keystroke.key == "escape" {
-                                            if this.restore_pending_channel_change(split_id, cx) {
-                                                this.focus_input(window, cx);
-                                            } else {
-                                                this.chat_input_renderer.update(
-                                                    cx,
-                                                    |renderer, _| {
-                                                        renderer
-                                                            .input_manager
-                                                            .focused_placeholder = None;
-                                                    },
-                                                );
-                                                window.focus(&this.focus_handle(cx), cx);
-                                            }
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        } else if matches!(
-                                            event.keystroke.key.as_str(),
-                                            "up" | "down"
-                                        ) && !event.keystroke.modifiers.control
-                                            && !event.keystroke.modifiers.alt
-                                            && !event.keystroke.modifiers.platform
-                                            && !event.keystroke.modifiers.shift
-                                        {
-                                            this.chat_input_renderer.update(cx, |renderer, _| {
-                                                if let Some(chooser) = renderer
-                                                    .input_manager
-                                                    .placeholder_inputs
-                                                    .get_mut(&split_id)
-                                                {
-                                                    let count = chooser.suggestions.len();
-                                                    if count > 0 {
-                                                        chooser.selected = Some(
-                                                            match (
-                                                                chooser.selected,
-                                                                event.keystroke.key.as_str(),
-                                                            ) {
-                                                                (Some(index), "up") => {
-                                                                    (index + count - 1) % count
-                                                                }
-                                                                (Some(index), _) => {
-                                                                    (index + 1) % count
-                                                                }
-                                                                (None, "up") => count - 1,
-                                                                (None, _) => 0,
-                                                            },
-                                                        );
-                                                        let index = chooser.selected.unwrap();
-                                                        let recent = chooser
-                                                            .suggestions
-                                                            .iter()
-                                                            .take_while(|row| matches!(row, ChannelSuggestion::Recent(_)))
-                                                            .count();
-                                                        match index.checked_sub(recent) {
-                                                            None => chooser.scroll.scroll_to_item(index),
-                                                            // Live rows sit in the Live now group, below its header.
-                                                            Some(pos) => crate::components::overlays::scroll_grouped_row_into_view(
-                                                                &chooser.scroll,
-                                                                &chooser.live_scroll,
-                                                                pos + 1,
-                                                            ),
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }
+                                        this.handle_channel_chooser_key_down(
+                                            split_id,
+                                            &keyboard_input,
+                                            event,
+                                            window,
+                                            cx,
+                                        );
                                     },
                                 ))
                                 .capture_action(cx.listener(move |this, action: &Enter, _window, cx| {
@@ -580,221 +597,23 @@ pub fn render_placeholder_pane(
                                 .child(text)
                         }))
                         .when(!rows.is_empty(), |column| {
-                            column.child(
-                                div()
-                                    .id(("channel-suggestions", split_id.as_u64() as usize))
-                                    .role(Role::ListBox)
-                                    .aria_label("Suggested Twitch channels")
-                                    .aria_size_of_set(rows.len())
-                                    .max_h(px((pane_height - 190.0).clamp(48.0, 224.0)))
-                                    .overflow_y_scroll()
-                                    .track_scroll(&suggestions_scroll)
-                                    .flex()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .children(suggestions.into_iter().enumerate().map(
-                                        |(index, login)| {
-                                            let path = path.clone();
-                                            let label = login.to_string();
-                                            let suggestion_id = format!("channel-suggestion-{login}");
-                                            let app = cx.weak_entity();
-                                            let activate = Rc::new(move |cx: &mut App| {
-                                                let _ = app.update(cx, |this, cx| {
-                                                    if this.channel_chooser_path(split_id, cx).is_some() {
-                                                        this.set_active_split(path.clone(), cx);
-                                                        this.set_channel_for_path(path.clone(), login.clone(), cx);
-                                                    }
-                                                });
-                                            });
-                                            let pointer_activate = activate.clone();
-                                            div()
-                                                .id(SharedString::from(suggestion_id))
-                                                .role(Role::ListBoxOption)
-                                                .aria_label(label.clone())
-                                                .aria_selected(selected == Some(index))
-                                                .aria_position_in_set(index + 1)
-                                                .flex_shrink_0()
-                                                .px_3()
-                                                .py_1()
-                                                .rounded(Radii::md())
-                                                .text_sm()
-                                                .text_color(colors::text_secondary())
-                                                .cursor_pointer()
-                                                .when(selected == Some(index), |row| {
-                                                    row.bg(colors::bg_hover())
-                                                        .text_color(colors::text_primary())
-                                                })
-                                                .hover(|row| row.bg(colors::bg_hover()))
-                                                .on_activate_without_tab_stop(move |_, _, cx| pointer_activate(cx))
-                                                .on_a11y_action(accesskit::Action::Click, move |_, _, cx| activate(cx))
-                                                .child(label)
-                                        },
-                                    ))
-                                    .when(!live.rows.is_empty(), |list| {
-                                        list.child(
-                                            div()
-                                                .id(("channel-live-group", split_id.as_u64() as usize))
-                                                .role(Role::Group)
-                                                .aria_label("Live now")
-                                                .flex_shrink_0()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_0p5()
-                                                .track_scroll(&live_scroll)
-                                                .child(live_now_header())
-                                                .children(live.rows.iter().enumerate().map(|(pos, stream)| {
-                                                    let index = recent_count + pos;
-                                                    let is_selected = selected == Some(index);
-                                                    let open_elsewhere = open_elsewhere[pos];
-                                                    let login = stream.login.clone();
-                                                    let viewers = (!hide_viewer_count)
-                                                        .then(|| format_viewer_count(stream.viewer_count));
-                                                    let label = match (stream.category.trim(), &viewers) {
-                                                        ("", None) => format!("{}, live", stream.display_name),
-                                                        ("", Some(viewers)) => {
-                                                            format!("{}, live, {viewers} viewers", stream.display_name)
-                                                        }
-                                                        (category, None) => {
-                                                            format!("{}, live, {category}", stream.display_name)
-                                                        }
-                                                        (category, Some(viewers)) => format!(
-                                                            "{}, live, {category}, {viewers} viewers",
-                                                            stream.display_name
-                                                        ),
-                                                    };
-                                                    let app = cx.weak_entity();
-                                                    let open_path = path.clone();
-                                                    let open_login = login.clone();
-                                                    let open_here = Rc::new(move |cx: &mut App| {
-                                                        let _ = app.update(cx, |this, cx| {
-                                                            if this.channel_chooser_path(split_id, cx).is_some() {
-                                                                this.set_active_split(open_path.clone(), cx);
-                                                                this.set_channel_for_path(
-                                                                    open_path.clone(),
-                                                                    open_login.clone(),
-                                                                    cx,
-                                                                );
-                                                            }
-                                                        });
-                                                    });
-                                                    let pointer_open_here = open_here.clone();
-                                                    let switch_app = cx.weak_entity();
-                                                    let switch_login = login.clone();
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .id(SharedString::from(format!("channel-live-{login}")))
-                                                                .role(Role::ListBoxOption)
-                                                                .aria_label(label)
-                                                                .when(open_elsewhere, |row| {
-                                                                    row.aria_description(
-                                                                        "Already open in another split. Shift+Enter switches there.",
-                                                                    )
-                                                                })
-                                                                .aria_selected(is_selected)
-                                                                .aria_position_in_set(index + 1)
-                                                                .flex_1()
-                                                                .min_w_0()
-                                                                .px_3()
-                                                                .py_1()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .rounded(Radii::md())
-                                                                .cursor_pointer()
-                                                                .when(is_selected, |row| row.bg(colors::bg_hover()))
-                                                                .hover(|row| row.bg(colors::bg_hover()))
-                                                                .on_activate_without_tab_stop(move |_, _, cx| pointer_open_here(cx))
-                                                                .on_a11y_action(accesskit::Action::Click, move |_, _, cx| open_here(cx))
-                                                                .child(
-                                                                    div()
-                                                                        .flex_shrink_0()
-                                                                        .w(px(6.0))
-                                                                        .h(px(6.0))
-                                                                        .rounded(Radii::full())
-                                                                        .bg(colors::signal_red()),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .flex_1()
-                                                                        .min_w_0()
-                                                                        .flex()
-                                                                        .flex_col()
-                                                                        .child(
-                                                                            div()
-                                                                                .text_sm()
-                                                                                .truncate()
-                                                                                .text_color(if is_selected {
-                                                                                    colors::text_primary()
-                                                                                } else {
-                                                                                    colors::text_secondary()
-                                                                                })
-                                                                                .child(stream.display_name.clone()),
-                                                                        )
-                                                                        .when(!stream.category.trim().is_empty(), |text| {
-                                                                            text.child(
-                                                                                div()
-                                                                                    .text_xs()
-                                                                                    .truncate()
-                                                                                    .text_color(colors::text_muted())
-                                                                                    .child(stream.category.trim().to_string()),
-                                                                            )
-                                                                        }),
-                                                                )
-                                                                .children(viewers.map(|viewers| {
-                                                                    div()
-                                                                        .flex_shrink_0()
-                                                                        .text_xs()
-                                                                        .text_color(colors::text_muted())
-                                                                        .child(viewers)
-                                                                })),
-                                                        )
-                                                        .when(open_elsewhere, |row| {
-                                                            // Pointer only: Shift+Enter is the keyboard path, so
-                                                            // the buttons do not add a tab stop per row.
-                                                            row.child(
-                                                                div()
-                                                                    .id(SharedString::from(format!(
-                                                                        "channel-live-switch-{login}"
-                                                                    )))
-                                                                    .role(Role::Button)
-                                                                    .aria_label(format!(
-                                                                        "Switch to {} where it is already open",
-                                                                        stream.display_name
-                                                                    ))
-                                                                    .flex_shrink_0()
-                                                                    .px_2()
-                                                                    .py_0p5()
-                                                                    .border_1()
-                                                                    .border_color(colors::border())
-                                                                    .rounded(Radii::md())
-                                                                    .text_xs()
-                                                                    .text_color(colors::text_secondary())
-                                                                    .cursor_pointer()
-                                                                    .hover(|button| button.bg(colors::bg_hover()))
-                                                                    .on_activate_without_tab_stop(move |_, _, cx| {
-                                                                        let _ = switch_app.update(cx, |this, cx| {
-                                                                            this.switch_to_open_channel(&switch_login, cx);
-                                                                        });
-                                                                    })
-                                                                    .child("Switch there"),
-                                                            )
-                                                        })
-                                                }))
-                                                .children(more_hint.clone().map(|more| {
-                                                    div()
-                                                        .px_3()
-                                                        .text_xs()
-                                                        .text_color(colors::text_muted())
-                                                        .child(more)
-                                                })),
-                                        )
-                                    }),
-                            )
+                            column.child(render_chooser_suggestions(
+                                ChooserSuggestionList {
+                                    split_id,
+                                    path: &path,
+                                    row_count: rows.len(),
+                                    recent: suggestions,
+                                    live: &live,
+                                    open_elsewhere: &open_elsewhere,
+                                    selected,
+                                    hide_viewer_count,
+                                    more_hint,
+                                    pane_height,
+                                    scroll: &suggestions_scroll,
+                                    live_scroll: &live_scroll,
+                                },
+                                cx,
+                            ))
                         })
                         .children(live.notice.filter(|_| live.rows.is_empty()).map(|notice| {
                             div()
@@ -876,7 +695,7 @@ pub fn render_placeholder_pane(
                 .read(cx)
                 .active_tab()
                 .layout
-                .get_channel_at_path(&path)
+                .channel_at_path(&path)
                 .unwrap_or_default();
             pane.child(render_collapsed_header_capsule(
                 &cx.entity(),
@@ -906,6 +725,273 @@ pub fn render_placeholder_pane(
         .into_any_element()
 }
 
+/// What the chooser's suggestion list shows: recent channels first, then the
+/// Live now group, indexed together in display order.
+struct ChooserSuggestionList<'a> {
+    split_id: SplitId,
+    path: &'a [usize],
+    /// Recent and live rows together, for the list's set size.
+    row_count: usize,
+    recent: Vec<String>,
+    live: &'a ChooserLiveRows,
+    /// Per live row: the channel is already open in another split.
+    open_elsewhere: &'a [bool],
+    selected: Option<usize>,
+    hide_viewer_count: bool,
+    more_hint: Option<String>,
+    pane_height: f32,
+    scroll: &'a ScrollHandle,
+    live_scroll: &'a ScrollHandle,
+}
+
+/// Set `login` as the channel of the chooser's split, if that split still
+/// shows the chooser.
+fn choose_channel_action(
+    app: WeakEntity<EchoApp>,
+    split_id: SplitId,
+    path: Vec<usize>,
+    login: String,
+) -> Rc<dyn Fn(&mut App)> {
+    Rc::new(move |cx: &mut App| {
+        let _ = app.update(cx, |this, cx| {
+            if this.channel_chooser_path(split_id, cx).is_some() {
+                this.set_active_split(path.clone(), cx);
+                this.set_channel_for_path(path.clone(), login.clone(), cx);
+            }
+        });
+    })
+}
+
+fn render_chooser_suggestions(
+    list: ChooserSuggestionList<'_>,
+    cx: &Context<EchoApp>,
+) -> Stateful<Div> {
+    let recent_count = list.recent.len();
+    div()
+        .id(("channel-suggestions", list.split_id.as_u64() as usize))
+        .role(Role::ListBox)
+        .aria_label("Suggested Twitch channels")
+        .aria_size_of_set(list.row_count)
+        .max_h(px((list.pane_height - 190.0).clamp(48.0, 224.0)))
+        .overflow_y_scroll()
+        .track_scroll(list.scroll)
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .children(
+            list.recent
+                .iter()
+                .enumerate()
+                .map(|(index, login)| render_recent_suggestion(&list, index, login, cx)),
+        )
+        .when(!list.live.rows.is_empty(), |column| {
+            column.child(
+                div()
+                    .id(("channel-live-group", list.split_id.as_u64() as usize))
+                    .role(Role::Group)
+                    .aria_label("Live now")
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .track_scroll(list.live_scroll)
+                    .child(live_now_header())
+                    .children(list.live.rows.iter().enumerate().map(|(pos, stream)| {
+                        render_live_suggestion(&list, recent_count + pos, pos, stream, cx)
+                    }))
+                    .children(list.more_hint.clone().map(|more| {
+                        div()
+                            .px_3()
+                            .text_xs()
+                            .text_color(colors::text_muted())
+                            .child(more)
+                    })),
+            )
+        })
+}
+
+fn render_recent_suggestion(
+    list: &ChooserSuggestionList<'_>,
+    index: usize,
+    login: &str,
+    cx: &Context<EchoApp>,
+) -> Stateful<Div> {
+    let label = login.to_string();
+    let activate = choose_channel_action(
+        cx.weak_entity(),
+        list.split_id,
+        list.path.to_vec(),
+        login.to_string(),
+    );
+    let pointer_activate = activate.clone();
+    let is_selected = list.selected == Some(index);
+    div()
+        .id(SharedString::from(format!("channel-suggestion-{login}")))
+        .role(Role::ListBoxOption)
+        .aria_label(label.clone())
+        .aria_selected(is_selected)
+        .aria_position_in_set(index + 1)
+        .flex_shrink_0()
+        .px_3()
+        .py_1()
+        .rounded(Radii::md())
+        .text_sm()
+        .text_color(colors::text_secondary())
+        .cursor_pointer()
+        .when(is_selected, |row| {
+            row.bg(colors::bg_hover())
+                .text_color(colors::text_primary())
+        })
+        .hover(|row| row.bg(colors::bg_hover()))
+        .on_activate_without_tab_stop(move |_, _, cx| pointer_activate(cx))
+        .on_a11y_action(accesskit::Action::Click, move |_, _, cx| activate(cx))
+        .child(label)
+}
+
+/// Accessible name of a Live now row: name, "live", category and viewers.
+fn live_suggestion_label(stream: &FollowedLiveStream, viewers: Option<&String>) -> String {
+    match (stream.category.trim(), viewers) {
+        ("", None) => format!("{}, live", stream.display_name),
+        ("", Some(viewers)) => {
+            format!("{}, live, {viewers} viewers", stream.display_name)
+        }
+        (category, None) => {
+            format!("{}, live, {category}", stream.display_name)
+        }
+        (category, Some(viewers)) => format!(
+            "{}, live, {category}, {viewers} viewers",
+            stream.display_name
+        ),
+    }
+}
+
+/// One Live now row at display `index` (live row `pos`), plus its pointer-only
+/// "Switch there" button when the channel is open in another split.
+fn render_live_suggestion(
+    list: &ChooserSuggestionList<'_>,
+    index: usize,
+    pos: usize,
+    stream: &FollowedLiveStream,
+    cx: &Context<EchoApp>,
+) -> Div {
+    let is_selected = list.selected == Some(index);
+    let open_elsewhere = list.open_elsewhere[pos];
+    let login = stream.login.clone();
+    let viewers = (!list.hide_viewer_count).then(|| format_viewer_count(stream.viewer_count));
+    let label = live_suggestion_label(stream, viewers.as_ref());
+    let open_here = choose_channel_action(
+        cx.weak_entity(),
+        list.split_id,
+        list.path.to_vec(),
+        login.clone(),
+    );
+    let pointer_open_here = open_here.clone();
+    let switch_app = cx.weak_entity();
+    let switch_login = login.clone();
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .id(SharedString::from(format!("channel-live-{login}")))
+                .role(Role::ListBoxOption)
+                .aria_label(label)
+                .when(open_elsewhere, |row| {
+                    row.aria_description(
+                        "Already open in another split. Shift+Enter switches there.",
+                    )
+                })
+                .aria_selected(is_selected)
+                .aria_position_in_set(index + 1)
+                .flex_1()
+                .min_w_0()
+                .px_3()
+                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(Radii::md())
+                .cursor_pointer()
+                .when(is_selected, |row| row.bg(colors::bg_hover()))
+                .hover(|row| row.bg(colors::bg_hover()))
+                .on_activate_without_tab_stop(move |_, _, cx| pointer_open_here(cx))
+                .on_a11y_action(accesskit::Action::Click, move |_, _, cx| open_here(cx))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded(Radii::full())
+                        .bg(colors::signal_red()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_sm()
+                                .truncate()
+                                .text_color(if is_selected {
+                                    colors::text_primary()
+                                } else {
+                                    colors::text_secondary()
+                                })
+                                .child(stream.display_name.clone()),
+                        )
+                        .when(!stream.category.trim().is_empty(), |text| {
+                            text.child(
+                                div()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(colors::text_muted())
+                                    .child(stream.category.trim().to_string()),
+                            )
+                        }),
+                )
+                .children(viewers.map(|viewers| {
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(colors::text_muted())
+                        .child(viewers)
+                })),
+        )
+        .when(open_elsewhere, |row| {
+            // Pointer only: Shift+Enter is the keyboard path, so the buttons
+            // do not add a tab stop per row.
+            row.child(
+                div()
+                    .id(SharedString::from(format!("channel-live-switch-{login}")))
+                    .role(Role::Button)
+                    .aria_label(format!(
+                        "Switch to {} where it is already open",
+                        stream.display_name
+                    ))
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_0p5()
+                    .border_1()
+                    .border_color(colors::border())
+                    .rounded(Radii::md())
+                    .text_xs()
+                    .text_color(colors::text_secondary())
+                    .cursor_pointer()
+                    .hover(|button| button.bg(colors::bg_hover()))
+                    .on_activate_without_tab_stop(move |_, _, cx| {
+                        let _ = switch_app.update(cx, |this, cx| {
+                            this.switch_to_open_channel(&switch_login, cx);
+                        });
+                    })
+                    .child("Switch there"),
+            )
+        })
+}
+
 /// Render a special Watching leaf before the browser has selected a Twitch channel.
 pub fn render_watching_pane(
     app: &mut EchoApp,
@@ -923,7 +1009,7 @@ pub fn render_watching_pane(
         .read(cx)
         .active_tab()
         .layout
-        .get_node_at_path(&path)
+        .node_at_path(&path)
     {
         Some(SplitNode::Leaf {
             split_id,
@@ -984,7 +1070,7 @@ pub fn render_watching_pane(
     };
 
     div()
-        .id(("watching-pane", bounds_path_key.as_u64()))
+        .id(("watching-pane", bounds_path_key.stable_hash()))
         .w(px(pane_width))
         .h(px(pane_height))
         .min_w_0()

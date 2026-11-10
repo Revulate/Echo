@@ -1,7 +1,6 @@
 //! Filters settings section.
 
 use super::render_similarity_section;
-use super::render_toggle_button;
 use crate::backend::{self, FilterAction, FilterRule};
 use crate::components::settings::draft_input::{self, DraftField, DraftInput};
 use crate::components::settings::editor_state::{EditorSnapshot, EditorState};
@@ -951,18 +950,27 @@ fn render_replace_controls<T: 'static>(
         .child(replacement_input.render(cx))
         .child(setting_target(
             FILTER_REPLACEMENT_REGEX,
-            render_toggle_button(
+            crate::components::settings::widgets::setting_compact_row(
+                FILTER_REPLACEMENT_REGEX.id,
                 "Regex",
-                editor.pattern_is_regex,
-                |cx| {
-                    update_editor(|editor| {
-                        editor.pattern_is_regex = !editor.pattern_is_regex;
-                        editor.status = None;
-                        editor.status_is_error = false;
-                    });
-                    cx.notify();
-                },
-                cx,
+                None,
+                labelled_toggle(
+                    FILTER_REPLACEMENT_REGEX.control_id,
+                    FILTER_REPLACEMENT_REGEX.label,
+                    editor.pattern_is_regex,
+                    cx,
+                    |is_regex, cx| {
+                        update_editor(|editor| {
+                            editor.pattern_is_regex = is_regex;
+                            editor.status = None;
+                            editor.status_is_error = false;
+                        });
+                        cx.notify();
+                    },
+                ),
+                false,
+                None,
+                false,
             ),
         ))
 }

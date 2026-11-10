@@ -4,6 +4,8 @@
 //! per-event volume controls. Uses rodio for audio playback in Rust.
 //! Triggered from irc.rs on mentions, whispers, subs, and raids.
 
+mod benchmark_hooks;
+
 use super::lock_utils::RwLockExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -528,7 +530,7 @@ fn normalize_sound_settings(mut settings: SoundSettings) -> SoundSettings {
 /// Copy a pre-config-root `sounds.json` from the working directory into the
 /// config root once. The legacy file is left in place.
 fn migrate_legacy_sound_settings(file_path: &std::path::Path) {
-    let Some(legacy_path) = crate::benchmark_profile::legacy_cwd_file("sounds.json") else {
+    let Some(legacy_path) = crate::storage_roots::legacy_cwd_file("sounds.json") else {
         return;
     };
     if file_path.exists() || !legacy_path.is_file() {
@@ -565,7 +567,7 @@ pub struct SoundStore {
 
 impl SoundStore {
     fn new() -> Self {
-        let file_path = crate::benchmark_profile::sound_settings_path();
+        let file_path = crate::storage_roots::sound_settings_path();
         migrate_legacy_sound_settings(&file_path);
         let loaded = match fs::read_to_string(&file_path) {
             Ok(content) => match serde_json::from_str(&content) {
@@ -607,7 +609,7 @@ impl SoundStore {
 
     /// Save settings to disk
     fn save(&self) {
-        if crate::benchmark_ui_fixture::should_suppress_persistence() {
+        if crate::bench::ui_fixture::should_suppress_persistence() {
             return;
         }
         if self.overwrite_blocked.load(Ordering::Acquire) {
@@ -626,33 +628,6 @@ impl SoundStore {
             Err(e) => {
                 tracing::error!("Failed to serialize sound settings: {e}");
             }
-        }
-    }
-
-    /// Restore the exact model captured by the disposable feedback fixture.
-    pub fn restore_settings_for_benchmark(&self, settings: SoundSettings) -> bool {
-        if !crate::benchmark_ui_fixture::feedback_ui_enabled() {
-            return false;
-        }
-        let mut current = self.settings.write_or_recover();
-        *current = settings;
-        true
-    }
-
-    pub fn file_bytes_for_benchmark(&self) -> Option<Vec<u8>> {
-        crate::benchmark_ui_fixture::feedback_ui_enabled()
-            .then(|| fs::read(&self.file_path).ok())
-            .flatten()
-    }
-
-    pub fn restore_file_bytes_for_benchmark(&self, bytes: Option<&[u8]>) -> bool {
-        if !crate::benchmark_ui_fixture::feedback_ui_enabled() {
-            return false;
-        }
-        match bytes {
-            Some(bytes) => fs::write(&self.file_path, bytes).is_ok(),
-            None if self.file_path.exists() => fs::remove_file(&self.file_path).is_ok(),
-            None => true,
         }
     }
 

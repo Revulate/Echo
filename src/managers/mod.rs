@@ -1,15 +1,17 @@
-//! Manager modules extracted from the app.rs monolith
+//! App-shell coordination that is not itself a view.
 //!
-//! This module contains the manager entities that coordinate different
-//! aspects of the Echo application:
+//! Three shapes live here:
 //!
-//! - **TabManager**: Tab bar, drag reorder, overflow, context menu
-//! - **InputManager**: Per-split input, history, autocomplete coordination
-//! - **OverlayManager**: Modal lifecycle, positioning, z-ordering
-//! - **SplitLayoutManager**: Split tree, drag-drop, resize, bounds tracking
-//! - **PollingCoordinator**: Background polling loop coordination
-//! - **RenderHooks**: Pre-render side effect extraction
-//! - **FrameRateController**: Automatic FPS management based on window focus
+//! - GPUI entities owned by `EchoApp`: **OverlayManager** (modal lifecycle,
+//!   positioning, z-ordering), **SplitLayoutManager** (active split, drag-drop,
+//!   resize, bounds tracking) and **PollingCoordinator** (the background polling
+//!   loop and UI-action dispatch).
+//! - Plain state owned by a component: **TabManager** (inside the tab bar
+//!   renderer: drag reorder, overflow, context menu) and **InputManager**
+//!   (inside the chat input renderer: per-split drafts and input history).
+//! - Free-function modules: **frame_rate_controller** (render mode and wakeups),
+//!   **dynamic_tick_scheduler** (animation tick cadence) and **render_hooks**
+//!   (side effects queued from render).
 
 pub mod dynamic_tick_scheduler;
 pub mod frame_rate_controller;

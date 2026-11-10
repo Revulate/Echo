@@ -1,8 +1,14 @@
-//! Application configuration constants
+//! Application configuration constants, and tab/workspace persistence
 //!
-//! Centralized location for magic numbers and configurable values.
+//! The first half is the central place for magic numbers and configurable
+//! values. The second half loads, migrates and saves the tab layout
+//! (`tabs.json`) through a debounced background writer.
 
+use crate::state::{SplitNode, TabState, TabVisibility};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{fs, io::Write};
 
 /// Compact height of the top application bar (custom titlebar).
 pub const TITLE_BAR_COMPACT_HEIGHT_PX: f32 = 28.0;
@@ -157,27 +163,23 @@ pub const HISTORY_MSG_PER_SEC_ESTIMATE: u32 = 10;
 
 /// Calculate adaptive history limit based on disconnect duration
 ///
-/// Uses a formula that scales with disconnect duration while respecting bounds:
-/// - Short disconnects (<5s): Minimum fetch (50 messages)
-/// - Medium disconnects (5-50s): Linear scale with estimated message rate
-/// - Long disconnects (>50s): Maximum fetch (500 messages)
+/// The estimate is `disconnect_secs * HISTORY_MSG_PER_SEC_ESTIMATE`, clamped to
+/// `HISTORY_MIN_GAP_FILL..=HISTORY_MAX_GAP_FILL`:
+/// - Short disconnects (<5s): minimum fetch (50 messages)
+/// - Medium disconnects (5-200s): linear scale with the estimated message rate
+/// - Long disconnects (>200s): maximum fetch (2000 messages)
 ///
-/// PERF: This adaptive approach prevents over-fetching for brief network hiccups
-/// while ensuring we capture all missed messages for longer disconnects.
+/// Scaling with the outage avoids over-fetching after a brief network hiccup
+/// while still covering the missed messages after a long one.
 pub fn calculate_adaptive_history_limit(disconnect_secs: u64) -> u32 {
     let estimated_missed = (disconnect_secs as u32).saturating_mul(HISTORY_MSG_PER_SEC_ESTIMATE);
 
     estimated_missed.clamp(HISTORY_MIN_GAP_FILL, HISTORY_MAX_GAP_FILL)
 }
 
-use crate::state::{SplitNode, TabState, TabVisibility};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::{fs, io::Write};
-
 /// Get the directory for storing workspace layouts
 fn get_layouts_dir() -> Result<PathBuf, std::io::Error> {
-    let config_root = crate::benchmark_profile::config_root()
+    let config_root = crate::storage_roots::config_root()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "config dir not found"))?;
     let config_dir = config_root.join("layouts");
 
@@ -429,8 +431,12 @@ fn write_pending_tabs(pending: &mut Option<std::sync::Arc<Vec<TabState>>>) {
 }
 
 /// Queue a tab snapshot for the background writer. Rapid changes coalesce
-/// into one write; `flush_tab_saves` forces it out.
+/// into one write; `flush_tab_saves` forces it out. Does nothing while the UI
+/// fixture keeps its synthetic tabs off disk.
 pub fn queue_save_tabs(tabs: std::sync::Arc<Vec<TabState>>) {
+    if crate::bench::ui_fixture::should_suppress_persistence() {
+        return;
+    }
     let queued =
         tabs_save_tx().is_some_and(|tx| tx.send(TabsSaveRequest::Snapshot(tabs.clone())).is_ok());
     if !queued && let Err(error) = save_tabs(&tabs) {

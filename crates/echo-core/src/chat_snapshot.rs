@@ -1,4 +1,5 @@
 use crate::message::{ChatMessage, MessageFlags, day_divider_id};
+use crate::message_buffer::{HistoryMergeStrategy, merge_history_by_timestamp};
 use chrono::{Local, NaiveDate, TimeZone};
 use smallvec::SmallVec;
 use std::collections::hash_map::DefaultHasher;
@@ -8,17 +9,15 @@ use std::sync::Arc;
 
 /// Bounded authoritative chat buffer and its published display projection.
 ///
-/// Rows are shared `Arc<ChatMessage>`s. Every publish hands splits a new
-/// immutable row list; with owned rows each one cloned the whole retained tail
-/// (~400 B and ~15 refcounts per row), which at 100 msg/s was the largest
-/// allocation stream in the process.
+/// Rows are shared `Arc<ChatMessage>`s because every publish hands splits a
+/// new immutable row list; sharing makes that list one pointer per row instead
+/// of a deep copy of the retained tail.
 #[derive(Clone)]
 pub struct ChatSnapshot {
     pub channel: String,
     message_capacity: usize,
     raw_messages: Arc<Vec<Arc<ChatMessage>>>,
     pub messages: Arc<Vec<Arc<ChatMessage>>>,
-    projection_utc_offset_seconds: i32,
 }
 
 impl ChatSnapshot {
@@ -29,7 +28,6 @@ impl ChatSnapshot {
             message_capacity: message_capacity.max(1),
             raw_messages: Arc::clone(&empty),
             messages: empty,
-            projection_utc_offset_seconds: current_local_utc_offset_seconds(),
         }
     }
 
@@ -175,84 +173,15 @@ impl ChatSnapshot {
             }
         }
 
-        let existing_earliest = existing.first().map(|m| m.timestamp).unwrap_or(i64::MAX);
-        let existing_latest = existing.last().map(|m| m.timestamp).unwrap_or(i64::MIN);
-        let incoming_earliest = incoming
-            .iter()
-            .map(|m| m.timestamp)
-            .min()
-            .unwrap_or(i64::MAX);
-        let incoming_latest = incoming
-            .iter()
-            .map(|m| m.timestamp)
-            .max()
-            .unwrap_or(i64::MIN);
-
-        let existing_ids: HashSet<&str> = existing.iter().map(|m| m.id.as_ref()).collect();
-        let mut seen_incoming_ids: HashSet<Arc<str>> = HashSet::new();
-        let new_incoming: Vec<Arc<ChatMessage>> = incoming
-            .into_iter()
-            .filter(|message| {
-                !existing_ids.contains(message.id.as_ref())
-                    && seen_incoming_ids.insert(Arc::clone(&message.id))
-            })
-            .map(Arc::new)
-            .collect();
-
-        if new_incoming.is_empty() {
+        let merge = merge_history_by_timestamp(existing, incoming, Arc::new);
+        if merge.strategy == HistoryMergeStrategy::NoNewRows {
             if parity_changed {
-                self.set_messages_vec(existing);
+                self.set_messages_vec(merge.rows);
             }
             return parity_changed;
         }
-
-        if incoming_latest < existing_earliest {
-            let mut merged = new_incoming;
-            merged.extend(existing);
-            self.set_messages_vec(Self::bounded_newest(merged, self.message_capacity));
-            return true;
-        }
-
-        if incoming_earliest > existing_latest {
-            let mut merged = existing;
-            merged.extend(new_incoming);
-            self.set_messages_vec(Self::bounded_newest(merged, self.message_capacity));
-            return true;
-        }
-
-        let mut sorted_incoming = new_incoming;
-        sorted_incoming.sort_by_key(|message| message.timestamp);
-        let mut merged = Vec::with_capacity(existing.len() + sorted_incoming.len());
-        let mut existing_idx = 0;
-        let mut incoming_idx = 0;
-        while existing_idx < existing.len() && incoming_idx < sorted_incoming.len() {
-            if existing[existing_idx].timestamp <= sorted_incoming[incoming_idx].timestamp {
-                merged.push(existing[existing_idx].clone());
-                existing_idx += 1;
-            } else {
-                merged.push(sorted_incoming[incoming_idx].clone());
-                incoming_idx += 1;
-            }
-        }
-        merged.extend(existing[existing_idx..].iter().cloned());
-        merged.extend(sorted_incoming[incoming_idx..].iter().cloned());
-
-        self.set_messages_vec(Self::bounded_newest(merged, self.message_capacity));
+        self.set_messages_vec(Self::bounded_newest(merge.rows, self.message_capacity));
         true
-    }
-
-    pub fn refresh_day_dividers_for_timezone(&mut self) -> bool {
-        if current_local_utc_offset_seconds() == self.projection_utc_offset_seconds {
-            return false;
-        }
-
-        let previous = Arc::clone(&self.messages);
-        self.publish_display_projection();
-        previous.len() != self.messages.len()
-            || previous
-                .iter()
-                .zip(self.messages.iter())
-                .any(|(left, right)| left.id != right.id)
     }
 
     fn bounded_newest<T>(messages: Vec<T>, capacity: usize) -> Vec<T> {
@@ -267,7 +196,6 @@ impl ChatSnapshot {
     }
 
     fn publish_display_projection(&mut self) {
-        self.projection_utc_offset_seconds = current_local_utc_offset_seconds();
         let boundaries = day_divider_boundaries(&self.raw_messages);
         if boundaries.is_empty() {
             self.messages = Arc::clone(&self.raw_messages);
@@ -298,10 +226,6 @@ impl ChatSnapshot {
                 .zip(incoming.iter())
                 .all(|(left, right)| messages_equivalent_for_snapshot(left, right))
     }
-}
-
-fn current_local_utc_offset_seconds() -> i32 {
-    Local::now().offset().local_minus_utc()
 }
 
 #[derive(Clone, Copy)]

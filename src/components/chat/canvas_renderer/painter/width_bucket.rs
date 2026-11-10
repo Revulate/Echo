@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Full rebuilds should only prime the rows the user is likely to see next.
+///
+/// The remaining offscreen rows keep fallback/estimated heights and are laid out on demand when
+/// they enter the viewport. This prevents startup/resize rebuilds from queueing hundreds of
+/// background layouts in one UI-frame.
+const FULL_REBUILD_LAYOUT_PRIME_BUDGET: usize = 160;
+/// Adaptive upper bound for incremental same-size buffer rotations before falling back.
+const MAX_INCREMENTAL_ROTATION_ABS: usize = 256;
+
 impl CanvasMessageList {
     pub(super) fn queue_layout_rebuild(&mut self) {
         self.message_state.needs_layout_rebuild = true;

@@ -16,10 +16,6 @@ use image::codecs::gif::{GifEncoder, Repeat};
 use image::{Delay, DynamicImage, Frame, ImageFormat, Rgba, RgbaImage};
 use std::io::Cursor;
 use std::sync::Arc;
-
-fn replace_bench_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
-}
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -118,7 +114,6 @@ fn bench_disk_cache_io(c: &mut Criterion) {
     let temp_dir = tempfile::tempdir().expect("create tempdir");
     let mut raw_layer = DiskLayer::new(
         std::env::temp_dir().join("echo-loading-bench-cache"),
-        replace_bench_file,
         Arc::new(BudgetManager::new()),
         Arc::new(CacheStats::new()),
     );

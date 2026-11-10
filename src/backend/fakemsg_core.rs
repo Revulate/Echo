@@ -1,3 +1,5 @@
+//! Parsing `/fakemsg` raw IRC lines into the system events they would raise.
+
 use twitch_irc::message::{IRCMessage, IRCPrefix};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

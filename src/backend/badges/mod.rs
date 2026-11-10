@@ -1,3 +1,7 @@
+//! Chat badges: Twitch global and channel badges (Helix, with the API proxy
+//! and an embedded table as fallbacks), FFZ, BTTV and 7TV badges, and the
+//! per-user decorations the renderer looks up for each row.
+
 use dashmap::{DashMap, DashSet};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -8,11 +12,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::backend::constants::{
-    API_PROXY, API_PROXY_NOT_CONFIGURED, HELIX_BADGES_GLOBAL_ENDPOINT,
-};
+use crate::backend::api_error::ApiError;
+use crate::backend::constants::{API_PROXY, HELIX_BADGES_GLOBAL_ENDPOINT};
 use crate::backend::http;
 use crate::backend::twitch_api::{HelixAuthExt, send_helix_idempotent};
+use echo_core::channel_identity::normalize_channel_key;
 
 pub use super::badges_core::{
     BTTV_PRO_BADGE_KEY, NO_AUDIO_BADGE_KEY, NO_VIDEO_BADGE_KEY, badge_key_matches, badge_key_name,
@@ -34,15 +38,8 @@ static GLOBAL_BADGES_FIRST_QUERY: std::sync::OnceLock<Instant> = std::sync::Once
 static CHANNEL_BADGES_ATTEMPTED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 static CHANNEL_BADGES_FIRST_QUERY: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
 
-fn normalize_badge_channel(channel_login: &str) -> String {
-    channel_login
-        .trim()
-        .trim_start_matches('#')
-        .to_ascii_lowercase()
-}
-
 fn mark_channel_badges_attempted(channel_login: &str) {
-    let key = normalize_badge_channel(channel_login);
+    let key = normalize_channel_key(channel_login.trim());
     CHANNEL_BADGES_FIRST_QUERY.remove(&key);
     CHANNEL_BADGES_ATTEMPTED.insert(key);
 }
@@ -306,10 +303,7 @@ impl TwitchBadgeCache {
                 extend_unique_badge_keys(&mut resolved, badges.iter());
             }
 
-            let channel_login = channel_login
-                .trim()
-                .trim_start_matches('#')
-                .to_ascii_lowercase();
+            let channel_login = normalize_channel_key(channel_login.trim());
             if let Some(channel) = self.ffz_channel_badges.get(&channel_login)
                 && let Some(badge_ids) = channel.badges_by_user_id.get(user_id)
             {
@@ -337,10 +331,7 @@ impl TwitchBadgeCache {
         vip_url: Option<String>,
         badges_by_user_id: HashMap<String, Vec<u64>>,
     ) {
-        let channel_login = channel_login
-            .trim()
-            .trim_start_matches('#')
-            .to_ascii_lowercase();
+        let channel_login = normalize_channel_key(channel_login.trim());
         if channel_login.is_empty() {
             return;
         }
@@ -372,10 +363,7 @@ impl TwitchBadgeCache {
     }
 
     pub fn has_ffz_channel_badge_state_sync(&self, channel_login: &str) -> bool {
-        let channel_login = channel_login
-            .trim()
-            .trim_start_matches('#')
-            .to_ascii_lowercase();
+        let channel_login = normalize_channel_key(channel_login.trim());
         !channel_login.is_empty() && self.ffz_channel_badges.contains_key(&channel_login)
     }
 
@@ -383,7 +371,7 @@ impl TwitchBadgeCache {
         let Some(slot) = ffz_authority_slot(badge_key) else {
             return false;
         };
-        let channel_login = normalized_ffz_channel_key(channel_login);
+        let channel_login = normalize_channel_key(channel_login.trim());
         let Some(channel) = self.ffz_channel_badges.get(&channel_login) else {
             return false;
         };
@@ -411,7 +399,7 @@ impl TwitchBadgeCache {
 
     fn ffz_authority_badge_url_sync(&self, badge_key: &str, channel_login: &str) -> Option<String> {
         let slot = ffz_authority_slot(badge_key)?;
-        let channel_login = normalized_ffz_channel_key(channel_login);
+        let channel_login = normalize_channel_key(channel_login.trim());
         let channel = self.ffz_channel_badges.get(&channel_login)?;
         let url = match slot {
             FfzAuthoritySlot::Moderator => channel.moderator_url.as_ref(),
@@ -515,7 +503,7 @@ impl TwitchBadgeCache {
                     crate::log_cache!(info, "Loaded global badges (Helix)");
                     b
                 }
-                Err(e) if e.contains("401") || e.contains("Unauthorized") || e.contains("403") => {
+                Err(e) if e.is_auth_rejection() => {
                     crate::log_cache!(warn, "Helix auth failed ({}), falling back to CDN", e);
                     match self.fetch_global_badges_proxy().await {
                         Ok(b) => {
@@ -546,7 +534,7 @@ impl TwitchBadgeCache {
                     crate::log_cache!(info, "Loaded global badges (CDN)");
                     b
                 }
-                Err(e) if e == API_PROXY_NOT_CONFIGURED => {
+                Err(e) if e.is_proxy_not_configured() => {
                     crate::log_cache!(debug, "{}, using embedded badges", e);
                     get_embedded_global_badges()
                 }
@@ -730,7 +718,7 @@ impl TwitchBadgeCache {
         &self,
         channel_id: &str,
         channel_login: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), ApiError> {
         let cache_key = channel_login.to_lowercase();
 
         if !LOADING_CHANNELS.insert(cache_key.clone()) {
@@ -752,7 +740,7 @@ impl TwitchBadgeCache {
         channel_id: &str,
         channel_login: &str,
         cache_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), ApiError> {
         if let Some(entry) = self.channels.get(cache_key)
             && entry.fetched_at.elapsed() < self.ttl
         {
@@ -779,7 +767,7 @@ impl TwitchBadgeCache {
                     );
                     b
                 }
-                Err(e) if e.contains("401") || e.contains("Unauthorized") || e.contains("403") => {
+                Err(e) if e.is_auth_rejection() => {
                     crate::log_cache!(
                         warn,
                         "Helix auth failed for {}: {}, falling back to proxy",
@@ -821,10 +809,10 @@ impl TwitchBadgeCache {
         };
         if let Some(auth) = auth {
             auth.commit_if_current(publish).ok_or_else(|| {
-                format!(
+                ApiError::account_changed(format!(
                     "Twitch account changed while publishing badges for {}",
                     channel_login
-                )
+                ))
             })?;
         } else {
             publish();
@@ -841,7 +829,7 @@ impl TwitchBadgeCache {
 
     /// Load channel badges by login name (looks up channel ID first)
     /// This is useful when joining a channel before receiving any messages
-    pub async fn load_channel_badges_by_login(&self, channel_login: &str) -> Result<(), String> {
+    pub async fn load_channel_badges_by_login(&self, channel_login: &str) -> Result<(), ApiError> {
         let cache_key = channel_login.to_lowercase();
         crate::log_cache!(
             debug,
@@ -871,7 +859,7 @@ impl TwitchBadgeCache {
         &self,
         channel_login: &str,
         cache_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), ApiError> {
         if let Some(entry) = self.channels.get(cache_key)
             && entry.fetched_at.elapsed() < self.ttl
         {
@@ -897,7 +885,7 @@ impl TwitchBadgeCache {
     pub async fn load_channel_badges_batch(
         &self,
         channels: Vec<(String, String)>,
-    ) -> Vec<Result<(), String>> {
+    ) -> Vec<Result<(), ApiError>> {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         let mut tasks = FuturesUnordered::new();
@@ -928,20 +916,26 @@ impl TwitchBadgeCache {
         results
     }
 
-    async fn fetch_global_badges(&self, token: &str) -> Result<HashMap<String, String>, String> {
+    async fn fetch_global_badges(&self, token: &str) -> Result<HashMap<String, String>, ApiError> {
         let resp = send_helix_idempotent(token, |token| {
             self.client
                 .get(HELIX_BADGES_GLOBAL_ENDPOINT)
                 .helix_auth(token)
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch global badges"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Failed to fetch global badges: {}", resp.status()));
+            return Err(ApiError::status(
+                resp.status(),
+                format!("Failed to fetch global badges: {}", resp.status()),
+            ));
         }
 
-        let response: BadgesResponse = resp.json().await.map_err(|e| e.to_string())?;
+        let response: BadgesResponse = resp
+            .json()
+            .await
+            .map_err(|e| ApiError::other(e.to_string()))?;
         Ok(convert_badges(response))
     }
 
@@ -949,25 +943,31 @@ impl TwitchBadgeCache {
         &self,
         channel_id: &str,
         token: &str,
-    ) -> Result<HashMap<String, String>, String> {
+    ) -> Result<HashMap<String, String>, ApiError> {
         let url = format!(
             "https://api.twitch.tv/helix/chat/badges?broadcaster_id={}",
             channel_id
         );
         let resp = send_helix_idempotent(token, |token| self.client.get(&url).helix_auth(token))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ApiError::transport(e, "Failed to fetch channel badges"))?;
 
         if !resp.status().is_success() {
-            return Err(format!("Failed to fetch channel badges: {}", resp.status()));
+            return Err(ApiError::status(
+                resp.status(),
+                format!("Failed to fetch channel badges: {}", resp.status()),
+            ));
         }
 
-        let response: BadgesResponse = resp.json().await.map_err(|e| e.to_string())?;
+        let response: BadgesResponse = resp
+            .json()
+            .await
+            .map_err(|e| ApiError::other(e.to_string()))?;
         Ok(convert_badges(response))
     }
 
-    async fn fetch_global_badges_proxy(&self) -> Result<HashMap<String, String>, String> {
-        let (proxy_url, proxy_key) = API_PROXY.ok_or(API_PROXY_NOT_CONFIGURED)?;
+    async fn fetch_global_badges_proxy(&self) -> Result<HashMap<String, String>, ApiError> {
+        let (proxy_url, proxy_key) = API_PROXY.ok_or_else(ApiError::proxy_not_configured)?;
         let url = format!("{}/badges/global", proxy_url);
         crate::log_cache!(debug, "Fetching global badges from proxy: {}", url);
 
@@ -976,20 +976,23 @@ impl TwitchBadgeCache {
             self.client.get(&url).header("X-Echo-Key", proxy_key),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch global badges from proxy"))?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = crate::backend::http::error_body(resp).await;
-            return Err(format!(
-                "Failed to fetch global badges from proxy: {} - {}",
-                status, body
+            return Err(ApiError::status(
+                status,
+                format!(
+                    "Failed to fetch global badges from proxy: {} - {}",
+                    status, body
+                ),
             ));
         }
 
         let response: BadgesResponse = resp.json().await.map_err(|e| {
             crate::log_cache!(warn, "Failed to parse proxy response: {}", e);
-            e.to_string()
+            ApiError::other(e.to_string())
         })?;
 
         let badges = convert_badges(response);
@@ -1000,8 +1003,8 @@ impl TwitchBadgeCache {
     async fn fetch_channel_badges_proxy(
         &self,
         channel_id: &str,
-    ) -> Result<HashMap<String, String>, String> {
-        let (proxy_url, proxy_key) = API_PROXY.ok_or(API_PROXY_NOT_CONFIGURED)?;
+    ) -> Result<HashMap<String, String>, ApiError> {
+        let (proxy_url, proxy_key) = API_PROXY.ok_or_else(ApiError::proxy_not_configured)?;
         let url = format!("{}/badges/channel/{}", proxy_url, channel_id);
         crate::log_cache!(debug, "Fetching channel badges from proxy: {}", url);
 
@@ -1010,22 +1013,25 @@ impl TwitchBadgeCache {
             self.client.get(&url).header("X-Echo-Key", proxy_key),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch channel badges from proxy"))?;
 
         if !resp.status().is_success() {
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 crate::log_cache!(debug, "No custom badges for channel {}", channel_id);
                 return Ok(HashMap::new());
             }
-            return Err(format!(
-                "Failed to fetch channel badges from proxy: {}",
-                resp.status()
+            return Err(ApiError::status(
+                resp.status(),
+                format!(
+                    "Failed to fetch channel badges from proxy: {}",
+                    resp.status()
+                ),
             ));
         }
 
         let response: BadgesResponse = resp.json().await.map_err(|e| {
             crate::log_cache!(warn, "Failed to parse channel proxy response: {}", e);
-            e.to_string()
+            ApiError::other(e.to_string())
         })?;
 
         let badges = convert_badges(response);
@@ -1387,13 +1393,6 @@ fn ffz_authority_slot(badge_key: &str) -> Option<FfzAuthoritySlot> {
     }
 }
 
-fn normalized_ffz_channel_key(channel_login: &str) -> String {
-    channel_login
-        .trim()
-        .trim_start_matches('#')
-        .to_ascii_lowercase()
-}
-
 fn convert_badges(response: BadgesResponse) -> HashMap<String, String> {
     let mut badges = HashMap::new();
     for set in response.data {
@@ -1516,243 +1515,232 @@ fn normalize_external_badge_url(url: &str) -> String {
 
 /// Embedded fallback badges for common Twitch badges.
 /// These are loaded when network requests fail
+const EMBEDDED_GLOBAL_BADGES: &[(&str, &str)] = &[
+    (
+        "broadcaster:1",
+        "https://static-cdn.jtvnw.net/badges/v1/5527c58c-fb7d-422d-b71b-f309dcb85cc1/3",
+    ),
+    (
+        "moderator:1",
+        "https://static-cdn.jtvnw.net/badges/v1/3267646d-33f0-4b17-b3df-f923a41db1d0/3",
+    ),
+    (
+        "vip:1",
+        "https://static-cdn.jtvnw.net/badges/v1/b817aba4-fad8-49e2-b88a-7cc744f92f10/3",
+    ),
+    (
+        "partner:1",
+        "https://static-cdn.jtvnw.net/badges/v1/d12a2e27-16f6-41d0-ab77-b780518f00a3/3",
+    ),
+    (
+        "staff:1",
+        "https://static-cdn.jtvnw.net/badges/v1/d97c37bd-a6f5-4c38-8f57-4e4bef88af34/3",
+    ),
+    (
+        "admin:1",
+        "https://static-cdn.jtvnw.net/badges/v1/9ef7e029-4cdf-4d4d-a0d5-e2b3fb2571a1/3",
+    ),
+    (
+        "global_mod:1",
+        "https://static-cdn.jtvnw.net/badges/v1/9384c43e-4ce7-4e94-b2a1-b93656896eba/3",
+    ),
+    (
+        "turbo:1",
+        "https://static-cdn.jtvnw.net/badges/v1/bd444ec6-8f34-4bf9-91f4-af1e3428d80f/3",
+    ),
+    (
+        "premium:1",
+        "https://static-cdn.jtvnw.net/badges/v1/bbbe0db0-a598-423e-86d0-f9fb98ca1933/3",
+    ),
+    (
+        "subscriber:0",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "subscriber:1",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "subscriber:3",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "subscriber:6",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "subscriber:12",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "subscriber:24",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "subscriber:36",
+        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3",
+    ),
+    (
+        "founder:0",
+        "https://static-cdn.jtvnw.net/badges/v1/511b78a9-ab37-472f-9569-457753bbe7d3/3",
+    ),
+    (
+        "sub-gifter:1",
+        "https://static-cdn.jtvnw.net/badges/v1/f1d8486f-eb2e-4553-b44f-4d614617f18f/3",
+    ),
+    (
+        "sub-gifter:5",
+        "https://static-cdn.jtvnw.net/badges/v1/3e638e02-b765-4070-81bd-a73d1ae34b7f/3",
+    ),
+    (
+        "sub-gifter:10",
+        "https://static-cdn.jtvnw.net/badges/v1/bffca343-9d7d-49b4-a1ca-90af2c6a1639/3",
+    ),
+    (
+        "sub-gifter:25",
+        "https://static-cdn.jtvnw.net/badges/v1/17e09e26-2528-4a04-9c7f-8f8578d77487/3",
+    ),
+    (
+        "sub-gifter:50",
+        "https://static-cdn.jtvnw.net/badges/v1/47308ed4-c979-4f3f-ad20-35a8ab76d85d/3",
+    ),
+    (
+        "sub-gifter:100",
+        "https://static-cdn.jtvnw.net/badges/v1/5056c366-7299-4b3c-a15a-a18573650bfb/3",
+    ),
+    (
+        "sub-gifter:250",
+        "https://static-cdn.jtvnw.net/badges/v1/df25dded-df81-408e-a2d3-40d48f0d529f/3",
+    ),
+    (
+        "sub-gifter:500",
+        "https://static-cdn.jtvnw.net/badges/v1/f440decb-7468-4bf9-8666-98ba74f6eab5/3",
+    ),
+    (
+        "sub-gifter:1000",
+        "https://static-cdn.jtvnw.net/badges/v1/b8c76744-c7e9-44be-90d0-08840a8f6e39/3",
+    ),
+    (
+        "bits:1",
+        "https://static-cdn.jtvnw.net/badges/v1/73b5c3fb-24f9-4a82-a852-2f475b59411c/3",
+    ),
+    (
+        "bits:100",
+        "https://static-cdn.jtvnw.net/badges/v1/09d93036-e7ce-431c-9a9e-7044297133f2/3",
+    ),
+    (
+        "bits:1000",
+        "https://static-cdn.jtvnw.net/badges/v1/0d85a29e-79ad-4c63-a285-3acd2c66f2ba/3",
+    ),
+    (
+        "bits:5000",
+        "https://static-cdn.jtvnw.net/badges/v1/57cd97fc-3e9e-4c6d-9d41-60147137234e/3",
+    ),
+    (
+        "bits:10000",
+        "https://static-cdn.jtvnw.net/badges/v1/68af213b-a771-4124-b6e3-9bb6d98aa732/3",
+    ),
+    (
+        "bits:25000",
+        "https://static-cdn.jtvnw.net/badges/v1/64ca5920-c663-4bd8-bfb1-751b4caea2dd/3",
+    ),
+    (
+        "bits:50000",
+        "https://static-cdn.jtvnw.net/badges/v1/62310ba7-9571-4b07-a244-d3916e3a798c/3",
+    ),
+    (
+        "bits:75000",
+        "https://static-cdn.jtvnw.net/badges/v1/ce491fa4-b82c-4f3d-a7f2-5823b69c289c/3",
+    ),
+    (
+        "bits:100000",
+        "https://static-cdn.jtvnw.net/badges/v1/96f0540f-aa63-49e1-a8b3-259ece3bd098/3",
+    ),
+    (
+        "bits:200000",
+        "https://static-cdn.jtvnw.net/badges/v1/4a0b90c4-e4ef-407f-84fe-36b14aebdfc6/3",
+    ),
+    (
+        "bits:300000",
+        "https://static-cdn.jtvnw.net/badges/v1/ac13372d-2e94-41d1-ae11-ecd677f69bb6/3",
+    ),
+    (
+        "bits:400000",
+        "https://static-cdn.jtvnw.net/badges/v1/a8f393af-76e6-4aa2-9dd0-7dcc1c34f036/3",
+    ),
+    (
+        "bits:500000",
+        "https://static-cdn.jtvnw.net/badges/v1/f6932b57-6a6e-4062-a770-dfbd9f4302e5/3",
+    ),
+    (
+        "bits:600000",
+        "https://static-cdn.jtvnw.net/badges/v1/4d908059-f91c-4aef-9f24-f9361ae86a12/3",
+    ),
+    (
+        "bits:700000",
+        "https://static-cdn.jtvnw.net/badges/v1/a1d2a824-f216-4b9f-9642-3de8ed370957/3",
+    ),
+    (
+        "bits:800000",
+        "https://static-cdn.jtvnw.net/badges/v1/5ec2ee3e-5633-4c2a-8e77-77473fe409e6/3",
+    ),
+    (
+        "bits:900000",
+        "https://static-cdn.jtvnw.net/badges/v1/088c58c6-7c38-45ba-8f73-63ef24189b84/3",
+    ),
+    (
+        "bits:1000000",
+        "https://static-cdn.jtvnw.net/badges/v1/494d1c8e-c3b2-4d88-8528-baff57c9bd3f/3",
+    ),
+    (
+        "predictions:blue-1",
+        "https://static-cdn.jtvnw.net/badges/v1/e33d8b46-f63b-4e67-996f-4f4266e66fcd/3",
+    ),
+    (
+        "predictions:pink-1",
+        "https://static-cdn.jtvnw.net/badges/v1/4b76d5f2-91cc-4400-adf2-908a1e6cfd1e/3",
+    ),
+    (
+        "predictions:gray-1",
+        "https://static-cdn.jtvnw.net/badges/v1/c2e85edf-efc2-4290-8112-d057d44d8c07/3",
+    ),
+    (
+        "predictions:blue-2",
+        "https://static-cdn.jtvnw.net/badges/v1/e33d8b46-f63b-4e67-996f-4f4266e66fcd/3",
+    ),
+    (
+        "predictions:pink-2",
+        "https://static-cdn.jtvnw.net/badges/v1/4b76d5f2-91cc-4400-adf2-908a1e6cfd1e/3",
+    ),
+    (
+        "predictions:gray-2",
+        "https://static-cdn.jtvnw.net/badges/v1/c2e85edf-efc2-4290-8112-d057d44d8c07/3",
+    ),
+    (
+        "artist-badge:1",
+        "https://static-cdn.jtvnw.net/badges/v1/4300a897-03dc-4e83-8c0e-c332fee7057f/3",
+    ),
+    (
+        "hype-train:1",
+        "https://static-cdn.jtvnw.net/badges/v1/fae4086c-3190-44d4-83c8-8ef0cbe1a515/3",
+    ),
+    (
+        "hype-train:2",
+        "https://static-cdn.jtvnw.net/badges/v1/9c8d038a-3a29-45ea-96d4-5031fb1a7a81/3",
+    ),
+];
+
 fn get_embedded_global_badges() -> HashMap<String, String> {
-    let mut badges = HashMap::new();
-
-    badges.insert(
-        "broadcaster:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5527c58c-fb7d-422d-b71b-f309dcb85cc1/3".to_string(),
-    );
-
-    badges.insert(
-        "moderator:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/3267646d-33f0-4b17-b3df-f923a41db1d0/3".to_string(),
-    );
-
-    badges.insert(
-        "vip:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/b817aba4-fad8-49e2-b88a-7cc744f92f10/3".to_string(),
-    );
-
-    badges.insert(
-        "partner:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/d12a2e27-16f6-41d0-ab77-b780518f00a3/3".to_string(),
-    );
-
-    badges.insert(
-        "staff:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/d97c37bd-a6f5-4c38-8f57-4e4bef88af34/3".to_string(),
-    );
-
-    badges.insert(
-        "admin:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/9ef7e029-4cdf-4d4d-a0d5-e2b3fb2571a1/3".to_string(),
-    );
-
-    badges.insert(
-        "global_mod:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/9384c43e-4ce7-4e94-b2a1-b93656896eba/3".to_string(),
-    );
-
-    badges.insert(
-        "turbo:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/bd444ec6-8f34-4bf9-91f4-af1e3428d80f/3".to_string(),
-    );
-
-    badges.insert(
-        "premium:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/bbbe0db0-a598-423e-86d0-f9fb98ca1933/3".to_string(),
-    );
-
-    badges.insert(
-        "subscriber:0".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-    badges.insert(
-        "subscriber:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-    badges.insert(
-        "subscriber:3".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-    badges.insert(
-        "subscriber:6".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-    badges.insert(
-        "subscriber:12".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-    badges.insert(
-        "subscriber:24".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-    badges.insert(
-        "subscriber:36".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5d9f2208-5dd8-11e7-8513-2ff4adfae661/3".to_string(),
-    );
-
-    badges.insert(
-        "founder:0".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/511b78a9-ab37-472f-9569-457753bbe7d3/3".to_string(),
-    );
-
-    badges.insert(
-        "sub-gifter:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/f1d8486f-eb2e-4553-b44f-4d614617f18f/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:5".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/3e638e02-b765-4070-81bd-a73d1ae34b7f/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:10".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/bffca343-9d7d-49b4-a1ca-90af2c6a1639/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:25".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/17e09e26-2528-4a04-9c7f-8f8578d77487/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:50".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/47308ed4-c979-4f3f-ad20-35a8ab76d85d/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:100".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5056c366-7299-4b3c-a15a-a18573650bfb/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:250".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/df25dded-df81-408e-a2d3-40d48f0d529f/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:500".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/f440decb-7468-4bf9-8666-98ba74f6eab5/3".to_string(),
-    );
-    badges.insert(
-        "sub-gifter:1000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/b8c76744-c7e9-44be-90d0-08840a8f6e39/3".to_string(),
-    );
-
-    badges.insert(
-        "bits:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/73b5c3fb-24f9-4a82-a852-2f475b59411c/3".to_string(),
-    );
-    badges.insert(
-        "bits:100".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/09d93036-e7ce-431c-9a9e-7044297133f2/3".to_string(),
-    );
-    badges.insert(
-        "bits:1000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/0d85a29e-79ad-4c63-a285-3acd2c66f2ba/3".to_string(),
-    );
-    badges.insert(
-        "bits:5000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/57cd97fc-3e9e-4c6d-9d41-60147137234e/3".to_string(),
-    );
-    badges.insert(
-        "bits:10000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/68af213b-a771-4124-b6e3-9bb6d98aa732/3".to_string(),
-    );
-    badges.insert(
-        "bits:25000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/64ca5920-c663-4bd8-bfb1-751b4caea2dd/3".to_string(),
-    );
-    badges.insert(
-        "bits:50000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/62310ba7-9571-4b07-a244-d3916e3a798c/3".to_string(),
-    );
-    badges.insert(
-        "bits:75000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/ce491fa4-b82c-4f3d-a7f2-5823b69c289c/3".to_string(),
-    );
-    badges.insert(
-        "bits:100000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/96f0540f-aa63-49e1-a8b3-259ece3bd098/3".to_string(),
-    );
-    badges.insert(
-        "bits:200000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/4a0b90c4-e4ef-407f-84fe-36b14aebdfc6/3".to_string(),
-    );
-    badges.insert(
-        "bits:300000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/ac13372d-2e94-41d1-ae11-ecd677f69bb6/3".to_string(),
-    );
-    badges.insert(
-        "bits:400000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/a8f393af-76e6-4aa2-9dd0-7dcc1c34f036/3".to_string(),
-    );
-    badges.insert(
-        "bits:500000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/f6932b57-6a6e-4062-a770-dfbd9f4302e5/3".to_string(),
-    );
-    badges.insert(
-        "bits:600000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/4d908059-f91c-4aef-9f24-f9361ae86a12/3".to_string(),
-    );
-    badges.insert(
-        "bits:700000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/a1d2a824-f216-4b9f-9642-3de8ed370957/3".to_string(),
-    );
-    badges.insert(
-        "bits:800000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/5ec2ee3e-5633-4c2a-8e77-77473fe409e6/3".to_string(),
-    );
-    badges.insert(
-        "bits:900000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/088c58c6-7c38-45ba-8f73-63ef24189b84/3".to_string(),
-    );
-    badges.insert(
-        "bits:1000000".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/494d1c8e-c3b2-4d88-8528-baff57c9bd3f/3".to_string(),
-    );
-
-    badges.insert(
-        "predictions:blue-1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/e33d8b46-f63b-4e67-996f-4f4266e66fcd/3".to_string(),
-    );
-    badges.insert(
-        "predictions:pink-1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/4b76d5f2-91cc-4400-adf2-908a1e6cfd1e/3".to_string(),
-    );
-    badges.insert(
-        "predictions:gray-1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/c2e85edf-efc2-4290-8112-d057d44d8c07/3".to_string(),
-    );
-    badges.insert(
-        "predictions:blue-2".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/e33d8b46-f63b-4e67-996f-4f4266e66fcd/3".to_string(),
-    );
-    badges.insert(
-        "predictions:pink-2".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/4b76d5f2-91cc-4400-adf2-908a1e6cfd1e/3".to_string(),
-    );
-    badges.insert(
-        "predictions:gray-2".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/c2e85edf-efc2-4290-8112-d057d44d8c07/3".to_string(),
-    );
-
+    let mut badges: HashMap<String, String> = EMBEDDED_GLOBAL_BADGES
+        .iter()
+        .map(|(key, url)| (key.to_string(), url.to_string()))
+        .collect();
     if let Some(url) = embedded_twitch_badge_fallback_url(NO_AUDIO_BADGE_KEY) {
         badges.insert(NO_AUDIO_BADGE_KEY.to_string(), url.to_string());
     }
     if let Some(url) = embedded_twitch_badge_fallback_url(NO_VIDEO_BADGE_KEY) {
         badges.insert(NO_VIDEO_BADGE_KEY.to_string(), url.to_string());
     }
-
-    badges.insert(
-        "artist-badge:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/4300a897-03dc-4e83-8c0e-c332fee7057f/3".to_string(),
-    );
-
-    badges.insert(
-        "hype-train:1".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/fae4086c-3190-44d4-83c8-8ef0cbe1a515/3".to_string(),
-    );
-    badges.insert(
-        "hype-train:2".to_string(),
-        "https://static-cdn.jtvnw.net/badges/v1/9c8d038a-3a29-45ea-96d4-5031fb1a7a81/3".to_string(),
-    );
 
     crate::log_cache!(info, "Using {} embedded fallback badges", badges.len());
     badges

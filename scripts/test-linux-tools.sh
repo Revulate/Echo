@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Check that scripts/linux-test-targets.tsv classifies exactly the binary targets
+# of tools/*/Cargo.toml, then run every `contract` tool (deterministic,
+# no-argument checks) as its own stage, with one report per tool under
+# target/linux-tool-checks/.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,11 +57,8 @@ if ! diff -u "$tmp_dir/manifests.tsv" "$tmp_dir/registry.tsv"; then
     exit 1
 fi
 
+# check-linux-test-inventory.sh pins the expected number of contracts.
 contract_count="$(awk -F '\t' '$1 !~ /^#/ && $4 == "contract" { count++ } END { print count + 0 }' "$registry")"
-if [[ "$contract_count" != 38 ]]; then
-    printf 'Expected exactly 38 deterministic no-argument contracts, found %s.\n' "$contract_count" >&2
-    exit 1
-fi
 printf 'Tool registry PASS binaries=%s contracts=%s\n' "$(wc -l <"$tmp_dir/registry.tsv")" "$contract_count"
 
 while IFS=$'\t' read -r directory package target category; do

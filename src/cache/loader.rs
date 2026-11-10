@@ -23,13 +23,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::budget::BudgetManager;
 use super::disk_layer::{DiskLayer, MediaSourceId};
 use super::frame_layer::FrameLayer;
-use super::memory_layer::MemoryLayer;
-use super::preload_plan::{
+use echo_cache_policy::preload_plan::{
     EAGER_CHANNEL_PRELOAD_LIMIT, MAX_CHANNEL_PRELOAD_URLS, plan_channel_preload,
 };
-use super::stats::CacheStats;
+use echo_cache_policy::stats::CacheStats;
+use echo_media_cache::memory::MemoryLayer;
 
 pub use super::PickerViewport;
+pub use super::frame_layer::{AnimatedFrame, FrameQuery};
 
 /// Image loading state
 #[derive(Clone, Debug, PartialEq)]
@@ -108,8 +109,7 @@ static MEMORY_LAYER: LazyLock<Arc<MemoryLayer>> =
 static DISK_LAYER: LazyLock<Arc<DiskLayer>> = LazyLock::new(|| {
     echo_media_cache::install_cache_log_enabled(|| crate::log::enabled("cache"));
     Arc::new(DiskLayer::new(
-        crate::benchmark_profile::config_root_or_current_dir().join("cache"),
-        crate::utils::replace_file,
+        crate::storage_roots::config_root_or_current_dir().join("cache"),
         Arc::clone(&BUDGET),
         Arc::clone(&STATS),
     ))
@@ -139,21 +139,30 @@ pub fn stats() -> &'static Arc<CacheStats> {
     &STATS
 }
 
-/// Decoded-media residency for the memory breakdown diagnostic, in bytes:
-/// `(static, frames, metadata, animation_sources, total_budget)`.
-///
-/// The first three are what the budget manager believes each layer holds; the
-/// fourth is the zstd-compressed animation source cache, which is accounted
-/// separately because it is not charged to a budget layer.
-pub fn decoded_media_residency() -> (usize, usize, usize, usize, usize) {
+/// Decoded-media residency for the memory breakdown diagnostic, in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodedMediaResidency {
+    /// What the budget manager charges to the static layer.
+    pub static_bytes: usize,
+    /// What the budget manager charges to the frames layer.
+    pub frame_bytes: usize,
+    /// What the budget manager charges to the metadata layer.
+    pub metadata_bytes: usize,
+    /// The zstd-compressed animation source cache, accounted separately
+    /// because it is not charged to a budget layer.
+    pub animation_source_bytes: usize,
+    pub total_budget_bytes: usize,
+}
+
+pub fn decoded_media_residency() -> DecodedMediaResidency {
     use super::budget::CacheLayer;
-    (
-        BUDGET.used_bytes(CacheLayer::Static),
-        BUDGET.used_bytes(CacheLayer::Frames),
-        BUDGET.used_bytes(CacheLayer::Metadata),
-        DECODED_ANIMATION_SOURCE_BYTES.load(Ordering::Relaxed),
-        super::budget::default_total_budget_bytes_public(),
-    )
+    DecodedMediaResidency {
+        static_bytes: BUDGET.used_bytes(CacheLayer::Static),
+        frame_bytes: BUDGET.used_bytes(CacheLayer::Frames),
+        metadata_bytes: BUDGET.used_bytes(CacheLayer::Metadata),
+        animation_source_bytes: DECODED_ANIMATION_SOURCE_BYTES.load(Ordering::Relaxed),
+        total_budget_bytes: super::budget::default_total_budget_bytes(),
+    }
 }
 
 /// Bytes of animation refill sources held in sidecar files on disk, including
@@ -201,31 +210,21 @@ pub(crate) struct PickerMediaDiagnostics {
 
 pub(crate) fn picker_media_diagnostics() -> PickerMediaDiagnostics {
     let visible = super::picker_visible_media_stats();
-    let (
-        frames,
-        frame_urls,
-        protected_frames,
-        protected_bytes,
-        maximum_frames_per_url,
-        urls_over_limit,
-        render_images,
-        global_entry_limit,
-        entries_over_global_limit,
-    ) = FRAME_LAYER.diagnostic_residency_counts();
+    let frames = FRAME_LAYER.diagnostic_residency_counts();
     PickerMediaDiagnostics {
         picker_scopes: BUDGET.picker_scope_count(),
         picker_touched_urls: PICKER_TOUCHED_URLS.len(),
         picker_touched_keys: PICKER_TOUCHED_MEDIA_KEYS.len(),
         picker_visible: visible,
-        hot_frames: frames,
-        hot_frame_urls: frame_urls,
-        picker_protected_frames: protected_frames,
-        picker_protected_bytes: protected_bytes,
-        hot_frames_max_per_url: maximum_frames_per_url,
-        hot_frame_urls_over_limit: urls_over_limit,
-        hot_render_images: render_images,
-        hot_frame_entry_limit: global_entry_limit,
-        hot_frame_entries_over_limit: entries_over_global_limit,
+        hot_frames: frames.frames,
+        hot_frame_urls: frames.urls,
+        picker_protected_frames: frames.picker_protected_frames,
+        picker_protected_bytes: frames.picker_protected_bytes,
+        hot_frames_max_per_url: frames.max_frames_per_url,
+        hot_frame_urls_over_limit: frames.urls_over_limit,
+        hot_render_images: frames.render_images,
+        hot_frame_entry_limit: frames.entry_limit,
+        hot_frame_entries_over_limit: frames.entries_over_limit,
     }
 }
 
@@ -908,16 +907,24 @@ static ANIMATION_FRAME_REBUILDS: AtomicU64 = AtomicU64::new(0);
 static ANIMATION_REFILL_WINDOWS: AtomicU64 = AtomicU64::new(0);
 static ANIMATION_REFILL_FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// Cumulative `(frame_decompressions, refill_windows, refill_frames)` since
-/// process start. Decompressions include initial windows; refill windows and
-/// frames count only prefetch-token windows that materialized at least one
-/// frame after the initial window.
-pub(crate) fn animation_refill_totals() -> (u64, u64, u64) {
-    (
-        ANIMATION_FRAME_DECOMPRESSIONS.load(Ordering::Relaxed),
-        ANIMATION_REFILL_WINDOWS.load(Ordering::Relaxed),
-        ANIMATION_REFILL_FRAMES.load(Ordering::Relaxed),
-    )
+/// Cumulative animation refill counters since process start.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnimationRefillTotals {
+    /// Frame decompressions, including initial windows.
+    pub(crate) frame_decompressions: u64,
+    /// Prefetch-token windows that materialized at least one frame after the
+    /// initial window.
+    pub(crate) refill_windows: u64,
+    /// Frames those windows materialized.
+    pub(crate) refill_frames: u64,
+}
+
+pub(crate) fn animation_refill_totals() -> AnimationRefillTotals {
+    AnimationRefillTotals {
+        frame_decompressions: ANIMATION_FRAME_DECOMPRESSIONS.load(Ordering::Relaxed),
+        refill_windows: ANIMATION_REFILL_WINDOWS.load(Ordering::Relaxed),
+        refill_frames: ANIMATION_REFILL_FRAMES.load(Ordering::Relaxed),
+    }
 }
 /// First disk miss observed after a decoded source was evicted. A brief grace
 /// period lets the detached initial disk save finish; a persistent miss then
@@ -1707,56 +1714,145 @@ fn record_cache_emote_stage_with_source(
     }
 }
 
-/// Pending batch for eager preloads
-static PENDING_EAGER: LazyLock<Mutex<Vec<PendingPreload>>> =
-    LazyLock::new(|| Mutex::new(Vec::with_capacity(100)));
-
-/// Pending batch for lazy preloads
-static PENDING_LAZY: LazyLock<Mutex<Vec<PendingPreload>>> =
-    LazyLock::new(|| Mutex::new(Vec::with_capacity(100)));
-
 /// Hard cap on each pending queue. When a burst would push a queue past this
 /// limit, the oldest (front) entries are dropped — they are re-enqueued by the
 /// render path on the next frame anyway.
 const PENDING_PRELOAD_MAX: usize = 1_000;
 
-/// Recently enqueued eager-preload URLs to avoid repeated tiny cache-hit batches
-/// from hot render paths.
-static RECENT_EAGER_PRELOAD_ENQUEUES: LazyLock<DashMap<u64, Instant>> =
-    LazyLock::new(|| DashMap::with_capacity(2048));
-/// Recently enqueued lazy-preload URLs to suppress repeated disk-hit batches.
-static RECENT_LAZY_PRELOAD_ENQUEUES: LazyLock<DashMap<u64, Instant>> =
-    LazyLock::new(|| DashMap::with_capacity(4096));
+/// One of the two debounced preload queues.
+///
+/// Render paths ask for the same media many times per second, so a lane
+/// drops requests that are resident, in flight, recently failed or recently
+/// enqueued, batches the rest, and flushes once per debounce interval.
+struct PreloadLane {
+    /// Lazy lanes only hydrate from disk-backed caches at background priority.
+    lazy: bool,
+    pending: Mutex<Vec<PendingPreload>>,
+    /// Request keys enqueued within `enqueue_cooldown`. Eager requests repeat
+    /// from hot render paths; lazy ones would repeat disk-hit batches.
+    recent: LazyLock<DashMap<u64, Instant>>,
+    enqueue_cooldown: Duration,
+    flush_scheduled: std::sync::atomic::AtomicBool,
+}
+
+static EAGER_LANE: PreloadLane = PreloadLane {
+    lazy: false,
+    pending: Mutex::new(Vec::new()),
+    recent: LazyLock::new(|| DashMap::with_capacity(2048)),
+    enqueue_cooldown: Duration::from_millis(EAGER_PRELOAD_ENQUEUE_COOLDOWN_MS),
+    flush_scheduled: std::sync::atomic::AtomicBool::new(false),
+};
+
+static LAZY_LANE: PreloadLane = PreloadLane {
+    lazy: true,
+    pending: Mutex::new(Vec::new()),
+    recent: LazyLock::new(|| DashMap::with_capacity(4096)),
+    enqueue_cooldown: Duration::from_millis(LAZY_PRELOAD_ENQUEUE_COOLDOWN_MS),
+    flush_scheduled: std::sync::atomic::AtomicBool::new(false),
+};
+
+impl PreloadLane {
+    /// Whether a request should join this lane: it is not already resident or
+    /// downloading, did not fail recently, and was not enqueued within the
+    /// lane's cooldown. Admission records the enqueue time.
+    fn admits(
+        &self,
+        url: &str,
+        identity: Option<&MediaSourceId>,
+        request_key: u64,
+        url_hash: u64,
+        now: Instant,
+    ) -> bool {
+        if url.is_empty() {
+            return false;
+        }
+
+        let resident = if self.lazy {
+            is_downloading_fresh_keyed(url, request_key)
+                || LOADED_MEDIA_KEYS.contains(&request_key)
+                || url_is_loaded(url_hash)
+                || MEMORY_LAYER.contains_url(url)
+                || alias_static_memory_if_resident_keyed(identity, url_hash)
+        } else {
+            MEMORY_LAYER.contains_url(url)
+                || alias_static_memory_if_resident_keyed(identity, url_hash)
+                || is_downloading_fresh_keyed(url, request_key)
+        };
+        if resident {
+            return false;
+        }
+
+        if let Some(failed_at) = FAILED_URLS.get(&url_hash)
+            && failed_at.elapsed().as_secs() < FAILED_URL_COOLDOWN_SECS
+        {
+            return false;
+        }
+
+        if let Some(last) = self.recent.get(&request_key)
+            && now.duration_since(*last) < self.enqueue_cooldown
+        {
+            return false;
+        }
+        self.recent.insert(request_key, now);
+        true
+    }
+
+    /// Queue admitted requests, dropping the oldest beyond
+    /// [`PENDING_PRELOAD_MAX`] (the render path asks again next frame), and
+    /// schedule a debounced flush.
+    fn enqueue(
+        &'static self,
+        entries: impl IntoIterator<Item = PendingPreload>,
+        requested: usize,
+        accepted: usize,
+        source: PreloadSource,
+    ) {
+        {
+            let mut pending = self.pending.lock();
+            pending.extend(entries);
+            if pending.len() > PENDING_PRELOAD_MAX {
+                let overflow = pending.len() - PENDING_PRELOAD_MAX;
+                pending.drain(0..overflow);
+            }
+            crate::log_cache!(
+                trace,
+                requested,
+                accepted,
+                queued = pending.len(),
+                lazy = self.lazy,
+                source = source.as_str(),
+                "Filtered preload enqueue"
+            );
+        }
+
+        if !self.flush_scheduled.swap(true, Ordering::SeqCst) {
+            PRELOAD_RUNTIME.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(DEBOUNCE_INTERVAL_MS)).await;
+                self.flush().await;
+            });
+        }
+    }
+
+    async fn flush(&self) {
+        let entries = {
+            let mut pending = self.pending.lock();
+            let entries = std::mem::take(&mut *pending);
+            self.flush_scheduled.store(false, Ordering::SeqCst);
+            entries
+        };
+
+        for (source, requests) in group_pending_by_source(entries, self.lazy) {
+            preload_media_batch(requests, self.lazy, source).await;
+        }
+    }
+}
+
 /// Recently persisted visible-media touches. Render discovery can revisit the
 /// same visible emotes many times per second, while disk retention is measured
 /// in days; coalesce repeated request clones and index writes.
 static RECENT_DISPLAYED_MEDIA_RECORDS: LazyLock<DashMap<u64, Instant>> =
     LazyLock::new(|| DashMap::with_capacity(4096));
 const DISPLAYED_MEDIA_RECORD_COOLDOWN: Duration = Duration::from_secs(5 * 60);
-
-/// Last flush time for eager preloads
-static LAST_EAGER_FLUSH: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
-
-/// Last flush time for lazy preloads
-static LAST_LAZY_FLUSH: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
-
-/// Whether a flush task is already scheduled for eager preloads
-static EAGER_FLUSH_SCHEDULED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Whether a flush task is already scheduled for lazy preloads
-static LAZY_FLUSH_SCHEDULED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Image loader with unified cache integration
-pub struct ImageLoader {
-    /// Memory layer reference
-    memory: Arc<MemoryLayer>,
-    /// Disk layer reference
-    disk: Arc<DiskLayer>,
-    /// Statistics
-    stats: Arc<CacheStats>,
-}
 
 /// Batch-shared state moved into each individual media download.
 ///
@@ -1773,247 +1869,227 @@ struct PreloadDownloadContext {
     source: PreloadSource,
 }
 
-impl ImageLoader {
-    /// Create a new image loader
-    pub fn new(memory: Arc<MemoryLayer>, disk: Arc<DiskLayer>, stats: Arc<CacheStats>) -> Self {
-        Self {
-            memory,
-            disk,
-            stats,
+/// Download, hydrate and decode one batch of preload requests. Returns how
+/// many ended up loaded.
+async fn preload_media_batch(
+    requests: Vec<MediaRequest>,
+    lazy: bool,
+    source: PreloadSource,
+) -> usize {
+    use futures_util::stream::{self, StreamExt};
+
+    if requests.is_empty() {
+        return 0;
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut unique_requests = Vec::with_capacity(requests.len());
+    for request in requests {
+        let key = media_request_key_for_request(&request);
+        if seen.insert(key) {
+            unique_requests.push((key, request));
         }
     }
 
-    pub async fn preload_media_batch(
-        &self,
-        requests: Vec<MediaRequest>,
-        lazy: bool,
-        source: PreloadSource,
-    ) -> usize {
-        use futures_util::stream::{self, StreamExt};
-
-        if requests.is_empty() {
-            return 0;
+    if !lazy && source.retains_decoded_media() {
+        for (_, request) in &unique_requests {
+            mark_retained_decoded_media(&request.url, request.identity.as_deref());
         }
+    }
 
-        let mut seen = std::collections::HashSet::new();
-        let mut unique_requests = Vec::with_capacity(requests.len());
-        for request in requests {
-            let key = media_request_key_for_request(&request);
-            if seen.insert(key) {
-                unique_requests.push((key, request));
-            }
-        }
+    let start = Instant::now();
+    let total = unique_requests.len();
 
-        if !lazy && source.retains_decoded_media() {
-            for (_, request) in &unique_requests {
-                mark_retained_decoded_media(&request.url, request.identity.as_deref());
-            }
-        }
-
-        let start = Instant::now();
-        let total = unique_requests.len();
-
-        if total >= LOG_BATCH_SIZE_THRESHOLD {
-            crate::log_cache!(
-                info,
-                count = total,
-                lazy,
-                source = source.as_str(),
-                "Starting batch preload"
-            );
-        } else {
-            crate::log_cache!(
-                trace,
-                count = total,
-                lazy,
-                source = source.as_str(),
-                "Starting small batch preload"
-            );
-        }
-
-        let filter_start = Instant::now();
-        let requests_to_load: Vec<(u64, MediaRequest)> = unique_requests
-            .into_iter()
-            .filter(|(request_key, request)| {
-                let url = &request.url;
-                let url_key = url_key(url);
-                if !lazy && self.memory.contains_url(url) {
-                    self.stats.record_hit();
-                    return false;
-                }
-                if !lazy && alias_static_memory_if_resident(url, request.identity.as_deref()) {
-                    self.stats.record_hit();
-                    return false;
-                }
-                if lazy && (LOADED_MEDIA_KEYS.contains(request_key) || url_is_loaded(url_key)) {
-                    self.stats.record_hit();
-                    return false;
-                }
-                if url_is_loaded(url_key) && self.memory.contains_url(url) {
-                    self.stats.record_hit();
-                    return false;
-                }
-                if is_downloading_fresh_keyed(url, *request_key) {
-                    return false;
-                }
-                if let Some(failed_at) = FAILED_URLS.get(&url_key)
-                    && failed_at.elapsed().as_secs() < FAILED_URL_COOLDOWN_SECS
-                {
-                    return false;
-                }
-                // Claim last and atomically: a concurrent batch that passed the
-                // same checks loses the insert and skips this key.
-                try_claim_downloading_key(*request_key)
-            })
-            .collect();
-        let filter_elapsed = filter_start.elapsed();
-
-        let to_load = requests_to_load.len();
-        record_cache_emote_stage_with_source(
-            "cache.preload.filter",
-            source,
-            filter_elapsed,
-            to_load,
-        );
-        if to_load == 0 {
-            crate::log_cache!(
-                debug,
-                total,
-                cached = total,
-                source = source.as_str(),
-                "All URLs already cached"
-            );
-            record_cache_emote_stage_with_source(
-                "cache.preload.total",
-                source,
-                start.elapsed(),
-                total,
-            );
-            return total;
-        }
-
-        let downloading_keys: Vec<u64> = requests_to_load
-            .iter()
-            .map(|(request_key, _)| *request_key)
-            .collect();
-
-        let per_batch_limit = if lazy {
-            lazy_batch_inflight_limit()
-        } else {
-            eager_batch_inflight_limit()
-        };
-        let loaded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let download_context = PreloadDownloadContext {
-            loaded_counter: Arc::clone(&loaded),
-            memory: Arc::clone(&self.memory),
-            disk: Arc::clone(&self.disk),
-            stats: Arc::clone(&self.stats),
+    if total >= LOG_BATCH_SIZE_THRESHOLD {
+        crate::log_cache!(
+            info,
+            count = total,
             lazy,
-            source,
-        };
+            source = source.as_str(),
+            "Starting batch preload"
+        );
+    } else {
+        crate::log_cache!(
+            trace,
+            count = total,
+            lazy,
+            source = source.as_str(),
+            "Starting small batch preload"
+        );
+    }
 
-        let wait_downloads_start = Instant::now();
-        let batch_timeout = preload_batch_timeout(lazy, to_load, per_batch_limit);
-        let batch_wait_result = tokio::time::timeout(
-            batch_timeout,
-            stream::iter(requests_to_load.into_iter().map(|(request_key, request)| {
-                let download_context = download_context.clone();
-                async move {
-                    download_url(request_key, request, download_context).await;
-                }
-            }))
-            .buffer_unordered(per_batch_limit)
-            .for_each(|_| async {}),
-        )
-        .await;
+    let filter_start = Instant::now();
+    let requests_to_load: Vec<(u64, MediaRequest)> = unique_requests
+        .into_iter()
+        .filter(|(request_key, request)| {
+            let url = &request.url;
+            let url_key = url_key(url);
+            if !lazy && MEMORY_LAYER.contains_url(url) {
+                STATS.record_hit();
+                return false;
+            }
+            if !lazy && alias_static_memory_if_resident(url, request.identity.as_deref()) {
+                STATS.record_hit();
+                return false;
+            }
+            if lazy && (LOADED_MEDIA_KEYS.contains(request_key) || url_is_loaded(url_key)) {
+                STATS.record_hit();
+                return false;
+            }
+            if url_is_loaded(url_key) && MEMORY_LAYER.contains_url(url) {
+                STATS.record_hit();
+                return false;
+            }
+            if is_downloading_fresh_keyed(url, *request_key) {
+                return false;
+            }
+            if let Some(failed_at) = FAILED_URLS.get(&url_key)
+                && failed_at.elapsed().as_secs() < FAILED_URL_COOLDOWN_SECS
+            {
+                return false;
+            }
+            // Claim last and atomically: a concurrent batch that passed the
+            // same checks loses the insert and skips this key.
+            try_claim_downloading_key(*request_key)
+        })
+        .collect();
+    let filter_elapsed = filter_start.elapsed();
+
+    let to_load = requests_to_load.len();
+    record_cache_emote_stage_with_source("cache.preload.filter", source, filter_elapsed, to_load);
+    if to_load == 0 {
+        crate::log_cache!(
+            debug,
+            total,
+            cached = total,
+            source = source.as_str(),
+            "All URLs already cached"
+        );
+        record_cache_emote_stage_with_source("cache.preload.total", source, start.elapsed(), total);
+        return total;
+    }
+
+    let downloading_keys: Vec<u64> = requests_to_load
+        .iter()
+        .map(|(request_key, _)| *request_key)
+        .collect();
+
+    let per_batch_limit = if lazy {
+        lazy_batch_inflight_limit()
+    } else {
+        eager_batch_inflight_limit()
+    };
+    let loaded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let download_context = PreloadDownloadContext {
+        loaded_counter: Arc::clone(&loaded),
+        memory: Arc::clone(&MEMORY_LAYER),
+        disk: Arc::clone(&DISK_LAYER),
+        stats: Arc::clone(&STATS),
+        lazy,
+        source,
+    };
+
+    let wait_downloads_start = Instant::now();
+    let batch_timeout = preload_batch_timeout(lazy, to_load, per_batch_limit);
+    let batch_wait_result = tokio::time::timeout(
+        batch_timeout,
+        stream::iter(requests_to_load.into_iter().map(|(request_key, request)| {
+            let download_context = download_context.clone();
+            async move {
+                download_url(request_key, request, download_context).await;
+            }
+        }))
+        .buffer_unordered(per_batch_limit)
+        .for_each(|_| async {}),
+    )
+    .await;
+    record_cache_emote_stage_with_source(
+        "cache.preload.wait_downloads",
+        source,
+        wait_downloads_start.elapsed(),
+        to_load,
+    );
+    if batch_wait_result.is_err() {
         record_cache_emote_stage_with_source(
-            "cache.preload.wait_downloads",
+            "cache.preload.batch_timeout",
             source,
-            wait_downloads_start.elapsed(),
+            batch_timeout,
             to_load,
         );
-        if batch_wait_result.is_err() {
-            record_cache_emote_stage_with_source(
-                "cache.preload.batch_timeout",
-                source,
-                batch_timeout,
-                to_load,
-            );
-            crate::log_cache!(
-                warn,
-                lazy,
-                to_load,
-                per_batch_limit,
-                source = source.as_str(),
-                timeout_ms = batch_timeout.as_millis(),
-                "Preload batch wait timed out; clearing in-flight markers for batch"
-            );
-            // Started downloads cleared their own markers when the timeout
-            // dropped them; clear only claims still dated before this wait,
-            // so a key another batch re-claimed since keeps its marker.
-            for request_key in downloading_keys {
-                if DOWNLOADING_SINCE
-                    .remove_if(&request_key, |_, since| *since <= wait_downloads_start)
-                    .is_some()
-                {
-                    DOWNLOADING.remove(&request_key);
-                }
+        crate::log_cache!(
+            warn,
+            lazy,
+            to_load,
+            per_batch_limit,
+            source = source.as_str(),
+            timeout_ms = batch_timeout.as_millis(),
+            "Preload batch wait timed out; clearing in-flight markers for batch"
+        );
+        // Started downloads cleared their own markers when the timeout
+        // dropped them; clear only claims still dated before this wait,
+        // so a key another batch re-claimed since keeps its marker.
+        for request_key in downloading_keys {
+            if DOWNLOADING_SINCE
+                .remove_if(&request_key, |_, since| *since <= wait_downloads_start)
+                .is_some()
+            {
+                DOWNLOADING.remove(&request_key);
             }
         }
-        record_cache_emote_stage_with_source(
-            if lazy {
-                "cache.preload.batch_inflight.lazy"
-            } else {
-                "cache.preload.batch_inflight.eager"
-            },
-            source,
-            Duration::ZERO,
-            per_batch_limit,
-        );
-        record_cache_emote_stage_with_source(
-            if lazy {
-                "cache.preload.batch_inflight.lazy.active_downloads"
-            } else {
-                "cache.preload.batch_inflight.eager.active_downloads"
-            },
-            source,
-            Duration::ZERO,
-            ACTIVE_DOWNLOADS.load(Ordering::Relaxed) as usize,
-        );
-
-        let final_loaded = loaded.load(Ordering::Relaxed);
-        let elapsed = start.elapsed();
-
-        if total >= LOG_BATCH_SIZE_THRESHOLD {
-            crate::log_cache!(
-                info,
-                loaded = final_loaded,
-                total,
-                lazy,
-                source = source.as_str(),
-                elapsed_ms = elapsed.as_millis(),
-                rate_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                    (final_loaded as f64 / elapsed.as_secs_f64()) as u32
-                } else {
-                    0
-                },
-                "Batch preload complete"
-            );
-        } else {
-            crate::log_cache!(
-                trace,
-                loaded = final_loaded,
-                total,
-                lazy,
-                source = source.as_str(),
-                elapsed_ms = elapsed.as_millis(),
-                "Small batch complete"
-            );
-        }
-        record_cache_emote_stage_with_source("cache.preload.total", source, elapsed, final_loaded);
-
-        final_loaded
     }
+    record_cache_emote_stage_with_source(
+        if lazy {
+            "cache.preload.batch_inflight.lazy"
+        } else {
+            "cache.preload.batch_inflight.eager"
+        },
+        source,
+        Duration::ZERO,
+        per_batch_limit,
+    );
+    record_cache_emote_stage_with_source(
+        if lazy {
+            "cache.preload.batch_inflight.lazy.active_downloads"
+        } else {
+            "cache.preload.batch_inflight.eager.active_downloads"
+        },
+        source,
+        Duration::ZERO,
+        ACTIVE_DOWNLOADS.load(Ordering::Relaxed) as usize,
+    );
+
+    let final_loaded = loaded.load(Ordering::Relaxed);
+    let elapsed = start.elapsed();
+
+    if total >= LOG_BATCH_SIZE_THRESHOLD {
+        crate::log_cache!(
+            info,
+            loaded = final_loaded,
+            total,
+            lazy,
+            source = source.as_str(),
+            elapsed_ms = elapsed.as_millis(),
+            rate_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                (final_loaded as f64 / elapsed.as_secs_f64()) as u32
+            } else {
+                0
+            },
+            "Batch preload complete"
+        );
+    } else {
+        crate::log_cache!(
+            trace,
+            loaded = final_loaded,
+            total,
+            lazy,
+            source = source.as_str(),
+            elapsed_ms = elapsed.as_millis(),
+            "Small batch complete"
+        );
+    }
+    record_cache_emote_stage_with_source("cache.preload.total", source, elapsed, final_loaded);
+
+    final_loaded
 }
 
 #[inline]
@@ -2029,11 +2105,16 @@ fn extract_host_key(url: &str) -> Option<String> {
     }
 }
 
+/// Media CDN hosts with their own download limits and pressure bias.
+const TWITCH_CDN_HOST: &str = "static-cdn.jtvnw.net";
+const TWITCH_EMOTE_CDN_PREFIX: &str = "static-cdn.jtvnw.net/emoticons/v2/";
+const SEVENTV_CDN_HOST: &str = "cdn.7tv.app";
+
 #[inline]
 fn host_download_limit(host: &str) -> usize {
-    if host.ends_with("static-cdn.jtvnw.net") {
+    if host.ends_with(TWITCH_CDN_HOST) {
         12
-    } else if host.ends_with("cdn.7tv.app") {
+    } else if host.ends_with(SEVENTV_CDN_HOST) {
         10
     } else if host.ends_with("cdn.betterttv.net") || host.ends_with("cdn.frankerfacez.com") {
         8
@@ -2072,9 +2153,9 @@ enum HostPressureSignal {
 
 #[inline]
 fn host_pressure_weight(host: &str, signal: HostPressureSignal) -> u8 {
-    let host_bias = if host.ends_with("cdn.7tv.app") {
+    let host_bias = if host.ends_with(SEVENTV_CDN_HOST) {
         2
-    } else if host.ends_with("static-cdn.jtvnw.net") {
+    } else if host.ends_with(TWITCH_CDN_HOST) {
         1
     } else {
         0
@@ -2212,6 +2293,18 @@ fn adaptive_retry_delay(url: &str, attempt: u8, status: Option<reqwest::StatusCo
     Duration::from_millis(delay_ms)
 }
 
+/// Host pressure score at which batch concurrency is cut hard.
+const HOST_PRESSURE_HIGH: u8 = 14;
+/// Host pressure score at which batch concurrency is trimmed.
+const HOST_PRESSURE_ELEVATED: u8 = 8;
+
+/// How loaded the busiest emote CDN currently is.
+fn emote_cdn_pressure() -> u8 {
+    host_pressure_score(SEVENTV_CDN_HOST).max(host_pressure_score(TWITCH_CDN_HOST))
+}
+
+/// Concurrent downloads one eager batch may run: generous during the startup
+/// burst, then stepped down as total active downloads and CDN pressure rise.
 #[inline]
 fn eager_batch_inflight_limit() -> usize {
     let active = ACTIVE_DOWNLOADS.load(Ordering::Relaxed) as usize;
@@ -2226,17 +2319,18 @@ fn eager_batch_inflight_limit() -> usize {
     } else if active >= 40 {
         target = target.min(28);
     }
-    let pressure_7tv = host_pressure_score("cdn.7tv.app");
-    let pressure_twitch = host_pressure_score("static-cdn.jtvnw.net");
-    if pressure_7tv >= 14 || pressure_twitch >= 14 {
+    let pressure = emote_cdn_pressure();
+    if pressure >= HOST_PRESSURE_HIGH {
         target = target.min(18);
-    } else if pressure_7tv >= 8 || pressure_twitch >= 8 {
+    } else if pressure >= HOST_PRESSURE_ELEVATED {
         target = target.min(24);
     }
     target.clamp(MIN_EAGER_BATCH_INFLIGHT, MAX_EAGER_BATCH_INFLIGHT)
 }
 
 #[inline]
+/// Concurrent downloads one lazy batch may run; background hydration yields
+/// to everything else as active downloads and CDN pressure rise.
 fn lazy_batch_inflight_limit() -> usize {
     let active = ACTIVE_DOWNLOADS.load(Ordering::Relaxed) as usize;
     let target = if active >= 64 {
@@ -2248,11 +2342,10 @@ fn lazy_batch_inflight_limit() -> usize {
     } else {
         MAX_LAZY_BATCH_INFLIGHT
     };
-    let pressure_7tv = host_pressure_score("cdn.7tv.app");
-    let pressure_twitch = host_pressure_score("static-cdn.jtvnw.net");
-    let target = if pressure_7tv >= 14 || pressure_twitch >= 14 {
+    let pressure = emote_cdn_pressure();
+    let target = if pressure >= HOST_PRESSURE_HIGH {
         target.min(4)
-    } else if pressure_7tv >= 8 || pressure_twitch >= 8 {
+    } else if pressure >= HOST_PRESSURE_ELEVATED {
         target.min(6)
     } else {
         target
@@ -3223,8 +3316,8 @@ fn is_downloading_fresh(url: &str) -> bool {
 }
 
 /// `is_downloading_fresh` for a pre-computed URL key.
-/// PERF: lets callers that already hashed the URL (e.g. `get_state_and_downloading`)
-/// avoid re-hashing. `url` is still needed for the stale-entry warn log.
+/// For callers that already hashed the URL (e.g. `get_state_and_downloading`).
+/// `url` is still needed for the stale-entry warn log.
 #[inline]
 fn is_downloading_fresh_keyed(url: &str, k: u64) -> bool {
     if !DOWNLOADING.contains(&k) {
@@ -3250,29 +3343,40 @@ fn is_downloading_fresh_keyed(url: &str, k: u64) -> bool {
     false
 }
 
-pub fn trigger_preload_with_source<T>(urls: Vec<T>, source: PreloadSource)
+pub fn trigger_preload<T>(urls: Vec<T>, source: PreloadSource)
 where
     T: AsRef<str> + Into<Arc<str>>,
 {
     if urls.is_empty() {
         return;
     }
-
     if source.retains_decoded_media() {
         mark_retained_decoded_urls(&urls);
     }
+    enqueue_urls(&EAGER_LANE, urls, source);
+}
 
-    let requested = urls.len();
+/// Queue plain URLs (no provider identity) on `lane`, converting only the
+/// admitted ones to shared strings.
+fn enqueue_urls<T>(
+    lane: &'static PreloadLane,
+    urls: impl IntoIterator<Item = T>,
+    source: PreloadSource,
+) where
+    T: AsRef<str> + Into<Arc<str>>,
+{
     let now = Instant::now();
+    let mut requested = 0usize;
     let mut dedup: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut filtered = Vec::with_capacity(requested.min(PENDING_PRELOAD_MAX));
+    let mut filtered = Vec::new();
 
     for url in urls {
+        requested += 1;
         let key = url_key(url.as_ref());
         if !dedup.insert(key) {
             continue;
         }
-        if should_enqueue_eager_preload_request_keyed(url.as_ref(), None, key, key, now) {
+        if lane.admits(url.as_ref(), None, key, key, now) {
             filtered.push(url);
         }
     }
@@ -3285,51 +3389,32 @@ where
     if source.is_picker() {
         mark_picker_touched_urls(&filtered);
     }
-
-    {
-        let mut pending = PENDING_EAGER.lock();
-        pending.extend(filtered.into_iter().map(|url| PendingPreload {
+    lane.enqueue(
+        filtered.into_iter().map(|url| PendingPreload {
             url: url.into(),
             identity: None,
             source,
-        }));
-        if pending.len() > PENDING_PRELOAD_MAX {
-            let overflow = pending.len() - PENDING_PRELOAD_MAX;
-            pending.drain(0..overflow);
-        }
-        crate::log_cache!(
-            trace,
-            requested,
-            accepted,
-            queued = pending.len(),
-            source = source.as_str(),
-            "Filtered eager preload enqueue"
-        );
-    }
-
-    if !EAGER_FLUSH_SCHEDULED.swap(true, Ordering::SeqCst) {
-        PRELOAD_RUNTIME.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_INTERVAL_MS)).await;
-
-            flush_eager_batch().await;
-        });
-    }
+        }),
+        requested,
+        accepted,
+        source,
+    );
 }
 
-pub fn trigger_preload_media_with_source(requests: Vec<MediaRequest>, source: PreloadSource) {
+pub fn trigger_preload_media(requests: Vec<MediaRequest>, source: PreloadSource) {
     enqueue_media_preload(requests, false, source);
 }
 
-pub fn trigger_lazy_preload_media_with_source(requests: Vec<MediaRequest>, source: PreloadSource) {
+pub fn trigger_lazy_preload_media(requests: Vec<MediaRequest>, source: PreloadSource) {
     enqueue_media_preload(requests, true, source);
 }
 
-pub fn trigger_preload_media_single_with_source(
+pub fn trigger_preload_media_single(
     url: &str,
     identity: Option<MediaSourceId>,
     source: PreloadSource,
 ) {
-    trigger_preload_media_with_source(vec![MediaRequest::new(url, identity)], source);
+    trigger_preload_media(vec![MediaRequest::new(url, identity)], source);
 }
 
 /// Queue static first-frame posters for animated picker entries.
@@ -3337,10 +3422,7 @@ pub fn trigger_preload_media_single_with_source(
 /// The ordinary eager loader intentionally decodes GIF/WebP to one
 /// `RenderImage`. Marking these URLs as posters lets a later hover/playback
 /// request start the full animation even though that static image is resident.
-pub fn trigger_animated_poster_preload_media_with_source(
-    requests: Vec<MediaRequest>,
-    source: PreloadSource,
-) {
+pub fn trigger_animated_poster_preload_media(requests: Vec<MediaRequest>, source: PreloadSource) {
     for request in &requests {
         if !request.url.is_empty() {
             ANIMATED_POSTER_URLS.insert(url_key(&request.url));
@@ -3349,12 +3431,12 @@ pub fn trigger_animated_poster_preload_media_with_source(
             }
         }
     }
-    trigger_preload_media_with_source(requests, source);
+    trigger_preload_media(requests, source);
 }
 
 /// Persist animated poster source bytes through the bounded lazy queue while
 /// marking them for later first-frame hydration/full-playback coexistence.
-pub fn trigger_lazy_animated_poster_preload_media_with_source(
+pub fn trigger_lazy_animated_poster_preload_media(
     requests: Vec<MediaRequest>,
     source: PreloadSource,
 ) {
@@ -3366,11 +3448,11 @@ pub fn trigger_lazy_animated_poster_preload_media_with_source(
             }
         }
     }
-    trigger_lazy_preload_media_with_source(requests, source);
+    trigger_lazy_preload_media(requests, source);
 }
 
 /// Queue one static first-frame poster for an animated picker entry.
-pub fn trigger_animated_poster_preload_media_single_with_source(
+pub fn trigger_animated_poster_preload_media_single(
     url: &str,
     identity: Option<MediaSourceId>,
     source: PreloadSource,
@@ -3382,13 +3464,14 @@ pub fn trigger_animated_poster_preload_media_single_with_source(
     if source.is_picker() {
         mark_picker_touched_media(url, identity.as_ref());
     }
-    trigger_preload_media_single_with_source(url, identity, source);
+    trigger_preload_media_single(url, identity, source);
 }
 
 fn enqueue_media_preload(requests: Vec<MediaRequest>, lazy: bool, source: PreloadSource) {
     if requests.is_empty() {
         return;
     }
+    let lane = if lazy { &LAZY_LANE } else { &EAGER_LANE };
 
     let requested = requests.len();
     let now = Instant::now();
@@ -3407,24 +3490,13 @@ fn enqueue_media_preload(requests: Vec<MediaRequest>, lazy: bool, source: Preloa
             .identity
             .as_ref()
             .map_or(key, |_| url_key(&request.url));
-        let should_enqueue = if lazy {
-            should_enqueue_lazy_preload_request_keyed(
-                &request.url,
-                request.identity.as_deref(),
-                key,
-                url_hash,
-                now,
-            )
-        } else {
-            should_enqueue_eager_preload_request_keyed(
-                &request.url,
-                request.identity.as_deref(),
-                key,
-                url_hash,
-                now,
-            )
-        };
-        if should_enqueue {
+        if lane.admits(
+            &request.url,
+            request.identity.as_deref(),
+            key,
+            url_hash,
+            now,
+        ) {
             filtered.push(request);
         }
     }
@@ -3445,256 +3517,30 @@ fn enqueue_media_preload(requests: Vec<MediaRequest>, lazy: bool, source: Preloa
         }
     }
 
-    let target = if lazy { &PENDING_LAZY } else { &PENDING_EAGER };
-    {
-        let mut pending = target.lock();
-        pending.extend(filtered.into_iter().map(|request| PendingPreload {
+    lane.enqueue(
+        filtered.into_iter().map(|request| PendingPreload {
             url: request.url,
             identity: request.identity,
             source,
-        }));
-        if pending.len() > PENDING_PRELOAD_MAX {
-            let overflow = pending.len() - PENDING_PRELOAD_MAX;
-            pending.drain(0..overflow);
-        }
-        crate::log_cache!(
-            trace,
-            requested,
-            accepted,
-            queued = pending.len(),
-            lazy,
-            source = source.as_str(),
-            "Filtered identity-aware preload enqueue"
-        );
-    }
-
-    let scheduled = if lazy {
-        &LAZY_FLUSH_SCHEDULED
-    } else {
-        &EAGER_FLUSH_SCHEDULED
-    };
-    if !scheduled.swap(true, Ordering::SeqCst) {
-        PRELOAD_RUNTIME.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_INTERVAL_MS)).await;
-            if lazy {
-                flush_lazy_batch().await;
-            } else {
-                flush_eager_batch().await;
-            }
-        });
-    }
+        }),
+        requested,
+        accepted,
+        source,
+    );
 }
 
-#[inline]
-fn should_enqueue_eager_preload_url(url: &str, now: Instant) -> bool {
-    should_enqueue_eager_preload_request(url, None, now)
-}
-
-#[inline]
-fn should_enqueue_eager_preload_request(
-    url: &str,
-    identity: Option<&MediaSourceId>,
-    now: Instant,
-) -> bool {
-    if url.is_empty() {
-        return false;
-    }
-
-    let request_key = media_request_key(url, identity);
-    let url_hash = identity.map_or(request_key, |_| url_key(url));
-    should_enqueue_eager_preload_request_keyed(url, identity, request_key, url_hash, now)
-}
-
-#[inline]
-fn should_enqueue_eager_preload_request_keyed(
-    url: &str,
-    identity: Option<&MediaSourceId>,
-    request_key: u64,
-    url_hash: u64,
-    now: Instant,
-) -> bool {
-    if url.is_empty() {
-        return false;
-    }
-
-    if MEMORY_LAYER.contains_url(url)
-        || alias_static_memory_if_resident_keyed(identity, url_hash)
-        || is_downloading_fresh_keyed(url, request_key)
-    {
-        return false;
-    }
-
-    if let Some(failed_at) = FAILED_URLS.get(&url_hash)
-        && failed_at.elapsed().as_secs() < FAILED_URL_COOLDOWN_SECS
-    {
-        return false;
-    }
-
-    if let Some(last) = RECENT_EAGER_PRELOAD_ENQUEUES.get(&request_key)
-        && now.duration_since(*last) < Duration::from_millis(EAGER_PRELOAD_ENQUEUE_COOLDOWN_MS)
-    {
-        return false;
-    }
-    RECENT_EAGER_PRELOAD_ENQUEUES.insert(request_key, now);
-    true
-}
-
-pub fn trigger_preload_single_with_source(url: &str, source: PreloadSource) {
+pub fn trigger_preload_single(url: &str, source: PreloadSource) {
     if source.retains_decoded_media() {
         mark_retained_decoded_url(url);
     }
-
-    if !should_enqueue_eager_preload_url(url, Instant::now()) {
-        return;
-    }
-
-    if source.is_picker() {
-        mark_picker_touched_url(url);
-    }
-
-    {
-        let mut pending = PENDING_EAGER.lock();
-        if pending.len() >= PENDING_PRELOAD_MAX {
-            pending.drain(0..PENDING_PRELOAD_MAX / 10);
-        }
-        pending.push(PendingPreload {
-            url: url.into(),
-            identity: None,
-            source,
-        });
-    }
-
-    if !EAGER_FLUSH_SCHEDULED.swap(true, Ordering::SeqCst) {
-        PRELOAD_RUNTIME.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_INTERVAL_MS)).await;
-            flush_eager_batch().await;
-        });
-    }
+    enqueue_urls(&EAGER_LANE, std::iter::once(url), source);
 }
 
-pub fn trigger_lazy_preload_with_source(urls: Vec<String>, source: PreloadSource) {
+pub fn trigger_lazy_preload(urls: Vec<String>, source: PreloadSource) {
     if urls.is_empty() {
         return;
     }
-
-    let requested = urls.len();
-    let now = Instant::now();
-    let mut dedup: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut filtered = Vec::with_capacity(requested.min(PENDING_PRELOAD_MAX));
-
-    for url in urls {
-        let key = url_key(&url);
-        if !dedup.insert(key) {
-            continue;
-        }
-        if should_enqueue_lazy_preload_request_keyed(&url, None, key, key, now) {
-            filtered.push(url);
-        }
-    }
-
-    if filtered.is_empty() {
-        return;
-    }
-
-    let accepted = filtered.len();
-    if source.is_picker() {
-        mark_picker_touched_urls(&filtered);
-    }
-
-    {
-        let mut pending = PENDING_LAZY.lock();
-        pending.extend(filtered.into_iter().map(|url| PendingPreload {
-            url: url.into(),
-            identity: None,
-            source,
-        }));
-        if pending.len() > PENDING_PRELOAD_MAX {
-            let overflow = pending.len() - PENDING_PRELOAD_MAX;
-            pending.drain(0..overflow);
-        }
-        crate::log_cache!(
-            trace,
-            requested,
-            accepted,
-            queued = pending.len(),
-            source = source.as_str(),
-            "Filtered lazy preload enqueue"
-        );
-    }
-
-    if !LAZY_FLUSH_SCHEDULED.swap(true, Ordering::SeqCst) {
-        PRELOAD_RUNTIME.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_INTERVAL_MS)).await;
-
-            flush_lazy_batch().await;
-        });
-    }
-}
-
-#[inline]
-fn should_enqueue_lazy_preload_request_keyed(
-    url: &str,
-    identity: Option<&MediaSourceId>,
-    request_key: u64,
-    url_hash: u64,
-    now: Instant,
-) -> bool {
-    if url.is_empty() {
-        return false;
-    }
-
-    if is_downloading_fresh_keyed(url, request_key)
-        || LOADED_MEDIA_KEYS.contains(&request_key)
-        || url_is_loaded(url_hash)
-        || MEMORY_LAYER.contains_url(url)
-        || alias_static_memory_if_resident_keyed(identity, url_hash)
-    {
-        return false;
-    }
-
-    if let Some(failed_at) = FAILED_URLS.get(&url_hash)
-        && failed_at.elapsed().as_secs() < FAILED_URL_COOLDOWN_SECS
-    {
-        return false;
-    }
-
-    if let Some(last) = RECENT_LAZY_PRELOAD_ENQUEUES.get(&request_key)
-        && now.duration_since(*last) < Duration::from_millis(LAZY_PRELOAD_ENQUEUE_COOLDOWN_MS)
-    {
-        return false;
-    }
-    RECENT_LAZY_PRELOAD_ENQUEUES.insert(request_key, now);
-    true
-}
-
-/// Flush pending eager preload batch
-async fn flush_eager_batch() {
-    let entries: Vec<PendingPreload> = {
-        let mut pending = PENDING_EAGER.lock();
-        let entries = std::mem::take(&mut *pending);
-        *LAST_EAGER_FLUSH.lock() = Instant::now();
-        EAGER_FLUSH_SCHEDULED.store(false, Ordering::SeqCst);
-        entries
-    };
-
-    for (source, requests) in group_pending_by_source(entries, false) {
-        preload_media_internal(requests, false, source).await;
-    }
-}
-
-/// Flush pending lazy preload batch
-async fn flush_lazy_batch() {
-    let entries: Vec<PendingPreload> = {
-        let mut pending = PENDING_LAZY.lock();
-        let entries = std::mem::take(&mut *pending);
-        *LAST_LAZY_FLUSH.lock() = Instant::now();
-        LAZY_FLUSH_SCHEDULED.store(false, Ordering::SeqCst);
-        entries
-    };
-
-    for (source, requests) in group_pending_by_source(entries, true) {
-        preload_media_internal(requests, true, source).await;
-    }
+    enqueue_urls(&LAZY_LANE, urls, source);
 }
 
 fn group_pending_by_source(
@@ -3713,15 +3559,6 @@ fn group_pending_by_source(
     let mut grouped: Vec<_> = grouped.into_iter().collect();
     grouped.sort_by_key(|(source, _)| source.priority(lazy));
     grouped
-}
-
-async fn preload_media_internal(requests: Vec<MediaRequest>, lazy: bool, source: PreloadSource) {
-    let loader = ImageLoader::new(
-        Arc::clone(&MEMORY_LAYER),
-        Arc::clone(&DISK_LAYER),
-        Arc::clone(&STATS),
-    );
-    loader.preload_media_batch(requests, lazy, source).await;
 }
 
 fn schedule_warm_start_eager_hydration(urls: Vec<String>) {
@@ -3893,7 +3730,7 @@ pub async fn ensure_render_image_cached(url: String, source: PreloadSource) -> b
     if source.retains_decoded_media() {
         mark_retained_decoded_urls(std::slice::from_ref(&url));
     }
-    preload_media_internal(
+    preload_media_batch(
         vec![MediaRequest::new(Arc::clone(&url), None)],
         false,
         source,
@@ -4160,15 +3997,7 @@ pub fn close_picker_media_scope() {
 fn maybe_trim_process_working_set_for_diagnostic() {
     use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 
-    let enabled = std::env::var("ECHO_DIAGNOSTIC_TRIM_WORKING_SET_ON_PICKER_CLOSE")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    if !enabled {
+    if !echo_core::env::flag("ECHO_DIAGNOSTIC_TRIM_WORKING_SET_ON_PICKER_CLOSE") {
         return;
     }
 
@@ -4280,15 +4109,17 @@ fn cleanup_stale_cache_entries() {
     FAILED_URLS.retain(|_, timestamp| now.duration_since(*timestamp) < failed_ttl);
     let failed_after = FAILED_URLS.len();
 
-    let recent_before = RECENT_EAGER_PRELOAD_ENQUEUES.len();
-    RECENT_EAGER_PRELOAD_ENQUEUES
+    let recent_before = EAGER_LANE.recent.len();
+    EAGER_LANE
+        .recent
         .retain(|_, timestamp| now.duration_since(*timestamp) < recent_enqueue_ttl);
-    let recent_after = RECENT_EAGER_PRELOAD_ENQUEUES.len();
+    let recent_after = EAGER_LANE.recent.len();
 
-    let recent_lazy_before = RECENT_LAZY_PRELOAD_ENQUEUES.len();
-    RECENT_LAZY_PRELOAD_ENQUEUES
+    let recent_lazy_before = LAZY_LANE.recent.len();
+    LAZY_LANE
+        .recent
         .retain(|_, timestamp| now.duration_since(*timestamp) < recent_lazy_enqueue_ttl);
-    let recent_lazy_after = RECENT_LAZY_PRELOAD_ENQUEUES.len();
+    let recent_lazy_after = LAZY_LANE.recent.len();
 
     let displayed_before = RECENT_DISPLAYED_MEDIA_RECORDS.len();
     RECENT_DISPLAYED_MEDIA_RECORDS.retain(|_, timestamp| {
@@ -4366,7 +4197,7 @@ pub async fn shutdown() {
 }
 
 /// Trigger emote preload for a channel (matches old emote_loader API)
-/// PERF: Bounded to MAX_CONCURRENT_PRELOADS threads to prevent resource exhaustion
+/// Bounded to MAX_CONCURRENT_PRELOADS concurrent channel preloads.
 pub fn trigger_channel_preload(channel: &str) {
     if channel.is_empty() {
         return;
@@ -4551,8 +4382,7 @@ pub fn trigger_channels_preload_batch(channels: Vec<String>) {
                     Duration::ZERO,
                     eager_requests.len(),
                 );
-                preload_media_internal(eager_requests, false, PreloadSource::ChannelBatchEager)
-                    .await;
+                preload_media_batch(eager_requests, false, PreloadSource::ChannelBatchEager).await;
             }
 
             if !lazy_requests.is_empty() {
@@ -4565,8 +4395,7 @@ pub fn trigger_channels_preload_batch(channels: Vec<String>) {
                 );
                 PRELOAD_RUNTIME.spawn(async move {
                     let lazy_start = Instant::now();
-                    preload_media_internal(lazy_requests, true, PreloadSource::ChannelBatchLazy)
-                        .await;
+                    preload_media_batch(lazy_requests, true, PreloadSource::ChannelBatchLazy).await;
                     record_cache_emote_stage_with_source(
                         "cache.preload.batch_channel.lazy_phase.deferred",
                         PreloadSource::ChannelBatchLazy,
@@ -4681,7 +4510,7 @@ async fn do_channel_preload_async(channel: String) {
                     Duration::ZERO,
                     eager_requests.len(),
                 );
-                preload_media_internal(eager_requests, false, PreloadSource::Channel).await;
+                preload_media_batch(eager_requests, false, PreloadSource::Channel).await;
                 if !lazy_requests.is_empty() {
                     record_cache_emote_stage_with_source(
                         "cache.preload.channel.lazy_phase",
@@ -4693,7 +4522,7 @@ async fn do_channel_preload_async(channel: String) {
                     let lazy_count = lazy_requests.len();
                     PRELOAD_RUNTIME.spawn(async move {
                         let lazy_start = Instant::now();
-                        preload_media_internal(lazy_requests, true, PreloadSource::ChannelLazyTail)
+                        preload_media_batch(lazy_requests, true, PreloadSource::ChannelLazyTail)
                             .await;
                         record_cache_emote_stage_with_source(
                             "cache.preload.channel.lazy_phase.deferred",
@@ -4711,7 +4540,7 @@ async fn do_channel_preload_async(channel: String) {
                     });
                 }
             } else {
-                preload_media_internal(requests, false, PreloadSource::Channel).await;
+                preload_media_batch(requests, false, PreloadSource::Channel).await;
             }
 
             let elapsed = start.elapsed();
@@ -4773,9 +4602,8 @@ pub fn get_state(url: &str) -> ImageLoadState {
 
 /// Get the load state AND the downloading flag for a URL in a single keyed pass.
 ///
-/// PERF: the image-miss paint path computes `url_key` once here and reuses it
-/// for every probe instead of hashing the URL in `is_downloading()` and
-/// `get_state()` separately.
+/// Hashes the URL once for every probe the image-miss paint path makes,
+/// rather than once each in `is_downloading()` and `get_state()`.
 ///
 /// The returned `bool` is the freshly-validated downloading flag (same semantics as
 /// `is_downloading`). When it is `true` the state is always `Loading`.
@@ -4866,10 +4694,10 @@ pub fn retry_failed_media(url: &str, is_animated: bool, source: PreloadSource) -
         });
 
     if is_animated {
-        trigger_animated_decode_with_source(url, source);
+        trigger_animated_decode(url, source);
     } else {
-        RECENT_EAGER_PRELOAD_ENQUEUES.remove(&key);
-        trigger_preload_single_with_source(url, source);
+        EAGER_LANE.recent.remove(&key);
+        trigger_preload_single(url, source);
     }
 
     crate::log_cache!(
@@ -4922,19 +4750,19 @@ fn cleanup_retry_states() {
 }
 
 /// Trigger animated image decode with source attribution for cache scope cleanup.
-pub fn trigger_animated_decode_with_source(url: &str, source: PreloadSource) {
-    trigger_animated_decode_media_with_source(url, None, source);
+pub fn trigger_animated_decode(url: &str, source: PreloadSource) {
+    trigger_animated_decode_media(url, None, source);
 }
 
-pub fn trigger_animated_decode_media_with_source(
+pub fn trigger_animated_decode_media(
     url: &str,
     identity: Option<MediaSourceId>,
     source: PreloadSource,
 ) {
-    trigger_animated_decode_request_with_source(MediaRequest::new(url, identity), source);
+    trigger_animated_decode_request(MediaRequest::new(url, identity), source);
 }
 
-pub fn trigger_animated_decode_request_with_source(request: MediaRequest, source: PreloadSource) {
+pub fn trigger_animated_decode_request(request: MediaRequest, source: PreloadSource) {
     let MediaRequest { url, identity } = request;
     let key = media_request_key(&url, identity.as_deref());
     let url_hash = url_key(&url);
@@ -4985,7 +4813,7 @@ pub fn trigger_animated_decode_request_with_source(request: MediaRequest, source
                 );
                 mark_animated_decode_failed(&url, identity.as_deref());
             } else {
-                trigger_preload_media_with_source(vec![MediaRequest { url, identity }], source);
+                trigger_preload_media(vec![MediaRequest { url, identity }], source);
             }
         }
         return;
@@ -5147,21 +4975,17 @@ fn install_decoded_animation(
     let total_duration_ms = metadata.total_duration_ms;
     let current_frame = metadata.frame_index_at(super::frame_layer::current_animation_time_ms());
     let source_key = static_source_key(identity);
-    if initial_frame_window == full_frame_window && full_frame_window > sliding_frame_window {
-        FRAME_LAYER.register_full_cycle_animation_with_source_key(
-            url,
-            source_key,
-            metadata,
-            sliding_frame_window as usize,
-        );
-    } else {
-        FRAME_LAYER.register_animation_with_source_key_and_limit(
-            url,
-            source_key,
-            metadata,
-            initial_frame_window as usize,
-        );
-    }
+    let residency =
+        if initial_frame_window == full_frame_window && full_frame_window > sliding_frame_window {
+            super::frame_layer::AnimationResidency::FullCycle {
+                fallback_frames: sliding_frame_window as usize,
+            }
+        } else {
+            super::frame_layer::AnimationResidency::Sliding {
+                frames: initial_frame_window as usize,
+            }
+        };
+    FRAME_LAYER.register_animation_with(url, source_key, metadata, residency);
     clear_animated_static_fallback(url, identity);
     clear_animated_decode_failed(url, identity);
     if let Some(source_key) = source_key {
@@ -5172,7 +4996,7 @@ fn install_decoded_animation(
     let source = cache_decoded_animation_source(url, identity, decoded);
     let inserted_frames =
         insert_decoded_frame_window(url, &source, current_frame, initial_frame_window, None);
-    ANIMATION_REFILL_DISK_MISS_SINCE.remove(&super::frame_layer::FrameLayer::hash_url(url));
+    ANIMATION_REFILL_DISK_MISS_SINCE.remove(&url_key(url));
 
     InstalledAnimation {
         frame_count,
@@ -5308,6 +5132,20 @@ async fn install_lower_resolution_animation(
 /// CRITICAL FIX: When animated decode fails (image is actually static despite
 /// being flagged as animated), we fall back to static decoding. This handles
 /// Twitch emotes that have format=["animated"] but serve static PNGs.
+fn log_installed_animation(url: &str, installed: &InstalledAnimation, message: &'static str) {
+    crate::log_cache!(
+        debug,
+        url = %url,
+        frame_count = installed.frame_count,
+        duration_ms = installed.total_duration_ms,
+        hot_frame_limit = installed.hot_frame_limit,
+        inserted_frames = installed.inserted_frames,
+        raw_frame_bytes = installed.raw_frame_bytes,
+        compressed_source_bytes = installed.compressed_source_bytes,
+        "{message}"
+    );
+}
+
 async fn decode_animated_url(
     url: &Arc<str>,
     identity: Option<&MediaSourceId>,
@@ -5339,11 +5177,11 @@ async fn decode_animated_url(
         None => DISK_LAYER.load_image(url).await,
     };
     if let Some(bytes) = disk_bytes {
-        crate::log_emotes!(
+        crate::log_cache!(
             debug,
-            "[ANIMATED] Disk cache hit for url={}, {} bytes",
-            url,
-            bytes.len()
+            url = %url,
+            bytes = bytes.len(),
+            "Animated source found in disk cache"
         );
         let (bytes, outcome) = match tokio::task::spawn_blocking(move || {
             let outcome = crate::image_decode::decode_animated_frames_outcome(&bytes);
@@ -5357,25 +5195,7 @@ async fn decode_animated_url(
         let (decoded, shrinkable) = animated_decode_parts(outcome);
         if let Some(decoded) = decoded {
             let installed = install_decoded_animation(url, identity, decoded, initial_frame_window);
-            crate::log_emotes!(
-                debug,
-                "[ANIMATED] Decode SUCCESS: url={}, frames={}, duration_ms={}, hot_frame_limit={}, raw_bytes={}, source_bytes={}",
-                url,
-                installed.frame_count,
-                installed.total_duration_ms,
-                installed.hot_frame_limit,
-                installed.raw_frame_bytes,
-                installed.compressed_source_bytes
-            );
-            crate::log_cache!(
-                trace,
-                url = %url,
-                frame_count = installed.frame_count,
-                inserted_frames = installed.inserted_frames,
-                raw_frame_bytes = installed.raw_frame_bytes,
-                compressed_source_bytes = installed.compressed_source_bytes,
-                "Decoded animated image from cache"
-            );
+            log_installed_animation(url, &installed, "Decoded animated image from cache");
             return;
         } else {
             if shrinkable {
@@ -5400,91 +5220,74 @@ async fn decode_animated_url(
             let is_animated_container = bytes.starts_with(b"GIF8")
                 || (bytes.len() >= 12 && bytes[..4] == *b"RIFF" && bytes[8..12] == *b"WEBP");
             if cache_animated_static_fallback(url, identity, source_key, bytes, source).await {
-                crate::log_emotes!(
+                crate::log_cache!(
                     debug,
-                    "[ANIMATED] No multi-frame decode; using static fallback: url={}",
-                    url
+                    url = %url,
+                    "No multi-frame decode; using the cached copy as a still image"
                 );
-                crate::log_cache!(trace, url = %url, "Animated decode failed, fell back to static from cache");
                 return;
             }
 
             if is_animated_container {
-                crate::log_emotes!(
+                crate::log_cache!(
                     warn,
-                    "[ANIMATED] Animation and static fallback decode FAILED: url={}",
-                    crate::log::redact_url(url)
+                    url = %crate::log::redact_url(url),
+                    "Cached animation failed to decode as an animation or a still image"
                 );
             } else {
-                crate::log_emotes!(
+                crate::log_cache!(
                     debug,
-                    "[ANIMATED] Static format in animated cache slot failed to decode: url={}",
-                    url
+                    url = %url,
+                    "Cached still image in an animated slot failed to decode"
                 );
             }
         }
     }
 
-    if url.contains("static-cdn.jtvnw.net/emoticons/v2/") && url.contains("/default/") {
+    if url.contains(TWITCH_EMOTE_CDN_PREFIX) && url.contains("/default/") {
         let animated_url = url.replace("/default/", "/animated/");
-        crate::log_emotes!(
-            debug,
-            "[ANIMATED] Twitch CDN: trying animated variant url={}",
-            animated_url
-        );
-        if let Ok(response) = HTTP_CLIENT.get(&animated_url).send().await {
-            if response.status().is_success() {
-                if let Ok(bytes) = read_media_body(response).await {
-                    spawn_save_source_image(
-                        Arc::clone(&DISK_LAYER),
-                        identity.cloned(),
-                        Arc::clone(url),
-                        bytes.clone(),
-                    );
-
-                    let decoded = match tokio::task::spawn_blocking(move || {
-                        crate::image_decode::decode_animated_frames(bytes.as_ref())
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => return,
-                    };
-                    if let Some(decoded) = decoded {
-                        let installed =
-                            install_decoded_animation(url, identity, decoded, initial_frame_window);
-                        crate::log_emotes!(
-                            debug,
-                            "[ANIMATED] Twitch CDN animated variant SUCCESS: url={}, frames={}, duration_ms={}, hot_frame_limit={}, inserted={}, raw_bytes={}, source_bytes={}",
-                            url,
-                            installed.frame_count,
-                            installed.total_duration_ms,
-                            installed.hot_frame_limit,
-                            installed.inserted_frames,
-                            installed.raw_frame_bytes,
-                            installed.compressed_source_bytes
-                        );
-                        crate::log_cache!(
-                            debug,
-                            url = %url,
-                            frame_count = installed.frame_count,
-                            inserted_frames = installed.inserted_frames,
-                            raw_frame_bytes = installed.raw_frame_bytes,
-                            compressed_source_bytes = installed.compressed_source_bytes,
-                            "Twitch animated variant decoded"
-                        );
-                        return;
-                    }
-                    crate::log_emotes!(
-                        debug,
-                        "[ANIMATED] Twitch CDN animated variant decode failed, trying /default/"
-                    );
-                }
-            } else {
-                crate::log_emotes!(
-                    debug,
-                    "[ANIMATED] Twitch CDN animated variant 404 (not animated), trying /default/"
+        crate::log_cache!(debug, url = %animated_url, "Twitch CDN: trying animated variant");
+        match fetch_media_bytes(&animated_url).await {
+            Ok(bytes) => {
+                spawn_save_source_image(
+                    Arc::clone(&DISK_LAYER),
+                    identity.cloned(),
+                    Arc::clone(url),
+                    bytes.clone(),
                 );
+
+                let decoded = match tokio::task::spawn_blocking(move || {
+                    crate::image_decode::decode_animated_frames(bytes.as_ref())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => return,
+                };
+                if let Some(decoded) = decoded {
+                    let installed =
+                        install_decoded_animation(url, identity, decoded, initial_frame_window);
+                    log_installed_animation(url, &installed, "Twitch animated variant decoded");
+                    return;
+                }
+                crate::log_cache!(
+                    debug,
+                    url = %url,
+                    "Twitch animated variant failed to decode, trying /default/"
+                );
+            }
+            // The emote has no animated copy; the /default/ copy is still worth a try.
+            Err(MediaFetchFailure::Refused) => {
+                crate::log_cache!(
+                    debug,
+                    url = %url,
+                    "Twitch animated variant refused (not animated), trying /default/"
+                );
+            }
+            // The CDN is failing; the /default/ copy on the same host would too.
+            Err(MediaFetchFailure::Transient) => {
+                mark_animated_decode_failed(url, identity);
+                return;
             }
         }
     }
@@ -5514,26 +5317,7 @@ async fn decode_animated_url(
         let (decoded, shrinkable) = animated_decode_parts(outcome);
         if let Some(decoded) = decoded {
             let installed = install_decoded_animation(url, identity, decoded, initial_frame_window);
-            crate::log_emotes!(
-                debug,
-                "[ANIMATED] Network decode SUCCESS: url={}, frames={}, duration_ms={}, hot_frame_limit={}, inserted={}, raw_bytes={}, source_bytes={}",
-                url,
-                installed.frame_count,
-                installed.total_duration_ms,
-                installed.hot_frame_limit,
-                installed.inserted_frames,
-                installed.raw_frame_bytes,
-                installed.compressed_source_bytes
-            );
-            crate::log_cache!(
-                debug,
-                url = %url,
-                frame_count = installed.frame_count,
-                inserted_frames = installed.inserted_frames,
-                raw_frame_bytes = installed.raw_frame_bytes,
-                compressed_source_bytes = installed.compressed_source_bytes,
-                "Downloaded and decoded animated image"
-            );
+            log_installed_animation(url, &installed, "Downloaded and decoded animated image");
             return;
         }
         if shrinkable && !ladder_walked {
@@ -5619,22 +5403,22 @@ fn insert_decoded_frame_window(
         // Hot frames live only in GPU atlases once shown; the source rebuilds
         // them for another window, a lost device, or the CPU paint compositor.
         let pixel_source = frame_pixel_source(&source.source, idx);
-        let inserted_frame = match prefetch_token {
-            Some(token) => FRAME_LAYER.insert_prefetched_releasable_frame(
-                url,
-                idx,
+        let admitted = FRAME_LAYER.insert_frame_with(
+            url,
+            idx,
+            super::frame_layer::FramePixels {
                 data,
                 width,
                 height,
-                token,
-                pixel_source,
-            ),
-            None => {
-                FRAME_LAYER.insert_releasable_frame(url, idx, data, width, height, pixel_source);
-                true
-            }
-        };
-        if !inserted_frame {
+            },
+            super::frame_layer::FrameInsertOptions {
+                prefetch_token,
+                pixel_source: Some(pixel_source),
+            },
+        );
+        // Only a refill stops early: its token may have been superseded. The
+        // initial window keeps going past a frame the budget refused.
+        if prefetch_token.is_some() && !admitted {
             break;
         }
         inserted += 1;
@@ -5727,10 +5511,19 @@ pub fn animated_cache_state_revision() -> u64 {
 
 /// Get current render image for an animated URL
 pub fn get_current_animated_render_image(url: &str) -> Option<Arc<RenderImage>> {
-    if !crate::emote_renderer::animation_enabled() {
-        return FRAME_LAYER.get_stable_frame(url);
-    }
-    get_current_animated_render_image_with_metadata_and_frame(url).map(|(image, _, _)| image)
+    animated_frame(url, FrameQuery::Current).map(|frame| frame.image)
+}
+
+/// One frame of an animated image as `query` selects it. With animation
+/// turned off every query returns the still [`FrameQuery::Stable`] frame,
+/// never reported as exact.
+pub fn animated_frame(url: &str, query: FrameQuery) -> Option<AnimatedFrame> {
+    let query = if crate::emote_renderer::animation_enabled() {
+        query
+    } else {
+        FrameQuery::Stable
+    };
+    FRAME_LAYER.animated_frame(url, query)
 }
 
 /// Get a stable resident animation frame without advancing phase or scheduling
@@ -5738,74 +5531,6 @@ pub fn get_current_animated_render_image(url: &str) -> Option<Arc<RenderImage>> 
 /// dedicated static poster is not yet available.
 pub fn get_stable_animated_render_image(url: &str) -> Option<Arc<RenderImage>> {
     FRAME_LAYER.get_stable_frame(url)
-}
-
-/// Get current render image AND animation metadata together, hashing the URL once.
-///
-/// PERF: Use this instead of the two-call pattern (get_current_animated_render_image
-/// + get_animation_metadata) to avoid a duplicate URL hash + DashMap lookup.
-pub fn get_current_animated_render_image_with_metadata(
-    url: &str,
-) -> Option<(Arc<RenderImage>, Arc<super::frame_layer::AnimationMetadata>)> {
-    if !crate::emote_renderer::animation_enabled() {
-        return FRAME_LAYER
-            .get_stable_frame(url)
-            .zip(FRAME_LAYER.get_metadata(url));
-    }
-    get_current_animated_render_image_with_metadata_and_frame(url)
-        .map(|(image, metadata, _)| (image, metadata))
-}
-
-/// Get the displayed animated image, its metadata, and the actual resident
-/// frame index selected by the cache (including bounded fallback selection).
-pub fn get_current_animated_render_image_with_metadata_and_frame(
-    url: &str,
-) -> Option<(
-    Arc<RenderImage>,
-    Arc<super::frame_layer::AnimationMetadata>,
-    u16,
-)> {
-    if !crate::emote_renderer::animation_enabled() {
-        return FRAME_LAYER.get_stable_frame_with_metadata_and_index(url);
-    }
-    FRAME_LAYER.get_current_frame_with_metadata_and_frame(url)
-}
-
-/// Get the displayed animated frame and report whether it is the exact
-/// wall-clock target rather than a held resident fallback.
-pub fn get_current_animated_render_image_with_metadata_frame_and_exactness(
-    url: &str,
-) -> Option<(
-    Arc<RenderImage>,
-    Arc<super::frame_layer::AnimationMetadata>,
-    u16,
-    bool,
-)> {
-    if !crate::emote_renderer::animation_enabled() {
-        return FRAME_LAYER
-            .get_stable_frame_with_metadata_and_index(url)
-            .map(|(image, metadata, frame_idx)| (image, metadata, frame_idx, false));
-    }
-    FRAME_LAYER.get_current_frame_with_metadata_frame_and_exactness(url)
-}
-
-/// Read one resident animation frame without admitting/scheduling refill work.
-/// Picker source handoff uses this strictly as a visual fallback while a single
-/// authoritative URL owns decode eligibility.
-pub fn get_resident_animated_render_image_with_metadata_frame_and_exactness(
-    url: &str,
-) -> Option<(
-    Arc<RenderImage>,
-    Arc<super::frame_layer::AnimationMetadata>,
-    u16,
-    bool,
-)> {
-    if !crate::emote_renderer::animation_enabled() {
-        return FRAME_LAYER
-            .get_stable_frame_with_metadata_and_index(url)
-            .map(|(image, metadata, frame_idx)| (image, metadata, frame_idx, false));
-    }
-    FRAME_LAYER.get_resident_frame_with_metadata_frame_and_exactness(url)
 }
 
 /// Check whether a decoded animated frame is resident without triggering prefetch.
@@ -5822,11 +5547,8 @@ pub fn has_visible_animations() -> bool {
     FRAME_LAYER.has_visible_animations()
 }
 
-/// Get animation metadata for a URL (if registered)
-///
-/// Returns the AnimationMetadata containing frame count, durations, and dimensions.
-/// This is used by DynamicTickScheduler to calculate optimal tick intervals.
-/// PERF: Returns Arc to avoid cloning Vec<u16> frame durations per-emote per-frame
+/// Animation metadata (frame count, durations, dimensions) for a URL, if
+/// registered. Shared, so per-frame callers do not copy the duration list.
 pub fn get_animation_metadata(url: &str) -> Option<Arc<super::frame_layer::AnimationMetadata>> {
     FRAME_LAYER.get_metadata(url)
 }
@@ -5844,7 +5566,7 @@ pub fn prefetch_animated_frames(
     prefetch_token: u64,
     picker_visible_at_trigger: bool,
 ) {
-    let url_hash = super::frame_layer::FrameLayer::hash_url(&url);
+    let url_hash = url_key(&url);
     if frame_indices.is_empty() {
         super::frame_layer::clear_prefetch_url_in_flight(url_hash, prefetch_token);
         return;
@@ -5872,7 +5594,7 @@ async fn prefetch_from_decoded_animation_source(
     prefetch_token: u64,
     picker_owned: bool,
 ) -> bool {
-    let url_hash = super::frame_layer::FrameLayer::hash_url(url);
+    let url_hash = url_key(url);
     if !super::frame_layer::prefetch_token_is_current(url_hash, prefetch_token) {
         return true;
     }
@@ -5942,7 +5664,7 @@ fn invalidate_unrecoverable_animation_refill(
         reason,
         "Invalidated unrecoverable animation refill"
     );
-    trigger_animated_decode_with_source(
+    trigger_animated_decode(
         url,
         if picker_owned {
             PreloadSource::PickerCell
@@ -5961,7 +5683,7 @@ async fn prefetch_animated_frames_async(
     prefetch_token: u64,
     picker_owned: bool,
 ) {
-    let url_hash = super::frame_layer::FrameLayer::hash_url(url);
+    let url_hash = url_key(url);
     let mut unique_frame_indices: SmallVec<[u16; 4]> = SmallVec::new();
     for frame_idx in frame_indices {
         if !unique_frame_indices.contains(&frame_idx) {

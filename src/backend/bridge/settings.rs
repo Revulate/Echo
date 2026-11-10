@@ -53,8 +53,8 @@ pub fn get_appearance_settings() -> AppearanceSettings {
         theme: settings.theme.clone(),
         primary_accent_color: settings.primary_accent_color.clone(),
         font_scale: settings.font_scale,
-        tab_theme: settings.tab_theme.clone().into(),
-        badge_display_mode: settings.badge_display_mode.clone().into(),
+        tab_theme: settings.tab_theme.clone(),
+        badge_display_mode: settings.badge_display_mode.clone(),
     }
 }
 
@@ -75,22 +75,22 @@ pub fn set_font_scale(scale: f32) {
 
 /// Set tab theme style
 pub fn set_tab_theme(theme: TabTheme) {
-    crate::backend::settings::set_tab_theme(theme.into());
+    crate::backend::settings::set_tab_theme(theme);
 }
 
 /// Get tab overflow mode
 pub fn get_tab_overflow_mode() -> TabOverflowMode {
-    crate::backend::settings::get_tab_overflow_mode().into()
+    crate::backend::settings::get_tab_overflow_mode()
 }
 
 /// Set tab overflow mode
 pub fn set_tab_overflow_mode(mode: TabOverflowMode) {
-    crate::backend::settings::set_tab_overflow_mode(mode.into());
+    crate::backend::settings::set_tab_overflow_mode(mode);
 }
 
 /// Set badge display mode
 pub fn set_badge_display_mode(mode: BadgeDisplayMode) {
-    crate::backend::settings::set_badge_display_mode(mode.into());
+    crate::backend::settings::set_badge_display_mode(mode);
 }
 
 /// Set anonymous mode
@@ -140,7 +140,7 @@ pub fn get_sound_settings() -> SoundSettings {
                 .cloned()
                 .unwrap_or_else(|| event_type.default_settings());
             SoundEventSettings {
-                event_type: (*event_type).into(),
+                event_type: *event_type,
                 display_name: event_type.display_name().to_string(),
                 enabled: event_settings.enabled,
                 volume: event_settings.volume,
@@ -174,12 +174,12 @@ pub fn set_desktop_notifications_enabled(enabled: bool) {
 
 /// Set sound event enabled
 pub fn set_sound_event_enabled(event_type: SoundEventType, enabled: bool) {
-    crate::backend::sounds::SOUND_STORE.set_event_enabled(event_type.into(), enabled);
+    crate::backend::sounds::SOUND_STORE.set_event_enabled(event_type, enabled);
 }
 
 /// Set sound event volume
 pub fn set_sound_event_volume(event_type: SoundEventType, volume: f32) {
-    crate::backend::sounds::SOUND_STORE.set_event_volume(event_type.into(), volume.clamp(0.0, 1.0));
+    crate::backend::sounds::SOUND_STORE.set_event_volume(event_type, volume.clamp(0.0, 1.0));
 }
 
 /// Set per-channel sound and desktop notification mute state.
@@ -198,32 +198,7 @@ pub fn clear_highlight_sound_muted_channels() {
 
 /// Test sound playback
 pub fn test_sound(event_type: SoundEventType) {
-    crate::backend::sounds::SOUND_STORE.test_sound(event_type.into());
-}
-
-/// Set mention highlight color
-pub fn set_mention_color(color: &str) {
-    crate::backend::settings::set_mention_color(color.to_string());
-}
-
-/// Set whisper highlight color
-pub fn set_whisper_color(color: &str) {
-    crate::backend::settings::set_whisper_color(color.to_string());
-}
-
-/// Set subscription highlight color
-pub fn set_subscription_color(color: &str) {
-    crate::backend::settings::set_subscription_color(color.to_string());
-}
-
-/// Set first message highlight color
-pub fn set_first_message_color(color: &str) {
-    crate::backend::settings::set_first_message_color(color.to_string());
-}
-
-/// Set reply-thread highlight color
-pub fn set_thread_highlight_color(color: &str) {
-    crate::backend::settings::set_thread_highlight_color(color.to_string());
+    crate::backend::sounds::SOUND_STORE.test_sound(event_type);
 }
 
 /// Set flash on mention
@@ -254,19 +229,16 @@ pub fn set_thread_highlight_show_in_mentions(enabled: bool) {
 /// Get filters
 pub fn get_filters() -> Vec<FilterRule> {
     crate::backend::settings::get_filters()
-        .into_iter()
-        .map(|f| f.into())
-        .collect()
 }
 
 /// Add filter
 pub fn add_filter(filter: FilterRule) {
-    crate::backend::settings::add_filter(filter.into());
+    crate::backend::settings::add_filter(filter);
 }
 
 /// Update filter
 pub fn update_filter(id: &str, filter: FilterRule) {
-    crate::backend::settings::update_filter(id, filter.into());
+    crate::backend::settings::update_filter(id, filter);
 }
 
 /// Remove filter

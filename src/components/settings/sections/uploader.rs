@@ -1869,7 +1869,7 @@ fn render_upload_history_entry<T: 'static>(
     let image_url_for_open = entry.image_url.clone();
     let entry_id = entry.id.clone();
     let is_image = entry.mime_type.starts_with("image/");
-    let render_preview = is_image && !crate::benchmark_ui_fixture::is_enabled();
+    let render_preview = is_image && !crate::bench::ui_fixture::is_enabled();
 
     div()
         .id(SharedString::from(format!("upload-history-{entry_id}")))
@@ -2148,7 +2148,7 @@ fn render_provider_dropdown<T: 'static>(
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(colors::text_primary())
                         .text_ellipsis()
@@ -2158,7 +2158,7 @@ fn render_provider_dropdown<T: 'static>(
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                         .text_color(colors::text_primary())
                         .child(if is_open { "▴" } else { "▾" }),
                 )
@@ -2450,7 +2450,7 @@ fn render_labeled_text_box<T: 'static>(
         .gap(px(SettingsMetrics::LABEL_GAP))
         .child(
             div()
-                .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(colors::text_primary())
                 .child(descriptor.label.to_string()),

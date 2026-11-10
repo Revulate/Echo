@@ -445,7 +445,7 @@ fn render_toggle_row<T: 'static>(
             )
         }),
         stacked,
-        crate::components::settings::widgets::SettingsMetrics::CALM_CONTROL_WIDTH,
+        crate::components::settings::widgets::SettingsMetrics::ROW_CONTROL_WIDTH,
         true,
         enabled,
     )
@@ -518,7 +518,7 @@ fn render_number_row<T: 'static>(
             )
         }),
         stacked,
-        crate::components::settings::widgets::SettingsMetrics::CALM_CONTROL_WIDTH,
+        crate::components::settings::widgets::SettingsMetrics::ROW_CONTROL_WIDTH,
         false,
         enabled,
     )

@@ -121,16 +121,11 @@ pub async fn upload_image_bytes(
             };
         }
 
-        let parsed = parse_upload_response(
+        parse_upload_response(
             &response_text,
             &config.image_link_template,
             &config.deletion_link_template,
-        )?;
-
-        Ok(UploadResult {
-            image_link: parsed.image_link,
-            deletion_link: parsed.deletion_link,
-        })
+        )
     })
     .await
     .map_err(|_| {

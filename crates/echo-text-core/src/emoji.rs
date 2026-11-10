@@ -1,7 +1,7 @@
 //! Emoji Utilities
 //!
 //! Provides functions for detecting and rendering emoji characters as images.
-//! Supports multiple emoji styles (Twitter, Apple, Google, Facebook) via CDN.
+//! Each [`EmojiStyle`] maps to a CDN image set (Twemoji or Noto).
 //!
 //! Uses the `emojis` crate for O(1) emoji lookup (Unicode 17.0 support).
 
@@ -18,7 +18,7 @@ use crate::EmojiStyle;
 /// Twemoji version (Twitter's open-source emoji)
 const TWEMOJI_VERSION: &str = "14.0.2";
 
-/// emoji-datasource version for Apple/Google/Facebook styles
+/// emoji-datasource version for the Noto (Google) style
 const EMOJI_DATASOURCE_VERSION: &str = "16.0.1";
 
 // ============================================================================

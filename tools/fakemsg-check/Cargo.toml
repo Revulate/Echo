@@ -1,9 +1,11 @@
 [package]
-name = "echo-fakemsg-check"
-version = "0.1.0"
+name = "fakemsg-check"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
-twitch-irc = { version = "6.0.0", default-features = false }
+check-support.workspace = true
+twitch-irc.workspace = true

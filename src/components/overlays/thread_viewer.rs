@@ -7,12 +7,12 @@
 //! - Reply input within thread
 //! - Close on Escape
 
-use super::ContextMenuState;
 use super::traits::{Openable, OverlayPointerIsolation};
 use super::{
     Autocomplete, AutocompleteHelper, AutocompleteState, AutocompleteSuggestion, AutocompleteType,
     InlineTabCompletionSession,
 };
+use super::{ContextMenuState, MessageMenuTarget};
 use crate::backend::{self, ChatMessage};
 use crate::components::ui::ButtonExt;
 use crate::components::ui::input::{
@@ -425,20 +425,11 @@ impl ThreadViewer {
             let Some(context) = AutocompleteHelper::detect_tab_context(&text, cursor) else {
                 return false;
             };
-            let Some(channel) = self.state.channel.clone() else {
+            let Some(channel) = self.state.channel.as_deref() else {
                 return false;
             };
 
-            self.reply_autocomplete
-                .update_state(AutocompleteState::open(
-                    0.0,
-                    0.0,
-                    channel,
-                    self.completion_target,
-                    context.clone(),
-                ));
-            let candidates = self.reply_autocomplete.inline_tab_candidates();
-            self.close_reply_autocomplete();
+            let candidates = self.reply_autocomplete.tab_candidates(channel, &context);
             self.tab_completion = InlineTabCompletionSession::new(context, candidates);
         }
 
@@ -515,8 +506,8 @@ impl ThreadViewer {
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<crate::benchmark_ui_fixture::CompletionUiSnapshot> {
-        if !crate::benchmark_ui_fixture::is_enabled() || !self.state.is_open {
+    ) -> Option<crate::bench::ui_fixture::CompletionUiSnapshot> {
+        if !crate::bench::ui_fixture::is_enabled() || !self.state.is_open {
             return None;
         }
         self.ensure_reply_input(window, cx);
@@ -539,8 +530,8 @@ impl ThreadViewer {
         &self,
         window: &Window,
         cx: &App,
-    ) -> Option<crate::benchmark_ui_fixture::CompletionUiSnapshot> {
-        if !crate::benchmark_ui_fixture::is_enabled() || !self.state.is_open {
+    ) -> Option<crate::bench::ui_fixture::CompletionUiSnapshot> {
+        if !crate::bench::ui_fixture::is_enabled() || !self.state.is_open {
             return None;
         }
         let input = self.reply_input.as_ref()?.read(cx);
@@ -551,7 +542,7 @@ impl ThreadViewer {
                 self.reply_autocomplete.state.selected_index,
             )
             .map(|selection| selection.text);
-        Some(crate::benchmark_ui_fixture::CompletionUiSnapshot {
+        Some(crate::bench::ui_fixture::CompletionUiSnapshot {
             input: input.value().to_string(),
             cursor: input.cursor(),
             focused: input.focus_handle().is_focused(window),
@@ -642,8 +633,8 @@ impl ThreadViewer {
         if reply_text.is_empty() {
             return;
         }
-        if let Err(error) = backend::irc::ensure_authenticated_send_ready() {
-            push_thread_send_blocked_toast(&error);
+        if let Err(block) = backend::irc::ensure_authenticated_send_ready() {
+            push_thread_send_blocked_toast(&block.to_string());
             return;
         }
         if let (Some(channel), Some(msg_id)) = (&self.state.channel, &self.state.root_message_id) {
@@ -965,7 +956,7 @@ impl ThreadViewer {
         let reply_input = self.reply_input.clone();
         let send_block_reason = backend::irc::ensure_authenticated_send_ready()
             .err()
-            .map(|error| thread_send_block_status_text(&error));
+            .map(|block| thread_send_block_status_text(&block));
         let send_blocked = send_block_reason.is_some();
 
         div()
@@ -1226,16 +1217,15 @@ fn push_thread_send_blocked_toast(error: &str) {
     });
 }
 
-fn thread_send_block_status_text(error: &str) -> &'static str {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("anonymously") {
-        "Anonymous chat active"
-    } else if lower.contains("re-authenticated") || lower.contains("chat token") {
-        "Re-authentication required"
-    } else if lower.contains("active twitch account") {
-        "Log in to Twitch"
-    } else {
-        "Reply unavailable"
+fn thread_send_block_status_text(block: &backend::irc::SendBlock) -> &'static str {
+    use backend::irc::SendBlock;
+    match block {
+        SendBlock::Anonymous => "Anonymous chat active",
+        SendBlock::NeedsReauth | SendBlock::NoChatToken { .. } => "Re-authentication required",
+        SendBlock::NoAccount => "Log in to Twitch",
+        SendBlock::Reconnecting | SendBlock::Disconnected | SendBlock::ClientNotReady => {
+            "Reply unavailable"
+        }
     }
 }
 
@@ -1251,16 +1241,18 @@ fn render_thread_message(idx: usize, msg: &ChatMessage, is_root: bool) -> impl I
         msg.flags.highlight_type.as_ref(),
         Some(crate::backend::HighlightType::Whisper)
     );
-    let menu_source = (
-        msg.id.clone(),
-        msg.content.clone(),
-        msg.sender.clone(),
-        msg.display_name.clone(),
-        msg.timestamp,
-        msg.channel.clone(),
-        msg.allows_remote_message_actions() && !is_whisper,
-        msg.flags.highlight_type.clone(),
-    );
+    let menu_target = MessageMenuTarget {
+        message_id: msg.id.to_string(),
+        content: msg.content.to_string(),
+        sender: msg.sender.to_string(),
+        display_name: msg.display_name.to_string(),
+        timestamp: msg.timestamp,
+        channel: msg.channel.to_string(),
+        source_split_id: None,
+        allow_remote_actions: msg.allows_remote_message_actions() && !is_whisper,
+        is_whisper,
+        highlight_type: msg.flags.highlight_type.clone(),
+    };
     let card_login = msg.sender.to_string();
     let card_display_name = msg.display_name.to_string();
     let card_user_id = msg.user_id.as_ref().map(ToString::to_string);
@@ -1309,29 +1301,10 @@ fn render_thread_message(idx: usize, msg: &ChatMessage, is_root: bool) -> impl I
         .py_1p5()
         .rounded(Radii::sm())
         .on_mouse_down(MouseButton::Right, move |event, _window, cx| {
-            let (
-                id,
-                content,
-                sender,
-                display_name,
-                timestamp,
-                channel,
-                remote_actions,
-                highlight_type,
-            ) = &menu_source;
             let menu = ContextMenuState::open_message(
                 event.position.x.into(),
                 event.position.y.into(),
-                id.to_string(),
-                content.to_string(),
-                sender.to_string(),
-                display_name.to_string(),
-                *timestamp,
-                channel.to_string(),
-                None,
-                *remote_actions,
-                is_whisper,
-                highlight_type.clone(),
+                menu_target.clone(),
             );
             backend::push_ui_action(backend::UiAction::ShowContextMenu(menu));
             cx.stop_propagation();

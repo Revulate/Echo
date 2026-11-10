@@ -7,9 +7,10 @@
 //! activates its main window with that token, which lets KWin raise it instead
 //! of only flagging it for attention. A first Echo that no longer acknowledges
 //! (it is shutting down) is waited for, so the relaunch then starts normally.
-//! Both files live under [`echo_gpui::benchmark_profile::runtime_root`], so a
+//! Both files live under [`echo_gpui::storage_roots::runtime_root`], so a
 //! benchmark profile never collides with the user's own Echo.
 
+use echo_core::sync::MutexExt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -39,7 +40,7 @@ static LISTENER: Mutex<Option<UnixListener>> = Mutex::new(None);
 /// accepted the activation request. Any failure to create or lock the files
 /// fails open, so a broken runtime directory never stops Echo starting.
 pub fn acquire_single_instance() -> bool {
-    let Some(root) = echo_gpui::benchmark_profile::runtime_root() else {
+    let Some(root) = echo_gpui::storage_roots::runtime_root() else {
         return true;
     };
     if let Err(error) = std::fs::DirBuilder::new()
@@ -96,7 +97,7 @@ pub fn acquire_single_instance() -> bool {
     let _ = std::fs::remove_file(&socket);
     match UnixListener::bind(&socket) {
         Ok(listener) => {
-            *LISTENER.lock().unwrap_or_else(|error| error.into_inner()) = Some(listener);
+            *LISTENER.lock_or_recover() = Some(listener);
         }
         Err(error) => eprintln!(
             "Echo could not listen for activation requests at {}: {error}",
@@ -108,11 +109,7 @@ pub fn acquire_single_instance() -> bool {
 
 /// Serve activation requests for `window` once it exists.
 pub fn install(window: &gpui::Window, cx: &mut gpui::App) {
-    let Some(listener) = LISTENER
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
-    else {
+    let Some(listener) = LISTENER.lock_or_recover().take() else {
         return;
     };
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();

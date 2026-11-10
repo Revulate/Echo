@@ -214,7 +214,6 @@ fn sound_defaults() -> &'static backend::sounds::SoundSettings {
 }
 
 fn sound_event_default(event_type: backend::SoundEventType) -> backend::sounds::SoundEventSettings {
-    let event_type: backend::sounds::SoundEventType = event_type.into();
     event_type.default_settings()
 }
 
@@ -389,7 +388,7 @@ fn render_live_notification_delay_row<T: 'static>(
             )
         }),
         stacked,
-        SettingsMetrics::CALM_CONTROL_WIDTH,
+        SettingsMetrics::ROW_CONTROL_WIDTH,
         false,
         enabled,
     )
@@ -547,7 +546,7 @@ fn render_master_sound_row<T: 'static>(
                     )
                 }),
                 stacked,
-                SettingsMetrics::CALM_SLIDER_CONTROL_WIDTH,
+                SettingsMetrics::ROW_SLIDER_CONTROL_WIDTH,
                 false,
                 is_enabled,
             ),
@@ -567,7 +566,7 @@ fn render_sound_events_settings<T: 'static>(
     let events_modified = events
         .iter()
         .filter(|event| {
-            let default = sound_event_default(event.event_type.clone());
+            let default = sound_event_default(event.event_type);
             event.enabled != default.enabled || setting_float_modified(event.volume, default.volume)
         })
         .count();
@@ -704,7 +703,7 @@ fn render_desktop_notification_row<T: 'static>(
         .aria_description(SharedString::from(detail.clone()))
         .w_full()
         .min_w_0()
-        .min_h(px(SettingsMetrics::CALM_ROW_MIN_HEIGHT))
+        .min_h(px(SettingsMetrics::ROW_MIN_HEIGHT))
         .py(px(Spacing::SM))
         .flex()
         .gap(px(SettingsMetrics::ROW_COLUMN_GAP))
@@ -730,7 +729,7 @@ fn render_desktop_notification_row<T: 'static>(
                         .gap(px(Spacing::SM))
                         .child(
                             div()
-                                .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                                .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(colors::text_primary())
                                 .child(DESKTOP_NOTIFICATIONS.label),
@@ -738,7 +737,7 @@ fn render_desktop_notification_row<T: 'static>(
                         .when(modified, |label| {
                             label.child(
                                 div()
-                                    .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                                    .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                                     .text_color(colors::text_secondary())
                                     .child("Modified"),
                             )
@@ -747,7 +746,7 @@ fn render_desktop_notification_row<T: 'static>(
                 .child(
                     div()
                         .min_w_0()
-                        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                         .text_color(detail_color)
                         .whitespace_normal()
                         .child(detail),
@@ -761,7 +760,7 @@ fn render_desktop_notification_row<T: 'static>(
                     if stacked {
                         column.w_full()
                     } else {
-                        column.w(px(SettingsMetrics::CALM_CONTROL_WIDTH))
+                        column.w(px(SettingsMetrics::ROW_CONTROL_WIDTH))
                     }
                 })
                 .flex()
@@ -981,25 +980,25 @@ fn render_sound_event_row<T: 'static>(
     stacked: bool,
     cx: &mut Context<T>,
 ) -> impl IntoElement + use<T> {
-    let event_type_for_enabled = event.event_type.clone();
-    let event_type_for_enabled_reset = event.event_type.clone();
-    let event_type_for_test = event.event_type.clone();
-    let event_type_for_volume = event.event_type.clone();
-    let event_type_for_volume_reset = event.event_type.clone();
+    let event_type_for_enabled = event.event_type;
+    let event_type_for_enabled_reset = event.event_type;
+    let event_type_for_test = event.event_type;
+    let event_type_for_volume = event.event_type;
+    let event_type_for_volume_reset = event.event_type;
     let enabled_target = sound_event_descriptor(&event.event_type, SoundEventField::Enabled);
     let volume_target = sound_event_descriptor(&event.event_type, SoundEventField::Volume);
     let preview_target = sound_event_descriptor(&event.event_type, SoundEventField::Preview);
     let volume_slider_id = format!("vol-bar-{:?}", event.event_type);
-    let feedback_target = crate::benchmark_ui_fixture::feedback_ui_enabled()
+    let feedback_target = crate::bench::ui_fixture::feedback_ui_enabled()
         && event.event_type == backend::SoundEventType::Mention;
-    let display_name = sound_event_display_name(event.event_type.clone());
+    let display_name = sound_event_display_name(event.event_type);
     let is_enabled = event.enabled;
     let volume = event.volume;
     let volume_percent = (volume * 100.0).round() as i32;
-    let default = sound_event_default(event.event_type.clone());
+    let default = sound_event_default(event.event_type);
     let enabled_modified = is_enabled != default.enabled;
     let volume_modified = setting_float_modified(volume, default.volume);
-    let supports_desktop = supports_desktop_notification(event.event_type.clone().into());
+    let supports_desktop = supports_desktop_notification(event.event_type);
     let status_text = sound_event_status_text(
         event,
         global_enabled,
@@ -1027,7 +1026,7 @@ fn render_sound_event_row<T: 'static>(
                     global_enabled,
                     cx,
                     move |new_state, cx| {
-                        backend::set_sound_event_enabled(event_type_for_enabled.clone(), new_state);
+                        backend::set_sound_event_enabled(event_type_for_enabled, new_state);
                         cx.notify();
                     },
                 )
@@ -1040,10 +1039,7 @@ fn render_sound_event_row<T: 'static>(
                     &format!("{display_name} sound"),
                     cx,
                     move |cx| {
-                        backend::set_sound_event_enabled(
-                            event_type_for_enabled_reset.clone(),
-                            default,
-                        );
+                        backend::set_sound_event_enabled(event_type_for_enabled_reset, default);
                         cx.notify();
                     },
                 ))
@@ -1065,10 +1061,7 @@ fn render_sound_event_row<T: 'static>(
                             feedback_target,
                             cx,
                             move |new_volume, cx| {
-                                backend::set_sound_event_volume(
-                                    event_type_for_volume.clone(),
-                                    new_volume,
-                                );
+                                backend::set_sound_event_volume(event_type_for_volume, new_volume);
                                 cx.notify();
                             },
                         ),
@@ -1090,10 +1083,7 @@ fn render_sound_event_row<T: 'static>(
                     &format!("{display_name} sound volume"),
                     cx,
                     move |cx| {
-                        backend::set_sound_event_volume(
-                            event_type_for_volume_reset.clone(),
-                            default,
-                        );
+                        backend::set_sound_event_volume(event_type_for_volume_reset, default);
                         cx.notify();
                     },
                 ))
@@ -1105,7 +1095,7 @@ fn render_sound_event_row<T: 'static>(
         enabled_modified || volume_modified,
         None,
         stacked,
-        SettingsMetrics::CALM_SLIDER_CONTROL_WIDTH,
+        SettingsMetrics::ROW_SLIDER_CONTROL_WIDTH,
         false,
         global_enabled,
     )
@@ -1174,8 +1164,8 @@ fn render_sound_volume_slider<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 
             let slider_bounds = child_bounds.first().copied();
             bounds_for_prepaint.set(slider_bounds);
             if feedback_target && let Some(bounds) = slider_bounds {
-                crate::benchmark_ui_fixture::publish_feedback_sound_slider(
-                    crate::benchmark_ui_fixture::FeedbackRect {
+                crate::bench::ui_fixture::publish_feedback_sound_slider(
+                    crate::bench::ui_fixture::FeedbackRect {
                         x: bounds.origin.x.into(),
                         y: bounds.origin.y.into(),
                         width: bounds.size.width.into(),
@@ -1209,10 +1199,10 @@ fn render_sound_volume_slider<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 
         .when(feedback_target, |slider| {
             slider
                 .on_hover(|hovered, _window, _cx| {
-                    crate::benchmark_ui_fixture::set_feedback_sound_slider_hovered(*hovered);
+                    crate::bench::ui_fixture::set_feedback_sound_slider_hovered(*hovered);
                 })
                 .on_mouse_move(|_event, _window, _cx| {
-                    crate::benchmark_ui_fixture::set_feedback_sound_slider_hovered(true);
+                    crate::bench::ui_fixture::set_feedback_sound_slider_hovered(true);
                 })
         })
         .when(enabled && !feedback_target, |slider| {
@@ -1237,9 +1227,7 @@ fn render_sound_volume_slider<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 
                         let new_volume = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
                         on_change_for_drag(new_volume, cx);
                         if feedback_target {
-                            crate::benchmark_ui_fixture::set_feedback_sound_slider_clicked(
-                                new_volume,
-                            );
+                            crate::bench::ui_fixture::set_feedback_sound_slider_clicked(new_volume);
                         }
                     },
                 ))
@@ -1255,9 +1243,7 @@ fn render_sound_volume_slider<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 
                         let new_volume = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
                         on_change_for_click(new_volume, cx);
                         if feedback_target {
-                            crate::benchmark_ui_fixture::set_feedback_sound_slider_clicked(
-                                new_volume,
-                            );
+                            crate::bench::ui_fixture::set_feedback_sound_slider_clicked(new_volume);
                         }
                     }),
                 )
@@ -1325,10 +1311,10 @@ fn render_sound_volume_slider<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 
                     .inset_0()
                     .cursor_pointer()
                     .on_hover(|hovered, _window, _cx| {
-                        crate::benchmark_ui_fixture::set_feedback_sound_slider_hovered(*hovered);
+                        crate::bench::ui_fixture::set_feedback_sound_slider_hovered(*hovered);
                     })
                     .on_mouse_move(|_event, _window, _cx| {
-                        crate::benchmark_ui_fixture::set_feedback_sound_slider_hovered(true);
+                        crate::bench::ui_fixture::set_feedback_sound_slider_hovered(true);
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1344,9 +1330,7 @@ fn render_sound_volume_slider<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 
                             let width: f32 = bounds.size.width.into();
                             let new_volume = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
                             on_change_for_fixture_click(new_volume, cx);
-                            crate::benchmark_ui_fixture::set_feedback_sound_slider_clicked(
-                                new_volume,
-                            );
+                            crate::bench::ui_fixture::set_feedback_sound_slider_clicked(new_volume);
                         }),
                     ),
             )
@@ -1365,7 +1349,7 @@ fn render_test_button<T: 'static>(
         enabled,
         cx,
         move |cx| {
-            backend::test_sound(event_type.clone());
+            backend::test_sound(event_type);
             cx.notify();
         },
     )
@@ -1403,7 +1387,7 @@ fn render_secondary_action<T: 'static, F: Fn(&mut Context<T>) + 'static>(
         .border_color(colors::border())
         .cursor_pointer()
         .hover(|style| style.bg(colors::bg_hover()))
-        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
         .text_color(colors::text_primary())
         .child(label.to_string())
         .on_activate_if(

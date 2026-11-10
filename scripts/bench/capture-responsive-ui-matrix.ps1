@@ -1,3 +1,9 @@
+<#
+.SYNOPSIS
+Launch target\debug\echo.exe with the responsive-matrix fixture, resize its main
+window through a matrix of sizes and capture a PrintWindow screenshot of each,
+for checking responsive layout by eye.
+#>
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDir

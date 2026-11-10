@@ -1,7 +1,9 @@
-//! Channel observer system for push-based state updates.
+//! Per-channel observer channels that push message events to subscribers.
 //!
-//! Replaces polling-based version counters with direct notifications when
-//! messages arrive, reducing latency from 100ms to <16ms (next frame).
+//! This complements, and does not replace, the polled counters in
+//! [`crate::version_registry`]: observers carry the event payload to whoever
+//! subscribed to a channel, while the UI still detects "something changed" by
+//! polling versions.
 #![allow(clippy::large_enum_variant)] // Size difference is acceptable for event enum
 
 use crate::message::ChatMessage;
@@ -17,7 +19,7 @@ pub enum ChannelEvent {
     /// New message arrived
     NewMessage(ChatMessage),
     /// History batch loaded
-    /// PERF: Arc-wrapped to avoid cloning entire message buffer (500-1000 messages)
+    /// Arc-wrapped so every subscriber shares one copy of the batch.
     HistoryLoaded(Arc<Vec<ChatMessage>>),
     /// Messages were retokenized (emotes loaded, need to refresh from CHAT_MESSAGES)
     MessagesRetokenized,

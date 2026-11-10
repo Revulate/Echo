@@ -68,7 +68,7 @@ pub fn get_all_emotes(channel: &str) -> Vec<Arc<Emote>> {
 }
 
 /// Get categorized emotes for emote picker (NON-BLOCKING)
-/// PERF: Returns Arc to avoid cloning 4000+ emotes on every emote picker open
+/// Returns an `Arc` so opening the emote picker does not clone the catalog.
 /// The Arc makes cache hits O(1) instead of O(n) where n = number of emotes
 ///
 /// This function NEVER blocks the main thread:
@@ -276,7 +276,7 @@ async fn load_channel_emotes_async(channel_id: &str, channel_login: &str) {
 }
 
 /// Load channel emotes and badges for a channel
-/// PERF: Now fully asynchronous to avoid blocking the main thread.
+/// Runs asynchronously so the main thread never blocks on it.
 pub fn load_channel_assets(channel_login: &str) {
     let channel_login = channel_login.trim().to_lowercase();
 
@@ -421,7 +421,7 @@ pub fn refresh_authenticated_user_emotes_async() {
 /// Load assets (badges/emotes) for multiple channels with coordinated batching
 /// Prevents rate limiting by loading up to 5 channels concurrently
 pub fn load_channel_assets_batch(channels: Vec<String>) {
-    if crate::benchmark_profile::network_lanes_suppressed() {
+    if crate::bench::network_lanes_suppressed() {
         crate::log_emotes!(
             debug,
             "Offline benchmark suppressed channel asset batch for {} channels",
@@ -487,7 +487,7 @@ pub fn preload_channel_emotes_predictive(channel_login: &str) {
     if channel_login.is_empty() {
         return;
     }
-    if crate::benchmark_profile::network_lanes_suppressed() {
+    if crate::bench::network_lanes_suppressed() {
         crate::log_emotes!(
             debug,
             "Offline benchmark suppressed predictive emote preload for {}",
@@ -495,7 +495,7 @@ pub fn preload_channel_emotes_predictive(channel_login: &str) {
         );
         return;
     }
-    if crate::benchmark_ui_fixture::is_fixture_channel(&channel_login) {
+    if crate::bench::ui_fixture::is_fixture_channel(&channel_login) {
         crate::log_emotes!(
             debug,
             "Skipping provider preload for hermetic UI fixture channel {}",
@@ -619,7 +619,7 @@ async fn load_channel_badges_async(channel_id: &str, channel_login: &str) {
         .await
     {
         Ok(()) => {}
-        Err(e) if e == crate::backend::constants::API_PROXY_NOT_CONFIGURED => {
+        Err(e) if e.is_proxy_not_configured() => {
             crate::log_cache!(debug, "Skipped channel badges for {}: {}", channel_login, e);
         }
         Err(e) => crate::log_cache!(

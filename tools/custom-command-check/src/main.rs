@@ -1,3 +1,7 @@
+//! Contract: custom-command expansion in `src/backend/commands/custom.rs`: argument
+//! and channel/stream placeholders, fallbacks, disabled commands, built-in command
+//! protection and word-boundary matching.
+
 mod backend {
     #[derive(Clone)]
     pub struct StreamInfo {
@@ -84,11 +88,10 @@ mod backend {
     }
 }
 
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 use std::future::Future;
-use std::hint::black_box;
 use std::pin::Pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Instant;
+use std::task::{Context, Poll, Waker};
 
 fn main() {
     backend::settings::set_custom_commands(vec![
@@ -161,22 +164,7 @@ fn main() {
         Some("missing:no-id:offline:no-game:{unknown;literal}")
     );
 
-    let iterations = 200_000usize;
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..iterations {
-        let expanded = block_on(backend::commands::custom::expand_custom_command(
-            black_box("#SomeChannel"),
-            black_box("/hello one two"),
-        ))
-        .unwrap();
-        checksum = checksum.wrapping_add(expanded.len());
-    }
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / iterations as f64;
-    let units_per_second = iterations as f64 / elapsed.as_secs_f64();
-
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(
         hello.as_deref(),
         disabled.as_deref(),
@@ -184,10 +172,6 @@ fn main() {
         word_boundary.as_deref(),
         dynamic.as_deref(),
         fallback.as_deref(),
-    );
-    println!(
-        "expand,custom_command_placeholders,{},{:.2},{:.0},{}",
-        iterations, ns_per_unit, units_per_second, checksum
     );
 }
 
@@ -199,50 +183,40 @@ fn print_smoke_rows(
     dynamic: Option<&str>,
     fallback: Option<&str>,
 ) {
-    print_fixture(
+    assert_fixture(
         "custom_command_arg_tail",
         hello.unwrap_or("none"),
         "Hello one two from SomeChannel",
     );
-    print_fixture(
+    assert_fixture(
         "custom_command_disabled_skipped",
         bool_text(disabled.is_none()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "custom_command_builtin_protected",
         bool_text(builtin.is_none()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "custom_command_word_boundary",
         bool_text(word_boundary.is_none()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "custom_command_dynamic_placeholders",
         dynamic.unwrap_or("none"),
         "echo_user:SomeChannel-cached-id:Fixture Stream:Fixture Game:{:",
     );
-    print_fixture(
+    assert_fixture(
         "custom_command_fallback_placeholders",
         fallback.unwrap_or("none"),
         "missing:no-id:offline:no-game:{unknown;literal}",
     );
 }
 
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
 fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut future = Box::pin(future);
     loop {
         match Pin::new(&mut future).poll(&mut cx) {
@@ -250,16 +224,4 @@ fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => std::thread::yield_now(),
         }
     }
-}
-
-fn noop_waker() -> Waker {
-    unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    unsafe fn wake(_: *const ()) {}
-    unsafe fn wake_by_ref(_: *const ()) {}
-    unsafe fn drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    // SAFETY: every vtable function ignores its data pointer, so a null pointer satisfies the RawWaker contract.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }

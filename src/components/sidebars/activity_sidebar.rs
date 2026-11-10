@@ -1,5 +1,6 @@
 //! Shared shell for Echo's single global activity rail.
 
+use crate::components::common::count_label::capped_count_label;
 use crate::components::ui::ButtonExt;
 use crate::state::ActivitySection;
 use crate::theme::colors;
@@ -64,7 +65,6 @@ pub(crate) fn render_activity_copy_action(id: String, copy_text: String) -> impl
 ///
 /// `width` is resolved by the caller against the viewport: the rail is not
 /// entitled to its full width when that would leave the chat pane nothing.
-#[allow(clippy::too_many_arguments)]
 pub fn render_activity_sidebar<
     T: 'static,
     S: Fn(ActivitySection, &mut Context<T>) + 'static,
@@ -72,9 +72,7 @@ pub fn render_activity_sidebar<
 >(
     width: f32,
     section: ActivitySection,
-    mention_count: usize,
-    unread_whispers: u32,
-    event_count: usize,
+    counts: ActivityCounts,
     content: AnyElement,
     on_select: S,
     on_close: C,
@@ -168,67 +166,70 @@ pub fn render_activity_sidebar<
                 .gap_1()
                 .border_b_1()
                 .border_color(colors::border())
-                .child(render_activity_tab(
-                    "activity-tab-all",
-                    "All",
-                    None,
-                    ActivitySection::All,
-                    section == ActivitySection::All,
-                    compact,
-                    on_select.clone(),
-                    cx,
-                ))
-                .child(render_activity_tab(
-                    "activity-tab-mentions",
-                    "Mention",
-                    Some(mention_count),
-                    ActivitySection::Mentions,
-                    section == ActivitySection::Mentions,
-                    compact,
-                    on_select.clone(),
-                    cx,
-                ))
-                .child(render_activity_tab(
-                    "activity-tab-whispers",
-                    "Whisper",
-                    Some(unread_whispers as usize),
-                    ActivitySection::Whispers,
-                    section == ActivitySection::Whispers,
-                    compact,
-                    on_select.clone(),
-                    cx,
-                ))
-                .child(render_activity_tab(
-                    "activity-tab-events",
-                    "Events",
-                    Some(event_count),
-                    ActivitySection::Events,
-                    section == ActivitySection::Events,
-                    compact,
-                    on_select,
-                    cx,
-                )),
+                .children(
+                    [
+                        ActivityTab {
+                            id: "activity-tab-all",
+                            label: "All",
+                            count: 0,
+                            section: ActivitySection::All,
+                        },
+                        ActivityTab {
+                            id: "activity-tab-mentions",
+                            label: "Mention",
+                            count: counts.mentions,
+                            section: ActivitySection::Mentions,
+                        },
+                        ActivityTab {
+                            id: "activity-tab-whispers",
+                            label: "Whisper",
+                            count: counts.unread_whispers as usize,
+                            section: ActivitySection::Whispers,
+                        },
+                        ActivityTab {
+                            id: "activity-tab-events",
+                            label: "Events",
+                            count: counts.events,
+                            section: ActivitySection::Events,
+                        },
+                    ]
+                    .map(|tab| render_activity_tab(tab, section, compact, on_select.clone(), cx)),
+                ),
         )
         .child(content)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_activity_tab<T: 'static>(
+/// Unread attention shown on the rail's source tabs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ActivityCounts {
+    pub mentions: usize,
+    pub unread_whispers: u32,
+    pub events: usize,
+}
+
+/// One rail tab. A zero `count` shows no badge.
+struct ActivityTab {
     id: &'static str,
     label: &'static str,
-    count: Option<usize>,
+    count: usize,
     section: ActivitySection,
-    active: bool,
+}
+
+fn render_activity_tab<T: 'static>(
+    tab: ActivityTab,
+    current: ActivitySection,
     compact: bool,
     on_select: SelectSection<T>,
     cx: &mut Context<T>,
 ) -> impl IntoElement + use<T> {
-    let count = count.unwrap_or(0);
-    let count_label = if count > 99 {
-        "99+".to_string()
-    } else {
-        count.to_string()
-    };
+    let ActivityTab {
+        id,
+        label,
+        count,
+        section,
+    } = tab;
+    let active = section == current;
+    let count_label = capped_count_label(count);
 
     div()
         .id(id)

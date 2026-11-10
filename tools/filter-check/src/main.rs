@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+//! Contract: filter-expression validation and matching through the filter store in
+//! `src/backend/filters.rs`, and the filter action names.
 
 mod lock_utils {
     pub use echo_core::sync::RwLockExt;
@@ -44,11 +45,11 @@ mod backend {
 }
 
 use backend::settings;
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 #[path = "../../../src/backend/filters.rs"]
+#[allow(dead_code)] // the filter action is applied by the chat pipeline, not here
 mod filters;
 use filters::{FILTER_STORE, FilterAction, TestContext, validate_filter_expression};
-use std::hint::black_box;
-use std::time::Instant;
 
 #[derive(Clone, Copy)]
 struct FilterCase {
@@ -154,82 +155,8 @@ fn main() {
     assert!(validate_filter_expression(r#"message.content contains"#).is_err());
     assert!(validate_filter_expression(r#"message.content match r"(""#).is_err());
 
-    let benchmark_filters = vec![
-        settings::FilterRule {
-            id: "content-link".to_string(),
-            expression: r#"message.content contains "merge" && message.content match r"https://example\.com/\d+""#
-                .to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-        settings::FilterRule {
-            id: "badge-sub".to_string(),
-            expression: r#"author.badges contains "moderator" && author.sub_length >= 6"#.to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-        settings::FilterRule {
-            id: "capture".to_string(),
-            expression: r#"(message.content match {r"(\d\d)/(\d\d)/(\d\d\d\d)", 3}) == "2020""#
-                .to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-        settings::FilterRule {
-            id: "cheer".to_string(),
-            expression: r#"bits.amount >= 100 && flags.cheer_message"#.to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-        settings::FilterRule {
-            id: "channel-state".to_string(),
-            expression: r#"channel.watching && channel.live && reward.id == "reward-123""#
-                .to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-        settings::FilterRule {
-            id: "returning-chatter".to_string(),
-            expression: r#"flags.returning_chatter && author.login == "someviewer""#.to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-        settings::FilterRule {
-            id: "sub-watch-streak".to_string(),
-            expression: r#"flags.sub_message && flags.watch_streak"#.to_string(),
-            action: settings::FilterAction::Highlight,
-            enabled: true,
-        },
-    ];
-    let filter_count = benchmark_filters.len();
-    settings::set_filters(benchmark_filters);
-
-    black_box(FILTER_STORE.test_message(&ctx));
-
-    let iterations = 250_000usize;
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..iterations {
-        let results = FILTER_STORE.test_message(black_box(&ctx));
-        checksum = checksum.wrapping_add(results.iter().filter(|result| result.matched).count());
-    }
-    let elapsed = start.elapsed();
-    let units = iterations * filter_count;
-    let ns_per_unit = elapsed.as_nanos() as f64 / units as f64;
-    let units_per_second = units as f64 / elapsed.as_secs_f64();
-
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(&ctx);
-    println!(
-        "match,filter_expr,{},{:.2},{:.0},{}",
-        units, ns_per_unit, units_per_second, checksum
-    );
-    println!(
-        "action_map,hide={},highlight={},allow={}",
-        action_id(FilterAction::Hide),
-        action_id(FilterAction::Highlight),
-        action_id(FilterAction::Allow)
-    );
 }
 
 fn assert_filter_case(ctx: &TestContext, index: usize, case: &FilterCase) {
@@ -261,48 +188,39 @@ fn evaluate_filter_case(ctx: &TestContext, id: &str, expression: &str) -> bool {
 fn print_smoke_rows(ctx: &TestContext) {
     for case in FILTER_CASES {
         let matched = evaluate_filter_case(ctx, &format!("fixture-{}", case.name), case.expression);
-        print_fixture(
+        assert_fixture(
             &format!("filter_case_{}", case.name),
             bool_text(matched),
             bool_text(case.expected),
         );
     }
 
-    print_fixture(
+    assert_fixture(
         "filter_invalid_empty_rejected",
         bool_text(validate_filter_expression("").is_err()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "filter_invalid_missing_rhs_rejected",
         bool_text(validate_filter_expression(r#"message.content contains"#).is_err()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "filter_invalid_regex_rejected",
         bool_text(validate_filter_expression(r#"message.content match r"(""#).is_err()),
         "true",
     );
-    print_fixture("filter_action_hide", action_id(FilterAction::Hide), "hide");
-    print_fixture(
+    assert_fixture("filter_action_hide", action_id(FilterAction::Hide), "hide");
+    assert_fixture(
         "filter_action_highlight",
         action_id(FilterAction::Highlight),
         "highlight",
     );
-    print_fixture(
+    assert_fixture(
         "filter_action_allow",
         action_id(FilterAction::Allow),
         "allow",
     );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 fn action_id(action: FilterAction) -> &'static str {

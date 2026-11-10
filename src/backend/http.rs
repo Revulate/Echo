@@ -161,7 +161,8 @@ fn build_or_fallback(
     timeout: Option<Duration>,
 ) -> reqwest::Client {
     builder.build().unwrap_or_else(|error| {
-        tracing::error!(
+        crate::log_net!(
+            error,
             "Failed to create proxy-aware HTTP client: {}",
             error.without_url()
         );

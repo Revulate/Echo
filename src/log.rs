@@ -6,7 +6,7 @@
 //! Warn and error events always pass the category gate; trace, debug and
 //! info need their category enabled. With no logging env vars, a release
 //! build keeps warn and error in a small rotating `echo.log` (see
-//! [`crate::profiling`]).
+//! [`crate::diagnostics::profiling`]).
 //!
 //! ## Usage
 //!
@@ -81,10 +81,10 @@ pub(crate) const CATEGORY_TABLE: &[Category] = &[
 ];
 
 /// Env vars that turn on high-volume emote tracing (and with it the `emotes` category).
-pub(crate) const EMOTE_TRACE_ENV_VARS: &[&str] = &["ECHO_EMOTE_TRACE", "ECHO_LOG_EMOTE_TRACE"];
+const EMOTE_TRACE_ENV_VARS: &[&str] = &["ECHO_EMOTE_TRACE", "ECHO_LOG_EMOTE_TRACE"];
 
 /// Env vars that turn on layout/render tracing (and with it the `perf_render` category).
-pub(crate) const RENDER_TRACE_ENV_VARS: &[&str] = &[
+const RENDER_TRACE_ENV_VARS: &[&str] = &[
     "ECHO_LAYOUT_TRACE",
     "ECHO_LAYOUT_TRACE_VERBOSE",
     "ECHO_RENDER_TRACE",
@@ -92,7 +92,7 @@ pub(crate) const RENDER_TRACE_ENV_VARS: &[&str] = &[
 ];
 
 /// Whether `name` is one of the `perf_*` subcategories covered by the `perf` umbrella.
-pub(crate) fn is_perf_subcategory(name: &str) -> bool {
+fn is_perf_subcategory(name: &str) -> bool {
     name.starts_with("perf_")
 }
 
@@ -112,36 +112,70 @@ impl LogCategories {
 
 static CATEGORIES: OnceLock<LogCategories> = OnceLock::new();
 
-/// Whether `ECHO_RENDER_TRACE_VERBOSE` is set. Evaluated once at first access.
+/// Whether `ECHO_RENDER_TRACE_VERBOSE` is on. Evaluated once at first access.
 ///
 /// Used by `app.rs`, `chat_pane.rs`, and `chat_view.rs` to gate verbose render logs.
 /// The painter module (`canvas_renderer/painter/trace.rs`) has its own copy because
 /// it lives inside a `pub(super)` boundary.
 pub(crate) static RENDER_TRACE_VERBOSE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("ECHO_RENDER_TRACE_VERBOSE").is_some());
+    std::sync::LazyLock::new(|| echo_core::env::flag("ECHO_RENDER_TRACE_VERBOSE"));
+
+/// The categories named in the comma-separated `ECHO_LOG` list, trimmed.
+fn listed_categories() -> Vec<String> {
+    echo_core::env::value("ECHO_LOG")
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the environment switches `category` on.
+///
+/// This is the only place that rule lives: [`init`] stores its answers in the
+/// runtime flags, and the tracing filter in [`crate::diagnostics::profiling`] is built from
+/// those flags through [`enabled_categories`].
+fn category_enabled_by_env(category: &Category, listed: &[String]) -> bool {
+    let is_listed = |name: &str| listed.iter().any(|entry| entry == name);
+    let perf_all = is_listed("perf") || echo_core::env::flag("ECHO_LOG_PERF");
+    is_listed(category.name)
+        || echo_core::env::flag(category.env)
+        || (is_perf_subcategory(category.name) && perf_all)
+        || (category.name == "emotes" && emote_trace_enabled())
+        || (category.name == "perf_render" && render_trace_enabled())
+}
+
+fn render_trace_enabled() -> bool {
+    RENDER_TRACE_ENV_VARS
+        .iter()
+        .any(|var| echo_core::env::flag(var))
+}
+
+/// Whether any `ECHO_LOG*` or trace switch is on, which makes a release build
+/// keep its console-level logging instead of the quiet default.
+#[cfg(all(not(debug_assertions), not(feature = "profiling")))]
+pub(crate) fn any_category_switch_set() -> bool {
+    !listed_categories().is_empty()
+        || CATEGORY_TABLE
+            .iter()
+            .any(|category| echo_core::env::flag(category.env))
+        || emote_trace_enabled()
+        || render_trace_enabled()
+}
 
 /// Initialize log categories from environment variables.
-/// Must be called early in main(), after profiling::init().
+///
+/// Idempotent: the tracing filter built by [`crate::diagnostics::profiling::init`] already
+/// reads the categories through [`enabled_categories`].
 pub fn init() {
     CATEGORIES.get_or_init(|| {
-        let multi = std::env::var("ECHO_LOG").unwrap_or_default();
-        let enabled: Vec<&str> = multi.split(',').filter(|s| !s.is_empty()).collect();
-        let perf_all = enabled.contains(&"perf") || std::env::var("ECHO_LOG_PERF").is_ok();
-        let emote_trace = emote_trace_enabled();
-        let render_trace = RENDER_TRACE_ENV_VARS
-            .iter()
-            .any(|var| std::env::var_os(var).is_some());
-
+        let listed = listed_categories();
         let cats = LogCategories {
             flags: std::array::from_fn(|index| {
-                let category = &CATEGORY_TABLE[index];
-                AtomicBool::new(
-                    enabled.contains(&category.name)
-                        || std::env::var(category.env).is_ok()
-                        || (is_perf_subcategory(category.name) && perf_all)
-                        || (category.name == "emotes" && emote_trace)
-                        || (category.name == "perf_render" && render_trace),
-                )
+                AtomicBool::new(category_enabled_by_env(&CATEGORY_TABLE[index], &listed))
             }),
         };
 
@@ -153,14 +187,11 @@ pub fn init() {
                 .filter(|(_, flag)| flag.load(Ordering::Relaxed))
                 .map(|(category, _)| category.name)
                 .collect();
-            if emote_trace {
+            if emote_trace_enabled() {
                 active.push("emote_trace");
             }
             if !active.is_empty() {
-                eprintln!(
-                    "\x1b[36m[log]\x1b[0m Categories enabled: {}",
-                    active.join(", ")
-                );
+                eprintln!("[36m[log][0m Categories enabled: {}", active.join(", "));
             }
         }
 
@@ -197,7 +228,7 @@ pub fn emote_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         EMOTE_TRACE_ENV_VARS
             .iter()
-            .any(|var| std::env::var_os(var).is_some())
+            .any(|var| echo_core::env::flag(var))
     })
 }
 

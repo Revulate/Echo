@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Build, train and evaluate a profile-guided-optimization build of Echo on
+Windows. run-pgo-build.py is the Linux counterpart.
+#>
 [CmdletBinding()]
 param(
     [string]$RunDir = "",
@@ -39,52 +44,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $scenarioNotes = "PGO build workflow. Instrumented and optimized builds are build artifacts, not performance evidence."
-    if (-not [string]::IsNullOrWhiteSpace($Notes)) {
-        $scenarioNotes = "$scenarioNotes`n$Notes"
-    }
-
-    $args = @{
-        Scenario = $Scenario
-        EchoBuildType = $EchoBuildType
-        CacheState = $CacheState
-        NetworkState = $NetworkState
-        FixtureName = $FixtureName
-        Notes = $scenarioNotes
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-        $args.OutputRoot = $OutputRoot
-    }
-
-    $output = & $initializer @args
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Resolve-CommandPath {
     param(
@@ -145,95 +105,6 @@ function Resolve-LlvmProfdata {
     }
 
     return $null
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
-
-function Set-TemporaryEnv {
-    param(
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Previous,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyString()]
-        [string]$Value
-    )
-
-    if (-not $Previous.ContainsKey($Name)) {
-        $Previous[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
-    }
-
-    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
-}
-
-function Restore-Env {
-    param(
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Previous
-    )
-
-    foreach ($entry in $Previous.GetEnumerator()) {
-        if ($null -eq $entry.Value) {
-            [Environment]::SetEnvironmentVariable([string]$entry.Key, $null, "Process")
-        } else {
-            [Environment]::SetEnvironmentVariable([string]$entry.Key, [string]$entry.Value, "Process")
-        }
-    }
 }
 
 function Get-FileIdentity {
@@ -404,7 +275,19 @@ if ($StopMode -eq "leave-running" -and -not $DryRun) {
 if ($SkipInstrumentedBuild -and -not $SkipBaselineBuild) {
     throw "SkipInstrumentedBuild requires SkipBaselineBuild so a baseline rebuild cannot overwrite the reusable instrumented binary."
 }
-$scenarioDir = Initialize-RunDirectory -RepoRoot $repoRoot
+$runNotes = "PGO build workflow. Instrumented and optimized builds are build artifacts, not performance evidence."
+if (-not [string]::IsNullOrWhiteSpace($Notes)) {
+    $runNotes = "$runNotes`n$Notes"
+}
+$scenarioDir = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $Scenario
+    OutputRoot = $OutputRoot
+    EchoBuildType = $EchoBuildType
+    CacheState = $CacheState
+    NetworkState = $NetworkState
+    FixtureName = $FixtureName
+    Notes = $runNotes
+}
 $cargo = Resolve-CommandPath -Command $CargoPath
 if ($null -eq $cargo) {
     throw "CargoPath '$CargoPath' was not found."

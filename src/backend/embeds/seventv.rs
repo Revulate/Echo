@@ -45,11 +45,11 @@ impl SevenTvEmbedProvider {
         let response = match SEVENTV_HTTP_CLIENT.get(endpoint).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                tracing::debug!(status = %response.status(), "7TV emote metadata request failed");
+                crate::log_net!(debug, status = %response.status(), "7TV emote metadata request failed");
                 return basic_metadata(link_info);
             }
             Err(error) => {
-                tracing::debug!("7TV emote metadata request failed: {error}");
+                crate::log_net!(debug, "7TV emote metadata request failed: {error}");
                 return basic_metadata(link_info);
             }
         };
@@ -92,11 +92,11 @@ impl SevenTvEmbedProvider {
         let response = match SEVENTV_HTTP_CLIENT.get(endpoint).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                tracing::debug!(status = %response.status(), "7TV user metadata request failed");
+                crate::log_net!(debug, status = %response.status(), "7TV user metadata request failed");
                 return basic_metadata(link_info);
             }
             Err(error) => {
-                tracing::debug!("7TV user metadata request failed: {error}");
+                crate::log_net!(debug, "7TV user metadata request failed: {error}");
                 return basic_metadata(link_info);
             }
         };

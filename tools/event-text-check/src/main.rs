@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+//! Contract: EventSub notification titles and chat-row text in
+//! `src/backend/event_text.rs`, including the streamer-mode privacy redactions.
 
 mod backend {
     pub mod streamer_mode {
@@ -11,7 +12,10 @@ mod backend {
     }
 }
 
+// Mirrors `src/backend/components/event_notification.rs`; `event_text.rs` matches
+// every variant, so a missing one fails to compile.
 mod types {
+    #[allow(dead_code)] // the fixtures construct only the variants they format
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum TwitchEventType {
         Subscribe,
@@ -94,6 +98,7 @@ mod types {
 }
 
 #[path = "../../../src/backend/event_text.rs"]
+#[allow(dead_code)] // `streamer_mode_twitch_event_privacy` reads live settings
 mod event_text;
 
 use event_text::{TwitchEventTextPrivacy, format_twitch_event_text, twitch_event_title};

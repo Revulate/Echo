@@ -7,7 +7,7 @@ pub mod loaded_urls;
 pub mod preload_plan;
 pub mod stats;
 
-pub use budget::{BudgetManager, CacheLayer, EvictionThresholds};
+pub use budget::{BudgetManager, CacheLayer};
 pub use eviction::{AccessBuffer, Evictable, EvictableEntry, EvictionPolicy};
 pub use preload_plan::{
     ChannelPreloadPlan, ChannelPreloadSummary, EAGER_CHANNEL_PRELOAD_LIMIT,

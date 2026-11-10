@@ -1,60 +1,11 @@
-#![allow(dead_code, unused_variables)]
+//! Benchmark: `MessageBuffer` insert throughput, estimated heap and RSS growth for
+//! plain and rich messages, and (`--buffer-allocation-only`) the buffer's own
+//! storage allocations, with FIFO-eviction assertions.
 
-#[macro_export]
-macro_rules! log_irc {
-    ($($arg:tt)*) => {};
-}
-
-mod config {
-    pub const MAX_CACHED_MESSAGES: usize = 10_000;
-}
-
-mod backend {
-    pub mod embeds {
-        pub mod state {
-            #[inline]
-            pub fn prune_message_id(_id: &str) {}
-        }
-    }
-
-    pub mod slots {
-        pub use echo_core::slot::MessageSlot;
-    }
-
-    #[path = "../../../../src/backend/models.rs"]
-    pub mod models;
-}
-
-mod state {
-    // Local stub mirroring src/state/message_retention.rs (only the piece
-    // message_buffer.rs needs). The included message_buffer.rs references
-    // `crate::state::message_retention::active_channel_capacity`.
-    pub mod message_retention {
-        pub fn active_channel_capacity() -> usize {
-            crate::config::MAX_CACHED_MESSAGES.max(1)
-        }
-    }
-
-    // No-op stub for the layout-cache reclaim queue. The included
-    // message_buffer.rs calls `crate::state::layout_eviction::queue_evicted_id`
-    // and `queue_evicted_ids` on eviction; this bench has no layout cache to
-    // reclaim, so the calls do nothing here.
-    pub mod layout_eviction {
-        use std::sync::Arc;
-        #[inline]
-        pub fn queue_evicted_id(_id: Arc<str>) {}
-        #[inline]
-        pub fn queue_evicted_ids<I: IntoIterator<Item = Arc<str>>>(_ids: I) {}
-    }
-
-    #[path = "../../../../src/state/message_buffer.rs"]
-    pub mod message_buffer;
-}
-
-use backend::models::{ChatMessage, MessageFlags, ReplyInfo};
-use backend::slots::MessageSlot;
+use echo_core::message::{ChatMessage, MessageFlags, ReplyInfo};
+use echo_core::message_buffer::{MessageBuffer, MessageBufferPorts, install_message_buffer_ports};
+use echo_core::slot::MessageSlot;
 use smallvec::smallvec;
-use state::message_buffer::MessageBuffer;
 use std::alloc::{GlobalAlloc, Layout, System as StdSystem};
 use std::hint::black_box;
 use std::sync::{
@@ -117,18 +68,17 @@ unsafe impl GlobalAlloc for RequestedLiveBytesAllocator {
     }
 }
 
+const BENCH_DEFAULT_CAPACITY: usize = 10_000;
+
 fn main() {
-    // The bench keeps its own retention sizing and no-op reclaim stubs; install
-    // them so the extracted buffer behaves exactly as it did when this tool
-    // still compiled src/state/message_buffer.rs against them directly.
-    echo_core::message_buffer::install_message_buffer_ports(
-        echo_core::message_buffer::MessageBufferPorts {
-            default_capacity: state::message_retention::active_channel_capacity,
-            queue_evicted_id: state::layout_eviction::queue_evicted_id,
-            queue_evicted_ids: |ids| state::layout_eviction::queue_evicted_ids(ids),
-            prune_message_id: backend::embeds::state::prune_message_id,
-        },
-    );
+    // A 10k default capacity, and no layout cache or embed state to reclaim on
+    // eviction.
+    install_message_buffer_ports(MessageBufferPorts {
+        default_capacity: || BENCH_DEFAULT_CAPACITY,
+        queue_evicted_id: |_| {},
+        queue_evicted_ids: |_| {},
+        prune_message_id: |_| {},
+    });
 
     if std::env::args()
         .skip(1)

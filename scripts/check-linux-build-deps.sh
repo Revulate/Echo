@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Preflight for building Echo on Linux: checks the commands and pkg-config
+# modules the build needs and prints the Arch and Debian/Ubuntu install commands
+# when any is missing. CI installs the same set in .github/workflows/linux.yml.
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -24,7 +27,7 @@ if ((${#missing[@]})); then
     printf 'Echo Linux build dependencies are missing:\n' >&2
     printf '  - %s\n' "${missing[@]}" >&2
     printf '\nArch/CachyOS: sudo pacman -S --needed base-devel pkgconf python perl util-linux alsa-lib fontconfig openssl vulkan-headers vulkan-icd-loader wayland libxcb libxkbcommon libxkbcommon-x11\n' >&2
-    printf 'Debian/Ubuntu: sudo apt install build-essential pkg-config python3 perl util-linux libasound2-dev libfontconfig1-dev libssl-dev libvulkan-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev binutils file\n' >&2
+    printf 'Debian/Ubuntu: sudo apt install build-essential pkg-config python3 perl util-linux libasound2-dev libfontconfig1-dev libssl-dev libvulkan-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev binutils file\n' >&2
     exit 1
 fi
 

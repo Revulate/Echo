@@ -43,47 +43,19 @@ pub fn start_refresh_scheduler() {
         DEFAULT_REFRESH_INTERVAL_SECS
     );
 
-    let spawn_result = std::thread::Builder::new()
-        .name("emote-refresh-scheduler".into())
-        .spawn(|| {
-            struct RunningGuard;
-            impl Drop for RunningGuard {
-                fn drop(&mut self) {
-                    SCHEDULER_RUNNING.store(false, Ordering::SeqCst);
-                }
+    super::spawn_runtime_thread("emote-refresh-scheduler", &SCHEDULER_RUNNING, || async {
+        let mut ticker = interval(Duration::from_secs(DEFAULT_REFRESH_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            if let Err(e) = run_refresh_cycle().await {
+                crate::log_emotes!(warn, "Refresh cycle error: {}", e);
             }
-            let _guard = RunningGuard;
-
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    crate::log_emotes!(error, "Failed to create refresh scheduler runtime: {}", e);
-                    return;
-                }
-            };
-
-            rt.block_on(async {
-                let mut ticker = interval(Duration::from_secs(DEFAULT_REFRESH_INTERVAL_SECS));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                ticker.tick().await;
-
-                loop {
-                    ticker.tick().await;
-
-                    if let Err(e) = run_refresh_cycle().await {
-                        crate::log_emotes!(warn, "Refresh cycle error: {}", e);
-                    }
-                }
-            });
-        });
-
-    if let Err(e) = spawn_result {
-        SCHEDULER_RUNNING.store(false, Ordering::SeqCst);
-        crate::log_emotes!(error, "Failed to spawn refresh scheduler thread: {}", e);
-    }
+        }
+    });
 }
 
 /// Run a single refresh cycle
@@ -173,7 +145,7 @@ async fn process_failed_channels() -> usize {
 ///
 /// Returns true if a refresh was performed.
 async fn refresh_global_if_stale() -> bool {
-    if !EMOTE_CACHE.global_needs_refresh().await {
+    if !EMOTE_CACHE.global_needs_refresh() {
         return false;
     }
 

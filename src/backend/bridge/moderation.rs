@@ -5,6 +5,7 @@
 use super::{ModAction, RUNTIME};
 use crate::backend::commands::CommandResult;
 use crate::backend::components::mod_log::record_local_mod_action;
+use crate::backend::ui_actions::ChatterListSource;
 
 fn push_success_toast(message: String) {
     crate::backend::push_ui_action(crate::backend::UiAction::ShowSuccessToast {
@@ -45,7 +46,7 @@ fn publish_moderation_warning(channel: &str, visible_message: String, error: Str
 /// the live benchmark's no-send gate before they capture auth or spawn a
 /// remote Helix request.
 fn reject_live_moderation_action(channel: &str, action: &str) -> bool {
-    match crate::benchmark_profile::reject_live_outbound_user_action(action) {
+    match crate::bench::reject_live_outbound_user_action(action) {
         Ok(()) => false,
         Err(error) => {
             crate::log_irc!(warn, "{error}");
@@ -112,7 +113,7 @@ fn handle_role_command_result(
     mutation: RoleMutation,
     username: &str,
     channel: &str,
-    chatter_list_source_to_remove: Option<&'static str>,
+    chatter_list_source_to_remove: Option<ChatterListSource>,
 ) {
     let published = auth.commit_if_current(|| match result {
         CommandResult::Success(message) => {
@@ -126,7 +127,7 @@ fn handle_role_command_result(
             if let Some(source) = chatter_list_source_to_remove {
                 crate::backend::push_ui_action(crate::backend::UiAction::RemoveChatterListEntry {
                     channel: channel.to_string(),
-                    source: source.to_string(),
+                    source,
                     username: username.to_string(),
                 });
             }
@@ -209,11 +210,11 @@ pub fn timeout_user(channel: &str, username: &str, duration_seconds: u32, reason
                     duration_label(duration_seconds),
                     reason_suffix
                 );
-                record_local_mod_action(
-                    crate::backend::components::mod_log::ModActionType::Timeout,
+                crate::backend::components::mod_log::record_local_timeout(
                     username.clone(),
                     channel.clone(),
                     detail.clone(),
+                    u64::from(duration_seconds),
                 );
                 push_moderation_success_toast(detail, "Timed out a user.");
             },
@@ -419,7 +420,7 @@ fn run_role_mutation(
     channel: &str,
     username: &str,
     mutation: RoleMutation,
-    chatter_list_source_to_remove: Option<&'static str>,
+    chatter_list_source_to_remove: Option<ChatterListSource>,
 ) {
     if reject_live_moderation_action(channel, "moderation role change") {
         return;
@@ -466,12 +467,17 @@ pub fn unmod_chatter_list_user(channel: &str, username: &str) {
         channel,
         username,
         RoleMutation::Unmod,
-        Some("Twitch moderators"),
+        Some(ChatterListSource::Moderators),
     );
 }
 
 pub fn unvip_chatter_list_user(channel: &str, username: &str) {
-    run_role_mutation(channel, username, RoleMutation::Unvip, Some("Twitch VIPs"));
+    run_role_mutation(
+        channel,
+        username,
+        RoleMutation::Unvip,
+        Some(ChatterListSource::Vips),
+    );
 }
 
 /// Get recent mod actions
@@ -479,7 +485,6 @@ pub fn get_mod_actions(limit: u32) -> Vec<ModAction> {
     crate::backend::components::mod_log::get_mod_actions()
         .into_iter()
         .take(limit as usize)
-        .map(|a| a.into())
         .collect()
 }
 

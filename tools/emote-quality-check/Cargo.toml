@@ -1,8 +1,11 @@
 [package]
-name = "echo-emote-quality-check"
-version = "0.1.0"
+name = "emote-quality-check"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
-echo-emote-core = { path = "../../crates/echo-emote-core" }
+check-support.workspace = true
+echo-emote-core.workspace = true

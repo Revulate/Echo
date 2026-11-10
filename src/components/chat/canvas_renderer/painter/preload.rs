@@ -6,6 +6,14 @@ use super::media_preload::{
     trigger_visible_preload, trigger_visible_url_preload,
 };
 use super::*;
+use crate::components::chat::canvas_renderer::async_layout::LayoutStatus;
+
+/// Budget message scans for embed fetch discovery per render tick.
+const EMBED_SCAN_MESSAGE_BUDGET: usize = 48;
+/// Budget message scans for emote preload discovery per render tick.
+const EMOTE_PRELOAD_MESSAGE_BUDGET: usize = 64;
+/// Static-range emote preload rescan interval (keeps preload progress moving without 60fps scans).
+const EMOTE_PRELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
 #[derive(Default)]
 pub(super) struct VisibleImageMisses {
@@ -74,7 +82,7 @@ impl CanvasMessageList {
         if !crate::backend::bridge::hover_link_metadata_allowed(&url) {
             return;
         }
-        let generation = self.wake_state.tooltip_delay_wake_generation;
+        let generation = self.wake_state.hover_generation;
         let Some(owner) = self.interaction_state.tooltip.owner_window else {
             return;
         };
@@ -165,7 +173,7 @@ impl CanvasMessageList {
     }
 
     fn hover_link_request_is_current(&self, generation: u64, url: &str) -> bool {
-        self.wake_state.tooltip_delay_wake_generation == generation
+        self.wake_state.hover_generation == generation
             && self.is_tab_visible
             && !self.wake_state.window_hidden
             && self.scroll_controller.state.mouse_hovering_viewport
@@ -189,15 +197,11 @@ impl CanvasMessageList {
         let preload_start = start_idx.saturating_sub(8);
         let preload_end = (end_idx + 8).min(self.message_model.message_order.len());
 
-        const EMBED_SCAN_INTERVAL_MS: u128 = 300;
+        const EMBED_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
         let current_range = (preload_start, preload_end);
         let range_changed = self.preload_state.last_embed_fetch_range != Some(current_range);
-        let elapsed_ms = self
-            .preload_state
-            .last_embed_fetch_time
-            .elapsed()
-            .as_millis();
-        if !range_changed && elapsed_ms < EMBED_SCAN_INTERVAL_MS {
+        let elapsed = self.preload_state.last_embed_fetch_time.elapsed();
+        if !range_changed && elapsed < EMBED_SCAN_INTERVAL {
             return;
         }
         if range_changed {
@@ -253,7 +257,7 @@ impl CanvasMessageList {
     }
 
     /// Preload emote images for messages in visible range
-    /// PERF: Triggers async emote loading for messages entering viewport during scroll
+    /// Triggers async emote loading for messages entering viewport during scroll
     /// Only triggers when viewport range actually changes to avoid spam
     pub(super) fn preload_emotes_for_visible_range(&mut self, start_idx: usize, end_idx: usize) {
         let _layout_context = self.enter_layout_context();
@@ -267,12 +271,8 @@ impl CanvasMessageList {
 
         let current_range = (preload_start, preload_end);
         let range_changed = self.preload_state.last_emote_preload_range != Some(current_range);
-        let elapsed_ms = self
-            .preload_state
-            .last_emote_preload_time
-            .elapsed()
-            .as_millis();
-        if !range_changed && elapsed_ms < EMOTE_PRELOAD_INTERVAL_MS {
+        let elapsed = self.preload_state.last_emote_preload_time.elapsed();
+        if !range_changed && elapsed < EMOTE_PRELOAD_INTERVAL {
             return;
         }
         if range_changed {
@@ -386,12 +386,8 @@ impl CanvasMessageList {
         let current_range = (start_idx, end_idx);
         let range_changed =
             self.preload_state.last_layout_image_preload_range != Some(current_range);
-        let elapsed_ms = self
-            .preload_state
-            .last_layout_image_preload_time
-            .elapsed()
-            .as_millis();
-        if !range_changed && elapsed_ms < EMOTE_PRELOAD_INTERVAL_MS {
+        let elapsed = self.preload_state.last_layout_image_preload_time.elapsed();
+        if !range_changed && elapsed < EMOTE_PRELOAD_INTERVAL {
             return 0;
         }
 
@@ -441,7 +437,7 @@ impl CanvasMessageList {
                 }
                 match image_cache::get_animated_cache_state(url) {
                     image_cache::AnimatedCacheState::NotLoaded => {
-                        image_cache::trigger_animated_decode_with_source(
+                        image_cache::trigger_animated_decode(
                             url,
                             image_cache::PreloadSource::VisibleChat,
                         );
@@ -459,7 +455,7 @@ impl CanvasMessageList {
                     // Deduplicated in flight; requeues a decode whose static
                     // fallback was evicted.
                     image_cache::AnimatedCacheState::Loading => {
-                        image_cache::trigger_animated_decode_with_source(
+                        image_cache::trigger_animated_decode(
                             url,
                             image_cache::PreloadSource::VisibleChat,
                         );
@@ -526,7 +522,7 @@ impl CanvasMessageList {
     /// The animation scheduler runs before GPUI invokes canvas paint callbacks, so direct-paint
     /// animated emotes must publish visibility during render rather than from paint.
     ///
-    /// PERF: registration and the frame signature share a single pass over the visible rows,
+    /// Registration and the frame signature share a single pass over the visible rows,
     /// with one `get_animation_metadata` DashMap probe per animated emote. Registration always
     /// happens for every metadata-resolved emote even when the signature is unavailable (a
     /// current frame missing or metadata not yet decoded), so the waker keeps repainting until
@@ -963,5 +959,153 @@ impl CanvasMessageList {
 
         pending_count.hash(&mut hasher);
         Some(hasher.finish())
+    }
+}
+
+impl CanvasMessageList {
+    /// Count async-layout requests issued for an offscreen range, skipping rows that
+    /// are already visible or already have any cached layout width.
+    fn request_layout_prewarm_range(
+        &self,
+        start_idx: usize,
+        end_idx: usize,
+        range: std::ops::Range<usize>,
+    ) -> usize {
+        let mut requested = 0usize;
+        for idx in range {
+            if (start_idx..end_idx).contains(&idx) {
+                continue;
+            }
+            let Some(msg) = self.message_model.messages.get(idx) else {
+                continue;
+            };
+            let Some(shared_id) = self.message_model.message_order.get(idx) else {
+                continue;
+            };
+            if self.find_any_layout_for_message(shared_id).is_some() {
+                continue;
+            }
+            match self.request_async_layout(msg) {
+                LayoutStatus::Pending | LayoutStatus::Computing => {
+                    requested = requested.saturating_add(1);
+                }
+                LayoutStatus::Ready(_) | LayoutStatus::Failed => {}
+            }
+        }
+        requested
+    }
+
+    fn dispatch_layout_prewarm_window(
+        &self,
+        start_idx: usize,
+        end_idx: usize,
+        direction: ScrollDirection,
+        window_start: usize,
+        window_end: usize,
+    ) -> usize {
+        if matches!(direction, ScrollDirection::Up) {
+            self.request_layout_prewarm_range(start_idx, end_idx, window_start..start_idx)
+                .saturating_add(self.request_layout_prewarm_range(
+                    start_idx,
+                    end_idx,
+                    end_idx..window_end,
+                ))
+        } else {
+            self.request_layout_prewarm_range(start_idx, end_idx, end_idx..window_end)
+                .saturating_add(self.request_layout_prewarm_range(
+                    start_idx,
+                    end_idx,
+                    window_start..start_idx,
+                ))
+        }
+    }
+
+    fn landing_layout_prewarm_range(&self, message_count: usize) -> Option<(usize, usize)> {
+        if !self.scroll_controller.state.scroll_animating {
+            return None;
+        }
+
+        let current_offset = self.scroll_controller.offset;
+        let target_offset = self.scroll_controller.state.scroll_desired;
+        if (target_offset - current_offset).abs() < self.viewport_height * 0.35 {
+            return None;
+        }
+
+        let (landing_start, landing_end) = self.get_visible_range_for_offset(target_offset, true);
+        if landing_start >= landing_end {
+            return None;
+        }
+
+        let margin = 12usize;
+        Some((
+            landing_start.saturating_sub(margin),
+            landing_end.saturating_add(margin).min(message_count),
+        ))
+    }
+
+    /// Velocity-proportional async-layout lookahead.
+    ///
+    /// Dispatches background layout for messages just outside the visible range,
+    /// scaled by scroll direction and velocity using the same adaptive-margin
+    /// heuristic the emote preloader already uses (`get_adaptive_preload_margins`).
+    /// Without this, layouts are only requested on a visibility *miss* at render
+    /// time, so a message entering view renders at its estimated height for at
+    /// least one waker tick. Dispatching ahead of the scroll hides that latency.
+    ///
+    /// During smooth-scroll animation we also prewarm the *landing* viewport
+    /// around `scroll_desired`, so decelerating into a distant stop does not wait
+    /// for the visible-range lookahead to catch up one frame at a time.
+    pub(super) fn preload_layouts_for_visible_range(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> usize {
+        let message_count = self.message_model.messages.len();
+        if message_count == 0 || start_idx >= end_idx {
+            return 0;
+        }
+
+        let direction = self.detect_scroll_direction();
+        let (behind, ahead) = self.get_adaptive_preload_margins(direction);
+
+        let predictive = self.predictive_lookahead_boost();
+        let (behind, ahead) = match direction {
+            ScrollDirection::Down => (behind, ahead.saturating_add(predictive)),
+            ScrollDirection::Up => (behind.saturating_add(predictive), ahead),
+            ScrollDirection::Static => (behind, ahead),
+        };
+
+        let window_start = start_idx.saturating_sub(behind);
+        let window_end = end_idx.saturating_add(ahead).min(message_count);
+
+        let mut requested = 0usize;
+        let window = (window_start, window_end);
+        if self.preload_state.last_layout_lookahead_range != Some(window) {
+            self.preload_state.last_layout_lookahead_range = Some(window);
+            requested = requested.saturating_add(self.dispatch_layout_prewarm_window(
+                start_idx,
+                end_idx,
+                direction,
+                window_start,
+                window_end,
+            ));
+        }
+
+        if let Some(landing_window) = self.landing_layout_prewarm_range(message_count) {
+            if self.preload_state.last_layout_landing_range != Some(landing_window) {
+                self.preload_state.last_layout_landing_range = Some(landing_window);
+                requested = requested.saturating_add(self.dispatch_layout_prewarm_window(
+                    start_idx,
+                    end_idx,
+                    direction,
+                    landing_window.0,
+                    landing_window.1,
+                ));
+            }
+        } else {
+            self.preload_state.last_layout_landing_range = None;
+        }
+
+        requested
     }
 }

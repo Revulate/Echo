@@ -113,24 +113,17 @@ pub struct SplitLeafParamsGate {
     pub split_pane_id: Option<EntityId>,
 }
 
-/// Hash exactly the [`StreamInfo`] fields `stream_info_eq` compares.
-pub fn stream_info_gate_hash(info: Option<&StreamInfo>) -> u64 {
-    crate::backend::stream_info_gate_hash(info)
+/// The [`ReplyState`] fields a leaf renders. Both `reply_state_eq` and
+/// `reply_state_gate_hash` go through it, so they cannot drift apart.
+fn reply_state_key(state: &ReplyState) -> (&str, &str, &str) {
+    (&state.message_id, &state.username, &state.preview)
 }
 
-/// Hash exactly the [`ReplyState`] fields `reply_state_eq` compares.
+/// Change key for the reply state a leaf renders.
 pub fn reply_state_gate_hash(state: Option<&ReplyState>) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = ahash::AHasher::default();
-    match state {
-        None => 0u8.hash(&mut hasher),
-        Some(state) => {
-            1u8.hash(&mut hasher);
-            state.message_id.hash(&mut hasher);
-            state.username.hash(&mut hasher);
-            state.preview.hash(&mut hasher);
-        }
-    }
+    let mut hasher = rustc_hash::FxHasher::default();
+    state.map(reply_state_key).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -147,7 +140,7 @@ impl SplitLeafRenderParams {
             && self.show_split_input == other.show_split_input
             && self.drag_mode == other.drag_mode
             && self.is_active_split == other.is_active_split
-            && stream_info_eq(&self.stream_info, &other.stream_info)
+            && self.stream_info == other.stream_info
             && self.room_state == other.room_state
             && self.split_settings_open == other.split_settings_open
             && self.compact_split_header == other.compact_split_header
@@ -159,28 +152,8 @@ impl SplitLeafRenderParams {
     }
 }
 
-fn stream_info_eq(a: &Option<StreamInfo>, b: &Option<StreamInfo>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            a.title == b.title
-                && a.game_name == b.game_name
-                && a.viewer_count == b.viewer_count
-                && a.started_at == b.started_at
-                && a.is_live == b.is_live
-        }
-        (None, None) => true,
-        _ => false,
-    }
-}
-
 fn reply_state_eq(a: &Option<ReplyState>, b: &Option<ReplyState>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            a.message_id == b.message_id && a.username == b.username && a.preview == b.preview
-        }
-        (None, None) => true,
-        _ => false,
-    }
+    a.as_ref().map(reply_state_key) == b.as_ref().map(reply_state_key)
 }
 
 /// Retained, SplitId-keyed render boundary for steady-state chat leaves.
@@ -1205,7 +1178,7 @@ pub fn render_chat_pane(
         .read(cx)
         .active_tab()
         .layout
-        .get_split_id_at_path(&path)
+        .split_id_at_path(&path)
     else {
         return div().flex_1().min_h_0().min_w_0().into_any_element();
     };

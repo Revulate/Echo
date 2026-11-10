@@ -5,7 +5,9 @@
 //!
 //! ## Design Principles
 //!
-//! 1. **Single Source of Truth**: All version counters live here
+//! 1. **Shared counters**: counters that cross the backend/UI boundary live
+//!    here; a counter private to one module (settings, theme, UI
+//!    invalidation) stays next to the state it versions
 //! 2. **Consistent Types**: All counters are AtomicU64
 //! 3. **Memory Ordering**: Uses Acquire/Release pairs for proper synchronization
 //! 4. **Linked Versions**: Some counters (e.g., emote versions) trigger related counters
@@ -129,7 +131,7 @@ impl VersionRegistry {
 
     /// Get the current emote version for a specific channel.
     /// Uses DashMap for lock-free access - never blocks the UI thread.
-    /// PERF: Avoids allocation when channel name is already lowercase (common case)
+    /// Avoids allocation when channel name is already lowercase (common case)
     #[inline]
     pub fn channel_emote_version(channel: &str) -> u64 {
         // Fast path: channel is already lowercase (Twitch channels always are)

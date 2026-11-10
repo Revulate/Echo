@@ -1,3 +1,7 @@
+//! Fixture: decodes every cached image under a cache file or directory with
+//! `image_decode` and reports animated frame counts, payload sizes and decode
+//! failures. Usage: `animation-decode-check <cached-image-file-or-directory>`.
+
 use echo_gpui::image_decode::{decode_to_render_image, inspect_animated_frames};
 use std::fs;
 use std::io::Cursor;
@@ -8,7 +12,7 @@ const MAX_COMPRESSED_FILE_BYTES: u64 = 1024 * 1024;
 
 fn main() {
     let Some(cache_dir) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: echo-animation-decode-check <cached-image-file-or-directory>");
+        eprintln!("usage: animation-decode-check <cached-image-file-or-directory>");
         std::process::exit(2);
     };
 
@@ -107,7 +111,7 @@ fn main() {
                 decoded.frames.len(),
                 decoded.raw_frame_bytes,
             );
-        let legacy_peak_payload_bytes = decoded
+        let full_decode_peak_payload_bytes = decoded
             .raw_frame_bytes
             .saturating_add(decoded.compressed_source_bytes);
         let streaming_peak_payload_bound_bytes = decoded
@@ -124,7 +128,7 @@ fn main() {
             max_frame_duration_ms,
             frame_duration_runs,
             name_paint_initial_window_frames,
-            legacy_peak_payload_bytes,
+            full_decode_peak_payload_bytes,
             streaming_peak_payload_bound_bytes,
             complete: decoded.is_complete(),
             truncation: decoded.truncation.map(|reason| reason.as_str()),
@@ -176,8 +180,8 @@ fn main() {
     println!("compressed_source_bytes,{}", result.compressed_source_bytes);
     println!("max_raw_frame_bytes,{}", result.max_raw_frame_bytes);
     println!(
-        "legacy_peak_payload_bytes,{}",
-        result.legacy_peak_payload_bytes
+        "full_decode_peak_payload_bytes,{}",
+        result.full_decode_peak_payload_bytes
     );
     println!(
         "streaming_peak_payload_bound_bytes,{}",
@@ -186,7 +190,7 @@ fn main() {
     println!(
         "payload_peak_reduction_percent,{:.3}",
         percent_reduction(
-            result.legacy_peak_payload_bytes,
+            result.full_decode_peak_payload_bytes,
             result.streaming_peak_payload_bound_bytes
         )
     );
@@ -237,7 +241,7 @@ struct DecodeResult {
     max_frame_duration_ms: u32,
     frame_duration_runs: String,
     name_paint_initial_window_frames: u16,
-    legacy_peak_payload_bytes: usize,
+    full_decode_peak_payload_bytes: usize,
     streaming_peak_payload_bound_bytes: usize,
     complete: bool,
     truncation: Option<&'static str>,

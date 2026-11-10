@@ -4,7 +4,7 @@ mod atomic_file;
 pub mod channel_input;
 mod clipboard;
 pub mod color;
-pub mod fuzzy;
+
 mod image_drops;
 #[cfg(target_os = "linux")]
 pub mod kwin;
@@ -16,8 +16,8 @@ pub use clipboard::*;
 pub use color::{
     emote_provider_color, parse_hex_color_opt, parse_optional_hex_or, parse_user_color_opt,
 };
+pub use echo_core::fuzzy::fuzzy_score;
 pub use echo_core::notification_text::truncate_message as truncate_text;
-pub use fuzzy::fuzzy_score;
 pub use image_drops::drain_render_image_drops_coalesced;
 pub use open_url::*;
 pub use timestamp::{
@@ -33,8 +33,5 @@ pub(crate) use atomic_file::{
 
 /// Parse an environment variable as `usize`, returning `default` if absent or unparseable.
 pub(crate) fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(default)
+    echo_core::env::parsed(name).unwrap_or(default)
 }

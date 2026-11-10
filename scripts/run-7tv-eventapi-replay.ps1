@@ -1,5 +1,10 @@
+<#
+.SYNOPSIS
+Launch Echo with a recorded 7TV EventAPI fixture replayed into one channel.
+See docs/7TV_EVENTAPI_REPLAY.md.
+#>
 param(
-    [string]$Fixture = "docs\fixtures\7tv-eventapi\emote-set-add-remove-rename.json",
+    [string]$Fixture = "benchmarks\fixtures\7tv-eventapi\emote-set-add-remove-rename.json",
     [string]$SetId = "example_set_id",
     [string]$Channel = "examplechannel",
     [int]$DelayMs = 3000,

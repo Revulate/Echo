@@ -1,7 +1,17 @@
 //! Message-buffer lifecycle and split activity handling.
 
-use super::message_delta::MessageDeltaPlan;
+use super::message_delta::{MessageDeltaPlan, ids_align, same_count_rotation};
 use super::*;
+
+/// Rows on each side of the last viewport whose layouts a split keeps while
+/// its tab is hidden. See `CanvasMessageList::trim_layouts_for_hidden_tab`.
+const HIDDEN_TAB_LAYOUT_MARGIN_ROWS: usize = 64;
+/// Newest prepended history rows to pre-layout first.
+///
+/// These are the rows immediately above the pre-existing viewport after a
+/// history prepend, so resolving them early prevents scrollback spacing from
+/// changing as soon as the user scrolls upward.
+const HISTORY_PREPEND_ASYNC_PRIME_LIMIT: usize = 192;
 
 /// Row identities around the viewport captured before a message-buffer
 /// replacement, so the view can be re-anchored on retained content.
@@ -138,10 +148,6 @@ impl CanvasMessageList {
     pub fn set_active(&mut self, active: bool) -> bool {
         let changed = self.is_active_split != active;
         self.is_active_split = active;
-
-        let target_capacity_nz = NonZeroUsize::new(ACTIVE_LAYOUT_CACHE_CAPACITY).unwrap();
-        self.layout_store.layouts.resize(target_capacity_nz);
-
         changed
     }
 
@@ -435,22 +441,13 @@ impl CanvasMessageList {
             }
         } else if new_count == old_count && content_changed && new_count > 0 {
             let same_message_order = self.message_model.message_order.len() == new_count
-                && self
-                    .message_model
-                    .message_order
-                    .iter()
-                    .zip(messages.iter())
-                    .all(|(old_id, new_msg)| old_id.as_ref() == new_msg.id.as_ref());
+                && ids_align(&self.message_model.message_order, &messages);
 
             if same_message_order {
                 had_new_messages = false;
                 self.message_model.rebuild_message_index_from_order();
                 self.message_state.pending_new_message_count = 0;
-                self.layout_store.runtime.has_stale_layouts = true;
-                self.layout_store.runtime.stale_layout_refresh_cursor = 0;
-                self.layout_store
-                    .runtime
-                    .stale_layout_refresh_pass_found_stale = false;
+                self.layout_store.runtime.mark_stale();
                 self.layout_store.runtime.last_checked_emote_version = 0;
                 self.layout_store.runtime.last_checked_channel_emote_version = 0;
                 self.interaction_state.hitbox_manager.invalidate_cache();
@@ -461,27 +458,11 @@ impl CanvasMessageList {
                 self.viewport_state.cached_viewport_paint_rows = None;
                 self.interaction_state.hitbox_manager.invalidate_cache();
 
-                let rotated_count = if !self.message_model.message_order.is_empty() {
-                    let first_new_id = &messages[0].id;
-                    self.message_model
-                        .message_order
-                        .iter()
-                        .position(|id| id.as_ref() == first_new_id.as_ref())
-                        .unwrap_or(new_count)
-                } else {
-                    new_count
-                };
-
-                let looks_like_rotation = rotated_count > 0
-                    && rotated_count < new_count
-                    && self.message_model.message_order.len() == old_count
-                    && self
-                        .message_model
-                        .message_order
-                        .iter()
-                        .skip(rotated_count.min(self.message_model.message_order.len()))
-                        .zip(messages.iter())
-                        .all(|(old_id, new_msg)| old_id.as_ref() == new_msg.id.as_ref());
+                let rotation = (self.message_model.message_order.len() == old_count)
+                    .then(|| same_count_rotation(&self.message_model.message_order, &messages))
+                    .flatten();
+                let looks_like_rotation = rotation.is_some();
+                let rotated_count = rotation.unwrap_or(0);
                 let incremental_rotation_limit = Self::incremental_rotation_limit(new_count);
                 let allow_incremental_rotation = looks_like_rotation
                     && (rotated_count <= incremental_rotation_limit
@@ -713,7 +694,7 @@ impl CanvasMessageList {
         self.render_perf_frame_stats.height_anchor_adjustments += 1;
     }
 
-    /// PERF: O(1) message lookup by ID using pre-built index
+    /// O(1) message lookup by ID using pre-built index
     #[inline]
     pub(in crate::components::chat::canvas_renderer) fn get_message(
         &self,
@@ -723,7 +704,7 @@ impl CanvasMessageList {
         self.message_model.messages.get(idx).map(Arc::as_ref)
     }
 
-    /// PERF: O(1) message index lookup by ID
+    /// O(1) message index lookup by ID
     #[inline]
     pub(in crate::components::chat::canvas_renderer) fn get_message_index(
         &self,

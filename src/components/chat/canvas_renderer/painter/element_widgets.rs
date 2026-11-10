@@ -153,7 +153,7 @@ pub(super) fn render_upload_preview(
     if let Some(thumb_url) = thumbnail_url {
         let cached_thumbnail = crate::cache::loader::get_cached_render_image(thumb_url.as_ref());
         if cached_thumbnail.is_none() {
-            crate::cache::loader::trigger_preload_single_with_source(
+            crate::cache::loader::trigger_preload_single(
                 thumb_url.as_ref(),
                 crate::cache::loader::PreloadSource::VisibleChat,
             );
@@ -297,7 +297,7 @@ pub(super) fn render_embed_preview(
             let cached_thumbnail =
                 crate::cache::loader::get_cached_render_image(thumb_url.as_ref());
             if cached_thumbnail.is_none() {
-                crate::cache::loader::trigger_preload_single_with_source(
+                crate::cache::loader::trigger_preload_single(
                     thumb_url.as_ref(),
                     crate::cache::loader::PreloadSource::VisibleChat,
                 );

@@ -1,9 +1,11 @@
 [package]
 name = "similarity-check"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
-echo-text-core = { path = "../../crates/echo-text-core" }
+check-support.workspace = true
+echo-text-core.workspace = true

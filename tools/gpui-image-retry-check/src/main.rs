@@ -1,3 +1,7 @@
+//! Runtime: GPUI's image asset loader against a loopback HTTP fixture. A cluster of
+//! truncated successful bodies is retried until every asset loads, while HTTP 404
+//! and corrupt images fail after one request each.
+
 use gpui::{App, Asset, ImageAssetLoader, ImageCacheError, Resource};
 use reqwest_client::ReqwestClient;
 use std::collections::HashMap;

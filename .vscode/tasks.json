@@ -10,9 +10,9 @@
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
     },
     {
-      "label": "cargo: clippy (-D warnings)",
+      "label": "cargo: lint",
       "type": "shell",
-      "command": "cargo clippy -- -D warnings",
+      "command": "cargo lint",
       "group": "build",
       "problemMatcher": ["$rustc"],
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
@@ -20,7 +20,7 @@
     {
       "label": "cargo: fmt",
       "type": "shell",
-      "command": "cargo fmt",
+      "command": "cargo fmt --all",
       "problemMatcher": [],
       "presentation": { "reveal": "silent", "panel": "dedicated" }
     },

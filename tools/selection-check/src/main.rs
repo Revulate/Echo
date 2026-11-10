@@ -1,5 +1,8 @@
-#![allow(dead_code, unused_variables)]
+//! Contract: chat text selection in `crates/echo-chat-render/src/selection.rs`:
+//! UTF-8 multi-message, reverse-drag, single-message and click-only selections,
+//! and the text copied to the clipboard, including multi-row system messages.
 
+use check_support::{FIXTURE_HEADER, assert_fixture};
 use std::sync::Arc;
 
 extern crate self as gpui;
@@ -61,7 +64,7 @@ use components::chat::canvas_renderer::layout::{CanvasMessageLayout, LayoutCache
 use components::chat::canvas_renderer::selection::{SelectionPoint, SelectionState};
 
 fn main() {
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
 
     let container_width = 320.0;
     let mut layouts = EvictionTrackingCache::new(std::num::NonZeroUsize::new(8).expect("non-zero"));
@@ -85,7 +88,7 @@ fn main() {
     let order = vec![msg1.clone(), msg2.clone(), msg3.clone()];
 
     let mut selection = SelectionState::new();
-    print_fixture(
+    assert_fixture(
         "selection_initial_has_selection",
         selection.has_selection().to_string(),
         "false",
@@ -94,27 +97,27 @@ fn main() {
     selection.extend_selection(point(&msg2, 1, 2));
     selection.end_drag();
 
-    print_fixture(
+    assert_fixture(
         "selection_drag_ended",
         selection.is_dragging.to_string(),
         "false",
     );
-    print_fixture(
+    assert_fixture(
         "selection_utf8_multimessage_text",
         selection.get_selected_text(&layouts, &order, container_width, true),
         "😊B\n中\nγε",
     );
-    print_fixture(
+    assert_fixture(
         "selection_first_message_range",
         range_summary(&selection.get_ranges_for_message(0, "A😊B\n中".chars().count())),
         "1..5",
     );
-    print_fixture(
+    assert_fixture(
         "selection_last_message_range",
         range_summary(&selection.get_ranges_for_message(1, "γειά σου".chars().count())),
         "0..2",
     );
-    print_fixture(
+    assert_fixture(
         "selection_contains_boundary",
         format!(
             "{}|{}|{}",
@@ -126,7 +129,7 @@ fn main() {
     );
 
     selection.copy_to_clipboard(&layouts, &order, container_width, true);
-    print_fixture(
+    assert_fixture(
         "selection_copy_to_clipboard",
         utils::copied_text(),
         "😊B\n中\nγε",
@@ -136,12 +139,12 @@ fn main() {
     reverse.start_selection(point(&msg2, 1, 99));
     reverse.extend_selection(point(&msg1, 0, 2));
     reverse.end_drag();
-    print_fixture(
+    assert_fixture(
         "selection_reverse_drag_text",
         reverse.get_selected_text(&layouts, &order, container_width, true),
         "B\n中\nγειά σου",
     );
-    print_fixture(
+    assert_fixture(
         "selection_reverse_normalized",
         normalized_summary(&reverse),
         "0:2->1:99",
@@ -151,19 +154,19 @@ fn main() {
     single.start_selection(point(&msg3, 2, 1));
     single.extend_selection(point(&msg3, 2, 3));
     single.end_drag();
-    print_fixture(
+    assert_fixture(
         "selection_single_message_text",
         single.get_selected_text(&layouts, &order, container_width, true),
         "ai",
     );
-    print_fixture(
+    assert_fixture(
         "selection_single_message_range",
         range_summary(&single.get_ranges_for_message(2, "tail".chars().count())),
         "1..3",
     );
 
     single.clear();
-    print_fixture(
+    assert_fixture(
         "selection_clear_has_selection",
         single.has_selection().to_string(),
         "false",
@@ -172,7 +175,7 @@ fn main() {
     let mut click_only = SelectionState::new();
     click_only.start_selection(point(&msg1, 0, 2));
     click_only.end_drag();
-    print_fixture(
+    assert_fixture(
         "selection_click_only_does_not_claim_clipboard",
         click_only
             .copy_to_clipboard(&layouts, &order, container_width, true)
@@ -197,13 +200,13 @@ fn main() {
     system_selection.start_selection(point(&system1, 0, 0));
     system_selection.extend_selection(point(&system2, 1, system2_text.chars().count()));
     system_selection.end_drag();
-    print_fixture(
+    assert_fixture(
         "selection_multiline_multirow_system_text",
         system_selection.get_selected_text(&layouts, &system_order, container_width, true),
         "A moderation event happened\nwith a second detail line\nAnother system row",
     );
     system_selection.copy_to_clipboard(&layouts, &system_order, container_width, true);
-    print_fixture(
+    assert_fixture(
         "selection_multiline_multirow_system_clipboard",
         utils::copied_text(),
         "A moderation event happened\nwith a second detail line\nAnother system row",
@@ -242,14 +245,4 @@ fn normalized_summary(selection: &SelectionState) -> String {
         "{}:{}->{}:{}",
         start.message_index, start.char_index, end.message_index, end.char_index
     )
-}
-
-fn print_fixture(name: &str, actual: impl AsRef<str>, expected: &str) {
-    let actual = actual.as_ref();
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
-}
-
-fn checksum(value: &str) -> usize {
-    value.bytes().map(usize::from).sum()
 }

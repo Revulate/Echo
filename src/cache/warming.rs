@@ -5,9 +5,7 @@ use std::sync::LazyLock;
 
 static TRACKER: LazyLock<WarmingTracker> = LazyLock::new(|| {
     echo_media_cache::install_cache_log_enabled(|| crate::log::enabled("cache"));
-    WarmingTracker::new(
-        crate::benchmark_profile::config_root_or_current_dir().join(WARMING_CACHE_FILE),
-    )
+    WarmingTracker::new(crate::storage_roots::config_root_or_current_dir().join(WARMING_CACHE_FILE))
 });
 
 pub async fn load_priorities() {

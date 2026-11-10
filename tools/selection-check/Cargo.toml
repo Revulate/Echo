@@ -1,10 +1,12 @@
 [package]
 name = "selection-check"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
-echo-render-core = { path = "../../crates/echo-render-core" }
-smallvec = "1"
+check-support.workspace = true
+echo-render-core.workspace = true
+smallvec.workspace = true

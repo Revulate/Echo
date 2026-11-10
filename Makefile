@@ -1,14 +1,18 @@
 # =============================================================================
-# Echo Development Makefile
+# Echo Development Makefile (Linux)
 # =============================================================================
-# Common development commands for Linux
+# Convenience targets over the documented commands. `make help` lists every
+# target, generated from the `## ` comment above it.
 # =============================================================================
 
-.PHONY: all build run release check test lint fmt clean
-.PHONY: profile flame heap memcheck asan install-tools
-.PHONY: watch logs help audit
-.PHONY: dist install uninstall
-.PHONY: linux-deps setup-gpui linux-verify linux-test quick-test nextest coverage-root
+.PHONY: all help
+.PHONY: build release build-profile build-debug-release dist
+.PHONY: linux-deps setup-gpui linux-verify install uninstall
+.PHONY: run rr run-profile run-debug run-trace run-log
+.PHONY: check lint lint-strict fmt fmt-check deny ci
+.PHONY: test test-verbose linux-test quick-test nextest coverage-root bench
+.PHONY: install-tools flame heap perf perf-record memcheck cache asan tsan strace
+.PHONY: clean watch logs
 
 # Local install layout (user-level, no root; CachyOS/Arch-friendly). The
 # binary is never put on PATH as `echo`, which would shadow coreutils' echo.
@@ -20,22 +24,26 @@ BIN_LINK     := $(HOME)/.local/bin/echo-gpui
 DESKTOP_FILE := $(HOME)/.local/share/applications/$(APP_ID).desktop
 ICON_FILE    := $(HOME)/.local/share/icons/hicolor/scalable/apps/$(APP_ID).svg
 
+# Log categories for `make run-log` (see docs/ENVIRONMENT.md), e.g.
+# `make run-log LOG=irc,emotes`.
+LOG ?= irc
+
 # Default target
 all: check
 
 # =============================================================================
-# Build Commands
+# Build
 # =============================================================================
 
 ## Build in debug mode
 build: setup-gpui
 	cargo build
 
-## Build in release mode
+## Build in release mode (fat LTO, slow; prefer dist)
 release: setup-gpui
 	cargo build --release
 
-## Build with profiling enabled (chrome://tracing output)
+## Build release with the Chrome tracing profiler (--features profiling)
 build-profile: setup-gpui
 	cargo build --release --features profiling
 
@@ -51,11 +59,11 @@ dist: setup-gpui
 linux-deps:
 	./scripts/check-linux-build-deps.sh
 
-## Reconstruct or validate the pinned sibling GPUI fork on Linux
+## Reconstruct or validate the pinned sibling GPUI fork
 setup-gpui:
 	./scripts/setup-gpui-fork.sh
 
-## Run the non-test Linux compile, dist-build, and ELF/linkage harness
+## Build dist and verify ELF type, linkage, stack policy and version identity
 linux-verify:
 	./scripts/verify-linux-build.sh
 
@@ -70,7 +78,7 @@ install: dist
 	-kbuildsycoca6 2>/dev/null || kbuildsycoca5 2>/dev/null
 	@echo "Installed: $(INSTALL_ROOT)/bin/echo (CLI: echo-gpui, launcher: Echo)"
 
-## Remove the user-level install
+## Remove the user-level install (settings and caches stay)
 uninstall:
 	rm -f $(BIN_LINK) $(DESKTOP_FILE) $(ICON_FILE)
 	rm -rf $(INSTALL_ROOT)/bin
@@ -79,7 +87,7 @@ uninstall:
 	@echo "Uninstalled Echo from user directories"
 
 # =============================================================================
-# Run Commands
+# Run
 # =============================================================================
 
 ## Run in debug mode
@@ -90,71 +98,67 @@ run:
 rr:
 	cargo run --release
 
-## Run with profiling (generates echo_trace.json)
+## Run with the Chrome tracing profiler (writes echo_trace.json)
 run-profile:
 	cargo run --release --features profiling
 
-## Run with verbose logging
+## Run with RUST_LOG=debug for every crate (ECHO_LOG categories are then ignored)
 run-debug:
 	RUST_LOG=debug cargo run
 
-## Run with trace logging (very verbose)
+## Run with RUST_LOG=trace for every crate (very verbose)
 run-trace:
 	RUST_LOG=trace cargo run
 
-## Run with specific module logging
+## Run with Echo log categories LOG (default irc), also written to the log file
 run-log:
-	RUST_LOG=warn,echo_gpui=info,echo_gpui::backend::irc=debug cargo run
+	ECHO_LOG=$(LOG) ECHO_LOG_FILE=1 cargo run
 
 # =============================================================================
-# Quality Checks
+# Quality
 # =============================================================================
 
 ## Quick compile check
 check: setup-gpui
 	cargo check --locked --bin echo
 
-## Run clippy lints (fails on correctness and suspicious lints)
+## Clippy gate: workspace libs and bins, failing on correctness and suspicious lints
 lint: setup-gpui
-	cargo clippy --locked -p echo_gpui -p echo-autocomplete-core -p echo-cache-policy -p echo-chat-render -p echo-core -p echo-cosmetics-core -p echo-emote-core -p echo-link-core -p echo-media-cache -p echo-render-core -p echo-text-core --lib -- -D clippy::correctness -D clippy::suspicious
+	cargo lint
 
-## Fail on every Clippy warning (currently a cleanup/ratchet target)
+## Clippy over the same targets, failing on every warning (cleanup ratchet, not a gate)
 lint-strict: setup-gpui
-	cargo clippy --locked -p echo_gpui -p echo-autocomplete-core -p echo-cache-policy -p echo-chat-render -p echo-core -p echo-cosmetics-core -p echo-emote-core -p echo-link-core -p echo-media-cache -p echo-render-core -p echo-text-core --lib -- -D warnings
+	cargo lint-strict
 
-## Format code
+## Format the whole workspace
 fmt:
-	cargo fmt
+	cargo fmt --all
 
-## Check formatting without modifying
+## Check workspace formatting (the canonical gate)
 fmt-check:
-	cargo fmt -- --check
+	cargo fmt --all -- --check
 
-## Run the authoritative Linux tests plus build/artifact verification
+## Dependency gate: advisories, licenses, bans and sources (docs/DEPENDENCY_POLICY.md)
+deny:
+	cargo deny --locked --all-features check advisories licenses bans sources
+
+## Run the Linux CI test suite plus build and artifact verification
 ci: linux-test linux-verify
 	@echo "Linux tests, build, and artifact verification passed!"
-
-## Run security audit on dependencies
-audit:
-	cargo audit
-
-## Run full dependency checks (advisories, bans, licenses)
-deny:
-	cargo deny check
 
 # =============================================================================
 # Testing
 # =============================================================================
 
-## Run all tests
+## Run the Linux test suite with plain cargo test
 test:
 	./scripts/test-linux.sh cargo
 
-## Run tests with output
+## Run the root library tests with output
 test-verbose: setup-gpui
 	RUST_MIN_STACK=268435456 cargo test --locked -p echo_gpui --lib -- --nocapture
 
-## Run the Linux CI suite with nextest, doctests, nested-workspace tests, and target checks
+## Run the CI mode: quick-nextest plus criterion bench compile checks
 linux-test:
 	./scripts/test-linux.sh ci
 
@@ -162,7 +166,7 @@ linux-test:
 quick-test:
 	./scripts/test-linux.sh quick
 
-## Run nextest for Echo and the extracted crates
+## Run nextest and doctests for Echo and the extracted crates
 nextest:
 	./scripts/test-linux.sh nextest
 
@@ -170,19 +174,19 @@ nextest:
 coverage-root:
 	./scripts/test-linux.sh coverage-root
 
-## Run benchmarks
+## Run the criterion benchmarks
 bench:
 	cargo bench
 
 # =============================================================================
-# Profiling (Linux)
+# Profiling (scripts/profile.sh; artifacts under target/profile/)
 # =============================================================================
 
 ## Install profiling tools
 install-tools:
 	./scripts/profile.sh install
 
-## Generate CPU flamegraph
+## Generate a CPU flamegraph
 flame:
 	./scripts/profile.sh flame
 
@@ -190,11 +194,11 @@ flame:
 heap:
 	./scripts/profile.sh heap
 
-## Run perf stat
+## perf stat counters
 perf:
 	./scripts/profile.sh perf
 
-## Detailed perf recording
+## Detailed perf recording and report
 perf-record:
 	./scripts/profile.sh perf-record
 
@@ -202,94 +206,53 @@ perf-record:
 memcheck:
 	./scripts/profile.sh memcheck
 
-## Cache analysis
+## Cachegrind cache analysis
 cache:
 	./scripts/profile.sh cache
 
-## Build with AddressSanitizer
+## Build and run with AddressSanitizer (nightly)
 asan:
 	./scripts/profile.sh asan
 
-## Build with ThreadSanitizer
+## Build and run with ThreadSanitizer (nightly)
 tsan:
 	./scripts/profile.sh tsan
 
-## System call trace
+## System call summary
 strace:
 	./scripts/profile.sh strace
 
 # =============================================================================
-# Development Utilities
+# Other
 # =============================================================================
 
-## Clean build artifacts
+## Remove build and profiling artifacts
 clean:
 	cargo clean
-	rm -f flamegraph.svg perf.data perf-report.txt valgrind.log
-	rm -f echo_trace.json strace-summary.txt
-	rm -f cachegrind.out.* heaptrack.echo.*
+	rm -f echo_trace.json
 
-## Watch for changes and rebuild
+## Watch for changes and re-run cargo check
 watch:
 	cargo watch -x check
 
-## Show recent logs (if using file logging)
+## Follow the opt-in debug log (ECHO_LOG_FILE=1)
 logs:
 	@if [ -f ~/.local/share/echo/echo.log ]; then \
 		tail -f ~/.local/share/echo/echo.log; \
 	else \
-		echo "No log file found. Run with RUST_LOG=... to see console logs"; \
+		echo "No log file found. Run with ECHO_LOG_FILE=1 (see docs/ENVIRONMENT.md)."; \
 	fi
-
-# =============================================================================
-# Help
-# =============================================================================
 
 ## Show this help
 help:
-	@echo "Echo Development Commands"
-	@echo ""
-	@echo "Build:"
-	@echo "  make build              Build debug"
-	@echo "  make release            Build release"
-	@echo "  make build-profile      Build with tracing profiler"
-	@echo "  make build-debug-release Build release with debug symbols"
-	@echo "  make linux-deps         Check native Linux build dependencies"
-	@echo "  make setup-gpui         Reconstruct or validate the GPUI fork"
-	@echo "  make linux-verify       Compile, build dist, and verify ELF linkage"
-	@echo ""
-	@echo "Run:"
-	@echo "  make run                Run debug"
-	@echo "  make rr                 Run release"
-	@echo "  make run-profile        Run with profiling"
-	@echo "  make run-debug          Run with RUST_LOG=debug"
-	@echo "  make run-trace          Run with RUST_LOG=trace"
-	@echo ""
-	@echo "Quality:"
-	@echo "  make check              Quick compile check"
-	@echo "  make lint               Clippy lints"
-	@echo "  make lint-strict        Pedantic clippy"
-	@echo "  make fmt                Format code"
-	@echo "  make test               Run Linux Cargo tests"
-	@echo "  make quick-test         Run the Linux pull-request suite"
-	@echo "  make nextest            Run nextest plus nested-workspace tests"
-	@echo "  make coverage-root      Attempt monolithic root Echo LCOV"
-	@echo "  make ci                 Full Linux tests, build, and artifact verification"
-	@echo "  make audit              Security audit dependencies"
-	@echo "  make deny               Full dependency checks"
-	@echo ""
-	@echo "Profiling (Linux):"
-	@echo "  make install-tools      Install profiling tools"
-	@echo "  make dist               Build distribution binary (dist profile)"
-	@echo "  make install            Build dist and install for current user"
-	@echo "  make uninstall          Remove the user-level install"
-	@echo "  make flame              CPU flamegraph"
-	@echo "  make heap               Memory profiling"
-	@echo "  make perf               perf stat counters"
-	@echo "  make memcheck           Valgrind memory check"
-	@echo "  make asan               AddressSanitizer build"
-	@echo "  make tsan               ThreadSanitizer build"
-	@echo ""
-	@echo "Other:"
-	@echo "  make clean              Remove build artifacts"
-	@echo "  make watch              Watch and rebuild"
+	@awk ' \
+		/^# =+$$/ { rule = 1; next } \
+		rule && /^# [A-Z]/ { section = substr($$0, 3); rule = 0; next } \
+		{ rule = 0 } \
+		/^## / { desc = substr($$0, 4); next } \
+		/^[a-zA-Z0-9_-]+:/ && desc != "" { \
+			if (section != "") { printf "\n%s:\n", section; section = "" } \
+			split($$0, t, ":"); printf "  make %-20s %s\n", t[1], desc \
+		} \
+		{ desc = "" } \
+	' $(firstword $(MAKEFILE_LIST))

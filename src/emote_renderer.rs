@@ -78,7 +78,7 @@ fn owner_entry(entries: &mut Vec<OwnerMetadata>, owner: u64) -> &mut OwnerMetada
 
 /// Register an animated emote's metadata as visible
 /// Call this during rendering for each visible animated emote
-/// PERF: Accepts Arc to avoid cloning Vec<u16> frame durations per-emote per-frame
+/// Accepts Arc to avoid cloning Vec<u16> frame durations per-emote per-frame
 pub fn register_visible_metadata(metadata: Arc<AnimationMetadata>) {
     if !animation_enabled() {
         return;
@@ -108,7 +108,7 @@ pub fn register_visible_metadata(metadata: Arc<AnimationMetadata>) {
 
 /// Get the count of visible animated emotes across every split.
 ///
-/// PERF: Ignores lists older than two animation frames. This enables
+/// Ignores lists older than two animation frames. This enables
 /// TrueIdle mode when no painting occurs (e.g., window minimized, all
 /// animations scrolled off-screen, or no visible content).
 pub fn visible_metadata_count() -> usize {

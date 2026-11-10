@@ -1,4 +1,4 @@
-//! Split Layout Manager - Extracted from app.rs monolith
+//! Split Layout Manager
 //!
 //! Handles:
 //! - Split tree rendering (recursive binary tree)
@@ -7,7 +7,6 @@
 //! - Drop zone visualization
 //! - Active split tracking
 //! - Hit testing and bounds tracking
-#![allow(clippy::wrong_self_convention)]
 
 use crate::state::{AddSplitDirection, DragDropState, DropZone, SplitNode, SplitOrientation};
 use gpui::*;
@@ -32,14 +31,17 @@ impl PathKey {
         }
     }
 
-    /// Convert back to a Vec<usize> (for compatibility with existing code)
+    pub fn as_slice(&self) -> &[usize] {
+        &self.path
+    }
+
     pub fn to_vec(&self) -> Vec<usize> {
         self.path.to_vec()
     }
 
-    /// Convert to a stable u64 hash for use in GPUI element IDs.
+    /// A hash of the path that is stable within the process, for GPUI element IDs.
     #[inline]
-    pub fn as_u64(&self) -> u64 {
+    pub fn stable_hash(&self) -> u64 {
         let mut hasher = ahash::AHasher::default();
         self.path.len().hash(&mut hasher);
         self.path.hash(&mut hasher);
@@ -819,7 +821,7 @@ impl SplitLayoutManager {
             orientation,
             children,
             ..
-        } = root.get_node_at_path(path)?
+        } = root.node_at_path(path)?
         else {
             return None;
         };
@@ -882,7 +884,7 @@ impl SplitLayoutManager {
         band_idx: usize,
     ) -> Option<GridBandGeometry> {
         let (orientation, parent_extent, parent_minimums) = self.divider_inputs(root, path, 0)?;
-        let node = root.get_node_at_path(path)?;
+        let node = root.node_at_path(path)?;
         if band_idx >= 2 || node.grid_band_split_ratio().is_none() {
             return None;
         }

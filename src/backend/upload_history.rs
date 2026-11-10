@@ -161,7 +161,7 @@ pub fn clear_history() -> usize {
 }
 
 fn history_path() -> Option<PathBuf> {
-    crate::benchmark_profile::config_root().map(|dir| dir.join(HISTORY_FILE))
+    crate::storage_roots::config_root().map(|dir| dir.join(HISTORY_FILE))
 }
 
 /// Set when the history file failed to load and could not be copied aside;
@@ -226,23 +226,23 @@ fn persist_history(history: &[UploadHistoryEntry]) {
         return;
     };
     if let Err(error) = fs::create_dir_all(parent) {
-        tracing::warn!(path = %parent.display(), %error, "Could not create upload history directory");
+        crate::log_persist!(warn, path = %parent.display(), %error, "Could not create upload history directory");
         return;
     }
 
     let temporary = path.with_extension("json.tmp");
     if let Err(error) = fs::write(&temporary, contents) {
-        tracing::warn!(path = %temporary.display(), %error, "Could not write upload history");
+        crate::log_persist!(warn, path = %temporary.display(), %error, "Could not write upload history");
         return;
     }
     #[cfg(unix)]
     if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(path = %temporary.display(), %error, "Could not restrict upload history permissions");
+        crate::log_persist!(warn, path = %temporary.display(), %error, "Could not restrict upload history permissions");
         let _ = fs::remove_file(&temporary);
         return;
     }
     if let Err(error) = crate::utils::replace_file(&temporary, &path) {
-        tracing::warn!(path = %path.display(), %error, "Could not publish upload history");
+        crate::log_persist!(warn, path = %path.display(), %error, "Could not publish upload history");
         let _ = fs::remove_file(&temporary);
     }
 }

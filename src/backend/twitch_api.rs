@@ -1,7 +1,8 @@
 //! Twitch API utilities
 //! Provides helper functions for Twitch Helix API calls
 
-use super::constants::{API_PROXY, API_PROXY_NOT_CONFIGURED, CLIENT_ID};
+pub use super::api_error::{ApiError, ApiErrorKind};
+use super::constants::{API_PROXY, CLIENT_ID};
 use super::http;
 use super::settings::get_token;
 use dashmap::DashMap;
@@ -32,7 +33,10 @@ fn build_twitch_http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_else(|error| {
-            tracing::error!("Failed to create HTTP client for Twitch API: {error}");
+            crate::log_net!(
+                error,
+                "Failed to create HTTP client for Twitch API: {error}"
+            );
             http::timed_client(Duration::from_secs(10))
         })
 }
@@ -138,18 +142,6 @@ static USER_PROFILE_STATUS: LazyLock<DashMap<String, UserCardFetchStatus>> =
     LazyLock::new(DashMap::new);
 static USER_PROFILE_FETCHES_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-static USER_FOLLOW_CACHE: LazyLock<DashMap<String, CachedEntry<TwitchUserFollowInfo>>> =
-    LazyLock::new(DashMap::new);
-static USER_FOLLOW_STATUS: LazyLock<DashMap<String, UserCardFetchStatus>> =
-    LazyLock::new(DashMap::new);
-static USER_FOLLOW_FETCHES_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-static USER_SUBSCRIPTION_CACHE: LazyLock<DashMap<String, CachedEntry<TwitchUserSubscriptionInfo>>> =
-    LazyLock::new(DashMap::new);
-static USER_SUBSCRIPTION_STATUS: LazyLock<DashMap<String, UserCardFetchStatus>> =
-    LazyLock::new(DashMap::new);
-static USER_SUBSCRIPTION_FETCHES_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 static USER_LIVE_CACHE: LazyLock<DashMap<String, CachedEntry<bool>>> = LazyLock::new(DashMap::new);
 static USER_LIVE_LAST_ATTEMPT: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
 static USER_LIVE_OBSERVED_USERS: LazyLock<DashMap<String, ObservedUserLiveStatus>> =
@@ -187,6 +179,7 @@ static PROXY_LOOKUPS: LazyLock<Mutex<ProxyLookups>> = LazyLock::new(Mutex::defau
 const CHANNEL_ID_CACHE_MAX: usize = 4096;
 
 /// Thin wrapper that pairs a cached value with its insertion timestamp.
+#[derive(Clone)]
 struct CachedEntry<T> {
     value: T,
     fetched_at: Instant,
@@ -239,7 +232,7 @@ pub struct UserCardFetchStatus {
 }
 
 impl UserCardFetchStatus {
-    fn idle() -> Self {
+    pub(crate) fn idle() -> Self {
         Self {
             state: UserCardFetchState::Idle,
             message: None,
@@ -409,16 +402,12 @@ pub fn get_user_profile_status(login_or_id: &str) -> UserCardFetchStatus {
 
 /// Queue a background Twitch user profile fetch if the cache does not already have it.
 pub fn queue_fetch_user_profile(username: &str) {
-    queue_fetch_user_profile_inner(username, false);
-}
-
-fn queue_fetch_user_profile_inner(username: &str, force: bool) {
     let username = username.trim().trim_start_matches('@').to_lowercase();
     if username.is_empty() {
         return;
     }
     let current_status = get_user_profile_status(&username);
-    if !force && !should_fetch_status(&current_status) {
+    if !should_fetch_status(&current_status) {
         return;
     }
 
@@ -1121,7 +1110,55 @@ mod proxy_lookup_tests {
     }
 }
 
-fn follow_cache_key(channel_login: &str, user_key: &str) -> String {
+/// Channel-scoped user-card metadata that has the same cache shape for follows
+/// and subscriptions.
+trait ChannelUserInfo: Clone + Send + Sync + 'static {
+    fn channel_login(&self) -> &str;
+    fn user_id(&self) -> &str;
+    fn user_login(&self) -> &str;
+}
+
+impl ChannelUserInfo for TwitchUserFollowInfo {
+    fn channel_login(&self) -> &str {
+        &self.channel_login
+    }
+    fn user_id(&self) -> &str {
+        &self.user_id
+    }
+    fn user_login(&self) -> &str {
+        &self.user_login
+    }
+}
+
+impl ChannelUserInfo for TwitchUserSubscriptionInfo {
+    fn channel_login(&self) -> &str {
+        &self.channel_login
+    }
+    fn user_id(&self) -> &str {
+        &self.user_id
+    }
+    fn user_login(&self) -> &str {
+        &self.user_login
+    }
+}
+
+/// Values and fetch status for one kind of channel-scoped user-card metadata,
+/// keyed by [`channel_user_key`] under both the user's login and id, plus the
+/// keys with a fetch in flight.
+struct ChannelUserResource<T> {
+    /// Names the metadata in status text ("follow", "subscription").
+    label: &'static str,
+    values: DashMap<String, CachedEntry<T>>,
+    status: DashMap<String, UserCardFetchStatus>,
+    in_flight: Mutex<HashSet<String>>,
+}
+
+static USER_FOLLOWS: LazyLock<ChannelUserResource<TwitchUserFollowInfo>> =
+    LazyLock::new(|| ChannelUserResource::new("follow"));
+static USER_SUBSCRIPTIONS: LazyLock<ChannelUserResource<TwitchUserSubscriptionInfo>> =
+    LazyLock::new(|| ChannelUserResource::new("subscription"));
+
+fn channel_user_key(channel_login: &str, user_key: &str) -> String {
     format!(
         "{}:{}",
         channel_login.trim().trim_start_matches('#').to_lowercase(),
@@ -1129,12 +1166,199 @@ fn follow_cache_key(channel_login: &str, user_key: &str) -> String {
     )
 }
 
-fn subscription_cache_key(channel_login: &str, user_key: &str) -> String {
-    format!(
-        "{}:{}",
-        channel_login.trim().trim_start_matches('#').to_lowercase(),
-        user_key.trim().trim_start_matches('@').to_lowercase()
-    )
+impl<T: ChannelUserInfo> ChannelUserResource<T> {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            values: DashMap::new(),
+            status: DashMap::new(),
+            in_flight: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Looks `map` up by user id first, then by login.
+    fn lookup<V: Clone>(
+        map: &DashMap<String, V>,
+        channel_login: &str,
+        user_login: &str,
+        user_id: Option<&str>,
+    ) -> Option<V> {
+        if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty())
+            && let Some(entry) = map.get(&channel_user_key(channel_login, user_id))
+        {
+            return Some(entry.value().clone());
+        }
+
+        let user_login = user_login.trim().trim_start_matches('@');
+        if user_login.is_empty() {
+            return None;
+        }
+        map.get(&channel_user_key(channel_login, user_login))
+            .map(|entry| entry.value().clone())
+    }
+
+    fn cached(&self, channel_login: &str, user_login: &str, user_id: Option<&str>) -> Option<T> {
+        Self::lookup(&self.values, channel_login, user_login, user_id).map(|entry| entry.value)
+    }
+
+    fn fetch_status(
+        &self,
+        channel_login: &str,
+        user_login: &str,
+        user_id: Option<&str>,
+    ) -> UserCardFetchStatus {
+        Self::lookup(&self.status, channel_login, user_login, user_id)
+            .unwrap_or_else(UserCardFetchStatus::idle)
+    }
+
+    fn cache(&self, info: T) {
+        let channel_login = info.channel_login().to_string();
+        let user_id_key = channel_user_key(&channel_login, info.user_id());
+        let user_login_key = channel_user_key(&channel_login, info.user_login());
+        let user_login = info.user_login().to_string();
+        self.values
+            .insert(user_id_key.clone(), CachedEntry::new(info.clone()));
+        self.values
+            .insert(user_login_key.clone(), CachedEntry::new(info));
+        let ready = UserCardFetchStatus::ready();
+        self.status.insert(user_id_key, ready.clone());
+        self.status.insert(user_login_key, ready);
+        publish_user_card_metadata_update(Some(&channel_login), &user_login);
+    }
+
+    fn set_status(
+        &self,
+        channel_login: &str,
+        user_login: &str,
+        user_id: Option<&str>,
+        status: UserCardFetchStatus,
+    ) {
+        let finished = status.state != UserCardFetchState::Loading;
+        self.status
+            .insert(channel_user_key(channel_login, user_login), status.clone());
+        if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty()) {
+            self.status
+                .insert(channel_user_key(channel_login, user_id), status);
+        }
+        if finished {
+            publish_user_card_metadata_update(Some(channel_login), user_login);
+        }
+    }
+
+    fn set_failure_status(
+        &self,
+        channel_login: &str,
+        user_login: &str,
+        user_id: Option<&str>,
+        status: UserCardFetchStatus,
+    ) {
+        self.set_status(
+            channel_login,
+            user_login,
+            user_id,
+            UserCardFetchStatus {
+                stale: self.cached(channel_login, user_login, user_id).is_some(),
+                ..status
+            },
+        );
+    }
+
+    /// Fetch in the background unless a fresh status exists or a fetch for the
+    /// same user is in flight. A Helix 401 renews the session and retries once;
+    /// a failure is recorded only while the account that sent the request is
+    /// still signed in.
+    fn queue<F, Fut>(
+        &'static self,
+        channel_login: &str,
+        user_login: &str,
+        user_id: Option<&str>,
+        fetch: F,
+    ) where
+        F: Fn(String, String, Option<String>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<T, ApiError>> + Send,
+    {
+        let channel_login = channel_login.trim().trim_start_matches('#').to_lowercase();
+        let user_login = user_login.trim().trim_start_matches('@').to_lowercase();
+        let user_id = user_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+
+        if channel_login.is_empty() || user_login.is_empty() {
+            return;
+        }
+        let current_status = self.fetch_status(&channel_login, &user_login, user_id.as_deref());
+        if !should_fetch_authenticated_status(&current_status) {
+            return;
+        }
+
+        let in_flight_key = channel_user_key(
+            &channel_login,
+            user_id.as_deref().unwrap_or(user_login.as_str()),
+        );
+        if !self
+            .in_flight
+            .lock_or_recover()
+            .insert(in_flight_key.clone())
+        {
+            return;
+        }
+        self.set_status(
+            &channel_login,
+            &user_login,
+            user_id.as_deref(),
+            UserCardFetchStatus {
+                stale: self
+                    .cached(&channel_login, &user_login, user_id.as_deref())
+                    .is_some(),
+                ..UserCardFetchStatus::loading()
+            },
+        );
+
+        let mut request_auth = super::auth::capture_authenticated_resource_fence();
+        crate::backend::bridge::get_runtime().spawn(async move {
+            let run = || fetch(channel_login.clone(), user_login.clone(), user_id.clone());
+            let mut result = run().await;
+            let retry = match &result {
+                Err(error) => {
+                    refreshed_after_unauthorized(
+                        error,
+                        request_auth.as_ref().map(|auth| auth.access_token()),
+                    )
+                    .await
+                }
+                Ok(_) => false,
+            };
+            if retry {
+                request_auth = super::auth::capture_authenticated_resource_fence();
+                result = run().await;
+            }
+            if let Err(error) = result
+                && authenticated_request_context_is_current(request_auth.as_ref())
+            {
+                self.set_failure_status(
+                    &channel_login,
+                    &user_login,
+                    user_id.as_deref(),
+                    classify_follow_or_subscription_error(&error, self.label),
+                );
+            }
+            self.in_flight.lock_or_recover().remove(&in_flight_key);
+        });
+    }
+
+    /// Drops values and statuses older than `ttl`; returns how many of each.
+    fn sweep(&self, now: Instant, ttl: Duration) -> (usize, usize) {
+        let values_before = self.values.len();
+        self.values
+            .retain(|_, entry| now.duration_since(entry.fetched_at) < ttl);
+        let status_before = self.status.len();
+        self.status
+            .retain(|_, status| now.duration_since(status.updated_at) < ttl);
+        (
+            values_before.saturating_sub(self.values.len()),
+            status_before.saturating_sub(self.status.len()),
+        )
+    }
 }
 
 /// Get cached channel-follow metadata by target login or user ID.
@@ -1143,20 +1367,7 @@ pub fn get_cached_user_follow(
     user_login: &str,
     user_id: Option<&str>,
 ) -> Option<TwitchUserFollowInfo> {
-    if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty())
-        && let Some(entry) = USER_FOLLOW_CACHE.get(&follow_cache_key(channel_login, user_id))
-    {
-        return Some(entry.value.clone());
-    }
-
-    let user_login = user_login.trim().trim_start_matches('@');
-    if user_login.is_empty() {
-        return None;
-    }
-
-    USER_FOLLOW_CACHE
-        .get(&follow_cache_key(channel_login, user_login))
-        .map(|entry| entry.value.clone())
+    USER_FOLLOWS.cached(channel_login, user_login, user_id)
 }
 
 pub fn get_user_follow_status(
@@ -1164,118 +1375,19 @@ pub fn get_user_follow_status(
     user_login: &str,
     user_id: Option<&str>,
 ) -> UserCardFetchStatus {
-    if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty())
-        && let Some(status) = USER_FOLLOW_STATUS.get(&follow_cache_key(channel_login, user_id))
-    {
-        return status.value().clone();
-    }
-
-    let user_login = user_login.trim().trim_start_matches('@');
-    if user_login.is_empty() {
-        return UserCardFetchStatus::idle();
-    }
-
-    USER_FOLLOW_STATUS
-        .get(&follow_cache_key(channel_login, user_login))
-        .map(|status| status.value().clone())
-        .unwrap_or_else(UserCardFetchStatus::idle)
+    USER_FOLLOWS.fetch_status(channel_login, user_login, user_id)
 }
 
 /// Queue a background Twitch channel-follow lookup if needed.
 pub fn queue_fetch_user_follow(channel_login: &str, user_login: &str, user_id: Option<&str>) {
-    queue_fetch_user_follow_inner(channel_login, user_login, user_id, false);
-}
-
-fn queue_fetch_user_follow_inner(
-    channel_login: &str,
-    user_login: &str,
-    user_id: Option<&str>,
-    force: bool,
-) {
-    let channel_login = channel_login.trim().trim_start_matches('#').to_lowercase();
-    let user_login = user_login.trim().trim_start_matches('@').to_lowercase();
-    let user_id = user_id
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty());
-
-    if channel_login.is_empty() || user_login.is_empty() {
-        return;
-    }
-    let current_status = get_user_follow_status(&channel_login, &user_login, user_id.as_deref());
-    if !force && !should_fetch_authenticated_status(&current_status) {
-        return;
-    }
-
-    let in_flight_key = follow_cache_key(
-        &channel_login,
-        user_id.as_deref().unwrap_or(user_login.as_str()),
-    );
-    {
-        let mut in_flight = USER_FOLLOW_FETCHES_IN_FLIGHT.lock_or_recover();
-        if !in_flight.insert(in_flight_key.clone()) {
-            return;
-        }
-    }
-    cache_user_follow_status(
-        &channel_login,
-        &user_login,
-        user_id.as_deref(),
-        UserCardFetchStatus {
-            stale: get_cached_user_follow(&channel_login, &user_login, user_id.as_deref())
-                .is_some(),
-            ..UserCardFetchStatus::loading()
+    USER_FOLLOWS.queue(
+        channel_login,
+        user_login,
+        user_id,
+        |channel_login, user_login, user_id| async move {
+            fetch_user_follow(&channel_login, &user_login, user_id.as_deref()).await
         },
     );
-
-    let mut request_auth = super::auth::capture_authenticated_resource_fence();
-    crate::backend::bridge::get_runtime().spawn(async move {
-        let mut result = fetch_user_follow(&channel_login, &user_login, user_id.as_deref()).await;
-        let retry = match &result {
-            Err(error) => {
-                refreshed_after_unauthorized(
-                    error,
-                    request_auth.as_ref().map(|auth| auth.access_token()),
-                )
-                .await
-            }
-            Ok(_) => false,
-        };
-        if retry {
-            request_auth = super::auth::capture_authenticated_resource_fence();
-            result = fetch_user_follow(&channel_login, &user_login, user_id.as_deref()).await;
-        }
-        if let Err(error) = result
-            && authenticated_request_context_is_current(request_auth.as_ref())
-        {
-            set_follow_failure_status(
-                &channel_login,
-                &user_login,
-                user_id.as_deref(),
-                classify_follow_or_subscription_error(&error, "follow"),
-            );
-        }
-        USER_FOLLOW_FETCHES_IN_FLIGHT
-            .lock_or_recover()
-            .remove(&in_flight_key);
-    });
-}
-
-fn cache_user_follow(info: TwitchUserFollowInfo) {
-    let channel_login = info.channel_login.clone();
-    let user_id = info.user_id.clone();
-    let user_login = info.user_login.clone();
-    USER_FOLLOW_CACHE.insert(
-        follow_cache_key(&channel_login, &user_id),
-        CachedEntry::new(info.clone()),
-    );
-    USER_FOLLOW_CACHE.insert(
-        follow_cache_key(&channel_login, &user_login),
-        CachedEntry::new(info),
-    );
-    let ready = UserCardFetchStatus::ready();
-    USER_FOLLOW_STATUS.insert(follow_cache_key(&channel_login, &user_id), ready.clone());
-    USER_FOLLOW_STATUS.insert(follow_cache_key(&channel_login, &user_login), ready);
-    publish_user_card_metadata_update(Some(&channel_login), &user_login);
 }
 
 /// Get cached channel-subscription metadata by target login or user ID.
@@ -1284,21 +1396,7 @@ pub fn get_cached_user_subscription(
     user_login: &str,
     user_id: Option<&str>,
 ) -> Option<TwitchUserSubscriptionInfo> {
-    if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty())
-        && let Some(entry) =
-            USER_SUBSCRIPTION_CACHE.get(&subscription_cache_key(channel_login, user_id))
-    {
-        return Some(entry.value.clone());
-    }
-
-    let user_login = user_login.trim().trim_start_matches('@');
-    if user_login.is_empty() {
-        return None;
-    }
-
-    USER_SUBSCRIPTION_CACHE
-        .get(&subscription_cache_key(channel_login, user_login))
-        .map(|entry| entry.value.clone())
+    USER_SUBSCRIPTIONS.cached(channel_login, user_login, user_id)
 }
 
 pub fn get_user_subscription_status(
@@ -1306,124 +1404,19 @@ pub fn get_user_subscription_status(
     user_login: &str,
     user_id: Option<&str>,
 ) -> UserCardFetchStatus {
-    if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty())
-        && let Some(status) =
-            USER_SUBSCRIPTION_STATUS.get(&subscription_cache_key(channel_login, user_id))
-    {
-        return status.value().clone();
-    }
-
-    let user_login = user_login.trim().trim_start_matches('@');
-    if user_login.is_empty() {
-        return UserCardFetchStatus::idle();
-    }
-
-    USER_SUBSCRIPTION_STATUS
-        .get(&subscription_cache_key(channel_login, user_login))
-        .map(|status| status.value().clone())
-        .unwrap_or_else(UserCardFetchStatus::idle)
+    USER_SUBSCRIPTIONS.fetch_status(channel_login, user_login, user_id)
 }
 
 /// Queue a background Twitch channel-subscription lookup if needed.
 pub fn queue_fetch_user_subscription(channel_login: &str, user_login: &str, user_id: Option<&str>) {
-    queue_fetch_user_subscription_inner(channel_login, user_login, user_id, false);
-}
-
-fn queue_fetch_user_subscription_inner(
-    channel_login: &str,
-    user_login: &str,
-    user_id: Option<&str>,
-    force: bool,
-) {
-    let channel_login = channel_login.trim().trim_start_matches('#').to_lowercase();
-    let user_login = user_login.trim().trim_start_matches('@').to_lowercase();
-    let user_id = user_id
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty());
-
-    if channel_login.is_empty() || user_login.is_empty() {
-        return;
-    }
-    let current_status =
-        get_user_subscription_status(&channel_login, &user_login, user_id.as_deref());
-    if !force && !should_fetch_authenticated_status(&current_status) {
-        return;
-    }
-
-    let in_flight_key = subscription_cache_key(
-        &channel_login,
-        user_id.as_deref().unwrap_or(user_login.as_str()),
-    );
-    {
-        let mut in_flight = USER_SUBSCRIPTION_FETCHES_IN_FLIGHT.lock_or_recover();
-        if !in_flight.insert(in_flight_key.clone()) {
-            return;
-        }
-    }
-    cache_user_subscription_status(
-        &channel_login,
-        &user_login,
-        user_id.as_deref(),
-        UserCardFetchStatus {
-            stale: get_cached_user_subscription(&channel_login, &user_login, user_id.as_deref())
-                .is_some(),
-            ..UserCardFetchStatus::loading()
+    USER_SUBSCRIPTIONS.queue(
+        channel_login,
+        user_login,
+        user_id,
+        |channel_login, user_login, user_id| async move {
+            fetch_user_subscription(&channel_login, &user_login, user_id.as_deref()).await
         },
     );
-
-    let mut request_auth = super::auth::capture_authenticated_resource_fence();
-    crate::backend::bridge::get_runtime().spawn(async move {
-        let mut result =
-            fetch_user_subscription(&channel_login, &user_login, user_id.as_deref()).await;
-        let retry = match &result {
-            Err(error) => {
-                refreshed_after_unauthorized(
-                    error,
-                    request_auth.as_ref().map(|auth| auth.access_token()),
-                )
-                .await
-            }
-            Ok(_) => false,
-        };
-        if retry {
-            request_auth = super::auth::capture_authenticated_resource_fence();
-            result = fetch_user_subscription(&channel_login, &user_login, user_id.as_deref()).await;
-        }
-        if let Err(error) = result
-            && authenticated_request_context_is_current(request_auth.as_ref())
-        {
-            set_subscription_failure_status(
-                &channel_login,
-                &user_login,
-                user_id.as_deref(),
-                classify_follow_or_subscription_error(&error, "subscription"),
-            );
-        }
-        USER_SUBSCRIPTION_FETCHES_IN_FLIGHT
-            .lock_or_recover()
-            .remove(&in_flight_key);
-    });
-}
-
-fn cache_user_subscription(info: TwitchUserSubscriptionInfo) {
-    let channel_login = info.channel_login.clone();
-    let user_id = info.user_id.clone();
-    let user_login = info.user_login.clone();
-    USER_SUBSCRIPTION_CACHE.insert(
-        subscription_cache_key(&channel_login, &user_id),
-        CachedEntry::new(info.clone()),
-    );
-    USER_SUBSCRIPTION_CACHE.insert(
-        subscription_cache_key(&channel_login, &user_login),
-        CachedEntry::new(info),
-    );
-    let ready = UserCardFetchStatus::ready();
-    USER_SUBSCRIPTION_STATUS.insert(
-        subscription_cache_key(&channel_login, &user_id),
-        ready.clone(),
-    );
-    USER_SUBSCRIPTION_STATUS.insert(subscription_cache_key(&channel_login, &user_login), ready);
-    publish_user_card_metadata_update(Some(&channel_login), &user_login);
 }
 
 fn set_profile_status(username: &str, status: UserCardFetchStatus) {
@@ -1437,80 +1430,11 @@ fn set_profile_status(username: &str, status: UserCardFetchStatus) {
     }
 }
 
-fn cache_user_follow_status(
-    channel_login: &str,
-    user_login: &str,
-    user_id: Option<&str>,
-    status: UserCardFetchStatus,
-) {
-    let finished = status.state != UserCardFetchState::Loading;
-    USER_FOLLOW_STATUS.insert(follow_cache_key(channel_login, user_login), status.clone());
-    if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty()) {
-        USER_FOLLOW_STATUS.insert(follow_cache_key(channel_login, user_id), status);
-    }
-    if finished {
-        publish_user_card_metadata_update(Some(channel_login), user_login);
-    }
-}
-
-fn cache_user_subscription_status(
-    channel_login: &str,
-    user_login: &str,
-    user_id: Option<&str>,
-    status: UserCardFetchStatus,
-) {
-    let finished = status.state != UserCardFetchState::Loading;
-    USER_SUBSCRIPTION_STATUS.insert(
-        subscription_cache_key(channel_login, user_login),
-        status.clone(),
-    );
-    if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty()) {
-        USER_SUBSCRIPTION_STATUS.insert(subscription_cache_key(channel_login, user_id), status);
-    }
-    if finished {
-        publish_user_card_metadata_update(Some(channel_login), user_login);
-    }
-}
-
 fn set_profile_failure_status(username: &str, status: UserCardFetchStatus) {
     set_profile_status(
         username,
         UserCardFetchStatus {
             stale: get_cached_user_profile(username).is_some(),
-            ..status
-        },
-    );
-}
-
-fn set_follow_failure_status(
-    channel_login: &str,
-    user_login: &str,
-    user_id: Option<&str>,
-    status: UserCardFetchStatus,
-) {
-    cache_user_follow_status(
-        channel_login,
-        user_login,
-        user_id,
-        UserCardFetchStatus {
-            stale: get_cached_user_follow(channel_login, user_login, user_id).is_some(),
-            ..status
-        },
-    );
-}
-
-fn set_subscription_failure_status(
-    channel_login: &str,
-    user_login: &str,
-    user_id: Option<&str>,
-    status: UserCardFetchStatus,
-) {
-    cache_user_subscription_status(
-        channel_login,
-        user_login,
-        user_id,
-        UserCardFetchStatus {
-            stale: get_cached_user_subscription(channel_login, user_login, user_id).is_some(),
             ..status
         },
     );
@@ -1541,9 +1465,9 @@ fn should_fetch_authenticated_status(status: &UserCardFetchStatus) -> bool {
 
 /// True after a user-card lookup failed with a Helix 401 and the session was renewed,
 /// so the caller retries once with the refreshed token.
-async fn refreshed_after_unauthorized(error: &str, rejected_token: Option<&str>) -> bool {
+async fn refreshed_after_unauthorized(error: &ApiError, rejected_token: Option<&str>) -> bool {
     match rejected_token {
-        Some(token) if error.contains("status 401") => {
+        Some(token) if error.status_code() == Some(401) => {
             super::auth::recover_helix_unauthorized(token, "")
                 .await
                 .is_some()
@@ -1561,100 +1485,84 @@ fn authenticated_request_context_is_current(
     }
 }
 
-fn classify_profile_error(error: &str) -> UserCardFetchStatus {
+/// User-card status text for each class of lookup failure.
+struct UserCardFailureMessages {
+    auth_required: String,
+    forbidden: String,
+    unavailable: String,
+    generic: String,
+    retryable: String,
+}
+
+fn classify_profile_error(error: &ApiError) -> UserCardFetchStatus {
     classify_twitch_error(
         error,
-        "Profile details need an authenticated Twitch account",
-        "Profile details are not available with the current Twitch account",
-        "Profile details are unavailable for this user",
-        "Could not load Twitch profile details right now",
-        "Profile details are temporarily unavailable",
+        UserCardFailureMessages {
+            auth_required: "Profile details need an authenticated Twitch account".to_string(),
+            forbidden: "Profile details are not available with the current Twitch account"
+                .to_string(),
+            unavailable: "Profile details are unavailable for this user".to_string(),
+            generic: "Could not load Twitch profile details right now".to_string(),
+            retryable: "Profile details are temporarily unavailable".to_string(),
+        },
     )
 }
 
-fn classify_follow_or_subscription_error(error: &str, label: &str) -> UserCardFetchStatus {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("no auth token") && crate::backend::bridge::is_authenticated() {
-        return UserCardFetchStatus::with_message(
-            UserCardFetchState::RetryableError,
-            format!("{label} details are temporarily unavailable while Twitch credentials refresh"),
-            false,
-        );
-    }
-    if lower.contains("status 401") && !lower.contains("no auth token") {
-        return UserCardFetchStatus::with_message(
-            UserCardFetchState::Forbidden,
-            format!("{label} details are not available with your permissions for this channel"),
-            false,
-        );
+fn classify_follow_or_subscription_error(error: &ApiError, label: &str) -> UserCardFetchStatus {
+    match error.kind() {
+        ApiErrorKind::NoAuth if crate::backend::bridge::is_authenticated() => {
+            return UserCardFetchStatus::with_message(
+                UserCardFetchState::RetryableError,
+                format!(
+                    "{label} details are temporarily unavailable while Twitch credentials refresh"
+                ),
+                false,
+            );
+        }
+        ApiErrorKind::Status(401) => {
+            return UserCardFetchStatus::with_message(
+                UserCardFetchState::Forbidden,
+                format!("{label} details are not available with your permissions for this channel"),
+                false,
+            );
+        }
+        _ => {}
     }
     classify_twitch_error(
         error,
-        &format!("{label} details need an authenticated Twitch account"),
-        &format!("{label} details are not available with your permissions for this channel"),
-        &format!("{label} details are unavailable for this user"),
-        &format!("Could not load {label} details right now"),
-        &format!("{label} details are temporarily unavailable"),
+        UserCardFailureMessages {
+            auth_required: format!("{label} details need an authenticated Twitch account"),
+            forbidden: format!(
+                "{label} details are not available with your permissions for this channel"
+            ),
+            unavailable: format!("{label} details are unavailable for this user"),
+            generic: format!("Could not load {label} details right now"),
+            retryable: format!("{label} details are temporarily unavailable"),
+        },
     )
 }
 
 fn classify_twitch_error(
-    error: &str,
-    auth_required_message: &str,
-    forbidden_message: &str,
-    unavailable_message: &str,
-    generic_message: &str,
-    retryable_message: &str,
+    error: &ApiError,
+    messages: UserCardFailureMessages,
 ) -> UserCardFetchStatus {
-    let lower = error.to_ascii_lowercase();
-
-    // A build without the proxy can only look users up through Helix, which needs a login.
-    if lower.contains("no auth token")
-        || lower.contains("status 401")
-        || error.contains(API_PROXY_NOT_CONFIGURED)
-    {
-        return UserCardFetchStatus::with_message(
-            UserCardFetchState::AuthRequired,
-            auth_required_message,
-            false,
-        );
-    }
-    if lower.contains("status 403") {
-        return UserCardFetchStatus::with_message(
-            UserCardFetchState::Forbidden,
-            forbidden_message,
-            false,
-        );
-    }
-    if lower.contains("status 404")
-        || lower.contains("not found")
-        || lower.contains("only viewable")
-    {
-        return UserCardFetchStatus::with_message(
-            UserCardFetchState::Unavailable,
-            unavailable_message,
-            false,
-        );
-    }
-    if lower.contains("status 429")
-        || lower.contains("status 500")
-        || lower.contains("status 502")
-        || lower.contains("status 503")
-        || lower.contains("status 504")
-        || lower.contains("timeout")
-        || lower.contains("temporar")
-        || lower.contains("connection")
-        || lower.contains("account changed")
-        || lower.contains("superseded")
-    {
-        return UserCardFetchStatus::with_message(
-            UserCardFetchState::RetryableError,
-            retryable_message,
-            false,
-        );
-    }
-
-    UserCardFetchStatus::with_message(UserCardFetchState::Error, generic_message, false)
+    let (state, message) = match error.kind() {
+        // A build without the proxy can only look users up through Helix, which needs a login.
+        ApiErrorKind::NoAuth | ApiErrorKind::ProxyNotConfigured | ApiErrorKind::Status(401) => {
+            (UserCardFetchState::AuthRequired, messages.auth_required)
+        }
+        ApiErrorKind::Status(403) => (UserCardFetchState::Forbidden, messages.forbidden),
+        ApiErrorKind::Status(404) | ApiErrorKind::NotFound => {
+            (UserCardFetchState::Unavailable, messages.unavailable)
+        }
+        ApiErrorKind::Status(429 | 500 | 502 | 503 | 504)
+        | ApiErrorKind::Transport { retryable: true }
+        | ApiErrorKind::AccountChanged => (UserCardFetchState::RetryableError, messages.retryable),
+        ApiErrorKind::Status(_)
+        | ApiErrorKind::Transport { retryable: false }
+        | ApiErrorKind::Other => (UserCardFetchState::Error, messages.generic),
+    };
+    UserCardFetchStatus::with_message(state, message, false)
 }
 
 /// Evict stale entries from all user-card caches.
@@ -1674,13 +1582,8 @@ pub fn sweep_user_card_caches() {
     USER_PROFILE_CACHE.retain(|_, entry| now.duration_since(entry.fetched_at) < eviction_ttl);
     let profile_evicted = profile_before.saturating_sub(USER_PROFILE_CACHE.len());
 
-    let follow_before = USER_FOLLOW_CACHE.len();
-    USER_FOLLOW_CACHE.retain(|_, entry| now.duration_since(entry.fetched_at) < eviction_ttl);
-    let follow_evicted = follow_before.saturating_sub(USER_FOLLOW_CACHE.len());
-
-    let sub_before = USER_SUBSCRIPTION_CACHE.len();
-    USER_SUBSCRIPTION_CACHE.retain(|_, entry| now.duration_since(entry.fetched_at) < eviction_ttl);
-    let sub_evicted = sub_before.saturating_sub(USER_SUBSCRIPTION_CACHE.len());
+    let (follow_evicted, follow_status_evicted) = USER_FOLLOWS.sweep(now, eviction_ttl);
+    let (sub_evicted, sub_status_evicted) = USER_SUBSCRIPTIONS.sweep(now, eviction_ttl);
 
     let live_before = USER_LIVE_CACHE.len();
     USER_LIVE_CACHE.retain(|_, entry| {
@@ -1702,15 +1605,6 @@ pub fn sweep_user_card_caches() {
     let profile_status_before = USER_PROFILE_STATUS.len();
     USER_PROFILE_STATUS.retain(|_, status| now.duration_since(status.updated_at) < eviction_ttl);
     let profile_status_evicted = profile_status_before.saturating_sub(USER_PROFILE_STATUS.len());
-
-    let follow_status_before = USER_FOLLOW_STATUS.len();
-    USER_FOLLOW_STATUS.retain(|_, status| now.duration_since(status.updated_at) < eviction_ttl);
-    let follow_status_evicted = follow_status_before.saturating_sub(USER_FOLLOW_STATUS.len());
-
-    let sub_status_before = USER_SUBSCRIPTION_STATUS.len();
-    USER_SUBSCRIPTION_STATUS
-        .retain(|_, status| now.duration_since(status.updated_at) < eviction_ttl);
-    let sub_status_evicted = sub_status_before.saturating_sub(USER_SUBSCRIPTION_STATUS.len());
 
     let channel_id_evicted = if CHANNEL_ID_CACHE.len() > CHANNEL_ID_CACHE_MAX
         || CHANNEL_LOGIN_BY_ID.len() > CHANNEL_ID_CACHE_MAX
@@ -1780,7 +1674,7 @@ pub async fn get_channel_login_by_id_cached(channel_id: &str) -> Option<String> 
 /// Warn about a failed channel ID/login lookup, at most once per key per
 /// [`LOOKUP_FAILURE_LOG_INTERVAL`]. Without the ID a channel gets no emotes
 /// or badges, so the cause (status, transport error) must reach the log.
-pub(crate) fn log_lookup_failure(kind: &str, key: &str, error: &str) {
+pub(crate) fn log_lookup_failure(kind: &str, key: &str, error: impl std::fmt::Display) {
     let log_key = format!("{kind}:{}", key.to_ascii_lowercase());
     let now = Instant::now();
     if !should_log_lookup_failure(&mut LOOKUP_FAILURE_LOGGED.lock_or_recover(), log_key, now) {
@@ -1816,7 +1710,7 @@ fn should_log_lookup_failure(
 }
 
 /// Get user ID with caching - checks cache first, then fetches from API
-pub async fn get_user_id_cached(username: &str) -> Result<String, String> {
+pub async fn get_user_id_cached(username: &str) -> Result<String, ApiError> {
     let key = username.to_lowercase();
 
     if let Some(id) = CHANNEL_ID_CACHE.get(&key) {
@@ -1902,71 +1796,74 @@ impl UserData {
 }
 
 /// Get user ID from username using the API proxy (no auth required)
-pub async fn get_user_id(username: &str) -> Result<String, String> {
+async fn get_user_id(username: &str) -> Result<String, ApiError> {
     let resp = proxy_lookup("users", username, false)
         .await
-        .map_err(|e| format!("Failed to fetch user: {}", e.without_url()))?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch user"))?;
 
     if !resp.status.is_success() {
         if let Some(auth) = super::auth::capture_authenticated_resource_fence() {
-            return get_user_id_helix(username, auth.access_token()).await;
+            return user_id_helix(username, auth.access_token()).await;
         }
         if API_PROXY.is_none() {
-            return Err(API_PROXY_NOT_CONFIGURED.to_string());
+            return Err(ApiError::proxy_not_configured());
         }
-        return Err(format!(
-            "User not found: {} (status {})",
-            username, resp.status
+        return Err(ApiError::status(
+            resp.status,
+            format!("User not found: {} (status {})", username, resp.status),
         ));
     }
 
     let data: UsersResponse = resp
         .json()
-        .map_err(|e| format!("Failed to parse user response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse user response: {}", e)))?;
 
     let Some(user) = data.data.first() else {
         if !CHANNEL_LOOKUP_MISSES.contains_key(&username.to_lowercase()) {
             record_channel_lookup_miss(username, ChannelLookupState::NotFound);
         }
-        return Err(format!("User not found: {}", username));
+        return Err(ApiError::not_found(format!("User not found: {}", username)));
     };
     Ok(user.id.clone())
 }
 
 /// Fetch Twitch profile data for a user and cache it.
-pub async fn fetch_user_profile(username: &str) -> Result<TwitchUserProfile, String> {
+pub async fn fetch_user_profile(username: &str) -> Result<TwitchUserProfile, ApiError> {
     let username = username.trim().trim_start_matches('@').to_lowercase();
     if username.is_empty() {
-        return Err("User profile lookup requires a username".to_string());
+        return Err(ApiError::other("User profile lookup requires a username"));
     }
 
     let resp = proxy_lookup("users", &username, false)
         .await
-        .map_err(|e| format!("Failed to fetch user profile: {}", e.without_url()))?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch user profile"))?;
 
     if !resp.status.is_success() {
         if let Some(token) = get_token() {
             return fetch_user_profile_helix(&username, &token).await;
         }
         if API_PROXY.is_none() {
-            return Err(API_PROXY_NOT_CONFIGURED.to_string());
+            return Err(ApiError::proxy_not_configured());
         }
-        return Err(format!(
-            "User profile not found: {} (status {})",
-            username, resp.status
+        return Err(ApiError::status(
+            resp.status,
+            format!(
+                "User profile not found: {} (status {})",
+                username, resp.status
+            ),
         ));
     }
 
     let data: UsersResponse = resp
         .json()
-        .map_err(|e| format!("Failed to parse user profile response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse user profile response: {}", e)))?;
 
     let profile = data
         .data
         .into_iter()
         .next()
         .map(UserData::into_profile)
-        .ok_or_else(|| format!("User profile not found: {}", username))?;
+        .ok_or_else(|| ApiError::not_found(format!("User profile not found: {}", username)))?;
     cache_user_profile(profile.clone());
     Ok(profile)
 }
@@ -1976,7 +1873,7 @@ pub async fn fetch_user_follow(
     channel_login: &str,
     user_login: &str,
     user_id: Option<&str>,
-) -> Result<TwitchUserFollowInfo, String> {
+) -> Result<TwitchUserFollowInfo, ApiError> {
     let channel_login = channel_login.trim().trim_start_matches('#').to_lowercase();
     let user_login = user_login.trim().trim_start_matches('@').to_lowercase();
     let user_id = user_id
@@ -1984,11 +1881,15 @@ pub async fn fetch_user_follow(
         .filter(|id| !id.is_empty());
 
     if channel_login.is_empty() || user_login.is_empty() {
-        return Err("Follow lookup requires channel and user logins".to_string());
+        return Err(ApiError::other(
+            "Follow lookup requires channel and user logins",
+        ));
     }
 
     let Some(auth) = super::auth::capture_authenticated_resource_fence() else {
-        return Err("No auth token available for follow lookup".to_string());
+        return Err(ApiError::no_auth(
+            "No auth token available for follow lookup",
+        ));
     };
     let token = auth.access_token().to_string();
 
@@ -1999,7 +1900,9 @@ pub async fn fetch_user_follow(
         get_user_id_cached(&user_login).await?
     };
     if !auth.is_current() {
-        return Err("Authenticated Twitch account changed during follow lookup".to_string());
+        return Err(ApiError::account_changed(
+            "Authenticated Twitch account changed during follow lookup",
+        ));
     }
 
     let user_follower_count = if super::settings::get_show_follower_count() {
@@ -2012,18 +1915,23 @@ pub async fn fetch_user_follow(
             TWITCH_HTTP_CLIENT.get(&count_url).helix_auth(&token),
         )
         .await
-        .map_err(|e| format!("Failed to fetch follower count: {}", e))?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch follower count"))?;
         if !count_resp.status().is_success() {
-            return Err(format!(
-                "Follower count lookup failed for {} (status {})",
-                user_login,
-                count_resp.status()
+            return Err(ApiError::status(
+                count_resp.status(),
+                format!(
+                    "Follower count lookup failed for {} (status {})",
+                    user_login,
+                    count_resp.status()
+                ),
             ));
         }
         count_resp
             .json::<ChannelFollowersResponse>()
             .await
-            .map_err(|e| format!("Failed to parse follower count response: {}", e))?
+            .map_err(|e| {
+                ApiError::other(format!("Failed to parse follower count response: {}", e))
+            })?
             .total
     } else {
         None
@@ -2042,18 +1950,23 @@ pub async fn fetch_user_follow(
             TWITCH_HTTP_CLIENT.get(&relationship_url).helix_auth(&token),
         )
         .await
-        .map_err(|e| format!("Failed to fetch follow metadata: {}", e))?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch follow metadata"))?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "Follow lookup failed for {} in #{} (status {})",
-                user_login,
-                channel_login,
-                resp.status()
+            return Err(ApiError::status(
+                resp.status(),
+                format!(
+                    "Follow lookup failed for {} in #{} (status {})",
+                    user_login,
+                    channel_login,
+                    resp.status()
+                ),
             ));
         }
         resp.json::<ChannelFollowersResponse>()
             .await
-            .map_err(|e| format!("Failed to parse follow metadata response: {}", e))?
+            .map_err(|e| {
+                ApiError::other(format!("Failed to parse follow metadata response: {}", e))
+            })?
             .data
             .into_iter()
             .next()
@@ -2061,7 +1974,9 @@ pub async fn fetch_user_follow(
         None
     };
     if !auth.is_current() {
-        return Err("Authenticated Twitch account changed during follow lookup".to_string());
+        return Err(ApiError::account_changed(
+            "Authenticated Twitch account changed during follow lookup",
+        ));
     }
     let followed_at = followed.as_ref().map(|follow| follow.followed_at.clone());
     let resolved_user_login = followed
@@ -2083,10 +1998,12 @@ pub async fn fetch_user_follow(
         follower_count: user_follower_count,
     };
     if auth
-        .commit_if_current(|| cache_user_follow(info.clone()))
+        .commit_if_current(|| USER_FOLLOWS.cache(info.clone()))
         .is_none()
     {
-        return Err("Authenticated Twitch account changed during follow lookup".to_string());
+        return Err(ApiError::account_changed(
+            "Authenticated Twitch account changed during follow lookup",
+        ));
     }
     Ok(info)
 }
@@ -2096,7 +2013,7 @@ pub async fn fetch_user_subscription(
     channel_login: &str,
     user_login: &str,
     user_id: Option<&str>,
-) -> Result<TwitchUserSubscriptionInfo, String> {
+) -> Result<TwitchUserSubscriptionInfo, ApiError> {
     let channel_login = channel_login.trim().trim_start_matches('#').to_lowercase();
     let user_login = user_login.trim().trim_start_matches('@').to_lowercase();
     let user_id = user_id
@@ -2104,11 +2021,15 @@ pub async fn fetch_user_subscription(
         .filter(|id| !id.is_empty());
 
     if channel_login.is_empty() || user_login.is_empty() {
-        return Err("Subscription lookup requires channel and user logins".to_string());
+        return Err(ApiError::other(
+            "Subscription lookup requires channel and user logins",
+        ));
     }
 
     let Some(auth) = super::auth::capture_authenticated_resource_fence() else {
-        return Err("No auth token available for subscription lookup".to_string());
+        return Err(ApiError::no_auth(
+            "No auth token available for subscription lookup",
+        ));
     };
     let token = auth.access_token().to_string();
 
@@ -2119,7 +2040,9 @@ pub async fn fetch_user_subscription(
         get_user_id_cached(&user_login).await?
     };
     if !auth.is_current() {
-        return Err("Authenticated Twitch account changed during subscription lookup".to_string());
+        return Err(ApiError::account_changed(
+            "Authenticated Twitch account changed during subscription lookup",
+        ));
     }
 
     let self_login = super::settings::get_username_lowercase();
@@ -2139,10 +2062,10 @@ pub async fn fetch_user_subscription(
             urlencoding::encode(&target_user_id)
         )
     } else {
-        return Err(format!(
+        return Err(ApiError::not_found(format!(
             "Subscription details for {} are only viewable for your own channel or your own subscriptions",
             user_login
-        ));
+        )));
     };
 
     let resp = http::send_logged(
@@ -2150,25 +2073,33 @@ pub async fn fetch_user_subscription(
         TWITCH_HTTP_CLIENT.get(&url).helix_auth(&token),
     )
     .await
-    .map_err(|e| format!("Failed to fetch subscription metadata: {}", e))?;
+    .map_err(|e| ApiError::transport(e, "Failed to fetch subscription metadata"))?;
 
     let response: BroadcasterSubscriptionsResponse = if is_own_card && resp.status().as_u16() == 404
     {
         BroadcasterSubscriptionsResponse { data: Vec::new() }
     } else if !resp.status().is_success() {
-        return Err(format!(
-            "Subscription lookup failed for {} in #{} (status {})",
-            user_login,
-            channel_login,
-            resp.status()
+        return Err(ApiError::status(
+            resp.status(),
+            format!(
+                "Subscription lookup failed for {} in #{} (status {})",
+                user_login,
+                channel_login,
+                resp.status()
+            ),
         ));
     } else {
-        resp.json()
-            .await
-            .map_err(|e| format!("Failed to parse subscription metadata response: {}", e))?
+        resp.json().await.map_err(|e| {
+            ApiError::other(format!(
+                "Failed to parse subscription metadata response: {}",
+                e
+            ))
+        })?
     };
     if !auth.is_current() {
-        return Err("Authenticated Twitch account changed during subscription lookup".to_string());
+        return Err(ApiError::account_changed(
+            "Authenticated Twitch account changed during subscription lookup",
+        ));
     }
     let subscription = response.data.into_iter().next();
     let resolved_user_login = subscription
@@ -2200,10 +2131,12 @@ pub async fn fetch_user_subscription(
             .and_then(|sub| non_empty_trimmed_string(&sub.gifter_name)),
     };
     if auth
-        .commit_if_current(|| cache_user_subscription(info.clone()))
+        .commit_if_current(|| USER_SUBSCRIPTIONS.cache(info.clone()))
         .is_none()
     {
-        return Err("Authenticated Twitch account changed during subscription lookup".to_string());
+        return Err(ApiError::account_changed(
+            "Authenticated Twitch account changed during subscription lookup",
+        ));
     }
     Ok(info)
 }
@@ -2216,7 +2149,7 @@ fn non_empty_trimmed_string(value: &str) -> Option<String> {
 async fn fetch_user_profile_helix(
     username: &str,
     token: &str,
-) -> Result<TwitchUserProfile, String> {
+) -> Result<TwitchUserProfile, ApiError> {
     let url = format!("https://api.twitch.tv/helix/users?login={}", username);
 
     let resp = http::send_logged(
@@ -2224,33 +2157,40 @@ async fn fetch_user_profile_helix(
         TWITCH_HTTP_CLIENT.get(&url).helix_auth(token),
     )
     .await
-    .map_err(|e| format!("Failed to fetch user profile: {}", e.without_url()))?;
+    .map_err(|e| ApiError::transport(e, "Failed to fetch user profile"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "User profile lookup failed: {} (status {})",
-            username,
-            resp.status()
+        return Err(ApiError::status(
+            resp.status(),
+            format!(
+                "User profile lookup failed: {} (status {})",
+                username,
+                resp.status()
+            ),
         ));
     }
 
     let data: UsersResponse = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse user profile response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse user profile response: {}", e)))?;
 
     let profile = data
         .data
         .into_iter()
         .next()
         .map(UserData::into_profile)
-        .ok_or_else(|| format!("User profile not found: {}", username))?;
+        .ok_or_else(|| ApiError::not_found(format!("User profile not found: {}", username)))?;
     cache_user_profile(profile.clone());
     Ok(profile)
 }
 
 /// Get user ID from username using Helix API (requires auth token)
 pub async fn get_user_id_helix(username: &str, token: &str) -> Result<String, String> {
+    user_id_helix(username, token).await.map_err(String::from)
+}
+
+async fn user_id_helix(username: &str, token: &str) -> Result<String, ApiError> {
     let url = format!(
         "https://api.twitch.tv/helix/users?login={}",
         username.to_lowercase()
@@ -2260,34 +2200,33 @@ pub async fn get_user_id_helix(username: &str, token: &str) -> Result<String, St
         TWITCH_HTTP_CLIENT.get(&url).helix_auth(token)
     })
     .await
-    .map_err(|e| format!("Failed to fetch user: {}", e.without_url()))?;
+    .map_err(|e| ApiError::transport(e, "Failed to fetch user"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "User not found: {} (status {})",
-            username,
-            resp.status()
+        return Err(ApiError::status(
+            resp.status(),
+            format!("User not found: {} (status {})", username, resp.status()),
         ));
     }
 
     let data: UsersResponse = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse user response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse user response: {}", e)))?;
 
     let Some(user) = data.data.first() else {
         if !CHANNEL_LOOKUP_MISSES.contains_key(&username.to_lowercase()) {
             record_channel_lookup_miss(username, ChannelLookupState::NotFound);
         }
-        return Err(format!("User not found: {}", username));
+        return Err(ApiError::not_found(format!("User not found: {}", username)));
     };
     Ok(user.id.clone())
 }
 
 /// Get channel login from user ID using Helix API (requires auth token)
-pub async fn get_channel_login_by_id(channel_id: &str) -> Result<String, String> {
+async fn get_channel_login_by_id(channel_id: &str) -> Result<String, ApiError> {
     let Some(token) = get_token() else {
-        return Err("No auth token available".to_string());
+        return Err(ApiError::no_auth("No auth token available"));
     };
 
     let url = format!("https://api.twitch.tv/helix/users?id={}", channel_id);
@@ -2296,25 +2235,28 @@ pub async fn get_channel_login_by_id(channel_id: &str) -> Result<String, String>
         TWITCH_HTTP_CLIENT.get(&url).helix_auth(token)
     })
     .await
-    .map_err(|e| format!("Failed to fetch user by ID: {}", e.without_url()))?;
+    .map_err(|e| ApiError::transport(e, "Failed to fetch user by ID"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "User lookup by ID failed: {} (status {})",
-            channel_id,
-            resp.status()
+        return Err(ApiError::status(
+            resp.status(),
+            format!(
+                "User lookup by ID failed: {} (status {})",
+                channel_id,
+                resp.status()
+            ),
         ));
     }
 
     let data: UsersResponse = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse user-by-id response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse user-by-id response: {}", e)))?;
 
     data.data
         .first()
         .map(|u| u.login.clone())
-        .ok_or_else(|| format!("User ID not found: {}", channel_id))
+        .ok_or_else(|| ApiError::not_found(format!("User ID not found: {}", channel_id)))
 }
 
 /// Response from /streams endpoint
@@ -2364,27 +2306,30 @@ pub struct StreamInfoResult {
 }
 
 /// Get stream info from username using API proxy
-pub async fn get_stream_info(username: &str) -> Result<Option<StreamInfoResult>, String> {
+pub async fn get_stream_info(username: &str) -> Result<Option<StreamInfoResult>, ApiError> {
     let resp = proxy_lookup("streams", username, false)
         .await
-        .map_err(|e| format!("Failed to fetch stream: {}", e))?;
+        .map_err(|e| ApiError::transport(e, "Failed to fetch stream"))?;
 
     if !resp.status.is_success() {
         if let Some(token) = get_token() {
             return get_stream_info_helix(username, &token).await;
         }
         if API_PROXY.is_none() {
-            return Err(API_PROXY_NOT_CONFIGURED.to_string());
+            return Err(ApiError::proxy_not_configured());
         }
-        return Err(format!(
-            "Stream lookup failed: {} (status {})",
-            username, resp.status
+        return Err(ApiError::status(
+            resp.status,
+            format!(
+                "Stream lookup failed: {} (status {})",
+                username, resp.status
+            ),
         ));
     }
 
     let data: StreamsResponse = resp
         .json()
-        .map_err(|e| format!("Failed to parse stream response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse stream response: {}", e)))?;
 
     if let Some(stream) = data.data.first() {
         Ok(Some(StreamInfoResult {
@@ -2413,7 +2358,7 @@ pub async fn get_stream_info(username: &str) -> Result<Option<StreamInfoResult>,
 pub async fn get_stream_info_helix(
     username: &str,
     token: &str,
-) -> Result<Option<StreamInfoResult>, String> {
+) -> Result<Option<StreamInfoResult>, ApiError> {
     crate::log_net!(debug, "Helix API call for: {}", username);
 
     let url = format!(
@@ -2425,20 +2370,23 @@ pub async fn get_stream_info_helix(
         TWITCH_HTTP_CLIENT.get(&url).helix_auth(token)
     })
     .await
-    .map_err(|e| format!("Failed to fetch stream: {}", e))?;
+    .map_err(|e| ApiError::transport(e, "Failed to fetch stream"))?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "Stream lookup failed: {} (status {})",
-            username,
-            resp.status()
+        return Err(ApiError::status(
+            resp.status(),
+            format!(
+                "Stream lookup failed: {} (status {})",
+                username,
+                resp.status()
+            ),
         ));
     }
 
     let data: StreamsResponse = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse stream response: {}", e))?;
+        .map_err(|e| ApiError::other(format!("Failed to parse stream response: {}", e)))?;
 
     if let Some(stream) = data.data.first() {
         Ok(Some(StreamInfoResult {

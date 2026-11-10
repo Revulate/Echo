@@ -222,7 +222,7 @@ pub async fn cmd_debug_enable_logfile(args: &str) -> CommandResult {
             Err(usage) => return CommandResult::Error(usage.to_string()),
         };
 
-    match crate::profiling::enable_runtime_log_file(&log_file_path) {
+    match crate::diagnostics::profiling::enable_runtime_log_file(&log_file_path) {
         Ok(path) => {
             CommandResult::Success(Some(format!("File logging enabled: {}", path.display())))
         }
@@ -231,7 +231,7 @@ pub async fn cmd_debug_enable_logfile(args: &str) -> CommandResult {
 }
 
 pub async fn cmd_debug_disable_logfile() -> CommandResult {
-    match crate::profiling::disable_runtime_log_file() {
+    match crate::diagnostics::profiling::disable_runtime_log_file() {
         Ok(Some(path)) => {
             CommandResult::Success(Some(format!("File logging disabled: {}", path.display())))
         }
@@ -264,7 +264,7 @@ pub async fn cmd_debug_relaunch_with_logfile(args: &str) -> CommandResult {
     if forced_rust_log {
         command.env("RUST_LOG", "debug");
     }
-    let inherited_forced_rust_log = std::env::var_os(ECHO_LOGFILE_RELAUNCH_ENV)
+    let inherited_forced_rust_log = echo_core::env::os_value(ECHO_LOGFILE_RELAUNCH_ENV)
         .is_some_and(|marker| marker == ECHO_LOGFILE_RELAUNCH_FORCED_RUST_LOG);
     command.env(
         ECHO_LOGFILE_RELAUNCH_ENV,
@@ -287,7 +287,7 @@ pub async fn cmd_debug_relaunch_with_logfile(args: &str) -> CommandResult {
 /// Drop the logging environment a `/debug-relaunch-with-logfile` session set for
 /// itself, so a process that relaunches Echo later (the updater) starts it normally.
 pub fn strip_logfile_relaunch_env(command: &mut Command) {
-    let Some(marker) = std::env::var_os(ECHO_LOGFILE_RELAUNCH_ENV) else {
+    let Some(marker) = echo_core::env::os_value(ECHO_LOGFILE_RELAUNCH_ENV) else {
         return;
     };
     command
@@ -536,7 +536,7 @@ pub async fn cmd_user(channel: &str, args: &str) -> CommandResult {
             Err(error) => return error,
         };
     let user_login = target.user.trim_start_matches('@').to_ascii_lowercase();
-    let channel_login = target.channel.trim_start_matches('#').to_ascii_lowercase();
+    let channel_login = echo_core::channel_identity::normalize_channel_key(&target.channel);
     if !crate::utils::channel_input::is_valid_twitch_login(&user_login)
         || !crate::utils::channel_input::is_valid_twitch_login(&channel_login)
     {
@@ -578,9 +578,9 @@ pub fn cmd_observed_chatters(channel: &str, reason: Option<&str>) -> CommandResu
     let chatters = crate::backend::get_recent_chatters(channel, usize::MAX);
     let entries: Vec<ChatterListEntry> = chatters
         .iter()
-        .map(|(username, display_name, _color)| ChatterListEntry {
-            username: username.clone(),
-            display_name: display_name.clone(),
+        .map(|chatter| ChatterListEntry {
+            username: chatter.login.clone(),
+            display_name: chatter.display_name.clone(),
             user_id: None,
         })
         .collect();
@@ -591,7 +591,7 @@ pub fn cmd_observed_chatters(channel: &str, reason: Option<&str>) -> CommandResu
             channel: channel.trim_start_matches('#').to_lowercase(),
             chatters: entries,
             total_count: count,
-            source: "observed".to_string(),
+            source: crate::backend::ui_actions::ChatterListSource::Observed,
             login_sorted: false,
             is_loading: false,
         },

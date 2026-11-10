@@ -6,7 +6,7 @@ use crate::backend;
 use crate::components::settings::settings_navigation::SettingDescriptor;
 use crate::components::settings::widgets::{SettingsMetrics, setting_target, settings_subheading};
 use crate::components::ui::ButtonExt;
-use crate::fps_profiler;
+use crate::diagnostics::fps_profiler;
 use crate::theme::colors;
 use crate::theme::tokens::{RadiiPixels, Spacing};
 use gpui::prelude::FluentBuilder;
@@ -318,14 +318,14 @@ fn render_health_summary(
         .border_color(colors::settings_group_rule(colors::bg_surface()))
         .child(
             div()
-                .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(colors::text_primary())
                 .child("Health summary"),
         )
         .child(
             div()
-                .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                 .text_color(colors::text_secondary())
                 .child(format!(
                     "{fps:.1} FPS · {eventapi} · {:.1} MB",
@@ -385,8 +385,8 @@ fn render_metric_row(label: &'static str, value: String) -> impl IntoElement + u
             div()
                 .min_w_0()
                 .flex_1()
-                .flex_basis(px(SettingsMetrics::CALM_CONTROL_WIDTH))
-                .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                .flex_basis(px(SettingsMetrics::ROW_CONTROL_WIDTH))
+                .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                 .text_color(colors::text_secondary())
                 .child(label),
         )
@@ -394,7 +394,7 @@ fn render_metric_row(label: &'static str, value: String) -> impl IntoElement + u
             div()
                 .min_w_0()
                 .max_w_full()
-                .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(colors::text_primary())
                 .whitespace_normal()
@@ -430,7 +430,7 @@ fn render_debug_action_row<T: 'static, F: Fn(&mut App) + 'static>(
                 .gap(px(Spacing::XXS))
                 .child(
                     div()
-                        .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(colors::text_primary())
                         .child(title),
@@ -438,7 +438,7 @@ fn render_debug_action_row<T: 'static, F: Fn(&mut App) + 'static>(
                 .child(
                     div()
                         .min_w_0()
-                        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                         .text_color(colors::text_secondary())
                         .whitespace_normal()
                         .child(description),
@@ -469,7 +469,7 @@ fn render_debug_action_row<T: 'static, F: Fn(&mut App) + 'static>(
                 .on_accessible_activate(move |_, _, cx| on_click(cx))
                 .child(
                     div()
-                        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(colors::interactive_foreground())
                         .child(button_label),

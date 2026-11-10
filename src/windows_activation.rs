@@ -1,3 +1,12 @@
+//! Windows single-instance lock and main-window activation.
+//!
+//! The first Echo holds a named mutex for its whole lifetime and tags its main
+//! window with a process-id property plus a subclass that listens for a
+//! registered activation message. A second launch finds the mutex taken, looks
+//! for the tagged window of the owning process, posts that message (after
+//! `AllowSetForegroundWindow`, so the first Echo may take focus) and exits.
+//! Under a benchmark profile the second launch exits without activating.
+
 use echo_gpui::backend;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::os::windows::ffi::OsStrExt;
@@ -30,7 +39,7 @@ pub fn acquire_single_instance() -> bool {
         };
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(handle);
-            if !echo_gpui::benchmark_profile::is_enabled() {
+            if !echo_gpui::storage_roots::is_isolated() {
                 activate_existing();
             }
             return false;

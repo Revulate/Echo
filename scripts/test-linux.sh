@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Echo's authoritative Linux test harness. Every stage runs through
+# run-linux-stage.sh (timeouts, heartbeats, per-stage logs under
+# target/linux-test-stages/). Modes are described in usage() and in
+# docs/LINUX_DEVELOPMENT.md.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,23 +13,29 @@ compile_timeout="${ECHO_LINUX_COMPILE_TIMEOUT_SECONDS:-900}"
 test_timeout="${ECHO_LINUX_TEST_TIMEOUT_SECONDS:-900}"
 coverage_timeout="${ECHO_LINUX_COVERAGE_TIMEOUT_SECONDS:-900}"
 heartbeat="${ECHO_LINUX_STAGE_HEARTBEAT_SECONDS:-30}"
-extracted_package_args=(
-    -p cache-preload-check
-    -p echo-autocomplete-core
-    -p echo-cache-policy
-    -p echo-chat-render
-    -p echo-core
-    -p echo-cosmetics-core
-    -p echo-emote-core
-    -p echo-link-core
-    -p echo-media-cache
-    -p echo-render-core
-    -p echo-text-core
-)
+# Packages whose library tests run next to the root crate's: every extracted
+# crate under crates/ (directory name == package name) plus the one tool with a
+# library test target.
+library_test_package_args=(-p cache-preload-check)
+for crate_manifest in "$repo_root"/crates/*/Cargo.toml; do
+    crate_dir="${crate_manifest%/Cargo.toml}"
+    library_test_package_args+=(-p "${crate_dir##*/}")
+done
 export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 
 usage() {
-    printf 'Usage: %s [quick|quick-nextest|cargo|nextest|ci|coverage-root]\n' "${0##*/}" >&2
+    cat >&2 <<USAGE
+Usage: ${0##*/} [mode]
+
+  cargo          (default) test inventory, then root and extracted-crate library
+                 tests and doctests with plain cargo test
+  quick          workspace bin check, inventory, guard self-test, bench script
+                 tests, the cargo test stages, contract tools, update-core check
+  quick-nextest  quick with nextest running the library tests (what CI runs)
+  nextest        inventory plus the nextest and doctest stages
+  ci             quick-nextest plus compile checks of the criterion benches
+  coverage-root  LCOV for the root library and every extracted crate (manual)
+USAGE
 }
 
 require_cargo_subcommand() {
@@ -39,8 +49,16 @@ require_cargo_subcommand() {
 }
 
 require_nextest() {
-    local minimum_version="0.9.143"
+    # .config/nextest.toml's nextest-version is the one pin; nextest enforces it
+    # too, but only after the build, so check it before compiling anything.
+    local minimum_version
     local installed_version
+    minimum_version="$(sed -nE 's/^nextest-version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+        "$repo_root/.config/nextest.toml")"
+    if [[ -z "$minimum_version" ]]; then
+        printf 'nextest-version is missing from .config/nextest.toml.\n' >&2
+        exit 1
+    fi
     require_cargo_subcommand nextest \
         'Install cargo-nextest from https://nexte.st/docs/installation/pre-built-binaries/.'
     installed_version="$(cargo nextest --version | awk 'NR == 1 { print $2 }')"
@@ -74,16 +92,15 @@ run_workspace_tests() {
             # to target/nextest/ci/junit.xml, so a second run would overwrite the
             # first instead of adding to it. Root and extracted cases must share
             # this command to share that report.
-            require_nextest
             run_stage "$test_timeout" root-workspace-nextest \
-                cargo nextest run --locked -p echo_gpui "${extracted_package_args[@]}" \
+                cargo nextest run --locked -p echo_gpui "${library_test_package_args[@]}" \
                     --lib --profile ci --retries 0 --flaky-result fail
             ;;
         cargo)
             run_stage "$test_timeout" root-lib-tests \
                 cargo test --locked -p echo_gpui --lib --no-fail-fast
             run_stage "$test_timeout" extracted-lib-tests \
-                cargo test --locked "${extracted_package_args[@]}" \
+                cargo test --locked "${library_test_package_args[@]}" \
                     --lib --no-fail-fast
             ;;
         *)
@@ -95,7 +112,7 @@ run_workspace_tests() {
     run_stage "$test_timeout" root-doctests \
         cargo test --locked -p echo_gpui --doc
     run_stage "$test_timeout" extracted-doctests \
-        cargo test --locked "${extracted_package_args[@]}" --doc
+        cargo test --locked "${library_test_package_args[@]}" --doc
 }
 
 run_update_core_check() {
@@ -107,7 +124,7 @@ run_bench_checks() {
     run_stage "$compile_timeout" bench-layout-check \
         cargo check --locked -p echo_gpui --bench layout_bench
     run_stage "$compile_timeout" bench-filter-check \
-        cargo check --locked -p echo_gpui --bench filter_bench
+        cargo check --locked -p echo_gpui --bench parse_bench
     run_stage "$compile_timeout" bench-loading-check \
         cargo check --locked -p echo_gpui --bench loading_bench
 }
@@ -118,8 +135,10 @@ run_quick_tests() {
         cargo check --locked --workspace --bins
     run_stage "$test_timeout" test-inventory \
         "$repo_root/scripts/check-linux-test-inventory.sh"
-    run_stage "$test_timeout" benchmark-profile-roots \
-        "$repo_root/scripts/check-benchmark-profile-roots.sh" --self-test
+    run_stage "$test_timeout" storage-roots \
+        "$repo_root/scripts/check-storage-roots.sh" --self-test
+    run_stage "$test_timeout" bench-script-tests \
+        python3 -m unittest discover -s "$repo_root/scripts/bench/tests"
     run_workspace_tests "$backend"
     "$repo_root/scripts/test-linux-tools.sh"
     run_update_core_check
@@ -164,7 +183,7 @@ case "$mode" in
             'Install cargo-llvm-cov from https://github.com/taiki-e/cargo-llvm-cov.'
         mkdir -p "$repo_root/target/coverage"
         run_stage "$coverage_timeout" root-coverage \
-            cargo llvm-cov --locked -p echo_gpui "${extracted_package_args[@]}" --lib \
+            cargo llvm-cov --locked -p echo_gpui "${library_test_package_args[@]}" --lib \
                 --lcov --output-path "$repo_root/target/coverage/echo.lcov"
         ;;
     *)

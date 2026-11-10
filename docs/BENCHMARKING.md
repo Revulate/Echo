@@ -25,7 +25,7 @@ here is listed in `docs/ENVIRONMENT.md`; memory-specific tools are in
 ## Isolated profiles
 
 `ECHO_BENCH_PROFILE_ROOT=<dir>` moves every Echo-owned config, data, cache, log
-and keyring path under `<dir>` (`src/benchmark_profile.rs`):
+and keyring path under `<dir>` (`src/storage_roots.rs`):
 
 | Path | Contents |
 | --- | --- |
@@ -63,6 +63,8 @@ A replay file is NDJSON, one event per line. Fixtures:
   uses it.
 - `benchmarks/fixtures/perf-rig/`: the three-split tab layout and mixed-rate
   animated-emote replay used by `run-perf-rig.ps1`.
+- `benchmarks/fixtures/7tv-eventapi/`: recorded 7TV EventAPI traffic for
+  `ECHO_7TV_EVENTAPI_REPLAY` (see [7TV_EVENTAPI_REPLAY.md](7TV_EVENTAPI_REPLAY.md)).
 - Generate others with `scripts/bench/new-chat-replay-fixture.ps1` (or `.py`):
   `-ReplayScenario normal | high-volume | burst | reconnect`, with
   `-MessageCount`, `-DurationSeconds`, `-UserCount`, `-Seed` and the burst
@@ -98,8 +100,19 @@ paths), `summary.json` (artifact paths and metrics) and `notes.md`.
 to have exist and parse, for example `-RequireEchoProfile`, `-RequireChatReplay`
 or `-RequireFrameTrace`.
 
-PowerShell scripts run on Windows; the `.py` versions run anywhere Python 3 is
-available.
+Where a script has both a `.ps1` and a `.py` version, the two produce the same
+artifact layout: use the PowerShell version on Windows and the `.py` version
+anywhere else Python 3 is available. Where one version does more, its table row
+says so. The exception is
+`run-pgo-build.py`, which is Linux-only (see the table). The PowerShell
+scripts share their helpers through `BenchLib.psm1`, the counterpart of
+`benchlib.py`. Every percentile either language reports is linear
+interpolation between the closest ranks (rank = p/100 x (n-1), as numpy's
+default and Excel's PERCENTILE.INC), rounded to 6 decimals.
+
+The Python helpers have unit tests under `scripts/bench/tests`; the Linux
+`quick` suite runs them, or run
+`python3 -m unittest discover -s scripts/bench/tests` directly.
 
 ### Launch and sample
 
@@ -108,7 +121,7 @@ available.
 | `run-echo-profile.ps1` / `.py` | Launch Echo with profiler logging, keep it alive for `-DurationSeconds`, stop it (`-StopMode close-main-window`), and validate the log with `profile-log-check`. The Python version also drives chat replay (`--chat-replay*`), an isolated offline mode (`--network-state offline-fixture`), and an app-owned graceful quit (`--app-owned-quit-after-ms`). |
 | `sample-process.ps1` / `.py` | Sample working set, private bytes, handles, threads and CPU of a launched or running process at a fixed interval. |
 | `measure-startup.ps1` / `.py` | Time process creation to readiness (`-ReadyMode` `process-start`, `main-window`, `input-idle` or `app-log`). With `-App echo -AppLogPath <log>` it also records Echo's `startup_marker` milestones. |
-| `run-startup-campaign.ps1` | Repeat `measure-startup.ps1` N times (`-ObservationCount`, at least 10) and report median and p95 for each startup milestone. |
+| `run-startup-campaign.ps1` | Repeat `measure-startup.ps1` N times (`-ObservationCount`, at least 10) and report median and p95 (linear interpolation, see above) for each startup milestone. |
 | `run-lifecycle-churn.ps1` | After a warm plateau, run `-Cycles` cycles that each open a split on a fixture channel, a popout and a scroll, then settle and check for growing handles, threads or private memory. Requires `-ReplayPath`. |
 | `snapshot-cache.ps1` / `.py`, `compare-cache-snapshots.ps1` / `.py` | Inventory a cache directory before and after a run and diff the two. |
 | `record-echo-baseline.ps1` / `.py` | Record an executable's size, SHA-256, commit and build type. |
@@ -118,14 +131,14 @@ available.
 
 | Script | Purpose |
 | --- | --- |
-| `run-perf-rig.ps1` | Release perf rig. Builds or takes `-Exe`, warms an isolated profile, opens the three-split layout from `benchmarks/fixtures/perf-rig/`, replays mixed-rate animated emotes, and writes a summary with process and main-thread CPU, per-thread CPU, GPU engine time, profiler frames and presents per second, per-split canvas counters and the memory breakdown. |
+| `run-perf-rig.ps1` | Release perf rig. Takes `-Exe`, or builds `cargo build --profile dist --locked --bin echo`, warms an isolated profile, opens the three-split layout from `benchmarks/fixtures/perf-rig/`, replays mixed-rate animated emotes, and writes into `-OutDir` one `summary.json` (its `run` object holds process and main-thread CPU, per-thread CPU, GPU engine time, profiler frames and presents per second, per-split canvas counters and the memory breakdown) plus `perf-lines.txt` and `replay-report.json`. It writes its own output directory rather than a `new-benchmark-run` run directory. |
 | `run-echo-ab.ps1` | Balanced A/B of two Echo binaries (`-BaselinePath`, `-CandidatePath`, `-Sequence ABBA`, `-RepeatCount`) through `sample-process.ps1`, optionally under a chat replay (`-EchoChatReplay`). Writes per-metric medians and deltas. |
 | `run-live-ui-suite.ps1` | Launches Echo (`-LaunchPath`, default `target\release\echo.exe`) and drives its window with native input: scripted UI fixture checkpoints (`-UiFixtureInteractions`, `-UiFixtureSettingsOnly`), feedback, cursor and popup checks, the emote-picker sweep and the link-preview matrix. It uses your normal profile except for `-LinkPreviewMatrix`, which runs in an isolated one. It never types chat text, presses Enter or sends. |
 | `capture-responsive-ui-matrix.ps1` | Screenshots of the UI fixture at the current, half-width, half-height and half-width-and-height window sizes. |
 | `capture-gpu-frame-times.ps1` | PresentMon frame-time capture for a launched Echo (`-PresentMonPath`); `install-presentmon.ps1` downloads a pinned PresentMon release. |
 | `capture-windows-gpu-counters.ps1` | Per-process GPU memory counters plus process samples over a long run, with optional periodic memory maps (`-MemoryMapIntervalSeconds`). `watch-owned-process.ps1` is its stop watchdog. |
 | `capture-process-memory-map.ps1` | One virtual-memory map of a running process (`-TargetProcessId`), with the largest allocations listed. |
-| `run-pgo-build.ps1` / `.py` | Build a PGO-optimized Echo: instrumented build, training run under chat replay, profile merge, optimized build. |
+| `run-pgo-build.ps1` | Build a PGO-optimized Echo: instrumented build, training run under chat replay, profile merge, optimized build. `run-pgo-build.py` is the Linux counterpart. |
 | `measure-dist-build.ps1` | Time `cargo build --profile dist --locked --bin echo` (`-CacheState` records whether `target/` was warm). |
 
 ### Summaries of saved traces
@@ -139,20 +152,20 @@ CSV or log trace into a structured summary inside a run directory.
 | Script | Purpose |
 | --- | --- |
 | `scripts/test-linux-app-smoke.sh` | Launch a debug build under an isolated profile, replay three messages from the normal fixture, quit through GPUI and validate the log. Needs a real X11 or Wayland session. |
-| `wayland_native_driver.py`, `kwin/echo-benchmark-receipt.js` | Native Wayland screenshot capture and keyboard input for an isolated Echo under KDE Plasma, with a temporary KWin script that confirms the target window. |
-| `compare-structural-visual.py` | Compare screenshot metadata and semantic rectangles between two captures. |
-| `scripts/profile.sh` | perf, flamegraph, heaptrack, Valgrind and sanitizer wrappers (`make flame`, `make heap`, ...). |
+| `scripts/profile.sh` | perf, flamegraph, heaptrack, Valgrind and sanitizer wrappers (`make flame`, `make heap`, ...). Runs under an isolated profile (`target/profile/echo-profile` unless `ECHO_BENCH_PROFILE_ROOT` is set) and writes artifacts to `target/profile/`. |
 
 ### Microbenchmarks
 
 - Criterion benches in `benches/`: `cargo bench --bench layout_bench`
-  (layout, height tree, scroll markers), `--bench filter_bench` (parsing and
-  filtering) and `--bench loading_bench` (image decode, GPU format conversion,
-  disk cache). Check one at a time with `cargo check -p echo_gpui --bench <name>`;
+  (layout, height tree, scroll markers), `--bench parse_bench` (message-ingest
+  parsing: emote tags, slot parsing, structure hashing) and
+  `--bench loading_bench` (image decode, GPU format conversion, disk cache). Check one at a time with `cargo check -p echo_gpui --bench <name>`;
   `--benches` also selects the root libtest target.
 - Standalone benchmark tools registered as `benchmark` in
-  `scripts/linux-test-targets.tsv`: `cargo run --release -p echo-resource-bench`,
-  `-p echo-search-bench` and `-p provider-index-bench`.
+  `scripts/linux-test-targets.tsv`: `cargo run --release -p resource-bench`,
+  `-p search-bench` and `-p provider-index-bench`. `tools/gpui-scene-bench`
+  is a Criterion bench of the production-shaped GPUI chat scene in a real
+  native window (`cargo bench -p gpui-scene-bench`).
 - `evaluate-provider-index-diff.py` models the incremental provider-index update
   in Python and checks it against a full rebuild.
 

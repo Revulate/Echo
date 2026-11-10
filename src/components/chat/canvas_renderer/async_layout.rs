@@ -1,7 +1,7 @@
 //! Async layout computation for canvas renderer.
 //!
-//! Moves expensive layout calculations to background threads to prevent
-//! UI blocking, enabling smooth 60 FPS even during heavy message loads.
+//! Shapes message layouts on a bounded pool of background workers so heavy
+//! message loads and resizes do not block the UI thread.
 
 use super::layout::{CanvasMessageLayout, message_content_fingerprint, quantize_width};
 use super::text_shaping::build_message_layout;
@@ -60,7 +60,18 @@ pub enum LayoutStatus {
     /// Layout ready to use
     Ready(Arc<CanvasMessageLayout>),
     /// Computation failed
-    Failed(()),
+    Failed,
+}
+
+/// The inputs besides width and channel that a stored layout must still match
+/// to be reused for a message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayoutVersions {
+    pub show_timestamp: bool,
+    pub content_fingerprint: u64,
+    pub layout_settings_version: u64,
+    pub emote_resolution_version: u64,
+    pub channel_emote_version: u64,
 }
 
 /// Request to compute layout for a message
@@ -104,6 +115,20 @@ struct LayoutIdentity {
 }
 
 impl LayoutIdentity {
+    /// Whether this identity was built for `versions` under the current
+    /// layout content epoch, display scale and mod-button mode.
+    fn matches_current(&self, versions: &LayoutVersions) -> bool {
+        self.cache_invalidation_version
+            == crate::components::chat::canvas_renderer::global_layout_cache::layout_content_epoch()
+            && self.layout_settings_version == versions.layout_settings_version
+            && self.show_timestamp == versions.show_timestamp
+            && self.content_fingerprint == versions.content_fingerprint
+            && self.emote_resolution_version == versions.emote_resolution_version
+            && self.channel_emote_version == versions.channel_emote_version
+            && self.scale_bits == super::layout_scale::current_bits()
+            && self.mod_buttons == super::layout_mode::mod_buttons()
+    }
+
     fn from_request(request: &LayoutRequest) -> Self {
         Self {
             quantized_width: quantize_width(request.available_width),
@@ -403,7 +428,7 @@ fn layout_worker_loop(worker_id: usize, worker_rx: CbReceiver<LayoutJob>) {
 
         match job {
             Ok(job) => {
-                if catch_unwind(AssertUnwindSafe(|| process_layout_job(worker_id, job))).is_err() {
+                if catch_unwind(AssertUnwindSafe(|| process_layout_job(job))).is_err() {
                     LAYOUT_WORKER_PANIC_TOTAL.fetch_add(1, Ordering::Relaxed);
                     crate::log_perf_render!(
                         error,
@@ -461,7 +486,7 @@ fn discard_obsolete_job(job: &LayoutJob, before_shape: bool) {
     }
 }
 
-fn process_layout_job(_worker_id: usize, mut job: LayoutJob) {
+fn process_layout_job(mut job: LayoutJob) {
     let queue_wait_us = job
         .enqueued_at
         .elapsed()
@@ -666,11 +691,11 @@ impl AsyncLayoutManager {
                     crate::log_perf_render!(error, "Async layout worker queue disconnected");
                 }
                 if let Some(entry) = statuses.get_mut(&message_id) {
-                    entry.status = LayoutStatus::Failed(());
+                    entry.status = LayoutStatus::Failed;
                 }
                 drop(statuses);
                 drop(job);
-                LayoutStatus::Failed(())
+                LayoutStatus::Failed
             }
         }
     }
@@ -681,37 +706,23 @@ impl AsyncLayoutManager {
     /// `LayoutRequest` on repeated frames. `request_layout` still performs the authoritative
     /// check under its write lock, so a result that changes immediately after this read remains
     /// race-safe.
-    #[allow(clippy::too_many_arguments)]
     pub fn get_exact_status(
         &self,
         message_id: &str,
         quantized_width: u32,
         channel: &str,
-        show_timestamp: bool,
-        content_fingerprint: u64,
-        layout_settings_version: u64,
-        emote_resolution_version: u64,
-        channel_emote_version: u64,
+        versions: &LayoutVersions,
     ) -> LayoutStatus {
         let statuses = self.statuses.read_or_recover();
         let current_manager_epoch = self.manager_work.current_epoch.load(Ordering::Acquire);
-        let current_cache_invalidation_version =
-            crate::components::chat::canvas_renderer::global_layout_cache::layout_content_epoch();
         statuses
             .get(message_id)
             .and_then(|entry| {
                 let identity = &entry.identity;
                 if entry.manager_epoch == current_manager_epoch
-                    && identity.cache_invalidation_version == current_cache_invalidation_version
                     && identity.quantized_width == quantized_width
                     && identity.channel.as_ref() == channel
-                    && identity.show_timestamp == show_timestamp
-                    && identity.content_fingerprint == content_fingerprint
-                    && identity.layout_settings_version == layout_settings_version
-                    && identity.emote_resolution_version == emote_resolution_version
-                    && identity.channel_emote_version == channel_emote_version
-                    && identity.scale_bits == super::layout_scale::current_bits()
-                    && identity.mod_buttons == super::layout_mode::mod_buttons()
+                    && identity.matches_current(versions)
                 {
                     match &entry.status {
                         LayoutStatus::Ready(layout)
@@ -723,7 +734,7 @@ impl AsyncLayoutManager {
                         LayoutStatus::Computing | LayoutStatus::Ready(_) => {
                             Some(entry.status.clone())
                         }
-                        LayoutStatus::Pending | LayoutStatus::Failed(()) => None,
+                        LayoutStatus::Pending | LayoutStatus::Failed => None,
                     }
                 } else {
                     None
@@ -733,32 +744,14 @@ impl AsyncLayoutManager {
     }
 
     /// Get layout status for a message
-    pub fn get_status(
-        &self,
-        message_id: &str,
-        show_timestamp: bool,
-        content_fingerprint: u64,
-        emote_resolution_version: u64,
-        channel_emote_version: u64,
-    ) -> LayoutStatus {
+    pub fn get_status(&self, message_id: &str, versions: &LayoutVersions) -> LayoutStatus {
         let statuses = self.statuses.read_or_recover();
-        let current_settings_version = settings::get_layout_settings_version();
         let current_manager_epoch = self.manager_work.current_epoch.load(Ordering::Acquire);
-        let current_cache_invalidation_version =
-            crate::components::chat::canvas_renderer::global_layout_cache::layout_content_epoch();
         statuses
             .get(message_id)
             .and_then(|entry| {
                 if entry.manager_epoch == current_manager_epoch
-                    && entry.identity.cache_invalidation_version
-                        == current_cache_invalidation_version
-                    && entry.identity.layout_settings_version == current_settings_version
-                    && entry.identity.show_timestamp == show_timestamp
-                    && entry.identity.content_fingerprint == content_fingerprint
-                    && entry.identity.emote_resolution_version == emote_resolution_version
-                    && entry.identity.channel_emote_version == channel_emote_version
-                    && entry.identity.scale_bits == super::layout_scale::current_bits()
-                    && entry.identity.mod_buttons == super::layout_mode::mod_buttons()
+                    && entry.identity.matches_current(versions)
                 {
                     match &entry.status {
                         LayoutStatus::Ready(layout)
@@ -776,20 +769,15 @@ impl AsyncLayoutManager {
             .unwrap_or(LayoutStatus::Pending)
     }
 
-    /// Get ready layout if available
+    /// The ready layout for a message with the quantized width bucket it was
+    /// shaped for, if one is available.
     pub fn get_layout(
         &self,
         message_id: &str,
-        show_timestamp: bool,
-        content_fingerprint: u64,
-        emote_resolution_version: u64,
-        channel_emote_version: u64,
-    ) -> Option<Arc<CanvasMessageLayout>> {
+        versions: &LayoutVersions,
+    ) -> Option<(Arc<CanvasMessageLayout>, u32)> {
         let statuses = self.statuses.read_or_recover();
-        let current_settings_version = settings::get_layout_settings_version();
         let current_manager_epoch = self.manager_work.current_epoch.load(Ordering::Acquire);
-        let current_cache_invalidation_version =
-            crate::components::chat::canvas_renderer::global_layout_cache::layout_content_epoch();
         match statuses.get(message_id) {
             Some(
                 entry @ LayoutStatusEntry {
@@ -799,18 +787,11 @@ impl AsyncLayoutManager {
                     ..
                 },
             ) if *manager_epoch == current_manager_epoch
-                && identity.cache_invalidation_version == current_cache_invalidation_version
-                && identity.layout_settings_version == current_settings_version
-                && identity.show_timestamp == show_timestamp
-                && identity.content_fingerprint == content_fingerprint
-                && identity.emote_resolution_version == emote_resolution_version
-                && identity.channel_emote_version == channel_emote_version
-                && identity.scale_bits == super::layout_scale::current_bits()
-                && identity.mod_buttons == super::layout_mode::mod_buttons()
+                && identity.matches_current(versions)
                 && !layout.is_stale_for_channel()
                 && entry.ready_layout_survives_evictions(layout) =>
             {
-                Some(layout.clone())
+                Some((layout.clone(), identity.quantized_width))
             }
             _ => None,
         }
@@ -821,19 +802,9 @@ impl AsyncLayoutManager {
     ///
     /// Returns the bucket (u32) directly so callers compare against `LayoutCacheKey`
     /// buckets without re-quantizing a raw f32 (which could spuriously cross a boundary).
-    pub fn get_layout_width(
-        &self,
-        message_id: &str,
-        show_timestamp: bool,
-        content_fingerprint: u64,
-        emote_resolution_version: u64,
-        channel_emote_version: u64,
-    ) -> Option<u32> {
+    pub fn get_layout_width(&self, message_id: &str, versions: &LayoutVersions) -> Option<u32> {
         let statuses = self.statuses.read_or_recover();
-        let current_settings_version = settings::get_layout_settings_version();
         let current_manager_epoch = self.manager_work.current_epoch.load(Ordering::Acquire);
-        let current_cache_invalidation_version =
-            crate::components::chat::canvas_renderer::global_layout_cache::layout_content_epoch();
         match statuses.get(message_id) {
             Some(
                 entry @ LayoutStatusEntry {
@@ -843,14 +814,7 @@ impl AsyncLayoutManager {
                     ..
                 },
             ) if *manager_epoch == current_manager_epoch
-                && identity.cache_invalidation_version == current_cache_invalidation_version
-                && identity.layout_settings_version == current_settings_version
-                && identity.show_timestamp == show_timestamp
-                && identity.content_fingerprint == content_fingerprint
-                && identity.emote_resolution_version == emote_resolution_version
-                && identity.channel_emote_version == channel_emote_version
-                && identity.scale_bits == super::layout_scale::current_bits()
-                && identity.mod_buttons == super::layout_mode::mod_buttons()
+                && identity.matches_current(versions)
                 && entry.ready_layout_survives_evictions(layout) =>
             {
                 Some(identity.quantized_width)
@@ -878,7 +842,7 @@ impl AsyncLayoutManager {
 
     /// Check if any admitted layouts are still queued or computing for this manager.
     ///
-    /// PERF: Called every waker tick to decide whether another animation frame is
+    /// Called every waker tick to decide whether another animation frame is
     /// needed. Reads a fast `AtomicUsize` counter instead of taking the `statuses`
     /// RwLock and doing an O(n) scan. A job-owned drop guard maintains the count across
     /// success, cancellation, queue rejection, and unwinding, while also cleaning up a

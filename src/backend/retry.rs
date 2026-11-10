@@ -6,7 +6,7 @@
 //! Usage pattern:
 //! ```rust,no_run
 //! use backon::Retryable;
-//! use echo_gpui::backend::retry::{default_backoff, is_transient_error};
+//! use echo_gpui::backend::retry::{default_backoff, is_reqwest_transient};
 //!
 //! # async fn fetch() -> Result<(), reqwest::Error> {
 //! let client = reqwest::Client::new();
@@ -16,7 +16,7 @@
 //!     async move { client.get(url).send().await }
 //! })
 //! .retry(default_backoff())
-//! .when(|e| is_transient_error(&e.to_string()))
+//! .when(is_reqwest_transient)
 //! .await?;
 //! # Ok(())
 //! # }
@@ -76,28 +76,8 @@ pub fn with_reconnect_jitter(delay: Duration) -> Duration {
     Duration::from_millis(millis.saturating_add(offset).saturating_sub(spread))
 }
 
-/// Check if an error string indicates a transient issue worth retrying
-pub fn is_transient_error(err: &str) -> bool {
-    let err_lower = err.to_lowercase();
-
-    err_lower.contains("connection")
-        || err_lower.contains("timeout")
-        || err_lower.contains("reset")
-        || err_lower.contains("refused")
-        || err_lower.contains("broken pipe")
-        || err_lower.contains("network")
-        || err_lower.contains("502")
-        || err_lower.contains("503")
-        || err_lower.contains("504")
-        || err_lower.contains("429")
-        || err_lower.contains("tls")
-        || err_lower.contains("ssl")
-        || err_lower.contains("certificate")
-        || err_lower.contains("dns")
-        || err_lower.contains("resolve")
-}
-
-/// Check if a reqwest error is transient (worth retrying)
+/// Whether a failed request is worth retrying: it never connected, timed out,
+/// got 429/502/503/504, or its connection dropped mid-exchange.
 pub fn is_reqwest_transient(err: &reqwest::Error) -> bool {
     if err.is_connect() || err.is_timeout() {
         return true;
@@ -108,7 +88,24 @@ pub fn is_reqwest_transient(err: &reqwest::Error) -> bool {
         return code == 429 || code == 502 || code == 503 || code == 504;
     }
 
-    is_transient_error(&err.to_string())
+    io_error_kinds(err).any(|kind| {
+        matches!(
+            kind,
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    })
+}
+
+/// The kinds of every I/O error in `err`'s source chain.
+fn io_error_kinds(err: &reqwest::Error) -> impl Iterator<Item = std::io::ErrorKind> + '_ {
+    std::iter::successors(std::error::Error::source(err), |source| source.source())
+        .filter_map(|source| source.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
 }
 
 /// Server-requested wait cap for emote provider fetches. Channel history waits

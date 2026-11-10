@@ -33,7 +33,8 @@ pub use echo_core::settings_event::SettingsEvent;
 
 static SETTINGS_TX: OnceLock<broadcast::Sender<SettingsEvent>> = OnceLock::new();
 
-/// PERF: Cached lowercase username for mention detection (avoids lock + clone + lowercase per message)
+/// Lowercased active username for mention detection, so the message path does
+/// not lock the settings mutex and lowercase the name per message.
 static CACHED_USERNAME_LOWERCASE: LazyLock<Mutex<String>> =
     LazyLock::new(|| Mutex::new(String::new()));
 
@@ -62,6 +63,10 @@ static FILTERS_VERSION: AtomicU64 = AtomicU64::new(1);
 /// Only logged when the `ui` log category is enabled (e.g., `ECHO_LOG_UI=1`).
 static SETTINGS_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_SETTINGS_BROADCAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+// Hot-path mirrors of individual settings, refreshed by
+// `publish_cached_settings_snapshot` and every setter, and read through
+// `mirror` so they never take the settings mutex.
 static CACHED_EMOTE_IMAGE_SCALE: AtomicU64 = AtomicU64::new(0);
 static CACHED_WINDOW_TRANSPARENT: AtomicBool = AtomicBool::new(false);
 /// Tray policy is read by the native Windows message window without taking the
@@ -432,7 +437,7 @@ fn find_config_file(candidates: &[PathBuf]) -> Option<PathBuf> {
     target_os = "openbsd"
 ))]
 fn config_home() -> Option<PathBuf> {
-    if crate::benchmark_profile::is_enabled() {
+    if crate::storage_roots::is_isolated() {
         return None;
     }
     std::env::var_os("XDG_CONFIG_HOME")
@@ -523,7 +528,7 @@ fn kde_globals_probe(path: &Path) -> Option<SystemThemeProbe> {
 
 #[cfg(target_os = "macos")]
 fn detect_resolved_system_theme_probe() -> SystemThemeProbe {
-    if crate::benchmark_profile::is_enabled() {
+    if crate::storage_roots::is_isolated() {
         return SystemThemeProbe::unavailable("benchmark profile disables OS theme discovery");
     }
     if let Some(probe) = env_theme_probe("APPLE_INTERFACE_STYLE") {
@@ -666,7 +671,7 @@ fn normalize_runtime_settings(settings: &mut AppSettings) {
         settings.emote_picker_animation_policy_revision =
             CURRENT_EMOTE_PICKER_ANIMATION_POLICY_REVISION;
     }
-    settings.log_directory = if crate::benchmark_profile::is_enabled() {
+    settings.log_directory = if crate::storage_roots::is_isolated() {
         None
     } else {
         normalize_optional_path(settings.log_directory.take())
@@ -786,10 +791,10 @@ fn normalize_chat_popup_window_descriptors(settings: &mut AppSettings) {
         }
 
         descriptor.channel = channel;
-        descriptor.width = descriptor.width.clamp(360, 3840);
-        descriptor.height = descriptor.height.clamp(420, 2160);
-        descriptor.x = descriptor.x.clamp(-100_000, 100_000);
-        descriptor.y = descriptor.y.clamp(-100_000, 100_000);
+        descriptor.width = descriptor.width.clamp(360, MAX_WINDOW_WIDTH);
+        descriptor.height = descriptor.height.clamp(420, MAX_WINDOW_HEIGHT);
+        descriptor.x = descriptor.x.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT);
+        descriptor.y = descriptor.y.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT);
 
         if let Some(index) = normalized
             .iter()
@@ -1123,7 +1128,7 @@ impl Default for EmbedContentSettings {
 }
 
 /// Tab theme options
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TabTheme {
     #[default]
     #[serde(rename = "chrome")]
@@ -1142,7 +1147,7 @@ pub enum TabTheme {
 }
 
 /// Tab overflow mode options - how tabs behave when they don't fit
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TabOverflowMode {
     #[serde(rename = "multiline")]
     MultiLine,
@@ -1184,7 +1189,7 @@ impl TitlebarDensity {
 }
 
 /// Badge display mode options
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BadgeDisplayMode {
     #[default]
     #[serde(rename = "number")]
@@ -1320,10 +1325,13 @@ impl UsernameRightClickBehavior {
             Self::Ignore => "ignore",
         }
     }
-}
 
-const fn default_username_right_click_modifier_behavior() -> UsernameRightClickBehavior {
-    UsernameRightClickBehavior::Reply
+    /// Inverse of [`Self::settings_value`].
+    pub fn from_settings_value(value: &str) -> Option<Self> {
+        [Self::Reply, Self::Mention, Self::Ignore]
+            .into_iter()
+            .find(|behavior| behavior.settings_value() == value)
+    }
 }
 
 /// Exact modifier chord which selects the alternate username right-click action.
@@ -1510,10 +1518,14 @@ pub enum StreamlinkQuality {
     Custom,
 }
 
-/// Theme mode options
+/// Value of the persisted `theme_mode` key.
+///
+/// Nothing reads it: the live theme is derived from [`AppSettings::theme`]
+/// (see `theme::colors::ThemeMode`). It is kept only so existing settings files
+/// keep round-tripping the key unchanged.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ThemeMode {
+pub enum PersistedThemeMode {
     #[default]
     Dark,
     Light,
@@ -1893,229 +1905,148 @@ impl SettingsNavigationPrefs {
     }
 }
 
+/// Persisted application settings (`settings.json`).
+///
+/// A missing key takes its value from [`AppSettings::default`], the one source
+/// of defaults. The two fields that keep a field-level `#[serde(default)]` are
+/// deliberate exceptions: there the type's default marks a file written before
+/// the field existed, which load-time migration must be able to tell apart.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AppSettings {
     pub username: Option<String>,
     pub token: Option<String>,
     pub refresh_token: Option<String>,
-    #[serde(default)]
     pub client_id: String,
-    #[serde(default)]
     pub channels: Vec<String>,
 
     /// Recently visited channels for predictive emote preloading (max 5)
-    #[serde(default)]
     pub recent_channels: Vec<String>,
 
-    #[serde(default)]
     pub theme: Option<String>,
-    #[serde(default)]
     pub resolved_system_theme: ResolvedSystemTheme,
-    #[serde(default = "default_accent_color")]
     pub primary_accent_color: String,
     /// Whether enabled switch tracks follow the accent or stay neutral.
-    #[serde(default)]
     pub switch_on_style: SwitchOnStyle,
     /// Optional user override for primary application/chat text.
     /// `None` keeps the active theme or theme-file palette in control.
-    #[serde(default)]
     pub primary_text_color: Option<String>,
     /// Custom theme colors (used when theme == "Custom")
-    #[serde(default)]
     pub custom_theme: CustomTheme,
-    #[serde(default)]
     pub custom_theme_file_path: String,
-    #[serde(default)]
     pub custom_theme_file_auto_reload: bool,
-    #[serde(default)]
     pub custom_theme_file_palette: Option<GeneratedPalette>,
-    #[serde(default)]
     pub custom_theme_file_accent: Option<String>,
-    #[serde(default)]
     pub custom_theme_file_loaded_mtime_ms: Option<i64>,
-    /// Theme mode (Dark, Light, System, OLED, Midnight)
-    #[serde(default)]
-    pub theme_mode: ThemeMode,
+    /// Unused; see [`PersistedThemeMode`].
+    pub theme_mode: PersistedThemeMode,
 
-    #[serde(default = "default_scale")]
     pub font_scale: f32,
-    #[serde(default = "default_scale")]
     pub emote_scale: f32,
-    #[serde(default)]
     pub emote_image_scale: EmoteImageScale,
-    #[serde(default = "default_badge_scale")]
     pub badge_scale: f32,
-    #[serde(default)]
     pub remove_emote_spacing: bool,
-    #[serde(default = "default_true")]
     pub zero_width_enabled: bool,
-    #[serde(default = "default_true")]
     pub enable_seventv_emotes: bool,
-    #[serde(default = "default_true")]
     pub enable_bttv_emotes: bool,
-    #[serde(default = "default_true")]
     pub enable_ffz_emotes: bool,
 
-    #[serde(default)]
     pub embed_display_mode: EmbedDisplayMode,
-    #[serde(default)]
     pub embed_providers: EmbedProviderSettings,
-    #[serde(default)]
     pub embed_content: EmbedContentSettings,
-    #[serde(default)]
     pub embed_remote_fetch_enabled: bool,
-    #[serde(default)]
     pub embed_thumbnail_mode: EmbedThumbnailMode,
 
-    #[serde(default)]
     pub tab_theme: TabTheme,
-    #[serde(default)]
     pub tab_overflow_mode: TabOverflowMode,
-    #[serde(default)]
     pub tab_placement: TabPlacement,
-    #[serde(default)]
     pub titlebar_density: TitlebarDensity,
 
-    #[serde(default)]
     pub badge_display_mode: BadgeDisplayMode,
 
-    #[serde(default = "default_true")]
     pub tab_complete_usernames: bool,
-    #[serde(default = "default_true")]
     pub mention_users_with_comma: bool,
-    #[serde(default)]
     pub username_right_click_behavior: UsernameRightClickBehavior,
-    #[serde(default = "default_username_right_click_modifier_behavior")]
     pub username_right_click_modifier_behavior: UsernameRightClickBehavior,
-    #[serde(default)]
     pub username_right_click_modifier: UsernameRightClickModifier,
-    #[serde(default)]
     pub show_reply_button: bool,
     /// Mark the last message seen before a tab or the window lost focus.
-    #[serde(default)]
     pub show_last_read_indicator: bool,
-    #[serde(default)]
     pub unified_input_mode: bool,
-    #[serde(default)]
     pub compact_split_header: bool,
-    #[serde(default)]
     pub show_send_button: bool,
-    #[serde(default = "default_true")]
     pub slash_commands_enabled: bool,
-    #[serde(default = "default_true")]
     pub command_autocomplete_enabled: bool,
-    #[serde(default = "default_true")]
     pub show_command_descriptions: bool,
 
-    #[serde(default)]
     pub emote_picker_animation_mode: EmotePickerAnimationMode,
-    /// Revision 0 represents settings saved before Always became the default.
+    /// Revision 0 represents settings saved before Always became the default,
+    /// so a missing key reads as 0, not as the current revision.
     #[serde(default)]
     pub emote_picker_animation_policy_revision: u8,
-    #[serde(default)]
     pub hide_emote_picker_load_more_warning: bool,
 
-    #[serde(default)]
     pub emoji_style: EmojiStyle,
 
-    #[serde(default)]
     pub anonymous_mode: bool,
 
-    #[serde(default = "default_true")]
     pub open_settings_as_popout: bool,
 
-    #[serde(default)]
     pub accounts: Vec<Account>,
-    #[serde(default)]
     pub token_expires_at: Option<i64>,
 
-    #[serde(default = "default_mention_color")]
     pub mention_color: String,
-    #[serde(default = "default_whisper_color")]
     pub whisper_color: String,
-    #[serde(default = "default_subscription_color")]
     pub subscription_color: String,
-    #[serde(default = "default_first_message_color")]
     pub first_message_color: String,
-    #[serde(default = "default_thread_highlight_color")]
     pub thread_highlight_color: String,
 
-    #[serde(default = "default_true")]
     pub flash_on_mention: bool,
-    #[serde(default = "default_true")]
     pub show_mention_in_title: bool,
-    #[serde(default = "default_true")]
     pub thread_highlight_enabled: bool,
-    #[serde(default = "default_true")]
     pub thread_highlight_sound_enabled: bool,
-    #[serde(default = "default_true")]
     pub thread_highlight_show_in_mentions: bool,
 
-    #[serde(default)]
     pub filters: Vec<FilterRule>,
-    #[serde(default = "default_true")]
     pub enable_twitch_blocked_users: bool,
-    #[serde(default)]
     pub show_blocked_users_messages: BlockedUserVisibility,
-    #[serde(default)]
     pub exclude_user_messages_from_filter: bool,
-    #[serde(default)]
     pub highlight_blacklist_users: Vec<HighlightBlacklistUser>,
-    #[serde(default)]
     pub highlight_rules: Vec<HighlightRule>,
 
-    #[serde(default)]
     pub custom_commands: Vec<CustomCommand>,
 
-    #[serde(default = "crate::backend::mod_buttons::default_mod_buttons")]
     pub mod_buttons: Vec<crate::backend::mod_buttons::ModButtonConfig>,
 
-    #[serde(default)]
     pub developer_mode: bool,
 
-    #[serde(default)]
     pub chat_logging_enabled: bool,
     /// Persist recent per-channel message history to disk for offline/gap-fill.
-    #[serde(default = "default_persist_history_enabled")]
     pub persist_history_enabled: bool,
-    #[serde(default)]
     pub log_directory: Option<String>,
-    #[serde(default = "default_log_format")]
     pub log_format: String,
 
-    #[serde(default)]
     pub proxy_enabled: bool,
-    #[serde(default)]
     pub proxy_url: String,
 
-    #[serde(default)]
     pub chat_density: ChatDensity,
-    #[serde(default)]
     pub username_display_mode: UsernameDisplayMode,
-    #[serde(default = "default_true")]
     pub colorize_users_without_color: bool,
     /// Show a compact LIVE marker for chatters currently streaming on Twitch.
-    #[serde(default = "default_true")]
     pub show_live_chatter_indicator: bool,
 
-    #[serde(default = "default_hotkeys")]
     pub hotkeys: HashMap<String, HotkeyBinding>,
 
-    #[serde(default)]
     pub streamer_mode: Option<super::streamer_mode::StreamerModeSettings>,
 
-    #[serde(default)]
     pub similarity: super::similarity::SimilaritySettings,
 
     /// Show system messages when users join or leave the channel
-    #[serde(default)]
     pub show_join_part_messages: bool,
 
     /// Alternate the background of every other chat message (zebra striping)
-    #[serde(default)]
     pub alternate_message_backgrounds: bool,
     /// Display message timestamps using the OS-local timezone.
-    #[serde(default = "default_true")]
     pub show_message_timestamps: bool,
     /// Ordered timestamp token pattern; visibility is stored separately.
     ///
@@ -2126,263 +2057,155 @@ pub struct AppSettings {
     ///
     /// It is read on load and migrated into `message_timestamp_pattern`, but
     /// never serialized again: Echo saves only the new representation.
-    #[serde(default, skip_serializing)]
+    #[serde(skip_serializing)]
     pub message_timestamp_format: Option<MessageTimestampFormat>,
     /// Hide the timestamp column while the channel is live.
-    #[serde(default)]
     pub hide_message_timestamps_when_live: bool,
 
     /// Local user renames applied to rendered display names
-    #[serde(default)]
     pub nicknames: Vec<NicknameRule>,
 
     /// Per-emote presentation rules: show an emote's code as text, or show an
     /// animated emote's first frame, everywhere or in one channel. Read
     /// leniently: an unparseable rule is dropped rather than failing the file.
-    #[serde(
-        default,
-        deserialize_with = "echo_core::emote_display_rules::deserialize_rules_lenient"
-    )]
+    #[serde(deserialize_with = "echo_core::emote_display_rules::deserialize_rules_lenient")]
     pub emote_display_rules: Vec<EmoteDisplayRule>,
 
     /// Animate animated emotes in chat and related previews.
-    #[serde(default = "default_true")]
     pub animate_emotes: bool,
     /// Render non-content interface motion statically. This intentionally does
     /// not change the user's animated-emote or picker playback policy.
-    #[serde(default)]
     pub reduce_decorative_motion: bool,
-    #[serde(default = "default_true")]
     pub highlight_flash_enabled: bool,
-    #[serde(default = "default_true")]
     pub smooth_scroll_enabled: bool,
     /// Spread bursts of live messages over the gap until the next burst.
-    #[serde(default = "default_true")]
     pub paced_chat_reveal: bool,
     /// Scroll animation duration in milliseconds (0 = instant, 50-500 typical)
     /// Default: 150ms
-    #[serde(default = "default_scroll_animation_duration")]
     pub scroll_animation_duration_ms: u32,
 
-    #[serde(default = "default_true")]
     pub show_ffz_badges: bool,
-    #[serde(default = "default_true")]
     pub show_bttv_badges: bool,
 
-    #[serde(default = "default_true")]
     pub show_bttv_pro_badges: bool,
-    #[serde(default = "default_true")]
     pub show_ffz_bot_badges: bool,
 
-    #[serde(default = "default_true")]
     pub show_seventv_name_paints: bool,
-    #[serde(default = "default_true")]
     pub show_seventv_paint_shadows: bool,
-    #[serde(default = "default_true")]
     pub show_seventv_cosmetic_badges: bool,
-    #[serde(default = "default_true")]
     pub show_seventv_profile_avatars: bool,
 
-    #[serde(default)]
     pub always_on_top: bool,
-    #[serde(default)]
     pub window_transparent: bool,
-    #[serde(default)]
     pub minimize_to_tray: bool,
-    #[serde(default)]
     pub close_to_tray: bool,
-    #[serde(default = "default_main_window_width")]
     pub main_window_width: u32,
-    #[serde(default = "default_main_window_height")]
     pub main_window_height: u32,
-    #[serde(default)]
     pub main_window_maximized: bool,
-    #[serde(default)]
     pub main_window_has_position: bool,
-    #[serde(default)]
     pub main_window_x: i32,
-    #[serde(default)]
     pub main_window_y: i32,
-    #[serde(default)]
     pub overlay_click_through: bool,
-    #[serde(default)]
     pub overlay_ghost_mode: bool,
-    #[serde(default = "default_overlay_window_width")]
     pub overlay_window_width: u32,
-    #[serde(default = "default_overlay_window_height")]
     pub overlay_window_height: u32,
-    #[serde(default)]
     pub overlay_window_has_position: bool,
-    #[serde(default)]
     pub overlay_window_x: i32,
-    #[serde(default)]
     pub overlay_window_y: i32,
-    #[serde(default = "default_overlay_max_messages")]
     pub overlay_max_messages: u32,
-    #[serde(default = "default_overlay_idle_fade_secs")]
     pub overlay_idle_fade_secs: u32,
-    #[serde(default = "default_overlay_min_opacity_percent")]
     pub overlay_min_opacity_percent: u8,
-    #[serde(default = "default_chat_popup_window_width")]
     pub chat_popup_window_width: u32,
-    #[serde(default = "default_chat_popup_window_height")]
     pub chat_popup_window_height: u32,
-    #[serde(default)]
     pub chat_popup_window_has_position: bool,
-    #[serde(default)]
     pub chat_popup_window_x: i32,
-    #[serde(default)]
     pub chat_popup_window_y: i32,
-    #[serde(default)]
     pub chat_popup_windows: Vec<ChatPopupWindowDescriptor>,
-    #[serde(default = "default_emote_picker_popout_window_width")]
     pub emote_picker_popout_window_width: u32,
-    #[serde(default = "default_emote_picker_popout_window_height")]
     pub emote_picker_popout_window_height: u32,
-    #[serde(default)]
     pub emote_picker_popout_window_has_position: bool,
-    #[serde(default)]
     pub emote_picker_popout_window_x: i32,
-    #[serde(default)]
     pub emote_picker_popout_window_y: i32,
-    #[serde(default)]
     pub emote_picker_popout_display_geometries: Vec<EmotePickerPopoutDisplayGeometry>,
-    #[serde(default = "default_user_card_popout_window_width")]
     pub user_card_popout_window_width: u32,
-    #[serde(default = "default_user_card_popout_window_height")]
     pub user_card_popout_window_height: u32,
-    #[serde(default)]
     pub user_card_popout_window_has_position: bool,
-    #[serde(default)]
     pub user_card_popout_window_x: i32,
-    #[serde(default)]
     pub user_card_popout_window_y: i32,
-    #[serde(default = "default_settings_popout_window_width")]
     pub settings_popout_window_width: u32,
-    #[serde(default = "default_settings_popout_window_height")]
     pub settings_popout_window_height: u32,
-    #[serde(default)]
     pub settings_popout_window_has_position: bool,
-    #[serde(default)]
     pub settings_popout_window_x: i32,
-    #[serde(default)]
     pub settings_popout_window_y: i32,
-    #[serde(default = "default_debug_popup_window_width")]
     pub debug_popup_window_width: u32,
-    #[serde(default = "default_debug_popup_window_height")]
     pub debug_popup_window_height: u32,
-    #[serde(default)]
     pub debug_popup_window_has_position: bool,
-    #[serde(default)]
     pub debug_popup_window_x: i32,
-    #[serde(default)]
     pub debug_popup_window_y: i32,
 
-    #[serde(default)]
     pub chat_pause_modifier: ChatPauseModifier,
-    #[serde(default)]
     pub chat_hover_pause_mode: ChatHoverPauseMode,
-    #[serde(default = "default_true")]
     pub show_pause_indicator: bool,
     /// Scales mouse-wheel line scrolling.
-    #[serde(default = "default_scale")]
     pub mouse_scroll_multiplier: f32,
 
-    #[serde(default)]
     pub show_char_counter: bool,
 
     /// Confirm every pasted image before uploading it.
-    #[serde(default = "default_true")]
     pub ask_before_paste_upload: bool,
 
-    #[serde(default = "default_true")]
     pub collapse_ascii_art: bool,
 
-    #[serde(default = "default_true")]
     pub show_pronouns: bool,
-    #[serde(default = "default_true")]
     pub show_follow_date: bool,
-    #[serde(default = "default_true")]
     pub show_follower_count: bool,
 
-    #[serde(default = "default_watchstreak_highlight_color")]
     pub watchstreak_highlight_color: String,
-    #[serde(default = "default_automod_highlight_color")]
     pub automod_highlight_color: String,
-    #[serde(default = "default_announcement_highlight_color")]
     pub announcement_highlight_color: String,
-    #[serde(default = "default_raid_highlight_color")]
     pub raid_highlight_color: String,
-    #[serde(default = "default_bits_highlight_color")]
     pub bits_highlight_color: String,
-    #[serde(default = "default_phrase_highlight_color")]
     pub phrase_highlight_color: String,
-    #[serde(default = "default_redeem_highlight_color")]
     pub redeem_highlight_color: String,
-    #[serde(default = "default_elevated_highlight_color")]
     pub elevated_highlight_color: String,
-    #[serde(default = "default_self_message_highlight_color")]
     pub self_message_highlight_color: String,
     /// Highlight all of the local user's own messages.
-    #[serde(default)]
     pub enable_self_message_highlight: bool,
     /// Tint paid/elevated and Hype Chat messages.
-    #[serde(default = "default_true")]
     pub enable_elevated_highlight: bool,
 
-    #[serde(default)]
     pub log_server_timestamps: bool,
-    #[serde(default)]
     pub log_by_stream_id: bool,
-    #[serde(default)]
     pub log_deleted_messages: bool,
-    #[serde(default = "default_deleted_log_char_limit")]
     pub deleted_log_char_limit: usize,
 
-    #[serde(default)]
     pub open_links_incognito: bool,
     /// Skip Echo's external-link confirmation for every HTTP(S) domain.
-    #[serde(default)]
     pub skip_open_link_confirmation: bool,
     /// Exact, normalized HTTP(S) hosts that may open without confirmation.
-    #[serde(default)]
     pub trusted_link_domains: Vec<String>,
     /// Check Echo's signed stable update manifest shortly after startup.
-    #[serde(default = "default_true")]
     pub auto_check_updates: bool,
-    #[serde(default)]
     pub browser_path: Option<String>,
 
-    #[serde(default = "default_true")]
     pub live_notifications_enabled: bool,
-    #[serde(default = "default_live_notification_startup_delay")]
     pub live_notification_startup_delay_secs: u32,
 
-    #[serde(default)]
     pub custom_player_path: Option<String>,
-    #[serde(default)]
     pub use_custom_player: bool,
-    #[serde(default)]
     pub streamlink_path: Option<String>,
-    #[serde(default)]
     pub streamlink_quality: StreamlinkQuality,
-    #[serde(default)]
     pub streamlink_custom_quality: String,
-    #[serde(default)]
     pub streamlink_extra_args: String,
 
-    #[serde(default)]
     pub image_uploader: crate::backend::image_uploader::ImageUploaderConfig,
 
-    #[serde(default)]
     pub deleted_message_mode: DeletedMessageMode,
 
-    #[serde(default)]
     pub settings_navigation: SettingsNavigationPrefs,
 
     /// The first-run "Import from Chatterino" card was dismissed or an import
     /// ran, so it never shows again.
-    #[serde(default)]
     pub chatterino_import_prompt_dismissed: bool,
 }
 
@@ -2717,7 +2540,7 @@ pub fn emote_display_rules_snapshot() -> Option<Arc<CompiledEmoteDisplayRules>> 
 }
 
 /// Filter action types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FilterAction {
     #[default]
     #[serde(rename = "allow")]
@@ -2734,20 +2557,8 @@ pub enum FilterAction {
 
 pub use echo_core::commands::CustomCommand;
 
-fn default_scale() -> f32 {
-    1.0
-}
-
-fn default_badge_scale() -> f32 {
-    1.0
-}
-
 fn default_true() -> bool {
     true
-}
-
-fn default_accent_color() -> String {
-    DEFAULT_ACCENT_COLOR.to_string()
 }
 
 pub(crate) const DEFAULT_MENTION_COLOR: &str = "#7F3F49";
@@ -2765,112 +2576,8 @@ pub(crate) const DEFAULT_REDEEM_HIGHLIGHT_COLOR: &str = "#1C7E8D";
 pub(crate) const DEFAULT_ELEVATED_HIGHLIGHT_COLOR: &str = "#FFAE42";
 pub(crate) const DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR: &str = "#0076DD";
 
-fn default_mention_color() -> String {
-    DEFAULT_MENTION_COLOR.to_string()
-}
-
-fn default_whisper_color() -> String {
-    DEFAULT_WHISPER_COLOR.to_string()
-}
-
-fn default_subscription_color() -> String {
-    DEFAULT_SUBSCRIPTION_COLOR.to_string()
-}
-
-fn default_first_message_color() -> String {
-    DEFAULT_FIRST_MESSAGE_COLOR.to_string()
-}
-
-fn default_thread_highlight_color() -> String {
-    DEFAULT_THREAD_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_log_format() -> String {
-    "txt".to_string()
-}
-
-fn default_persist_history_enabled() -> bool {
-    true
-}
-
-fn default_scroll_animation_duration() -> u32 {
-    150
-}
-
 fn default_hotkeys() -> HashMap<String, HotkeyBinding> {
     super::hotkeys::default_hotkeys()
-}
-
-fn default_watchstreak_highlight_color() -> String {
-    DEFAULT_WATCHSTREAK_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_automod_highlight_color() -> String {
-    DEFAULT_AUTOMOD_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_announcement_highlight_color() -> String {
-    DEFAULT_ANNOUNCEMENT_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_raid_highlight_color() -> String {
-    DEFAULT_RAID_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_bits_highlight_color() -> String {
-    DEFAULT_BITS_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_phrase_highlight_color() -> String {
-    DEFAULT_PHRASE_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_redeem_highlight_color() -> String {
-    DEFAULT_REDEEM_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_elevated_highlight_color() -> String {
-    DEFAULT_ELEVATED_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_self_message_highlight_color() -> String {
-    DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR.to_string()
-}
-
-fn default_deleted_log_char_limit() -> usize {
-    500
-}
-
-fn default_live_notification_startup_delay() -> u32 {
-    30
-}
-
-fn default_main_window_width() -> u32 {
-    1280
-}
-
-fn default_main_window_height() -> u32 {
-    800
-}
-
-fn default_overlay_window_width() -> u32 {
-    400
-}
-
-fn default_overlay_window_height() -> u32 {
-    500
-}
-
-fn default_overlay_max_messages() -> u32 {
-    15
-}
-
-fn default_overlay_idle_fade_secs() -> u32 {
-    30
-}
-
-fn default_overlay_min_opacity_percent() -> u8 {
-    10
 }
 
 fn default_chat_popup_window_width() -> u32 {
@@ -2887,22 +2594,6 @@ fn default_emote_picker_popout_window_width() -> u32 {
 
 fn default_emote_picker_popout_window_height() -> u32 {
     520
-}
-
-fn default_settings_popout_window_width() -> u32 {
-    850
-}
-
-fn default_settings_popout_window_height() -> u32 {
-    650
-}
-
-fn default_debug_popup_window_width() -> u32 {
-    720
-}
-
-fn default_debug_popup_window_height() -> u32 {
-    820
 }
 
 impl Default for AppSettings {
@@ -2925,7 +2616,7 @@ impl Default for AppSettings {
             custom_theme_file_palette: None,
             custom_theme_file_accent: None,
             custom_theme_file_loaded_mtime_ms: None,
-            theme_mode: ThemeMode::Dark,
+            theme_mode: PersistedThemeMode::Dark,
             font_scale: 1.0,
             emote_scale: 1.0,
             emote_image_scale: EmoteImageScale::default(),
@@ -2966,11 +2657,11 @@ impl Default for AppSettings {
             open_settings_as_popout: true,
             accounts: Vec::new(),
             token_expires_at: None,
-            mention_color: default_mention_color(),
-            whisper_color: default_whisper_color(),
-            subscription_color: default_subscription_color(),
-            first_message_color: default_first_message_color(),
-            thread_highlight_color: default_thread_highlight_color(),
+            mention_color: DEFAULT_MENTION_COLOR.to_string(),
+            whisper_color: DEFAULT_WHISPER_COLOR.to_string(),
+            subscription_color: DEFAULT_SUBSCRIPTION_COLOR.to_string(),
+            first_message_color: DEFAULT_FIRST_MESSAGE_COLOR.to_string(),
+            thread_highlight_color: DEFAULT_THREAD_HIGHLIGHT_COLOR.to_string(),
             flash_on_mention: true,
             show_mention_in_title: true,
             thread_highlight_enabled: true,
@@ -2986,9 +2677,9 @@ impl Default for AppSettings {
             mod_buttons: crate::backend::mod_buttons::default_mod_buttons(),
             developer_mode: false,
             chat_logging_enabled: false,
-            persist_history_enabled: default_persist_history_enabled(),
+            persist_history_enabled: true,
             log_directory: None,
-            log_format: default_log_format(),
+            log_format: "txt".to_string(),
             proxy_enabled: false,
             proxy_url: String::new(),
             chat_density: ChatDensity::Normal,
@@ -3011,7 +2702,7 @@ impl Default for AppSettings {
             highlight_flash_enabled: true,
             smooth_scroll_enabled: true,
             paced_chat_reveal: true,
-            scroll_animation_duration_ms: default_scroll_animation_duration(),
+            scroll_animation_duration_ms: 150,
             show_ffz_badges: true,
             show_bttv_badges: true,
             show_bttv_pro_badges: true,
@@ -3024,22 +2715,22 @@ impl Default for AppSettings {
             window_transparent: false,
             minimize_to_tray: false,
             close_to_tray: false,
-            main_window_width: default_main_window_width(),
-            main_window_height: default_main_window_height(),
+            main_window_width: 1280,
+            main_window_height: 800,
             main_window_maximized: false,
             main_window_has_position: false,
             main_window_x: 0,
             main_window_y: 0,
             overlay_click_through: false,
             overlay_ghost_mode: false,
-            overlay_window_width: default_overlay_window_width(),
-            overlay_window_height: default_overlay_window_height(),
+            overlay_window_width: 400,
+            overlay_window_height: 500,
             overlay_window_has_position: false,
             overlay_window_x: 0,
             overlay_window_y: 0,
-            overlay_max_messages: default_overlay_max_messages(),
-            overlay_idle_fade_secs: default_overlay_idle_fade_secs(),
-            overlay_min_opacity_percent: default_overlay_min_opacity_percent(),
+            overlay_max_messages: 15,
+            overlay_idle_fade_secs: 30,
+            overlay_min_opacity_percent: 10,
             chat_popup_window_width: default_chat_popup_window_width(),
             chat_popup_window_height: default_chat_popup_window_height(),
             chat_popup_window_has_position: false,
@@ -3053,17 +2744,17 @@ impl Default for AppSettings {
             emote_picker_popout_window_y: 0,
             emote_picker_popout_display_geometries: Vec::new(),
             user_card_popout_window_width: default_user_card_popout_window_width(),
-            user_card_popout_window_height: default_user_card_popout_window_height(),
+            user_card_popout_window_height: 560,
             user_card_popout_window_has_position: false,
             user_card_popout_window_x: 0,
             user_card_popout_window_y: 0,
-            settings_popout_window_width: default_settings_popout_window_width(),
-            settings_popout_window_height: default_settings_popout_window_height(),
+            settings_popout_window_width: 850,
+            settings_popout_window_height: 650,
             settings_popout_window_has_position: false,
             settings_popout_window_x: 0,
             settings_popout_window_y: 0,
-            debug_popup_window_width: default_debug_popup_window_width(),
-            debug_popup_window_height: default_debug_popup_window_height(),
+            debug_popup_window_width: 720,
+            debug_popup_window_height: 820,
             debug_popup_window_has_position: false,
             debug_popup_window_x: 0,
             debug_popup_window_y: 0,
@@ -3077,28 +2768,28 @@ impl Default for AppSettings {
             show_pronouns: true,
             show_follow_date: true,
             show_follower_count: true,
-            watchstreak_highlight_color: default_watchstreak_highlight_color(),
-            automod_highlight_color: default_automod_highlight_color(),
-            announcement_highlight_color: default_announcement_highlight_color(),
-            raid_highlight_color: default_raid_highlight_color(),
-            bits_highlight_color: default_bits_highlight_color(),
-            phrase_highlight_color: default_phrase_highlight_color(),
-            redeem_highlight_color: default_redeem_highlight_color(),
-            elevated_highlight_color: default_elevated_highlight_color(),
-            self_message_highlight_color: default_self_message_highlight_color(),
+            watchstreak_highlight_color: DEFAULT_WATCHSTREAK_HIGHLIGHT_COLOR.to_string(),
+            automod_highlight_color: DEFAULT_AUTOMOD_HIGHLIGHT_COLOR.to_string(),
+            announcement_highlight_color: DEFAULT_ANNOUNCEMENT_HIGHLIGHT_COLOR.to_string(),
+            raid_highlight_color: DEFAULT_RAID_HIGHLIGHT_COLOR.to_string(),
+            bits_highlight_color: DEFAULT_BITS_HIGHLIGHT_COLOR.to_string(),
+            phrase_highlight_color: DEFAULT_PHRASE_HIGHLIGHT_COLOR.to_string(),
+            redeem_highlight_color: DEFAULT_REDEEM_HIGHLIGHT_COLOR.to_string(),
+            elevated_highlight_color: DEFAULT_ELEVATED_HIGHLIGHT_COLOR.to_string(),
+            self_message_highlight_color: DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR.to_string(),
             enable_self_message_highlight: false,
             enable_elevated_highlight: true,
             log_server_timestamps: false,
             log_by_stream_id: false,
             log_deleted_messages: false,
-            deleted_log_char_limit: default_deleted_log_char_limit(),
+            deleted_log_char_limit: 500,
             open_links_incognito: false,
             skip_open_link_confirmation: false,
             trusted_link_domains: Vec::new(),
             auto_check_updates: true,
             browser_path: None,
             live_notifications_enabled: true,
-            live_notification_startup_delay_secs: default_live_notification_startup_delay(),
+            live_notification_startup_delay_secs: 30,
             custom_player_path: None,
             use_custom_player: false,
             streamlink_path: None,
@@ -3158,7 +2849,7 @@ pub struct SettingsManager {
 
 impl SettingsManager {
     pub fn new() -> Self {
-        let config_dir = crate::benchmark_profile::config_root_or_current_dir();
+        let config_dir = crate::storage_roots::config_root_or_current_dir();
         if let Err(e) = fs::create_dir_all(&config_dir) {
             tracing::warn!(
                 "Failed to create config directory '{}': {}",
@@ -3169,7 +2860,7 @@ impl SettingsManager {
 
         let file_path = config_dir.join("settings.json");
 
-        let legacy_path = crate::benchmark_profile::legacy_cwd_file("settings.json");
+        let legacy_path = crate::storage_roots::legacy_cwd_file("settings.json");
         if !file_path.exists()
             && !crate::utils::backup_generation_paths(&file_path)
                 .iter()
@@ -3424,6 +3115,17 @@ impl SettingsManager {
         fs::copy(&self.file_path, &backup_path).map_err(|e| e.to_string())?;
         Ok(Some(backup_path))
     }
+}
+
+/// A hot-path settings mirror, read after forcing [`SETTINGS`].
+///
+/// The mirrors are filled when the settings file loads, so a read that races
+/// startup would otherwise see the atomic's initial value instead of the user's
+/// setting. Once loaded, the force is a single acquire load.
+#[inline]
+fn mirror<A>(atomic: &A) -> &A {
+    LazyLock::force(&SETTINGS);
+    atomic
 }
 
 fn publish_cached_settings_snapshot(settings: &AppSettings) {
@@ -3687,7 +3389,9 @@ fn replace_settings_snapshot(
     }
     let (changed_channels, visibility_effects) = if blocked_users_enabled {
         (
-            crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held(),
+            crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held(
+                &visibility_commit,
+            ),
             None,
         )
     } else {
@@ -3695,7 +3399,10 @@ fn replace_settings_snapshot(
             Default::default(),
             Some(
                 crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
-                    crate::backend::blocked_users::current_auth_epoch_visibility_commit_held(),
+                    &visibility_commit,
+                    crate::backend::blocked_users::current_auth_epoch_visibility_commit_held(
+                        &visibility_commit,
+                    ),
                 ),
             ),
         )
@@ -3840,8 +3547,8 @@ fn normalize_runtime_oauth_token(token: &str) -> String {
     trimmed.to_string()
 }
 
-/// PERF: Get cached lowercase username for mention detection (lock-free clone)
-/// Returns empty string if not logged in
+/// Lowercased active username (empty when signed out). Takes the small
+/// username mutex, never the settings mutex.
 pub fn get_username_lowercase() -> String {
     CACHED_USERNAME_LOWERCASE.lock_or_recover().clone()
 }
@@ -3927,7 +3634,7 @@ pub fn get_emote_scale() -> f32 {
 }
 
 pub fn get_emote_image_scale() -> EmoteImageScale {
-    EmoteImageScale::from_u8(CACHED_EMOTE_IMAGE_SCALE.load(Ordering::Acquire) as u8)
+    EmoteImageScale::from_u8(mirror(&CACHED_EMOTE_IMAGE_SCALE).load(Ordering::Acquire) as u8)
 }
 
 /// Current window DPI scale (defaults to 1.0 until the first frame syncs it).
@@ -4125,7 +3832,7 @@ pub fn set_colorize_users_without_color(enabled: bool) {
 }
 
 pub fn get_show_live_chatter_indicator() -> bool {
-    CACHED_SHOW_LIVE_CHATTER_INDICATOR.load(Ordering::Acquire)
+    mirror(&CACHED_SHOW_LIVE_CHATTER_INDICATOR).load(Ordering::Acquire)
 }
 
 pub fn set_show_live_chatter_indicator(show: bool) {
@@ -4550,24 +4257,6 @@ pub fn set_custom_theme_saturation(saturation: f32) {
     }
 }
 
-/// Get the current theme mode
-pub fn get_theme_mode() -> ThemeMode {
-    SETTINGS.lock_or_recover().theme_mode
-}
-
-/// Set the theme mode
-pub fn set_theme_mode(mode: ThemeMode) {
-    {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.theme_mode == mode {
-            return;
-        }
-        settings.theme_mode = mode;
-    }
-    save_settings();
-    broadcast_theme_changed();
-}
-
 pub fn set_badge_display_mode(mode: BadgeDisplayMode) {
     SETTINGS.lock_or_recover().badge_display_mode = mode;
     save_settings();
@@ -4755,8 +4444,7 @@ pub fn set_anonymous_mode(anonymous: bool) {
 }
 
 pub fn get_anonymous_mode() -> bool {
-    LazyLock::force(&SETTINGS);
-    CACHED_ANONYMOUS_MODE.load(Ordering::Acquire)
+    mirror(&CACHED_ANONYMOUS_MODE).load(Ordering::Acquire)
 }
 
 pub fn get_emoji_style() -> EmojiStyle {
@@ -4948,54 +4636,147 @@ pub fn hex_to_rgba(hex: &str) -> Option<(u8, u8, u8, Option<u8>)> {
     }
 }
 
-pub fn get_mention_color() -> String {
-    SETTINGS.lock_or_recover().mention_color.clone()
+/// One user-editable highlight colour (Highlights › Palette).
+///
+/// Every kind is stored as its own `*_color` field of [`AppSettings`]; this
+/// enum is the single place that maps a kind to its field and default, so the
+/// settings UI never dispatches on strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HighlightColorKind {
+    Mention,
+    Whisper,
+    Subscription,
+    FirstMessage,
+    Thread,
+    WatchStreak,
+    AutoMod,
+    Announcement,
+    Raid,
+    Bits,
+    Phrase,
+    Redeem,
+    Elevated,
+    SelfMessage,
 }
 
-pub fn set_mention_color(color: String) {
-    SETTINGS.lock_or_recover().mention_color = color;
+impl HighlightColorKind {
+    pub const COUNT: usize = 14;
+    /// Every kind, in declaration order (`ALL[kind.index()] == kind`).
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Mention,
+        Self::Whisper,
+        Self::Subscription,
+        Self::FirstMessage,
+        Self::Thread,
+        Self::WatchStreak,
+        Self::AutoMod,
+        Self::Announcement,
+        Self::Raid,
+        Self::Bits,
+        Self::Phrase,
+        Self::Redeem,
+        Self::Elevated,
+        Self::SelfMessage,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable lowercase name, used to key per-kind UI state.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Whisper => "whisper",
+            Self::Subscription => "subscription",
+            Self::FirstMessage => "first_message",
+            Self::Thread => "thread",
+            Self::WatchStreak => "watchstreak",
+            Self::AutoMod => "automod",
+            Self::Announcement => "announcement",
+            Self::Raid => "raid",
+            Self::Bits => "bits",
+            Self::Phrase => "phrase",
+            Self::Redeem => "redeem",
+            Self::Elevated => "elevated",
+            Self::SelfMessage => "self_message",
+        }
+    }
+
+    pub const fn default_color(self) -> &'static str {
+        match self {
+            Self::Mention => DEFAULT_MENTION_COLOR,
+            Self::Whisper => DEFAULT_WHISPER_COLOR,
+            Self::Subscription => DEFAULT_SUBSCRIPTION_COLOR,
+            Self::FirstMessage => DEFAULT_FIRST_MESSAGE_COLOR,
+            Self::Thread => DEFAULT_THREAD_HIGHLIGHT_COLOR,
+            Self::WatchStreak => DEFAULT_WATCHSTREAK_HIGHLIGHT_COLOR,
+            Self::AutoMod => DEFAULT_AUTOMOD_HIGHLIGHT_COLOR,
+            Self::Announcement => DEFAULT_ANNOUNCEMENT_HIGHLIGHT_COLOR,
+            Self::Raid => DEFAULT_RAID_HIGHLIGHT_COLOR,
+            Self::Bits => DEFAULT_BITS_HIGHLIGHT_COLOR,
+            Self::Phrase => DEFAULT_PHRASE_HIGHLIGHT_COLOR,
+            Self::Redeem => DEFAULT_REDEEM_HIGHLIGHT_COLOR,
+            Self::Elevated => DEFAULT_ELEVATED_HIGHLIGHT_COLOR,
+            Self::SelfMessage => DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR,
+        }
+    }
+
+    fn field_mut(self, settings: &mut AppSettings) -> &mut String {
+        match self {
+            Self::Mention => &mut settings.mention_color,
+            Self::Whisper => &mut settings.whisper_color,
+            Self::Subscription => &mut settings.subscription_color,
+            Self::FirstMessage => &mut settings.first_message_color,
+            Self::Thread => &mut settings.thread_highlight_color,
+            Self::WatchStreak => &mut settings.watchstreak_highlight_color,
+            Self::AutoMod => &mut settings.automod_highlight_color,
+            Self::Announcement => &mut settings.announcement_highlight_color,
+            Self::Raid => &mut settings.raid_highlight_color,
+            Self::Bits => &mut settings.bits_highlight_color,
+            Self::Phrase => &mut settings.phrase_highlight_color,
+            Self::Redeem => &mut settings.redeem_highlight_color,
+            Self::Elevated => &mut settings.elevated_highlight_color,
+            Self::SelfMessage => &mut settings.self_message_highlight_color,
+        }
+    }
+}
+
+pub fn get_highlight_color(kind: HighlightColorKind) -> String {
+    kind.field_mut(&mut SETTINGS.lock_or_recover()).clone()
+}
+
+/// Every highlight colour, indexed by [`HighlightColorKind::index`], read
+/// under one lock.
+pub fn get_highlight_colors() -> [String; HighlightColorKind::COUNT] {
+    let mut settings = SETTINGS.lock_or_recover();
+    HighlightColorKind::ALL.map(|kind| kind.field_mut(&mut settings).clone())
+}
+
+pub fn set_highlight_color(kind: HighlightColorKind, color: String) {
+    *kind.field_mut(&mut SETTINGS.lock_or_recover()) = color;
     save_settings_debounced();
     broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+}
+
+pub fn get_mention_color() -> String {
+    get_highlight_color(HighlightColorKind::Mention)
 }
 
 pub fn get_whisper_color() -> String {
-    SETTINGS.lock_or_recover().whisper_color.clone()
-}
-
-pub fn set_whisper_color(color: String) {
-    SETTINGS.lock_or_recover().whisper_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Whisper)
 }
 
 pub fn get_subscription_color() -> String {
-    SETTINGS.lock_or_recover().subscription_color.clone()
-}
-
-pub fn set_subscription_color(color: String) {
-    SETTINGS.lock_or_recover().subscription_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Subscription)
 }
 
 pub fn get_first_message_color() -> String {
-    SETTINGS.lock_or_recover().first_message_color.clone()
-}
-
-pub fn set_first_message_color(color: String) {
-    SETTINGS.lock_or_recover().first_message_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::FirstMessage)
 }
 
 pub fn get_thread_highlight_color() -> String {
-    SETTINGS.lock_or_recover().thread_highlight_color.clone()
-}
-
-pub fn set_thread_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().thread_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Thread)
 }
 
 pub fn get_flash_on_mention() -> bool {
@@ -5045,8 +4826,7 @@ pub fn set_thread_highlight_show_in_mentions(enabled: bool) {
 }
 
 pub fn get_enable_twitch_blocked_users() -> bool {
-    LazyLock::force(&SETTINGS);
-    CACHED_ENABLE_TWITCH_BLOCKED_USERS.load(Ordering::Acquire)
+    mirror(&CACHED_ENABLE_TWITCH_BLOCKED_USERS).load(Ordering::Acquire)
 }
 
 pub fn set_enable_twitch_blocked_users(enabled: bool) {
@@ -5061,7 +4841,9 @@ pub fn set_enable_twitch_blocked_users(enabled: bool) {
     CACHED_ENABLE_TWITCH_BLOCKED_USERS.store(enabled, Ordering::Release);
     let (changed_channels, visibility_effects) = if enabled {
         (
-            crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held(),
+            crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held(
+                &visibility_commit,
+            ),
             None,
         )
     } else {
@@ -5069,7 +4851,10 @@ pub fn set_enable_twitch_blocked_users(enabled: bool) {
             Default::default(),
             Some(
                 crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
-                    crate::backend::blocked_users::current_auth_epoch_visibility_commit_held(),
+                    &visibility_commit,
+                    crate::backend::blocked_users::current_auth_epoch_visibility_commit_held(
+                        &visibility_commit,
+                    ),
                 ),
             ),
         )
@@ -5084,8 +4869,9 @@ pub fn set_enable_twitch_blocked_users(enabled: bool) {
 }
 
 pub fn get_show_blocked_users_messages() -> BlockedUserVisibility {
-    LazyLock::force(&SETTINGS);
-    BlockedUserVisibility::from_u64(CACHED_SHOW_BLOCKED_USERS_MESSAGES.load(Ordering::Acquire))
+    BlockedUserVisibility::from_u64(
+        mirror(&CACHED_SHOW_BLOCKED_USERS_MESSAGES).load(Ordering::Acquire),
+    )
 }
 
 pub fn set_show_blocked_users_messages(visibility: BlockedUserVisibility) {
@@ -5099,7 +4885,9 @@ pub fn set_show_blocked_users_messages(visibility: BlockedUserVisibility) {
     }
     CACHED_SHOW_BLOCKED_USERS_MESSAGES.store(visibility.as_u64(), Ordering::Release);
     let changed_channels =
-        crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held();
+        crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held(
+            &visibility_commit,
+        );
     drop(visibility_commit);
     crate::backend::irc::dispatch_blocked_channel_refreshes(changed_channels);
     save_settings();
@@ -5107,8 +4895,7 @@ pub fn set_show_blocked_users_messages(visibility: BlockedUserVisibility) {
 }
 
 pub fn get_exclude_user_messages_from_filter() -> bool {
-    LazyLock::force(&SETTINGS);
-    CACHED_EXCLUDE_USER_MESSAGES_FROM_FILTER.load(Ordering::Acquire)
+    mirror(&CACHED_EXCLUDE_USER_MESSAGES_FROM_FILTER).load(Ordering::Acquire)
 }
 
 pub fn set_exclude_user_messages_from_filter(excluded: bool) {
@@ -5737,7 +5524,7 @@ pub fn set_settings_navigation_last_developer(location: Option<PersistedSettings
 }
 
 pub fn get_tab_complete_usernames() -> bool {
-    crate::benchmark_ui_fixture::is_enabled() || SETTINGS.lock_or_recover().tab_complete_usernames
+    crate::bench::ui_fixture::is_enabled() || SETTINGS.lock_or_recover().tab_complete_usernames
 }
 
 pub fn set_tab_complete_usernames(enabled: bool) {
@@ -5746,7 +5533,7 @@ pub fn set_tab_complete_usernames(enabled: bool) {
 }
 
 pub fn get_mention_users_with_comma() -> bool {
-    crate::benchmark_ui_fixture::is_enabled() || SETTINGS.lock_or_recover().mention_users_with_comma
+    crate::bench::ui_fixture::is_enabled() || SETTINGS.lock_or_recover().mention_users_with_comma
 }
 
 pub fn set_mention_users_with_comma(enabled: bool) {
@@ -5929,7 +5716,7 @@ pub fn set_show_join_part_messages(enabled: bool) {
 
 /// Check if alternating (zebra) message backgrounds are enabled
 pub fn get_alternate_message_backgrounds() -> bool {
-    CACHED_ALTERNATE_MESSAGE_BACKGROUNDS.load(Ordering::Acquire)
+    mirror(&CACHED_ALTERNATE_MESSAGE_BACKGROUNDS).load(Ordering::Acquire)
 }
 
 pub fn set_alternate_message_backgrounds(enabled: bool) {
@@ -6173,14 +5960,14 @@ pub fn get_window_transparent() -> bool {
 
 /// Fast-path cached window transparency flag for render-time callers.
 pub fn get_window_transparent_cached() -> bool {
-    CACHED_WINDOW_TRANSPARENT.load(Ordering::Acquire)
+    mirror(&CACHED_WINDOW_TRANSPARENT).load(Ordering::Acquire)
 }
 
 /// Whether minimizing the main window should hide it in the Windows notification area.
 ///
 /// The native tray owner polls this without taking the settings mutex.
 pub fn get_minimize_to_tray() -> bool {
-    CACHED_MINIMIZE_TO_TRAY.load(Ordering::Acquire)
+    mirror(&CACHED_MINIMIZE_TO_TRAY).load(Ordering::Acquire)
 }
 
 pub fn set_minimize_to_tray(enabled: bool) {
@@ -6199,7 +5986,7 @@ pub fn set_minimize_to_tray(enabled: bool) {
 ///
 /// The native tray owner polls this without taking the settings mutex.
 pub fn get_close_to_tray() -> bool {
-    CACHED_CLOSE_TO_TRAY.load(Ordering::Acquire)
+    mirror(&CACHED_CLOSE_TO_TRAY).load(Ordering::Acquire)
 }
 
 pub fn set_close_to_tray(enabled: bool) {
@@ -6248,74 +6035,168 @@ pub fn set_overlay_ghost_mode(enabled: bool) {
     broadcast_settings_event(SettingsEvent::OverlaySettingsChanged);
 }
 
+/// Largest persisted window width, in logical pixels.
+const MAX_WINDOW_WIDTH: u32 = 3840;
+/// Largest persisted window height, in logical pixels.
+const MAX_WINDOW_HEIGHT: u32 = 2160;
+/// Bound on a persisted window origin, either sign, in logical pixels. Wide
+/// enough for any real multi-monitor layout; it only rejects garbage values.
+const WINDOW_COORD_LIMIT: i32 = 100_000;
+
+fn clamp_window_coord(value: i32) -> i32 {
+    value.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT)
+}
+
+fn round_window_coord(value: f32) -> i32 {
+    value
+        .round()
+        .clamp(-WINDOW_COORD_LIMIT as f32, WINDOW_COORD_LIMIT as f32) as i32
+}
+
+/// The size and origin fields one secondary window persists.
+struct WindowGeometryFields<'a> {
+    width: &'a mut u32,
+    height: &'a mut u32,
+    has_position: &'a mut bool,
+    x: &'a mut i32,
+    y: &'a mut i32,
+}
+
+/// Secondary windows whose geometry is a plain size plus an optional origin.
+#[derive(Clone, Copy)]
+enum PersistedWindow {
+    Overlay,
+    UserCardPopout,
+    SettingsPopout,
+    DebugPopup,
+}
+
+impl PersistedWindow {
+    /// Smallest width and height the window is restored at.
+    const fn min_size(self) -> (u32, u32) {
+        match self {
+            Self::Overlay => (200, 150),
+            Self::UserCardPopout => (320, 420),
+            Self::SettingsPopout => (600, 400),
+            Self::DebugPopup => (520, 520),
+        }
+    }
+
+    fn fields(self, settings: &mut AppSettings) -> WindowGeometryFields<'_> {
+        match self {
+            Self::Overlay => WindowGeometryFields {
+                width: &mut settings.overlay_window_width,
+                height: &mut settings.overlay_window_height,
+                has_position: &mut settings.overlay_window_has_position,
+                x: &mut settings.overlay_window_x,
+                y: &mut settings.overlay_window_y,
+            },
+            Self::UserCardPopout => WindowGeometryFields {
+                width: &mut settings.user_card_popout_window_width,
+                height: &mut settings.user_card_popout_window_height,
+                has_position: &mut settings.user_card_popout_window_has_position,
+                x: &mut settings.user_card_popout_window_x,
+                y: &mut settings.user_card_popout_window_y,
+            },
+            Self::SettingsPopout => WindowGeometryFields {
+                width: &mut settings.settings_popout_window_width,
+                height: &mut settings.settings_popout_window_height,
+                has_position: &mut settings.settings_popout_window_has_position,
+                x: &mut settings.settings_popout_window_x,
+                y: &mut settings.settings_popout_window_y,
+            },
+            Self::DebugPopup => WindowGeometryFields {
+                width: &mut settings.debug_popup_window_width,
+                height: &mut settings.debug_popup_window_height,
+                has_position: &mut settings.debug_popup_window_has_position,
+                x: &mut settings.debug_popup_window_x,
+                y: &mut settings.debug_popup_window_y,
+            },
+        }
+    }
+
+    fn size(self) -> (f32, f32) {
+        let (min_width, min_height) = self.min_size();
+        let mut settings = SETTINGS.lock_or_recover();
+        let fields = self.fields(&mut settings);
+        (
+            (*fields.width).clamp(min_width, MAX_WINDOW_WIDTH) as f32,
+            (*fields.height).clamp(min_height, MAX_WINDOW_HEIGHT) as f32,
+        )
+    }
+
+    fn set_size(self, width: f32, height: f32) {
+        if !width.is_finite() || !height.is_finite() {
+            return;
+        }
+        let (min_width, min_height) = self.min_size();
+        let width = (width.round() as u32).clamp(min_width, MAX_WINDOW_WIDTH);
+        let height = (height.round() as u32).clamp(min_height, MAX_WINDOW_HEIGHT);
+        let changed = {
+            let mut settings = SETTINGS.lock_or_recover();
+            let fields = self.fields(&mut settings);
+            if *fields.width == width && *fields.height == height {
+                false
+            } else {
+                *fields.width = width;
+                *fields.height = height;
+                true
+            }
+        };
+        if changed {
+            save_settings_debounced();
+        }
+    }
+
+    fn position(self) -> Option<(f32, f32)> {
+        let mut settings = SETTINGS.lock_or_recover();
+        let fields = self.fields(&mut settings);
+        (*fields.has_position).then(|| {
+            (
+                clamp_window_coord(*fields.x) as f32,
+                clamp_window_coord(*fields.y) as f32,
+            )
+        })
+    }
+
+    fn set_position(self, x: f32, y: f32) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        let x = round_window_coord(x);
+        let y = round_window_coord(y);
+        let changed = {
+            let mut settings = SETTINGS.lock_or_recover();
+            let fields = self.fields(&mut settings);
+            if *fields.has_position && *fields.x == x && *fields.y == y {
+                false
+            } else {
+                *fields.has_position = true;
+                *fields.x = x;
+                *fields.y = y;
+                true
+            }
+        };
+        if changed {
+            save_settings_debounced();
+        }
+    }
+}
+
 pub fn get_overlay_window_size() -> (f32, f32) {
-    let settings = SETTINGS.lock_or_recover();
-    (
-        settings.overlay_window_width.clamp(200, 3840) as f32,
-        settings.overlay_window_height.clamp(150, 2160) as f32,
-    )
+    PersistedWindow::Overlay.size()
 }
 
 pub fn set_overlay_window_size(width: f32, height: f32) {
-    if !width.is_finite() || !height.is_finite() {
-        return;
-    }
-
-    let width = (width.round() as u32).clamp(200, 3840);
-    let height = (height.round() as u32).clamp(150, 2160);
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.overlay_window_width == width && settings.overlay_window_height == height {
-            false
-        } else {
-            settings.overlay_window_width = width;
-            settings.overlay_window_height = height;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::Overlay.set_size(width, height);
 }
 
 pub fn get_overlay_window_position() -> Option<(f32, f32)> {
-    let settings = SETTINGS.lock_or_recover();
-    if !settings.overlay_window_has_position {
-        return None;
-    }
-
-    Some((
-        settings.overlay_window_x.clamp(-100_000, 100_000) as f32,
-        settings.overlay_window_y.clamp(-100_000, 100_000) as f32,
-    ))
+    PersistedWindow::Overlay.position()
 }
 
 pub fn set_overlay_window_position(x: f32, y: f32) {
-    if !x.is_finite() || !y.is_finite() {
-        return;
-    }
-
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.overlay_window_has_position
-            && settings.overlay_window_x == x
-            && settings.overlay_window_y == y
-        {
-            false
-        } else {
-            settings.overlay_window_has_position = true;
-            settings.overlay_window_x = x;
-            settings.overlay_window_y = y;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::Overlay.set_position(x, y);
 }
 
 pub fn clear_overlay_window_position() {
@@ -6390,11 +6271,19 @@ fn legacy_chat_popup_window_descriptor(
 ) -> ChatPopupWindowDescriptor {
     ChatPopupWindowDescriptor {
         channel,
-        width: settings.chat_popup_window_width.clamp(360, 3840),
-        height: settings.chat_popup_window_height.clamp(420, 2160),
+        width: settings
+            .chat_popup_window_width
+            .clamp(360, MAX_WINDOW_WIDTH),
+        height: settings
+            .chat_popup_window_height
+            .clamp(420, MAX_WINDOW_HEIGHT),
         has_position: settings.chat_popup_window_has_position,
-        x: settings.chat_popup_window_x.clamp(-100_000, 100_000),
-        y: settings.chat_popup_window_y.clamp(-100_000, 100_000),
+        x: settings
+            .chat_popup_window_x
+            .clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT),
+        y: settings
+            .chat_popup_window_y
+            .clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT),
         is_open: false,
         is_maximized: false,
     }
@@ -6449,10 +6338,10 @@ fn update_chat_popup_window_descriptor(
         let previous = descriptor.clone();
 
         update(&mut descriptor);
-        descriptor.width = descriptor.width.clamp(360, 3840);
-        descriptor.height = descriptor.height.clamp(420, 2160);
-        descriptor.x = descriptor.x.clamp(-100_000, 100_000);
-        descriptor.y = descriptor.y.clamp(-100_000, 100_000);
+        descriptor.width = descriptor.width.clamp(360, MAX_WINDOW_WIDTH);
+        descriptor.height = descriptor.height.clamp(420, MAX_WINDOW_HEIGHT);
+        descriptor.x = descriptor.x.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT);
+        descriptor.y = descriptor.y.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT);
 
         if existing_index.is_some() && descriptor == previous {
             settings
@@ -6481,8 +6370,8 @@ pub fn set_chat_popup_window_size_for_channel(channel: &str, width: f32, height:
         return;
     }
 
-    let width = (width.round() as u32).clamp(360, 3840);
-    let height = (height.round() as u32).clamp(420, 2160);
+    let width = (width.round() as u32).clamp(360, MAX_WINDOW_WIDTH);
+    let height = (height.round() as u32).clamp(420, MAX_WINDOW_HEIGHT);
     set_chat_popup_window_size(width as f32, height as f32);
     update_chat_popup_window_descriptor(channel, |descriptor| {
         descriptor.width = width;
@@ -6502,8 +6391,8 @@ pub fn set_chat_popup_window_position_for_channel(channel: &str, x: f32, y: f32)
         return;
     }
 
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
+    let x = round_window_coord(x);
+    let y = round_window_coord(y);
     set_chat_popup_window_position(x as f32, y as f32);
     update_chat_popup_window_descriptor(channel, |descriptor| {
         descriptor.has_position = true;
@@ -6547,8 +6436,8 @@ pub fn set_chat_popup_window_size(width: f32, height: f32) {
         return;
     }
 
-    let width = (width.round() as u32).clamp(360, 3840);
-    let height = (height.round() as u32).clamp(420, 2160);
+    let width = (width.round() as u32).clamp(360, MAX_WINDOW_WIDTH);
+    let height = (height.round() as u32).clamp(420, MAX_WINDOW_HEIGHT);
     let changed = {
         let mut settings = SETTINGS.lock_or_recover();
         if settings.chat_popup_window_width == width && settings.chat_popup_window_height == height
@@ -6571,8 +6460,8 @@ pub fn set_chat_popup_window_position(x: f32, y: f32) {
         return;
     }
 
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
+    let x = round_window_coord(x);
+    let y = round_window_coord(y);
     let changed = {
         let mut settings = SETTINGS.lock_or_recover();
         if settings.chat_popup_window_has_position
@@ -6597,87 +6486,31 @@ fn default_user_card_popout_window_width() -> u32 {
     470
 }
 
-fn default_user_card_popout_window_height() -> u32 {
-    560
-}
-
 pub fn get_user_card_popout_window_size() -> (f32, f32) {
-    let settings = SETTINGS.lock_or_recover();
-    (
-        settings.user_card_popout_window_width.clamp(320, 3840) as f32,
-        settings.user_card_popout_window_height.clamp(420, 2160) as f32,
-    )
+    PersistedWindow::UserCardPopout.size()
 }
 
 pub fn set_user_card_popout_window_size(width: f32, height: f32) {
-    if !width.is_finite() || !height.is_finite() {
-        return;
-    }
-
-    let width = (width.round() as u32).clamp(320, 3840);
-    let height = (height.round() as u32).clamp(420, 2160);
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.user_card_popout_window_width == width
-            && settings.user_card_popout_window_height == height
-        {
-            false
-        } else {
-            settings.user_card_popout_window_width = width;
-            settings.user_card_popout_window_height = height;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::UserCardPopout.set_size(width, height);
 }
 
 pub fn get_user_card_popout_window_position() -> Option<(f32, f32)> {
-    let settings = SETTINGS.lock_or_recover();
-    if !settings.user_card_popout_window_has_position {
-        return None;
-    }
-
-    Some((
-        settings.user_card_popout_window_x.clamp(-100_000, 100_000) as f32,
-        settings.user_card_popout_window_y.clamp(-100_000, 100_000) as f32,
-    ))
+    PersistedWindow::UserCardPopout.position()
 }
 
 pub fn set_user_card_popout_window_position(x: f32, y: f32) {
-    if !x.is_finite() || !y.is_finite() {
-        return;
-    }
-
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.user_card_popout_window_has_position
-            && settings.user_card_popout_window_x == x
-            && settings.user_card_popout_window_y == y
-        {
-            false
-        } else {
-            settings.user_card_popout_window_has_position = true;
-            settings.user_card_popout_window_x = x;
-            settings.user_card_popout_window_y = y;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::UserCardPopout.set_position(x, y);
 }
 
 pub fn get_emote_picker_popout_window_size() -> (f32, f32) {
     let settings = SETTINGS.lock_or_recover();
     (
-        settings.emote_picker_popout_window_width.clamp(320, 3840) as f32,
-        settings.emote_picker_popout_window_height.clamp(420, 2160) as f32,
+        settings
+            .emote_picker_popout_window_width
+            .clamp(320, MAX_WINDOW_WIDTH) as f32,
+        settings
+            .emote_picker_popout_window_height
+            .clamp(420, MAX_WINDOW_HEIGHT) as f32,
     )
 }
 
@@ -6686,8 +6519,8 @@ pub fn set_emote_picker_popout_window_size(width: f32, height: f32) {
         return;
     }
 
-    let width = (width.round() as u32).clamp(320, 3840);
-    let height = (height.round() as u32).clamp(420, 2160);
+    let width = (width.round() as u32).clamp(320, MAX_WINDOW_WIDTH);
+    let height = (height.round() as u32).clamp(420, MAX_WINDOW_HEIGHT);
     let changed = {
         let mut settings = SETTINGS.lock_or_recover();
         if settings.emote_picker_popout_window_width == width
@@ -6715,10 +6548,10 @@ pub fn get_emote_picker_popout_window_position() -> Option<(f32, f32)> {
     Some((
         settings
             .emote_picker_popout_window_x
-            .clamp(-100_000, 100_000) as f32,
+            .clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT) as f32,
         settings
             .emote_picker_popout_window_y
-            .clamp(-100_000, 100_000) as f32,
+            .clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT) as f32,
     ))
 }
 
@@ -6734,13 +6567,13 @@ pub fn get_emote_picker_popout_window_geometry_for_display(
         .iter()
         .find(|geometry| geometry.display_uuid == display_uuid)?;
     let size = (
-        geometry.width.clamp(320, 3840) as f32,
-        geometry.height.clamp(420, 2160) as f32,
+        geometry.width.clamp(320, MAX_WINDOW_WIDTH) as f32,
+        geometry.height.clamp(420, MAX_WINDOW_HEIGHT) as f32,
     );
     let position = geometry.has_position.then(|| {
         (
-            geometry.x.clamp(-100_000, 100_000) as f32,
-            geometry.y.clamp(-100_000, 100_000) as f32,
+            geometry.x.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT) as f32,
+            geometry.y.clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT) as f32,
         )
     });
     Some((size, position))
@@ -6751,8 +6584,8 @@ pub fn set_emote_picker_popout_window_position(x: f32, y: f32) {
         return;
     }
 
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
+    let x = round_window_coord(x);
+    let y = round_window_coord(y);
     let changed = {
         let mut settings = SETTINGS.lock_or_recover();
         if settings.emote_picker_popout_window_has_position
@@ -6790,10 +6623,10 @@ pub fn set_emote_picker_popout_window_geometry_for_display(
         return;
     }
 
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
-    let width = (width.round() as u32).clamp(320, 3840);
-    let height = (height.round() as u32).clamp(420, 2160);
+    let x = round_window_coord(x);
+    let y = round_window_coord(y);
+    let width = (width.round() as u32).clamp(320, MAX_WINDOW_WIDTH);
+    let height = (height.round() as u32).clamp(420, MAX_WINDOW_HEIGHT);
     let changed = {
         let mut settings = SETTINGS.lock_or_recover();
         let legacy_changed = !settings.emote_picker_popout_window_has_position
@@ -6848,147 +6681,35 @@ pub fn set_emote_picker_popout_window_geometry_for_display(
 }
 
 pub fn get_settings_popout_window_size() -> (f32, f32) {
-    let settings = SETTINGS.lock_or_recover();
-    (
-        settings.settings_popout_window_width.clamp(600, 3840) as f32,
-        settings.settings_popout_window_height.clamp(400, 2160) as f32,
-    )
+    PersistedWindow::SettingsPopout.size()
 }
 
 pub fn set_settings_popout_window_size(width: f32, height: f32) {
-    if !width.is_finite() || !height.is_finite() {
-        return;
-    }
-
-    let width = (width.round() as u32).clamp(600, 3840);
-    let height = (height.round() as u32).clamp(400, 2160);
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.settings_popout_window_width == width
-            && settings.settings_popout_window_height == height
-        {
-            false
-        } else {
-            settings.settings_popout_window_width = width;
-            settings.settings_popout_window_height = height;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::SettingsPopout.set_size(width, height);
 }
 
 pub fn get_settings_popout_window_position() -> Option<(f32, f32)> {
-    let settings = SETTINGS.lock_or_recover();
-    if !settings.settings_popout_window_has_position {
-        return None;
-    }
-
-    Some((
-        settings.settings_popout_window_x.clamp(-100_000, 100_000) as f32,
-        settings.settings_popout_window_y.clamp(-100_000, 100_000) as f32,
-    ))
+    PersistedWindow::SettingsPopout.position()
 }
 
 pub fn set_settings_popout_window_position(x: f32, y: f32) {
-    if !x.is_finite() || !y.is_finite() {
-        return;
-    }
-
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.settings_popout_window_has_position
-            && settings.settings_popout_window_x == x
-            && settings.settings_popout_window_y == y
-        {
-            false
-        } else {
-            settings.settings_popout_window_has_position = true;
-            settings.settings_popout_window_x = x;
-            settings.settings_popout_window_y = y;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::SettingsPopout.set_position(x, y);
 }
 
 pub fn get_debug_popup_window_size() -> (f32, f32) {
-    let settings = SETTINGS.lock_or_recover();
-    (
-        settings.debug_popup_window_width.clamp(520, 3840) as f32,
-        settings.debug_popup_window_height.clamp(520, 2160) as f32,
-    )
+    PersistedWindow::DebugPopup.size()
 }
 
 pub fn set_debug_popup_window_size(width: f32, height: f32) {
-    if !width.is_finite() || !height.is_finite() {
-        return;
-    }
-
-    let width = (width.round() as u32).clamp(520, 3840);
-    let height = (height.round() as u32).clamp(520, 2160);
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.debug_popup_window_width == width
-            && settings.debug_popup_window_height == height
-        {
-            false
-        } else {
-            settings.debug_popup_window_width = width;
-            settings.debug_popup_window_height = height;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::DebugPopup.set_size(width, height);
 }
 
 pub fn get_debug_popup_window_position() -> Option<(f32, f32)> {
-    let settings = SETTINGS.lock_or_recover();
-    if !settings.debug_popup_window_has_position {
-        return None;
-    }
-
-    Some((
-        settings.debug_popup_window_x.clamp(-100_000, 100_000) as f32,
-        settings.debug_popup_window_y.clamp(-100_000, 100_000) as f32,
-    ))
+    PersistedWindow::DebugPopup.position()
 }
 
 pub fn set_debug_popup_window_position(x: f32, y: f32) {
-    if !x.is_finite() || !y.is_finite() {
-        return;
-    }
-
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
-    let changed = {
-        let mut settings = SETTINGS.lock_or_recover();
-        if settings.debug_popup_window_has_position
-            && settings.debug_popup_window_x == x
-            && settings.debug_popup_window_y == y
-        {
-            false
-        } else {
-            settings.debug_popup_window_has_position = true;
-            settings.debug_popup_window_x = x;
-            settings.debug_popup_window_y = y;
-            true
-        }
-    };
-
-    if changed {
-        save_settings_debounced();
-    }
+    PersistedWindow::DebugPopup.set_position(x, y);
 }
 
 /// Native main-window minimums. Keep this contract shared by settings and
@@ -7063,8 +6784,12 @@ pub fn get_main_window_position() -> Option<(f32, f32)> {
     }
 
     Some((
-        settings.main_window_x.clamp(-100_000, 100_000) as f32,
-        settings.main_window_y.clamp(-100_000, 100_000) as f32,
+        settings
+            .main_window_x
+            .clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT) as f32,
+        settings
+            .main_window_y
+            .clamp(-WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT) as f32,
     ))
 }
 
@@ -7074,8 +6799,8 @@ pub fn set_main_window_position(x: f32, y: f32) {
         return;
     }
 
-    let x = x.round().clamp(-100_000.0, 100_000.0) as i32;
-    let y = y.round().clamp(-100_000.0, 100_000.0) as i32;
+    let x = round_window_coord(x);
+    let y = round_window_coord(y);
     let changed = {
         let mut settings = SETTINGS.lock_or_recover();
         if settings.main_window_has_position
@@ -7099,7 +6824,7 @@ pub fn set_main_window_position(x: f32, y: f32) {
 /// Modifier that pauses bottom-follow while held. This is an atomic read on the
 /// message/render hot path.
 pub fn get_chat_pause_modifier() -> ChatPauseModifier {
-    ChatPauseModifier::from_u8(CACHED_CHAT_PAUSE_MODIFIER.load(Ordering::Acquire))
+    ChatPauseModifier::from_u8(mirror(&CACHED_CHAT_PAUSE_MODIFIER).load(Ordering::Acquire))
 }
 
 pub fn set_chat_pause_modifier(modifier: ChatPauseModifier) {
@@ -7118,7 +6843,7 @@ pub fn set_chat_pause_modifier(modifier: ChatPauseModifier) {
 /// Optional mouse hover pause mode. Disabled is the default and keeps ordinary
 /// pointer movement behavior-neutral.
 pub fn get_chat_hover_pause_mode() -> ChatHoverPauseMode {
-    ChatHoverPauseMode::from_u8(CACHED_CHAT_HOVER_PAUSE_MODE.load(Ordering::Acquire))
+    ChatHoverPauseMode::from_u8(mirror(&CACHED_CHAT_HOVER_PAUSE_MODE).load(Ordering::Acquire))
 }
 
 pub fn set_chat_hover_pause_mode(mode: ChatHoverPauseMode) {
@@ -7136,7 +6861,7 @@ pub fn set_chat_hover_pause_mode(mode: ChatHoverPauseMode) {
 
 pub fn get_username_right_click_behavior() -> UsernameRightClickBehavior {
     UsernameRightClickBehavior::from_u8(
-        CACHED_USERNAME_RIGHT_CLICK_BEHAVIOR.load(Ordering::Acquire),
+        mirror(&CACHED_USERNAME_RIGHT_CLICK_BEHAVIOR).load(Ordering::Acquire),
     )
 }
 
@@ -7155,7 +6880,7 @@ pub fn set_username_right_click_behavior(behavior: UsernameRightClickBehavior) {
 
 pub fn get_username_right_click_modifier_behavior() -> UsernameRightClickBehavior {
     UsernameRightClickBehavior::from_u8(
-        CACHED_USERNAME_RIGHT_CLICK_MODIFIER_BEHAVIOR.load(Ordering::Acquire),
+        mirror(&CACHED_USERNAME_RIGHT_CLICK_MODIFIER_BEHAVIOR).load(Ordering::Acquire),
     )
 }
 
@@ -7174,7 +6899,7 @@ pub fn set_username_right_click_modifier_behavior(behavior: UsernameRightClickBe
 
 pub fn get_username_right_click_modifier() -> UsernameRightClickModifier {
     UsernameRightClickModifier::from_u8(
-        CACHED_USERNAME_RIGHT_CLICK_MODIFIER.load(Ordering::Acquire),
+        mirror(&CACHED_USERNAME_RIGHT_CLICK_MODIFIER).load(Ordering::Acquire),
     )
 }
 
@@ -7192,7 +6917,7 @@ pub fn set_username_right_click_modifier(modifier: UsernameRightClickModifier) {
 }
 
 pub fn get_show_reply_button() -> bool {
-    CACHED_SHOW_REPLY_BUTTON.load(Ordering::Acquire)
+    mirror(&CACHED_SHOW_REPLY_BUTTON).load(Ordering::Acquire)
 }
 
 pub fn set_show_reply_button(show: bool) {
@@ -7209,7 +6934,7 @@ pub fn set_show_reply_button(show: bool) {
 }
 
 pub fn get_show_last_read_indicator() -> bool {
-    CACHED_SHOW_LAST_READ_INDICATOR.load(Ordering::Acquire)
+    mirror(&CACHED_SHOW_LAST_READ_INDICATOR).load(Ordering::Acquire)
 }
 
 pub fn set_show_last_read_indicator(show: bool) {
@@ -7227,7 +6952,7 @@ pub fn set_show_last_read_indicator(show: bool) {
 
 /// Check if chat pause indicator is shown
 pub fn get_show_pause_indicator() -> bool {
-    CACHED_SHOW_PAUSE_INDICATOR.load(Ordering::Acquire)
+    mirror(&CACHED_SHOW_PAUSE_INDICATOR).load(Ordering::Acquire)
 }
 
 /// Set chat pause indicator visibility
@@ -7250,7 +6975,7 @@ fn clamp_mouse_scroll_multiplier(multiplier: f32) -> f32 {
 
 /// Multiplier applied to mouse-wheel line deltas; 1.0 keeps the default speed.
 pub fn get_mouse_scroll_multiplier() -> f32 {
-    f32::from_bits(CACHED_MOUSE_SCROLL_MULTIPLIER.load(Ordering::Acquire))
+    f32::from_bits(mirror(&CACHED_MOUSE_SCROLL_MULTIPLIER).load(Ordering::Acquire))
 }
 
 pub fn set_mouse_scroll_multiplier(multiplier: f32) {
@@ -7266,12 +6991,10 @@ pub fn set_mouse_scroll_multiplier(multiplier: f32) {
     save_settings_debounced();
 }
 
-/// Check if character counter is shown
 pub fn get_show_char_counter() -> bool {
     SETTINGS.lock_or_recover().show_char_counter
 }
 
-/// Set character counter visibility
 pub fn set_show_char_counter(show: bool) {
     SETTINGS.lock_or_recover().show_char_counter = show;
     save_settings();
@@ -7296,7 +7019,7 @@ pub fn set_ask_before_paste_upload(ask: bool) {
 /// Whether message timestamps are enabled globally.
 #[inline]
 pub fn get_show_message_timestamps() -> bool {
-    CACHED_SHOW_MESSAGE_TIMESTAMPS.load(Ordering::Acquire)
+    mirror(&CACHED_SHOW_MESSAGE_TIMESTAMPS).load(Ordering::Acquire)
 }
 
 /// Closest legacy-enum projection of the active token pattern.
@@ -7336,7 +7059,8 @@ pub fn get_message_timestamp_format() -> MessageTimestampFormat {
 #[inline]
 pub fn should_show_message_timestamps(channel_is_live: bool) -> bool {
     get_show_message_timestamps()
-        && !(channel_is_live && CACHED_HIDE_MESSAGE_TIMESTAMPS_WHEN_LIVE.load(Ordering::Acquire))
+        && !(channel_is_live
+            && mirror(&CACHED_HIDE_MESSAGE_TIMESTAMPS_WHEN_LIVE).load(Ordering::Acquire))
 }
 
 pub fn set_show_message_timestamps(show: bool) {
@@ -7386,7 +7110,7 @@ pub fn set_message_timestamp_pattern(
 }
 
 pub fn get_hide_message_timestamps_when_live() -> bool {
-    CACHED_HIDE_MESSAGE_TIMESTAMPS_WHEN_LIVE.load(Ordering::Acquire)
+    mirror(&CACHED_HIDE_MESSAGE_TIMESTAMPS_WHEN_LIVE).load(Ordering::Acquire)
 }
 
 pub fn set_hide_message_timestamps_when_live(hide: bool) {
@@ -7454,107 +7178,40 @@ pub fn set_show_follower_count(enabled: bool) {
     save_settings();
 }
 
-/// Get watchstreak highlight color
 pub fn get_watchstreak_highlight_color() -> String {
-    SETTINGS
-        .lock_or_recover()
-        .watchstreak_highlight_color
-        .clone()
+    get_highlight_color(HighlightColorKind::WatchStreak)
 }
 
-/// Set watchstreak highlight color
-pub fn set_watchstreak_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().watchstreak_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
-}
-
-/// Get automod highlight color
 pub fn get_automod_highlight_color() -> String {
-    SETTINGS.lock_or_recover().automod_highlight_color.clone()
-}
-
-/// Set automod highlight color
-pub fn set_automod_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().automod_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::AutoMod)
 }
 
 pub fn get_announcement_highlight_color() -> String {
-    SETTINGS
-        .lock_or_recover()
-        .announcement_highlight_color
-        .clone()
-}
-
-pub fn set_announcement_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().announcement_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Announcement)
 }
 
 pub fn get_raid_highlight_color() -> String {
-    SETTINGS.lock_or_recover().raid_highlight_color.clone()
-}
-
-pub fn set_raid_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().raid_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Raid)
 }
 
 pub fn get_bits_highlight_color() -> String {
-    SETTINGS.lock_or_recover().bits_highlight_color.clone()
-}
-
-pub fn set_bits_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().bits_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Bits)
 }
 
 pub fn get_phrase_highlight_color() -> String {
-    SETTINGS.lock_or_recover().phrase_highlight_color.clone()
-}
-
-pub fn set_phrase_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().phrase_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Phrase)
 }
 
 pub fn get_redeem_highlight_color() -> String {
-    SETTINGS.lock_or_recover().redeem_highlight_color.clone()
-}
-
-pub fn set_redeem_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().redeem_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Redeem)
 }
 
 pub fn get_elevated_highlight_color() -> String {
-    SETTINGS.lock_or_recover().elevated_highlight_color.clone()
-}
-
-pub fn set_elevated_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().elevated_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::Elevated)
 }
 
 pub fn get_self_message_highlight_color() -> String {
-    SETTINGS
-        .lock_or_recover()
-        .self_message_highlight_color
-        .clone()
-}
-
-pub fn set_self_message_highlight_color(color: String) {
-    SETTINGS.lock_or_recover().self_message_highlight_color = color;
-    save_settings_debounced();
-    broadcast_settings_event(SettingsEvent::HighlightColorChanged);
+    get_highlight_color(HighlightColorKind::SelfMessage)
 }
 
 pub fn get_enable_self_message_highlight() -> bool {
@@ -7649,7 +7306,7 @@ pub fn set_persist_history_enabled(enabled: bool) {
 
 /// Get the optional custom human-readable chat log directory
 pub fn get_log_directory() -> Option<String> {
-    if crate::benchmark_profile::is_enabled() {
+    if crate::storage_roots::is_isolated() {
         return None;
     }
     SETTINGS.lock_or_recover().log_directory.clone()
@@ -7657,7 +7314,7 @@ pub fn get_log_directory() -> Option<String> {
 
 /// Set the optional custom human-readable chat log directory
 pub fn set_log_directory(path: Option<String>) {
-    if crate::benchmark_profile::is_enabled() {
+    if crate::storage_roots::is_isolated() {
         return;
     }
     let path = normalize_optional_path(path);
@@ -8269,5 +7926,18 @@ mod security_tests {
         value["switch_on_style"] = serde_json::json!("future-style");
         let restored: AppSettings = serde_json::from_value(value).unwrap();
         assert_eq!(restored.switch_on_style, SwitchOnStyle::Neutral);
+    }
+
+    #[test]
+    fn empty_document_deserializes_to_defaults_except_migration_markers() {
+        let mut parsed: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.emote_picker_animation_policy_revision, 0);
+        assert!(parsed.message_timestamp_pattern.is_none());
+
+        let defaults = AppSettings::default();
+        parsed.emote_picker_animation_policy_revision =
+            defaults.emote_picker_animation_policy_revision;
+        parsed.message_timestamp_pattern = defaults.message_timestamp_pattern.clone();
+        assert!(parsed == defaults);
     }
 }

@@ -1,12 +1,13 @@
-//! Split Pane - Complete isolation for each split in the layout
+//! Split Pane - per-split state that is not the draft
 //!
-//! Each SplitPane is an Entity that owns all per-split state:
-//! - Input text and focus
-//! - Reply state (NOT global!)
+//! Each SplitPane is an Entity that owns one split's:
+//! - Focus handle
+//! - Reply state
 //! - Overlay state (emote picker, autocomplete)
-//! - Scroll position and selection
+//! - Pinned-chat dismissal and expansion
 //!
-//! This ensures typing in split A never affects split B.
+//! The draft text, caret and history live in `InputManager`, and scrolling in
+//! the split's chat view.
 
 use gpui::*;
 use std::collections::hash_map::DefaultHasher;
@@ -23,20 +24,21 @@ pub enum SplitPaneEvent {
     ChannelChanged { new_channel: String },
 }
 
-/// A split-local, in-memory identity for one dismissed Twitch pinned message.
+/// A split-local, in-memory identity for one Twitch pinned message, used for
+/// both the dismissed and the expanded pin.
 ///
 /// Twitch can update a pin without assigning it a new message ID, so the
 /// timestamp and a content hash distinguish a changed pin from the exact
 /// message the user dismissed. This deliberately never enters persisted
 /// workspace state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DismissedPinnedChat {
+struct PinnedChatIdentity {
     message_id: String,
     updated_at: Option<String>,
     content_hash: u64,
 }
 
-impl DismissedPinnedChat {
+impl PinnedChatIdentity {
     fn from_message(message_id: &str, updated_at: Option<&str>, text: &str) -> Self {
         let mut hasher = DefaultHasher::new();
         text.hash(&mut hasher);
@@ -48,17 +50,15 @@ impl DismissedPinnedChat {
     }
 }
 
-/// A complete, isolated split pane with all its state.
+/// One split's pane state, kept apart from every other split's.
 ///
 /// Each SplitPane is a GPUI Entity that owns:
 /// - Its unique identity (SplitId)
 /// - The channel it's displaying
-/// - Input state (text, cursor, focus)
+/// - Its focus handle
 /// - Reply state (which message we're replying to)
 /// - Overlay state (emote picker, autocomplete)
-/// - Scroll and selection state
-///
-/// This ensures complete isolation between splits.
+/// - Pinned-chat dismissal and expansion
 pub struct SplitPane {
     /// Stable unique identifier (survives layout changes)
     pub id: SplitId,
@@ -80,7 +80,7 @@ pub struct SplitPane {
 
     /// The pin dismissed in this split only. It is intentionally retained with
     /// the split entity rather than saved into workspace configuration.
-    dismissed_pinned_chat: Option<DismissedPinnedChat>,
+    dismissed_pinned_chat: Option<PinnedChatIdentity>,
 
     /// Monotonic split-local key for retained leaf invalidation when the pin
     /// dismissal changes without any other visible split parameter changing.
@@ -88,7 +88,7 @@ pub struct SplitPane {
 
     /// The exact pin expanded by the user in this split. Like dismissal, this
     /// is deliberately in-memory only and must never follow a replacement pin.
-    expanded_pinned_chat: Option<DismissedPinnedChat>,
+    expanded_pinned_chat: Option<PinnedChatIdentity>,
 
     /// Monotonic split-local key for retained leaf invalidation when the pin
     /// bubble's expanded/collapsed state changes.
@@ -157,7 +157,7 @@ impl SplitPane {
         self.dismissed_pinned_chat
             .as_ref()
             .is_some_and(|dismissed| {
-                *dismissed == DismissedPinnedChat::from_message(message_id, updated_at, text)
+                *dismissed == PinnedChatIdentity::from_message(message_id, updated_at, text)
             })
     }
 
@@ -178,7 +178,7 @@ impl SplitPane {
         text: &str,
     ) -> bool {
         self.expanded_pinned_chat.as_ref().is_some_and(|expanded| {
-            *expanded == DismissedPinnedChat::from_message(message_id, updated_at, text)
+            *expanded == PinnedChatIdentity::from_message(message_id, updated_at, text)
         })
     }
 
@@ -193,7 +193,7 @@ impl SplitPane {
         cx: &mut Context<Self>,
     ) {
         if self.expanded_pinned_chat.as_ref().is_some_and(|expanded| {
-            *expanded != DismissedPinnedChat::from_message(message_id, updated_at, text)
+            *expanded != PinnedChatIdentity::from_message(message_id, updated_at, text)
         }) && self.clear_pinned_chat_expansion()
         {
             cx.notify();
@@ -207,7 +207,7 @@ impl SplitPane {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        let identity = DismissedPinnedChat::from_message(message_id, updated_at, text);
+        let identity = PinnedChatIdentity::from_message(message_id, updated_at, text);
         if self.expanded_pinned_chat.as_ref() == Some(&identity) {
             self.expanded_pinned_chat = None;
         } else {
@@ -224,7 +224,7 @@ impl SplitPane {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        let dismissed = DismissedPinnedChat::from_message(message_id, updated_at, text);
+        let dismissed = PinnedChatIdentity::from_message(message_id, updated_at, text);
         if self.dismissed_pinned_chat != Some(dismissed.clone()) {
             self.dismissed_pinned_chat = Some(dismissed);
             self.pinned_chat_dismissal_version = self.pinned_chat_dismissal_version.wrapping_add(1);

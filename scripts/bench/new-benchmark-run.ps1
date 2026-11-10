@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+Create a timestamped benchmark artifact directory.
+
+Initializes run metadata only; it is not a performance measurement.
+new-benchmark-run.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -15,20 +22,9 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Invoke-GitValue {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments
-    )
-
-    $output = & git @Arguments 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        return $null
-    }
-
-    return (($output | Out-String).Trim())
-}
+# No -Force: Initialize-BenchRunDirectory runs this script from inside the
+# module, which must not be reloaded underneath it.
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -DisableNameChecking
 
 function Get-OptionalCimInstance {
     param(
@@ -41,21 +37,6 @@ function Get-OptionalCimInstance {
     } catch {
         return $null
     }
-}
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "scenario"
-    }
-
-    return $slug
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
@@ -72,7 +53,7 @@ $resolvedOutputRoot = if (Test-Path $OutputRoot) {
 }
 
 $runId = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
-$scenarioSlug = ConvertTo-Slug -Value $Scenario
+$scenarioSlug = ConvertTo-Slug -Value $Scenario -Fallback "scenario"
 $runRoot = Join-Path $resolvedOutputRoot $runId
 $scenarioDir = Join-Path $runRoot $scenarioSlug
 $suffix = 1

@@ -338,7 +338,7 @@ fn discord_config_name(normalized: &str) -> Option<&'static str> {
 }
 
 fn latest_obs_log_path() -> Option<PathBuf> {
-    let log_dir = crate::benchmark_profile::external_config_dir()?
+    let log_dir = crate::storage_roots::external_config_dir()?
         .join("obs-studio")
         .join("logs");
     fs::read_dir(log_dir)
@@ -354,7 +354,7 @@ fn latest_obs_log_path() -> Option<PathBuf> {
 }
 
 fn discord_renderer_log_path(config_name: &str) -> Option<PathBuf> {
-    let path = crate::benchmark_profile::external_config_dir()?
+    let path = crate::storage_roots::external_config_dir()?
         .join(config_name)
         .join("logs")
         .join("renderer_js.log");

@@ -7,6 +7,13 @@ use crate::components::chat::canvas_renderer::layout::hash_gpui_text_runs;
 use crate::components::chat::canvas_renderer::seventv_paint;
 use lru::LruCache;
 
+/// Per-UI-thread shaped text cache for direct canvas text paint.
+///
+/// This is intentionally separate from GPUI's frame-local layout cache: animation
+/// ticks repaint the same visible rows repeatedly, and recreating `ShapedLine`
+/// objects still pays font/run setup even when glyph layout is cached.
+const TEXT_SHAPE_CACHE_CAPACITY: usize = 4096;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TextShapeCacheKey {
     text: SharedString,
@@ -235,7 +242,9 @@ fn paint_single_text_direct(
             }
         }
     }
-    crate::startup_metrics::record("first_text_paint");
+    crate::diagnostics::startup_metrics::record(
+        crate::diagnostics::startup_metrics::StartupMarker::FirstTextPaint,
+    );
 }
 
 /// Paint a name-painted line with its painted run in the username's base
@@ -375,6 +384,8 @@ pub(super) fn paint_prepared_text_direct(
                 }
             }
         }
-        crate::startup_metrics::record("first_text_paint");
+        crate::diagnostics::startup_metrics::record(
+            crate::diagnostics::startup_metrics::StartupMarker::FirstTextPaint,
+        );
     }
 }

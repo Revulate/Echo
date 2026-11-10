@@ -1,22 +1,22 @@
 //! Main application shell
 //!
 //! Contains the root view that renders the entire application UI.
-#![allow(clippy::too_many_arguments)]
 
+mod activity_rail;
 mod benchmark_drivers;
 mod chatterino_import;
+mod pending_ui_work;
+mod split_menu;
 
 use crate::backend;
 use crate::backend::lock_utils::MutexExt;
-use crate::components::auth::LoginModal;
 use crate::components::chat::chat_header_renderer::main_split_header_height;
 use crate::components::chat::chat_pane::{
     SplitLeafParamsGate, SplitLeafRenderParams, SplitLeafView, SplitLeafViewHandles,
-    reply_state_gate_hash, stream_info_gate_hash,
+    reply_state_gate_hash,
 };
 use crate::components::chat::{ChatHeaderRenderer, ChatInputRenderer, ChatViewDirtyReason};
 use crate::components::settings::SettingsSectionId;
-use crate::components::splits::SplitTreeRenderer;
 use crate::components::tabs::TabBarRenderer;
 use crate::components::ui::menu::{MenuAction, MenuHost, MenuKeyboard, menu_item, menu_panel};
 use crate::components::ui::{ButtonExt, PressToClick};
@@ -32,10 +32,9 @@ use crate::state::{
 };
 use crate::theme::colors;
 use crate::theme::tokens::{Radii, RadiiPixels, Spacing};
+pub(crate) use crate::utils::apply_main_window_always_on_top;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-#[cfg(target_os = "windows")]
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use rustc_hash::FxHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -43,14 +42,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
-#[cfg(target_os = "windows")]
-use windows::Win32::Foundation::HWND;
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{
-    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-};
 
-const PENDING_UI_FAST_INTERVAL: Duration = Duration::from_millis(50);
 const PENDING_UI_EMBED_INTERVAL: Duration = Duration::from_millis(100);
 const PENDING_UI_REAUTH_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_UI_SETTINGS_INTERVAL: Duration = Duration::from_millis(250);
@@ -117,77 +109,6 @@ fn activity_sidebar_width(available_width: f32) -> f32 {
     }
 }
 
-/// Actions for the app
-pub mod actions {
-    use gpui::*;
-
-    actions!(
-        echo,
-        [
-            AddChannel,
-            SendMessage,
-            Backspace,
-            OpenSettings,
-            OpenSearch,
-            CloseTab,
-            NextTab,
-            PrevTab,
-            ScrollToBottom,
-            FocusInput,
-            HistoryUp,
-            HistoryDown,
-        ]
-    );
-}
-
-#[cfg(target_os = "windows")]
-fn main_window_hwnd(window: &Window) -> Option<HWND> {
-    let handle = HasWindowHandle::window_handle(window).ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::Win32(win32) => Some(HWND(win32.hwnd.get() as *mut core::ffi::c_void)),
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn apply_main_window_always_on_top(window: &Window, enabled: bool) -> bool {
-    let Some(hwnd) = main_window_hwnd(window) else {
-        return false;
-    };
-
-    let insert_after = if enabled {
-        HWND_TOPMOST
-    } else {
-        HWND_NOTOPMOST
-    };
-
-    // SAFETY: `hwnd` is this process's live main window handle, and SetWindowPos only changes its z-order flags.
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(insert_after),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
-        )
-        .is_ok()
-    }
-}
-
-/// Neither Wayland nor GPUI can keep a window above others; KWin can.
-#[cfg(target_os = "linux")]
-pub(crate) fn apply_main_window_always_on_top(_window: &Window, enabled: bool) -> bool {
-    crate::utils::kwin::set_main_window_keep_above(enabled);
-    true
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-pub(crate) fn apply_main_window_always_on_top(_window: &Window, _enabled: bool) -> bool {
-    false
-}
-
 fn find_first_path_for_channel(root: &SplitNode, target_channel: &str) -> Option<Vec<usize>> {
     fn walk(node: &SplitNode, target_channel: &str, path: &mut Vec<usize>) -> Option<Vec<usize>> {
         match node {
@@ -221,13 +142,13 @@ fn tab_channel_target(tab: &crate::state::TabState, channel: &str) -> Option<(Ve
     let active_path = tab.valid_active_split_path();
     let path = tab
         .layout
-        .get_channel_at_path(&active_path)
+        .channel_at_path(&active_path)
         .filter(|active_channel| active_channel.eq_ignore_ascii_case(channel))
         .map(|_| active_path)
         .or_else(|| find_first_path_for_channel(&tab.layout, channel))?;
     let resolved_channel = tab
         .layout
-        .get_channel_at_path(&path)
+        .channel_at_path(&path)
         .unwrap_or_else(|| channel.to_string());
     Some((path, resolved_channel))
 }
@@ -262,7 +183,7 @@ fn find_open_split_target(
         .enumerate()
         .find_map(|(tab_index, tab)| {
             let path = tab.split_path_for_id(split_id)?;
-            let channel = tab.layout.get_channel_at_path(&path)?;
+            let channel = tab.layout.channel_at_path(&path)?;
             (expected_channel.is_empty()
                 || channel
                     .trim_start_matches('#')
@@ -275,272 +196,12 @@ fn tab_active_split_target(
     tab: &crate::state::TabState,
 ) -> Option<(crate::state::SplitId, String)> {
     let path = tab.valid_active_split_path();
-    let channel = tab.layout.get_channel_at_path(&path)?;
+    let channel = tab.layout.channel_at_path(&path)?;
     if is_placeholder(&channel) {
         return None;
     }
-    let split_id = tab.layout.get_split_id_at_path(&path)?;
+    let split_id = tab.layout.split_id_at_path(&path)?;
     Some((split_id, channel))
-}
-
-/// Width band the split action menu may ask for before the viewport clamps it.
-///
-/// The floor keeps a short menu from reading as a tooltip; the cap stops a
-/// pathological label or rebound hotkey from producing a full-width panel.
-const SPLIT_MENU_MIN_WIDTH_PX: f32 = 160.0;
-const SPLIT_MENU_MAX_WIDTH_PX: f32 = 320.0;
-const SPLIT_MENU_MAX_HEIGHT_PX: f32 = 420.0;
-/// Label column below which the shortcut column is dropped instead of elided.
-const SPLIT_MENU_MIN_LABEL_PX: f32 = 72.0;
-/// The panel draws a 1px border on each side, inside its requested width.
-const SPLIT_MENU_BORDER_PX: f32 = 2.0;
-
-/// Split action menu entries, kept as data so one list drives both the width
-/// measurement and the painted rows.
-#[derive(Clone, Copy)]
-enum SplitMenuAction {
-    ToggleHeader,
-    AddSplit,
-    ChangeChannel,
-    LiveFollowedChannels,
-    OpenChatters,
-    OpenChannelPopup,
-    ModLog,
-    CycleDeletedMode,
-    OpenCustomPlayer,
-    OpenStreamlink,
-    CloseSplit,
-}
-
-/// Short name of a deleted-message mode in the split menu.
-fn deleted_mode_label(mode: backend::settings::DeletedMessageMode) -> &'static str {
-    use backend::settings::DeletedMessageMode;
-    match mode {
-        DeletedMessageMode::Disable => "Show",
-        DeletedMessageMode::Hide => "Hide",
-        DeletedMessageMode::Replace => "Click to reveal",
-        DeletedMessageMode::Strikethrough => "Strikethrough",
-        DeletedMessageMode::Dim => "Dimmed",
-    }
-}
-
-/// The mode after `current` when cycling a split's deleted-message override:
-/// follow the global setting, then each explicit mode, then back.
-fn next_deleted_mode(
-    current: Option<backend::settings::DeletedMessageMode>,
-) -> Option<backend::settings::DeletedMessageMode> {
-    use backend::settings::DeletedMessageMode;
-    match current {
-        None => Some(DeletedMessageMode::Dim),
-        Some(DeletedMessageMode::Dim) => Some(DeletedMessageMode::Strikethrough),
-        Some(DeletedMessageMode::Strikethrough) => Some(DeletedMessageMode::Replace),
-        Some(DeletedMessageMode::Replace) => Some(DeletedMessageMode::Hide),
-        Some(DeletedMessageMode::Hide) => Some(DeletedMessageMode::Disable),
-        Some(DeletedMessageMode::Disable) => None,
-    }
-}
-
-/// A split action menu row: an elidable label plus an optional trailing
-/// shortcut.
-struct SplitMenuRow {
-    action: SplitMenuAction,
-    label: SharedString,
-    shortcut: Option<SharedString>,
-}
-
-/// Width the split action menu needs, measured rather than guessed.
-///
-/// Returns the intrinsic width — widest `label + gap + shortcut` row plus the
-/// shared [`MenuMetrics`] inset and the panel border — and the width the
-/// shortcut column occupies, so a squeezed panel can drop that column instead
-/// of clipping it. Shaping through the same `shape_line` path the tab bar uses
-/// means the number matches what actually gets painted.
-fn measure_split_menu_width(rows: &[SplitMenuRow], window: &Window) -> (f32, f32) {
-    let font = window.text_style().font();
-    let measure = |text: &SharedString, font_size: f32| -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        let runs = [TextRun {
-            len: text.len(),
-            font: font.clone(),
-            color: colors::text_primary(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }];
-        window
-            .text_system()
-            .shape_line(text.clone(), px(font_size), &runs, None)
-            .width
-            .as_f32()
-    };
-
-    let mut widest_row: f32 = 0.0;
-    let mut widest_shortcut: f32 = 0.0;
-    for row in rows {
-        let label = measure(&row.label, MenuMetrics::ITEM_TEXT);
-        let shortcut = row
-            .shortcut
-            .as_ref()
-            .map(|shortcut| measure(shortcut, MenuMetrics::SECONDARY_TEXT))
-            .unwrap_or(0.0);
-        widest_shortcut = widest_shortcut.max(shortcut);
-        widest_row = widest_row.max(if shortcut > 0.0 {
-            label + MenuMetrics::ITEM_GAP + shortcut
-        } else {
-            label
-        });
-    }
-
-    let shortcut_column = if widest_shortcut > 0.0 {
-        MenuMetrics::ITEM_GAP + widest_shortcut
-    } else {
-        0.0
-    };
-    let insets = MenuMetrics::ITEM_PADDING_X * 2.0 + SPLIT_MENU_BORDER_PX;
-    (widest_row.ceil() + insets, shortcut_column)
-}
-
-fn is_automod_notification_event(event: &backend::TwitchEvent) -> bool {
-    matches!(
-        &event.event_type,
-        backend::types::TwitchEventType::AutomodMessageHold
-            | backend::types::TwitchEventType::AutomodMessageUpdate
-    )
-}
-
-fn pending_automod_message_id(event: &backend::TwitchEvent) -> Option<String> {
-    if !matches!(
-        &event.event_type,
-        backend::types::TwitchEventType::AutomodMessageHold
-    ) {
-        return None;
-    }
-
-    event
-        .message_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|message_id| !message_id.is_empty())
-        .map(str::to_string)
-}
-
-fn suspicious_user_notification_target(
-    event: &backend::TwitchEvent,
-) -> Option<(String, String, Option<String>, String)> {
-    if !matches!(
-        &event.event_type,
-        backend::types::TwitchEventType::SuspiciousUserMessage
-            | backend::types::TwitchEventType::SuspiciousUserUpdate
-    ) {
-        return None;
-    }
-
-    let channel = event.channel.trim().trim_start_matches('#').to_lowercase();
-    if channel.is_empty() {
-        return None;
-    }
-
-    let user_login = event
-        .user_login
-        .as_deref()
-        .or(event.user_name.as_deref())
-        .unwrap_or_default()
-        .trim()
-        .trim_start_matches('@')
-        .to_lowercase();
-    let user_id = event
-        .user_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string);
-    if user_login.is_empty() && user_id.is_none() {
-        return None;
-    }
-
-    Some((
-        channel,
-        user_login,
-        user_id,
-        event
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-    ))
-}
-
-fn accent_action_button(
-    id: SharedString,
-    label: &'static str,
-    accent: Hsla,
-    on_click: impl Fn() + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_2()
-        .py_0p5()
-        .rounded(Radii::sm())
-        .border_1()
-        .border_color(accent.opacity(0.45))
-        .bg(accent.opacity(0.12))
-        .cursor_pointer()
-        .hover(move |s| s.bg(accent.opacity(0.2)))
-        .on_activate(move |_event, _window, _cx| on_click())
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(accent)
-                .child(label),
-        )
-}
-
-fn automod_action_button(
-    label: &'static str,
-    message_id: String,
-    allow: bool,
-    event_timestamp: i64,
-) -> Stateful<Div> {
-    let accent = if allow {
-        colors::success()
-    } else {
-        colors::error()
-    };
-
-    let id = SharedString::from(format!("automod-{label}-{message_id}"));
-    accent_action_button(id, label, accent, move || {
-        backend::manage_held_automod_message_async(message_id.clone(), allow, event_timestamp);
-    })
-}
-
-fn suspicious_user_action_button(
-    label: &'static str,
-    channel: String,
-    user_login: String,
-    user_id: Option<String>,
-    action: backend::commands::helix::SuspiciousUserAction,
-    event_timestamp: i64,
-) -> Stateful<Div> {
-    let accent = match action {
-        backend::commands::helix::SuspiciousUserAction::Monitor => colors::info(),
-        backend::commands::helix::SuspiciousUserAction::Restrict => colors::warning(),
-        backend::commands::helix::SuspiciousUserAction::Clear => colors::text_muted(),
-    };
-
-    let id = SharedString::from(format!("suspicious-{label}-{user_login}-{event_timestamp}"));
-    accent_action_button(id, label, accent, move || {
-        backend::manage_suspicious_user_status_async(
-            channel.clone(),
-            user_login.clone(),
-            user_id.clone(),
-            action,
-            event_timestamp,
-        );
-    })
 }
 
 /// The root application view
@@ -561,8 +222,6 @@ pub struct EchoApp {
     pub chat_header_renderer: Entity<ChatHeaderRenderer>,
     /// Split layout manager (handles split tree state, resize, pane drag-drop)
     pub split_layout: Entity<SplitLayoutManager>,
-    /// Split tree renderer entity (handles split rendering helpers)
-    split_tree_renderer: Entity<SplitTreeRenderer>,
     /// Overlay manager (handles all modals, overlays, dropdowns, toasts)
     pub overlay_manager: Entity<OverlayManager>,
     /// Emote state manager (tracks emote loading state for reactive updates)
@@ -574,15 +233,11 @@ pub struct EchoApp {
     top_bar_view: Entity<crate::components::top_bar::TopBarView>,
     /// Last observed window active state (for transition-based focus updates)
     last_window_active: bool,
-    /// Last raw modifier/policy tuple propagated into retained chat canvases.
-    /// This keeps the app render boundary allocation-free in steady state.
-    last_chat_pause_modifier_state: Option<(
-        bool,
-        bool,
-        bool,
-        bool,
-        crate::backend::settings::ChatPauseModifier,
-    )>,
+    /// Last held modifiers (all released while the window is inactive) and
+    /// pause policy propagated into retained chat canvases, so render only
+    /// touches the canvases when one of them changes.
+    last_chat_pause_modifier_state:
+        Option<(Modifiers, crate::backend::settings::ChatPauseModifier)>,
     /// Last platform window title applied for mention-title updates.
     last_window_title: String,
     /// Last main window size persisted to settings.
@@ -595,7 +250,7 @@ pub struct EchoApp {
     chat_views: HashMap<SplitId, Entity<crate::components::chat::ChatView>>,
     /// Last viewport/unread key consumed by `mark_observed_activity_read`.
     activity_read_visibility_key: Option<u64>,
-    /// Per-split pane entities (new isolated architecture)
+    /// Per-split pane entities (reply, overlay and pinned-chat state).
     /// Keyed by SplitId for stable identity that survives layout changes
     pub split_panes:
         std::collections::HashMap<crate::state::SplitId, Entity<crate::state::SplitPane>>,
@@ -618,6 +273,10 @@ pub struct EchoApp {
     seen_closed_tab_generation: u64,
     /// Last `followed_live::version` pushed to the open Live now lists.
     seen_followed_live_version: u64,
+    /// Last `bridge::get_embed_metadata_version` whose layouts were invalidated.
+    seen_embed_metadata_version: u32,
+    /// Whether the first-usable-chat-view startup marker was recorded.
+    first_chat_view_usable_recorded: bool,
     /// Close-action generations whose Undo toast button was pressed.
     undo_closed_tab_requests: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     /// Last main-window transparency state applied to the live window.
@@ -649,8 +308,44 @@ pub struct EchoApp {
     chatterino_welcome: Option<PathBuf>,
 }
 
+/// Width and height, in pixels, of the area a pane or split subtree may fill.
+#[derive(Clone, Copy)]
+struct PaneExtent {
+    width: f32,
+    height: f32,
+}
+
+/// One chat leaf of the split tree, as `render_split_tree` hands it to the
+/// cached-leaf renderer.
+struct SplitLeaf<'a> {
+    split_id: SplitId,
+    channel: &'a str,
+    path: Vec<usize>,
+    header_collapsed: bool,
+}
+
+/// What `split_vertical_chrome` needs to know about a split to size its chrome.
+struct SplitChromeQuery<'a> {
+    split_id: Option<SplitId>,
+    channel: &'a str,
+    header_height: f32,
+    show_input: bool,
+    is_active: bool,
+    pane_width: f32,
+}
+
+/// An image read from the clipboard, waiting to be uploaded.
+pub struct PastedImage {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+    /// Size of the raw clipboard data, which decides whether to ask first.
+    pub source_bytes: u64,
+}
+
 #[derive(Clone)]
 struct SplitRenderContext {
+    highlights_enabled: bool,
     is_dragging: bool,
     add_split_mode: bool,
     resize_mode_active: bool,
@@ -737,7 +432,7 @@ impl EchoApp {
                 repaired |=
                     std::sync::Arc::make_mut(&mut tab.layout).ensure_unique_split_ids(&mut seen);
             }
-            if repaired && !crate::benchmark_ui_fixture::should_suppress_persistence() {
+            if repaired {
                 config::queue_save_tabs(state.tabs_for_persistence());
             }
         });
@@ -748,7 +443,6 @@ impl EchoApp {
         });
         let chat_header_renderer = cx.new(ChatHeaderRenderer::new);
         let chat_input_renderer = cx.new(ChatInputRenderer::new);
-        let split_tree_renderer = cx.new(|_cx| SplitTreeRenderer::new());
 
         let mut subscriptions = Self::create_subscriptions(&app_state, &emote_state, window, cx);
         subscriptions.push(cx.subscribe(
@@ -828,7 +522,6 @@ impl EchoApp {
             tab_bar_renderer,
             chat_header_renderer,
             split_layout,
-            split_tree_renderer,
             overlay_manager,
             _emote_state: emote_state,
             _image_cache_service: image_cache_service,
@@ -852,6 +545,8 @@ impl EchoApp {
             last_closed_split: None,
             seen_closed_tab_generation: 0,
             seen_followed_live_version: 0,
+            seen_embed_metadata_version: 0,
+            first_chat_view_usable_recorded: false,
             undo_closed_tab_requests: Default::default(),
             last_window_transparent: None,
             last_window_always_on_top: None,
@@ -883,21 +578,8 @@ impl EchoApp {
                     .unwrap_or_else(Instant::now);
 
             loop {
-                let interval = match crate::managers::frame_rate_controller::current_mode_cached() {
-                    crate::managers::frame_rate_controller::RenderMode::Interactive
-                    | crate::managers::frame_rate_controller::RenderMode::Animating => {
-                        PENDING_UI_FAST_INTERVAL
-                    }
-                    crate::managers::frame_rate_controller::RenderMode::FocusedIdle => {
-                        Duration::from_millis(100)
-                    }
-                    crate::managers::frame_rate_controller::RenderMode::DeepIdle => {
-                        Duration::from_millis(250)
-                    }
-                    crate::managers::frame_rate_controller::RenderMode::TrueIdle => {
-                        Duration::from_millis(500)
-                    }
-                };
+                let interval = crate::managers::frame_rate_controller::current_mode_cached()
+                    .pending_ui_interval();
                 cx.background_executor().timer(interval).await;
 
                 let now = Instant::now();
@@ -974,11 +656,11 @@ impl EchoApp {
         overlay_manager: &Entity<OverlayManager>,
         cx: &mut Context<Self>,
     ) {
-        if !crate::demo::is_demo_mode() {
+        if !crate::diagnostics::demo::is_demo_mode() {
             return;
         }
 
-        let demo_channel = crate::demo::get_demo_channel().to_string();
+        let demo_channel = crate::diagnostics::demo::DEMO_CHANNEL.to_string();
         crate::log_ui!(info, "Adding channel {} to active tab", demo_channel);
         app_state.update(cx, |state, cx| {
             state.add_channel(demo_channel.clone(), cx);
@@ -986,7 +668,10 @@ impl EchoApp {
 
         overlay_manager.update(cx, |manager, cx| {
             manager.toast_info(
-                format!("Demo mode: Testing #{}", crate::demo::get_demo_channel()),
+                format!(
+                    "Demo mode: Testing #{}",
+                    crate::diagnostics::demo::DEMO_CHANNEL
+                ),
                 cx,
             );
         });
@@ -997,7 +682,7 @@ impl EchoApp {
                 .timer(std::time::Duration::from_secs(3))
                 .await;
 
-            let results = crate::demo::run_demo_tests().await;
+            let results = crate::diagnostics::demo::run_demo_tests().await;
             let summary = results.summary();
             let is_success = results.is_success();
             let total_emotes = results.total_emotes();
@@ -1083,14 +768,7 @@ impl EchoApp {
                 if !is_active {
                     this.cancel_pointer_drags(cx);
                 }
-                let _ = this.sync_chat_pause_modifiers(
-                    modifiers.control,
-                    modifiers.alt,
-                    modifiers.shift,
-                    modifiers.platform,
-                    is_active,
-                    cx,
-                );
+                let _ = this.sync_chat_pause_modifiers(&modifiers, is_active, cx);
                 crate::managers::frame_rate_controller::set_focused(is_active);
                 this.sync_main_window_appearance(window);
                 this.update_window_title(window);
@@ -1108,7 +786,7 @@ impl EchoApp {
         }));
 
         subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
-            this.update_layout_caches(window, cx);
+            this.sync_window_persistence(window, cx);
             this.sync_main_window_appearance(window);
             this.update_window_title(window);
             crate::state::ui_invalidation::request(
@@ -1245,7 +923,7 @@ impl EchoApp {
             let app_state = self.app_state.read(cx);
             let tab = app_state.active_tab();
             let path = tab.split_path_for_id(split_id)?;
-            let stored_channel = tab.layout.get_channel_at_path(&path)?;
+            let stored_channel = tab.layout.channel_at_path(&path)?;
             let current_channel =
                 backend::browser_watching::resolve_layout_channel(&stored_channel)?;
             current_channel
@@ -1264,9 +942,9 @@ impl EchoApp {
     ) -> Option<(String, SplitId)> {
         let app_state = self.app_state.read(cx);
         let active_tab = app_state.active_tab();
-        let stored_channel = active_tab.layout.get_channel_at_path(path)?;
+        let stored_channel = active_tab.layout.channel_at_path(path)?;
         let channel = crate::backend::browser_watching::resolve_layout_channel(&stored_channel)?;
-        let split_id = active_tab.layout.get_split_id_at_path(path)?;
+        let split_id = active_tab.layout.split_id_at_path(path)?;
         Some((channel, split_id))
     }
 
@@ -1449,6 +1127,7 @@ impl EchoApp {
             }
 
             if let Err(error) = backend::irc::ensure_authenticated_send_ready()
+                .map_err(String::from)
                 .and_then(|_| backend::irc::ensure_channel_send_ready(&channel).map(|_| ()))
             {
                 self.chat_input_renderer.update(cx, |renderer, cx| {
@@ -1731,8 +1410,7 @@ impl EchoApp {
             .chat_input_renderer
             .read(cx)
             .input_manager
-            .input_texts
-            .get(&split_id)
+            .draft(split_id)
             .cloned()
             .unwrap_or_default();
         let preserved_cursor = self
@@ -1750,20 +1428,17 @@ impl EchoApp {
             .chat_input_renderer
             .read(cx)
             .input_manager
-            .input_texts
-            .contains_key(&split_id);
+            .has_draft(split_id);
         if should_restore {
             self.chat_input_renderer.update(cx, |renderer, _| {
                 renderer
                     .input_manager
-                    .input_texts
-                    .insert(split_id, preserved_text.clone());
+                    .set_draft_text(split_id, preserved_text.clone());
                 renderer
                     .input_manager
                     .set_cursor_for_split(split_id, preserved_cursor);
                 renderer.reset_composer_affinity(split_id);
-                renderer.input_manager.history_index.remove(&split_id);
-                renderer.input_manager.temp_input.remove(&split_id);
+                renderer.input_manager.drop_history_stash(split_id);
             });
             self.update_autocomplete(&channel, &active_path, Some(&preserved_text), cx);
             cx.notify();
@@ -1774,12 +1449,15 @@ impl EchoApp {
         &mut self,
         channel: String,
         split_id: SplitId,
-        width: usize,
-        height: usize,
-        rgba: Vec<u8>,
-        source_bytes: u64,
+        image: PastedImage,
         cx: &mut Context<Self>,
     ) {
+        let PastedImage {
+            width,
+            height,
+            rgba,
+            source_bytes,
+        } = image;
         let config = backend::settings::get_image_uploader_config();
         if !config.enabled || !config.paste_upload_enabled {
             return;
@@ -1863,7 +1541,7 @@ impl EchoApp {
                     return None;
                 }
                 let path = tab.split_path_for_id(*split_id)?;
-                let stored = tab.layout.get_channel_at_path(&path)?;
+                let stored = tab.layout.channel_at_path(&path)?;
                 if is_placeholder(&stored) {
                     return None;
                 }
@@ -2063,7 +1741,7 @@ impl EchoApp {
                 )
             })
             .or_else(|| {
-                let current = tab.layout.get_channel_at_path(&path).and_then(|stored| {
+                let current = tab.layout.channel_at_path(&path).and_then(|stored| {
                     backend::browser_watching::resolve_layout_channel(&stored)
                 })?;
                 self.file_drop_targets
@@ -2199,14 +1877,13 @@ impl EchoApp {
             self.chat_input_renderer
                 .read(cx)
                 .input_manager
-                .input_texts
-                .get(&split_id)
+                .draft(split_id)
                 .cloned()
                 .unwrap_or_default()
         });
         let input_len = {
             let renderer = self.chat_input_renderer.read(cx);
-            let candidate = if renderer.input_manager.input_texts.contains_key(&split_id) {
+            let candidate = if renderer.input_manager.has_draft(split_id) {
                 renderer
                     .input_manager
                     .cursor_for_split(split_id)
@@ -2265,7 +1942,7 @@ impl EchoApp {
         reverse: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        use crate::components::overlays::{AutocompleteState, AutocompleteType};
+        use crate::components::overlays::AutocompleteType;
 
         if context.ac_type != AutocompleteType::Tab {
             return false;
@@ -2293,18 +1970,9 @@ impl EchoApp {
             return false;
         }
 
-        let autocomplete = self.autocomplete(cx);
-        autocomplete.update(cx, |autocomplete, _cx| {
-            autocomplete.update_state(AutocompleteState::open(
-                0.0,
-                0.0,
-                target_channel,
-                split_id,
-                context.clone(),
-            ));
+        let candidates = self.autocomplete(cx).update(cx, |autocomplete, _cx| {
+            autocomplete.tab_candidates(&target_channel, &context)
         });
-        let candidates = autocomplete.read(cx).inline_tab_candidates();
-        autocomplete.update(cx, |autocomplete, _cx| autocomplete.state.close());
 
         let applied = self.chat_input_renderer.update(cx, |renderer, cx| {
             let applied = renderer
@@ -2628,7 +2296,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(&active_path);
+            .split_id_at_path(&active_path);
         self.pending_new_tab_focus = split_id.map(|split_id| (active_tab_idx, split_id));
         self.refocus_active_input(cx);
         cx.notify();
@@ -2779,7 +2447,7 @@ impl EchoApp {
         cx.notify();
     }
 
-    /// PERF: Clean up local caches when a channel is closed
+    /// Clean up local caches when a channel is closed
     fn cleanup_channel_caches(&mut self, channel: &str, cx: &mut Context<Self>) {
         let active_channels = self.app_state.read(cx).all_active_channels();
 
@@ -2980,7 +2648,7 @@ impl EchoApp {
         let placeholder = {
             let tab = self.app_state.read(cx).active_tab();
             tab.split_path_for_id(split_id)
-                .and_then(|path| tab.layout.get_channel_at_path(&path))
+                .and_then(|path| tab.layout.channel_at_path(&path))
                 .is_some_and(|channel| is_placeholder(&channel))
         };
         if placeholder {
@@ -3009,7 +2677,7 @@ impl EchoApp {
         let path = tab.split_path_for_id(split_id)?;
         let placeholder = tab
             .layout
-            .get_channel_at_path(&path)
+            .channel_at_path(&path)
             .is_some_and(|channel| is_placeholder(&channel));
         if placeholder {
             Some(
@@ -3063,7 +2731,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(&active_path);
+            .split_id_at_path(&active_path);
         if active_tab_idx != tab_idx || active_split_id != Some(split_id) {
             self.pending_new_tab_focus = None;
             return false;
@@ -3109,10 +2777,10 @@ impl EchoApp {
         let app_state = self.app_state.read(cx);
         let tab = app_state.active_tab();
         let path = tab.valid_active_split_path();
-        let split_id = tab.layout.get_split_id_at_path(&path)?;
+        let split_id = tab.layout.split_id_at_path(&path)?;
         let placeholder = tab
             .layout
-            .get_channel_at_path(&path)
+            .channel_at_path(&path)
             .is_some_and(|channel| is_placeholder(&channel));
         let handle = self.composer_focus_handle(split_id, cx)?;
         Some((split_id, handle, placeholder))
@@ -3128,9 +2796,9 @@ impl EchoApp {
             let tab = self.app_state.read(cx).active_tab();
             let path = tab.valid_active_split_path();
             tab.layout
-                .get_channel_at_path(&path)
+                .channel_at_path(&path)
                 .filter(|channel| is_placeholder(channel))
-                .and_then(|_| tab.layout.get_split_id_at_path(&path))
+                .and_then(|_| tab.layout.split_id_at_path(&path))
         };
         if let Some(split_id) = placeholder_split {
             self.ensure_channel_chooser(split_id, None, cx);
@@ -3338,7 +3006,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_channel_at_path(&active_path)
+            .channel_at_path(&active_path)
             .filter(|channel| !is_placeholder(channel));
         let Some(current_channel) = current_channel else {
             return false;
@@ -3349,7 +3017,7 @@ impl EchoApp {
 
         let placeholder = crate::state::new_placeholder();
         let changed = self.app_state.update(cx, |state, cx| {
-            let split_id = state.active_tab().layout.get_split_id_at_path(&active_path);
+            let split_id = state.active_tab().layout.split_id_at_path(&active_path);
             let tab = state.active_tab_mut();
             if tab.set_channel_at_path(&active_path, placeholder) {
                 if let Some(split_id) = split_id {
@@ -3373,7 +3041,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(&active_path)
+            .split_id_at_path(&active_path)
         {
             let this = cx.weak_entity();
             cx.defer(move |cx| {
@@ -3426,7 +3094,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(self.split_layout.read(cx).get_active_split_path())
+            .split_id_at_path(self.split_layout.read(cx).get_active_split_path())
             == Some(split_id);
         if is_active {
             self.refocus_active_input(cx);
@@ -3446,7 +3114,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(self.split_layout.read(cx).get_active_split_path());
+            .split_id_at_path(self.split_layout.read(cx).get_active_split_path());
         let abandoned: Vec<_> = self
             .app_state
             .read(cx)
@@ -3489,7 +3157,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_channel_at_path(&path)
+            .channel_at_path(&path)
             .filter(|channel| !is_placeholder(channel))?;
         crate::backend::browser_watching::resolve_layout_channel(&stored_channel)
     }
@@ -3500,7 +3168,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(path);
+            .split_id_at_path(path);
 
         for (split_id, view) in &self.chat_views {
             let is_active = active_split_id == Some(*split_id);
@@ -3517,20 +3185,24 @@ impl EchoApp {
     /// stationary chat input unaware of an Alt press or release.
     pub(crate) fn sync_chat_pause_modifiers(
         &mut self,
-        control: bool,
-        alt: bool,
-        shift: bool,
-        platform: bool,
+        modifiers: &Modifiers,
         window_active: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (control, alt, shift, platform) = if window_active {
-            (control, alt, shift, platform)
+        // Only the keys a pause policy can name; the rest never change the result.
+        let held = if window_active {
+            Modifiers {
+                control: modifiers.control,
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                platform: modifiers.platform,
+                ..Modifiers::default()
+            }
         } else {
-            (false, false, false, false)
+            Modifiers::default()
         };
         let policy = backend::settings::get_chat_pause_modifier();
-        let state = (control, alt, shift, platform, policy);
+        let state = (held, policy);
         if self.last_chat_pause_modifier_state == Some(state) {
             return false;
         }
@@ -3543,7 +3215,7 @@ impl EchoApp {
                 continue;
             }
             changed |= canvas_list.update(cx, |list, cx| {
-                let changed = list.set_chat_pause_modifiers(control, alt, shift, platform);
+                let changed = list.set_chat_pause_modifiers(held);
                 if changed {
                     crate::backend::metrics::record_ui_notify_source("app.chat_pause.modifier");
                     cx.notify();
@@ -3582,7 +3254,7 @@ impl EchoApp {
         self.last_rendered_tab_id = Some(tab_id);
         let pause_modifiers = self
             .last_chat_pause_modifier_state
-            .map(|(control, alt, shift, platform, _policy)| (control, alt, shift, platform));
+            .map(|(held, _policy)| held);
 
         for (split_id, chat_view) in &self.chat_views {
             let visible = visible_split_ids.contains(split_id);
@@ -3590,9 +3262,7 @@ impl EchoApp {
                 let changed = view.canvas_list.update(cx, |list, cx| {
                     let visibility_changed = list.set_tab_visible(visible);
                     let modifier_changed = if visible {
-                        pause_modifiers.is_some_and(|(control, alt, shift, platform)| {
-                            list.set_chat_pause_modifiers(control, alt, shift, platform)
-                        })
+                        pause_modifiers.is_some_and(|held| list.set_chat_pause_modifiers(held))
                     } else {
                         false
                     };
@@ -3617,9 +3287,9 @@ impl EchoApp {
             let tab = self.app_state.read(cx).active_tab();
             let path = tab.valid_active_split_path();
             tab.layout
-                .get_channel_at_path(&path)
+                .channel_at_path(&path)
                 .filter(|channel| is_placeholder(channel))
-                .and_then(|_| tab.layout.get_split_id_at_path(&path))
+                .and_then(|_| tab.layout.split_id_at_path(&path))
         };
         if let Some(split_id) = placeholder_split
             && let Some(input) = self.ensure_channel_chooser(split_id, Some(window), cx)
@@ -3638,7 +3308,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(&active_path);
+            .split_id_at_path(&active_path);
         if let Some(focus_handle) = split_id
             .and_then(|split_id| self.split_panes.get(&split_id))
             .map(|pane| pane.read(cx).focus_handle.clone())
@@ -3938,21 +3608,14 @@ impl Render for EchoApp {
         crate::utils::remember_main_window_display(window, cx);
         crate::backend::metrics::record_app_render();
         let modifiers = window.modifiers();
-        let _ = self.sync_chat_pause_modifiers(
-            modifiers.control,
-            modifiers.alt,
-            modifiers.shift,
-            modifiers.platform,
-            window.is_window_active(),
-            cx,
-        );
+        let _ = self.sync_chat_pause_modifiers(&modifiers, window.is_window_active(), cx);
         self.sync_visible_tab_chat_views(cx);
         if *crate::log::RENDER_TRACE_VERBOSE {
             crate::log_perf_render!(debug, chat_views = self.chat_views.len(), "app.render");
         }
-        let _frame_guard = crate::fps_profiler::FrameTimingGuard::begin();
+        let _frame_guard = crate::diagnostics::fps_profiler::FrameTimingGuard::begin();
 
-        let setup_start = crate::fps_profiler::phase_timer();
+        let setup_start = crate::diagnostics::fps_profiler::phase_timer();
 
         let viewport_size = window.viewport_size();
         let window_width: f32 = viewport_size.width.into();
@@ -3964,9 +3627,9 @@ impl Render for EchoApp {
         };
 
         let global_cursor = self.current_cursor(cx);
-        crate::fps_profiler::record_phase_since("setup", setup_start);
+        crate::diagnostics::fps_profiler::record_phase_since("setup", setup_start);
 
-        let tabbar_start = crate::fps_profiler::phase_timer();
+        let tabbar_start = crate::diagnostics::fps_profiler::phase_timer();
         let (tab_bar_stale, tab_bar_height, requires_dedicated_tab_row, inline_tab_demand) =
             self.tab_bar_renderer.update(cx, |renderer, cx| {
                 let stale = renderer.prepare(window, cx);
@@ -3977,7 +3640,7 @@ impl Render for EchoApp {
                     renderer.inline_tab_demand(),
                 )
             });
-        crate::fps_profiler::record_phase_since("tabbar", tabbar_start);
+        crate::diagnostics::fps_profiler::record_phase_since("tabbar", tabbar_start);
 
         let inline_tabs = backend::settings::get_tab_placement()
             == backend::settings::TabPlacement::Inline
@@ -3985,7 +3648,7 @@ impl Render for EchoApp {
         let titlebar_height = backend::settings::titlebar_height_px();
         let chrome_height = titlebar_height + if inline_tabs { 0.0 } else { tab_bar_height };
 
-        let topbar_start = crate::fps_profiler::phase_timer();
+        let topbar_start = crate::diagnostics::fps_profiler::phase_timer();
         let top_bar_stale = self.top_bar_view.update(cx, |view, cx| {
             view.prepare(
                 inline_tabs,
@@ -4004,65 +3667,68 @@ impl Render for EchoApp {
         let dedicated_tab_bar = (!inline_tabs).then(|| {
             TabBarRenderer::view_element(&self.tab_bar_renderer, tab_bar_height, tab_bar_stale)
         });
-        crate::fps_profiler::record_phase_since("topbar", topbar_start);
+        crate::diagnostics::fps_profiler::record_phase_since("topbar", topbar_start);
 
-        let content_start = crate::fps_profiler::phase_timer();
+        let content_start = crate::diagnostics::fps_profiler::phase_timer();
         let main_content = self.render_main_content_section(
             &layout,
             highlights_enabled,
-            window_width,
-            window_height,
+            PaneExtent {
+                width: window_width,
+                height: window_height,
+            },
             chrome_height,
             window,
             cx,
         );
-        crate::fps_profiler::record_phase_since("content", content_start);
-        crate::startup_metrics::record("first_root_render");
+        crate::diagnostics::fps_profiler::record_phase_since("content", content_start);
+        crate::diagnostics::startup_metrics::record(
+            crate::diagnostics::startup_metrics::StartupMarker::FirstRootRender,
+        );
         self.record_first_chat_view_usable(cx);
 
-        let input_start = crate::fps_profiler::phase_timer();
+        let input_start = crate::diagnostics::fps_profiler::phase_timer();
         let input = self.render_unified_input(window, cx);
-        crate::fps_profiler::record_phase_since("input", input_start);
+        crate::diagnostics::fps_profiler::record_phase_since("input", input_start);
 
-        let overlay_start = crate::fps_profiler::phase_timer();
+        let overlay_start = crate::diagnostics::fps_profiler::phase_timer();
         let chatterino_welcome = self.render_chatterino_welcome(chrome_height, cx);
         let overlays = self.render_all_overlays(window, chrome_height, cx);
-        crate::fps_profiler::record_phase_since("overlays", overlay_start);
+        crate::diagnostics::fps_profiler::record_phase_since("overlays", overlay_start);
         let drag_tracker = self.render_drag_tracker(cx);
         let drag_shield = self.render_pane_drag_shield(global_cursor, cx);
 
-        let assemble_start = crate::fps_profiler::phase_timer();
+        let assemble_start = crate::diagnostics::fps_profiler::phase_timer();
 
-        let result = self
-            .register_event_handlers(
-                div()
-                    .id("echo-app")
-                    .key_context("EchoApp")
-                    .track_focus(&self.focus_handle)
-                    .size_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .bg(colors::bg_void())
-                    .text_color(colors::text_primary())
-                    .font_family(echo_chat_render::text_run_intern::ui_font_family())
-                    .when_some(global_cursor, |div, cursor| div.cursor(cursor)),
-                window,
-                cx,
-            )
-            .child(top_bar)
-            .children(dedicated_tab_bar)
-            .child(main_content)
-            .children(input)
-            .children(chatterino_welcome)
-            .children(overlays)
-            .children(drag_shield)
-            .children(drag_tracker)
-            .when(crate::fps_profiler::is_overlay_enabled(), |div| {
-                div.child(crate::fps_profiler::render_fps_overlay())
-            });
-        crate::fps_profiler::record_phase_since("assemble", assemble_start);
+        let result = crate::event_handlers::register_event_handlers(
+            div()
+                .id("echo-app")
+                .key_context("EchoApp")
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .bg(colors::bg_void())
+                .text_color(colors::text_primary())
+                .font_family(echo_chat_render::text_run_intern::ui_font_family())
+                .when_some(global_cursor, |div, cursor| div.cursor(cursor)),
+            cx,
+        )
+        .child(top_bar)
+        .children(dedicated_tab_bar)
+        .child(main_content)
+        .children(input)
+        .children(chatterino_welcome)
+        .children(overlays)
+        .children(drag_shield)
+        .children(drag_tracker)
+        .when(
+            crate::diagnostics::fps_profiler::is_overlay_enabled(),
+            |div| div.child(crate::diagnostics::fps_profiler::render_fps_overlay()),
+        );
+        crate::diagnostics::fps_profiler::record_phase_since("assemble", assemble_start);
 
         result
     }
@@ -4098,17 +3764,12 @@ impl EchoApp {
 
     /// Poll and update embed metadata version, invalidating layouts if changed.
     fn update_embed_metadata(&mut self, cx: &mut Context<Self>) -> bool {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static LAST_EMBED_VERSION: AtomicU32 = AtomicU32::new(0);
-
         let current_version = backend::bridge::get_embed_metadata_version();
-        let last_version = LAST_EMBED_VERSION.load(Ordering::Relaxed);
-
+        let last_version = self.seen_embed_metadata_version;
         if current_version == last_version {
             return false;
         }
-
-        LAST_EMBED_VERSION.store(current_version, Ordering::Relaxed);
+        self.seen_embed_metadata_version = current_version;
 
         let pending = backend::bridge::take_pending_embed_layout_invalidations();
         let pending_count = pending.len();
@@ -4185,743 +3846,6 @@ impl EchoApp {
         processed
     }
 
-    /// Process pending UI queues that need EchoApp-owned entities.
-    fn process_pending_ui_work(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut processed = false;
-
-        if backend::ui_actions::take_pending_open_login() {
-            self.overlay_manager.update(cx, |overlays, cx| {
-                overlays.open_login(cx);
-            });
-            processed = true;
-        }
-
-        for mut edit in backend::ui_actions::drain_pending_composer_edits() {
-            if matches!(
-                edit.action,
-                backend::ui_actions::ComposerEditAction::PasteClipboard
-            ) {
-                match crate::utils::read_text(cx) {
-                    Some(text) if !text.is_empty() => {
-                        edit.action = backend::ui_actions::ComposerEditAction::Paste(text);
-                    }
-                    _ => continue,
-                }
-            }
-            let target = {
-                let app_state = self.app_state.read(cx);
-                find_open_split_target(app_state, edit.split_id, "")
-            };
-            let Some((tab_index, path, channel)) = target else {
-                continue;
-            };
-            processed = true;
-            let is_paste = matches!(
-                &edit.action,
-                backend::ui_actions::ComposerEditAction::Paste(_)
-            );
-            if let backend::ui_actions::ComposerEditAction::Paste(text) = &edit.action {
-                let offered = self.chat_input_renderer.update(cx, |renderer, cx| {
-                    renderer.offer_multiline_paste(edit.split_id, &channel, text, cx)
-                });
-                if offered {
-                    self.notify_split_leaf(edit.split_id, cx);
-                    continue;
-                }
-            }
-
-            let (current_text, copied_text) =
-                self.chat_input_renderer.update(cx, |renderer, cx| {
-                    use backend::ui_actions::ComposerEditAction;
-                    let mut copied_text = None;
-                    let changed = match edit.action {
-                        ComposerEditAction::Undo => renderer.input_manager.undo(edit.split_id),
-                        ComposerEditAction::Redo => renderer.input_manager.redo(edit.split_id),
-                        ComposerEditAction::Paste(text) => {
-                            renderer.insert_composer_paste(edit.split_id, &channel, &text, cx)
-                        }
-                        // Resolved into `Paste` when the edit was drained.
-                        ComposerEditAction::PasteClipboard => false,
-                        ComposerEditAction::DeleteSelection {
-                            range,
-                            expected_text,
-                            copy,
-                        } => {
-                            let removed = renderer.input_manager.delete_exact_selection(
-                                edit.split_id,
-                                range,
-                                &expected_text,
-                            );
-                            if copy {
-                                copied_text = removed.clone();
-                            }
-                            removed.is_some()
-                        }
-                        ComposerEditAction::SelectAll => {
-                            renderer.input_manager.select_all(edit.split_id)
-                        }
-                    };
-                    if !changed {
-                        return (None, None);
-                    }
-                    renderer.reset_composer_affinity(edit.split_id);
-                    renderer.input_manager.end_history_navigation(edit.split_id);
-                    let current_text = renderer
-                        .input_manager
-                        .input_texts
-                        .get(&edit.split_id)
-                        .cloned();
-                    (current_text, copied_text)
-                });
-            if let Some(copied_text) = copied_text {
-                crate::utils::copy_text(&copied_text);
-            }
-            if let Some(current_text) = current_text {
-                self.notify_split_leaf(edit.split_id, cx);
-                let is_active = tab_index == self.app_state.read(cx).active_tab_idx
-                    && self.split_layout.read(cx).get_active_split_path() == path;
-                if is_active {
-                    self.update_autocomplete(&channel, &path, Some(&current_text), cx);
-                }
-            } else if is_paste {
-                self.notify_split_leaf(edit.split_id, cx);
-            }
-        }
-
-        for insertion in backend::drain_pending_message_composer_inserts() {
-            processed = true;
-            let target = {
-                let app_state = self.app_state.read(cx);
-                insertion.source_split_id.map_or_else(
-                    || find_open_tab_channel_target(app_state, &insertion.channel),
-                    |split_id| find_open_split_target(app_state, split_id, &insertion.channel),
-                )
-            };
-            let Some((tab_index, path, channel)) = target else {
-                crate::log_ui!(
-                    info,
-                    channel = %insertion.channel,
-                    source_split_id = ?insertion.source_split_id,
-                    "Skipped message-text insertion because its source or matching composer is no longer open"
-                );
-                continue;
-            };
-
-            self.activate_tab_split(tab_index, path.clone(), cx);
-            let Some((_resolved_channel, split_id)) = self.split_target_for_path(&path, cx) else {
-                continue;
-            };
-
-            let current_text = self.chat_input_renderer.update(cx, |renderer, _| {
-                if !renderer
-                    .input_manager
-                    .insert_text_at_cursor(split_id, &insertion.text)
-                {
-                    return None;
-                }
-                renderer.reset_composer_affinity(split_id);
-                renderer.input_manager.end_history_navigation(split_id);
-                renderer.input_manager.input_texts.get(&split_id).cloned()
-            });
-
-            if let Some(current_text) = current_text {
-                self.focus_split_input(split_id, cx);
-                self.update_autocomplete(&channel, &path, Some(&current_text), cx);
-                crate::log_ui!(
-                    debug,
-                    split_id = %split_id,
-                    channel = %channel,
-                    "Inserted message text into matching composer draft"
-                );
-            }
-        }
-
-        processed |= self.process_picker_actions(cx);
-
-        for upload in backend::ui_actions::drain_confirmed_file_uploads() {
-            processed = true;
-            if upload.account == backend::ui_actions::composer_account()
-                && self.composer_target_is_current(upload.split_id, &upload.channel, cx)
-            {
-                backend::upload_image_files_async(
-                    upload.channel,
-                    upload.split_id,
-                    upload.paths,
-                    upload.source,
-                );
-            } else {
-                self.cancelled_upload_target(cx);
-            }
-        }
-
-        for completed in backend::ui_actions::drain_pending_completed_sends() {
-            processed = true;
-            let split_id = completed.origin.split_id;
-            let still_open = self.composer_target_is_current(split_id, &completed.channel, cx);
-            let matched = self.chat_input_renderer.update(cx, |renderer, cx| {
-                renderer.finish_send(
-                    &completed.origin,
-                    &completed.channel,
-                    completed.notice.clone(),
-                    cx,
-                )
-            });
-            if matched && still_open {
-                self.notify_split_leaf(split_id, cx);
-            }
-            self.advance_pasted_send(
-                &completed.origin,
-                matched && still_open && completed.notice.is_none(),
-                completed.notice.as_deref().unwrap_or("Target changed"),
-                cx,
-            );
-        }
-
-        for failed in backend::ui_actions::drain_pending_failed_sends() {
-            processed = true;
-            let split_id = failed.origin.split_id;
-            let notice = if failed.delivery_unknown {
-                "Not confirmed — check chat".to_string()
-            } else {
-                backend::ui_actions::composer_send::rejection_reason("", &failed.error)
-            };
-            let matched = self.chat_input_renderer.update(cx, |renderer, cx| {
-                renderer.finish_send(&failed.origin, &failed.channel, Some(notice), cx)
-            });
-            let still_open = self.composer_target_is_current(split_id, &failed.channel, cx);
-            if !matched || !still_open {
-                if failed.origin.account != backend::ui_actions::composer_account() {
-                    let title = if failed.delivery_unknown {
-                        "Previous-account send not confirmed"
-                    } else {
-                        "Previous-account message was not sent"
-                    };
-                    self.overlay_manager.update(cx, |manager, cx| {
-                        manager.push_toast(
-                            crate::components::overlays::Toast::warning(title).with_detail(
-                                format!(
-                                    "To #{}: {}. The text remains in that channel’s input history.",
-                                    failed.channel,
-                                    backend::ui_actions::composer_send::rejection_reason(
-                                        "",
-                                        &failed.error
-                                    )
-                                ),
-                            ),
-                            cx,
-                        )
-                    });
-                    if still_open {
-                        backend::bridge::publish_failed_send_row(
-                            &failed.channel,
-                            "Previous-account submission",
-                            &failed.error,
-                            true,
-                            failed.delivery_unknown,
-                        );
-                    }
-                }
-                self.advance_pasted_send(&failed.origin, false, "Target changed", cx);
-                continue;
-            }
-            let origin = failed.origin.clone();
-            self.notify_split_leaf(split_id, cx);
-            let restored = still_open
-                && !failed.delivery_unknown
-                && self.chat_input_renderer.update(cx, |renderer, _| {
-                    let draft_empty = renderer
-                        .input_manager
-                        .input_texts
-                        .get(&split_id)
-                        .is_none_or(|text| text.is_empty());
-                    if !draft_empty {
-                        return false;
-                    }
-                    let restored = renderer
-                        .input_manager
-                        .insert_text_at_cursor(split_id, &failed.origin.text);
-                    if restored {
-                        renderer.reset_composer_affinity(split_id);
-                    }
-                    restored
-                });
-            if restored {
-                if let Some(reply) = failed.origin.reply
-                    && let Some(pane) = self.split_panes.get(&split_id).cloned()
-                {
-                    pane.update(cx, |pane, _| {
-                        if pane.reply_to.is_none() {
-                            pane.reply_to = Some(reply);
-                        }
-                    });
-                }
-                self.notify_split_leaf(split_id, cx);
-            }
-            backend::bridge::publish_failed_send_row(
-                &failed.channel,
-                failed.action,
-                &failed.error,
-                !restored,
-                failed.delivery_unknown,
-            );
-            self.advance_pasted_send(
-                &origin,
-                false,
-                if failed.delivery_unknown {
-                    "Not confirmed — check chat"
-                } else {
-                    &failed.error
-                },
-                cx,
-            );
-        }
-
-        for upload in backend::drain_pending_uploaded_links() {
-            processed = true;
-            let target = {
-                let app_state = self.app_state.read(cx);
-                find_open_split_target(app_state, upload.split_id, &upload.channel)
-            };
-            let Some((tab_index, path, channel)) = target else {
-                crate::log_ui!(
-                    info,
-                    split_id = %upload.split_id,
-                    channel = %upload.channel,
-                    "Skipped uploaded-link insertion because the originating split no longer matches"
-                );
-                continue;
-            };
-
-            let inserted_text = format!("{} ", upload.url);
-            let current_text = self.chat_input_renderer.update(cx, |renderer, _| {
-                if !renderer
-                    .input_manager
-                    .insert_text_at_cursor(upload.split_id, &inserted_text)
-                {
-                    return None;
-                }
-                renderer.reset_composer_affinity(upload.split_id);
-                renderer
-                    .input_manager
-                    .end_history_navigation(upload.split_id);
-                renderer
-                    .input_manager
-                    .input_texts
-                    .get(&upload.split_id)
-                    .cloned()
-            });
-
-            if current_text.is_some() {
-                let is_active_origin = tab_index == self.app_state.read(cx).active_tab_idx
-                    && self.split_layout.read(cx).get_active_split_path() == path;
-                if is_active_origin {
-                    self.focus_split_input(upload.split_id, cx);
-                    self.notify_split_leaf(upload.split_id, cx);
-                    self.update_autocomplete(&channel, &path, current_text.as_deref(), cx);
-                }
-                crate::log_ui!(
-                    debug,
-                    split_id = %upload.split_id,
-                    channel = %channel,
-                    "Inserted uploaded image link into originating split draft"
-                );
-            }
-        }
-
-        for mention in backend::drain_pending_mentions() {
-            processed = true;
-            let active_path = self.split_layout.read(cx).get_active_split_path().to_vec();
-            let fallback_channel = self
-                .app_state
-                .read(cx)
-                .active_tab()
-                .layout
-                .get_channel_at_path(&active_path)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| mention.channel.clone());
-            let target = {
-                let app_state = self.app_state.read(cx);
-                mention.source_split_id.map_or_else(
-                    || find_open_tab_channel_target(app_state, &mention.channel),
-                    |split_id| find_open_split_target(app_state, split_id, &mention.channel),
-                )
-            };
-            if target.is_none()
-                && (mention.source_split_id.is_some() || !mention.channel.trim().is_empty())
-            {
-                crate::log_ui!(
-                    info,
-                    source_split_id = ?mention.source_split_id,
-                    channel = %mention.channel,
-                    "Skipped mention insertion because its source split is stale"
-                );
-                continue;
-            }
-            let (target_channel, target_path) = if let Some((tab_index, path, channel)) = target {
-                self.activate_tab_split(tab_index, path.clone(), cx);
-                (channel, path)
-            } else {
-                (fallback_channel, active_path)
-            };
-
-            if !target_channel.is_empty() {
-                let Some((_resolved_channel, split_id)) =
-                    self.split_target_for_path(&target_path, cx)
-                else {
-                    continue;
-                };
-                let inserted = self.chat_input_renderer.update(cx, |renderer, _| {
-                    let before = renderer.input_manager.input_texts.get(&split_id).cloned();
-                    renderer
-                        .input_manager
-                        .insert_mention(split_id, &mention.username);
-                    renderer.reset_composer_affinity(split_id);
-                    renderer.input_manager.input_texts.get(&split_id).cloned() != before
-                });
-                if inserted {
-                    self.focus_split_input(split_id, cx);
-                    let current_text = self
-                        .chat_input_renderer
-                        .read(cx)
-                        .input_manager
-                        .input_texts
-                        .get(&split_id)
-                        .cloned();
-                    self.update_autocomplete(
-                        &target_channel,
-                        &target_path,
-                        current_text.as_deref(),
-                        cx,
-                    );
-                    self.notify_split_leaf(split_id, cx);
-                }
-                crate::log_ui!(
-                    debug,
-                    "Inserted @mention '{}' into channel '{}'",
-                    mention.username,
-                    target_channel
-                );
-            }
-        }
-
-        if backend::take_pending_open_new_tab() {
-            processed = true;
-            self.create_new_tab(cx);
-        }
-
-        for open in backend::ui_actions::drain_pending_followed_channel_opens() {
-            processed = true;
-            self.open_followed_channel(open.login, open.fill_split, cx);
-        }
-
-        processed |= self.process_pending_chatterino_import(cx);
-
-        for close in backend::ui_actions::drain_pending_bulk_tab_closes() {
-            let scope = if close.to_right {
-                TabCloseScope::ToRight
-            } else {
-                TabCloseScope::Others
-            };
-            processed |= self.close_tabs_by_id(&close.tab_id, scope, cx);
-        }
-
-        let closed_tab_generation = self.app_state.read(cx).closed_tab_generation();
-        if closed_tab_generation != self.seen_closed_tab_generation {
-            self.seen_closed_tab_generation = closed_tab_generation;
-            processed = true;
-            let count = self.app_state.read(cx).last_closed_tab_count();
-            if count > 0 {
-                let message = if count == 1 {
-                    "Tab closed".to_string()
-                } else {
-                    format!("{count} tabs closed")
-                };
-                let requests = self.undo_closed_tab_requests.clone();
-                let toast = crate::components::overlays::Toast::info(message).with_action(
-                    "Undo",
-                    move || {
-                        requests
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .push(closed_tab_generation);
-                        backend::ui_actions::push_pending_reopen_closed_tab();
-                    },
-                );
-                self.overlay_manager.update(cx, |manager, cx| {
-                    manager.push_toast(toast, cx);
-                });
-            }
-        }
-
-        if backend::ui_actions::take_pending_reopen_closed_tab() {
-            processed = true;
-            let generations = std::mem::take(
-                &mut *self
-                    .undo_closed_tab_requests
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            );
-            for generation in generations {
-                let reopened = self.app_state.update(cx, |state, cx| {
-                    state.reopen_closed_tab_batch(generation, cx)
-                });
-                self.finish_reopen_closed_tabs(reopened, cx);
-            }
-        }
-
-        if backend::take_pending_open_whispers_split() {
-            processed = true;
-            let _ = self.open_or_focus_whispers_split(cx);
-        }
-
-        if backend::ui_actions::take_pending_refocus_active_input() {
-            processed = true;
-            self.refocus_active_input(cx);
-        }
-
-        for compose in backend::drain_pending_whisper_composes() {
-            processed = true;
-            let Some(target_path) = self.open_or_focus_whispers_split(cx) else {
-                continue;
-            };
-            let Some((_resolved_channel, split_id)) = self.split_target_for_path(&target_path, cx)
-            else {
-                continue;
-            };
-
-            let inserted = self.chat_input_renderer.update(cx, |renderer, _| {
-                let inserted = renderer
-                    .input_manager
-                    .compose_whisper(split_id, &compose.username);
-                if inserted {
-                    renderer.reset_composer_affinity(split_id);
-                }
-                inserted
-            });
-
-            if inserted {
-                backend::mark_whisper_thread_read(&compose.username);
-                self.app_state.update(cx, |state, _| {
-                    state.refresh_sidebar_caches();
-                });
-                crate::log_ui!(
-                    debug,
-                    "Prepared whisper draft for '{}' in the Whispers split (requested from {:?})",
-                    compose.username,
-                    compose.channel
-                );
-            } else {
-                let toast =
-                    crate::components::overlays::Toast::warning("Whisper draft not inserted")
-                        .with_detail("Clear the target input or existing whisper draft first.");
-                self.overlay_manager.update(cx, |manager, cx| {
-                    manager.push_toast(toast, cx);
-                });
-            }
-        }
-
-        for selection in backend::drain_pending_quick_switches() {
-            processed = true;
-            if self
-                .app_state
-                .read(cx)
-                .tabs
-                .get(selection.tab_index)
-                .is_some()
-            {
-                self.activate_tab_split(selection.tab_index, selection.split_path, cx);
-                self.refocus_active_input(cx);
-            }
-        }
-
-        for reply in backend::drain_pending_replies() {
-            processed = true;
-            let active_path = self.split_layout.read(cx).get_active_split_path().to_vec();
-            let target = {
-                let app_state = self.app_state.read(cx);
-                reply.source_split_id.map_or_else(
-                    || {
-                        find_open_tab_channel_target(app_state, &reply.channel)
-                            .map(|(tab_index, path, _)| (tab_index, path))
-                    },
-                    |split_id| {
-                        find_open_split_target(app_state, split_id, &reply.channel)
-                            .map(|(tab_index, path, _)| (tab_index, path))
-                    },
-                )
-            };
-            if target.is_none()
-                && (reply.source_split_id.is_some() || !reply.channel.trim().is_empty())
-            {
-                crate::log_ui!(
-                    info,
-                    source_split_id = ?reply.source_split_id,
-                    channel = %reply.channel,
-                    "Skipped reply activation because its source split is stale"
-                );
-                continue;
-            }
-            let target_path = if let Some((tab_index, path)) = target {
-                self.activate_tab_split(tab_index, path.clone(), cx);
-                path
-            } else {
-                active_path
-            };
-            let split_id = self
-                .app_state
-                .read(cx)
-                .active_tab()
-                .layout
-                .get_split_id_at_path(&target_path);
-
-            if let Some(split_id) = split_id {
-                if let Some(pane) = self.split_panes.get(&split_id) {
-                    pane.update(cx, |p, _| {
-                        p.reply_to = Some(crate::state::ReplyState {
-                            message_id: reply.message_id.clone(),
-                            username: reply.sender.clone(),
-                            preview: reply.content.clone(),
-                        });
-                    });
-                }
-
-                self.focus_split_input(split_id, cx);
-                self.notify_split_leaf(split_id, cx);
-
-                crate::log_ui!(
-                    debug,
-                    "Activated reply in split: channel='{}' msg_id='{}' display_name='{}'",
-                    reply.channel,
-                    reply.message_id,
-                    reply.display_name
-                );
-            }
-        }
-
-        for view in backend::drain_pending_thread_views() {
-            processed = true;
-            self.overlay_manager.update(cx, |manager, cx| {
-                manager.open_thread_viewer(
-                    view.message_id.clone(),
-                    view.channel.clone(),
-                    view.x,
-                    view.y,
-                    cx,
-                );
-                cx.notify();
-            });
-        }
-
-        for jump in backend::drain_pending_split_message_jumps() {
-            processed = true;
-            let target = {
-                let app_state = self.app_state.read(cx);
-                find_open_split_target(app_state, jump.split_id, &jump.channel)
-            };
-
-            let Some((tab_index, path, channel)) = target else {
-                crate::log_ui!(
-                    debug,
-                    "Split-local message jump dropped because its source split is gone: split_id={} channel={}",
-                    jump.split_id,
-                    jump.channel
-                );
-                continue;
-            };
-
-            self.activate_tab_split(tab_index, path, cx);
-
-            if let Some(chat_view) = self.chat_views.get(&jump.split_id).filter(|chat_view| {
-                chat_view
-                    .read(cx)
-                    .channel
-                    .trim_start_matches('#')
-                    .eq_ignore_ascii_case(channel.trim_start_matches('#'))
-            }) {
-                let found = chat_view.update(cx, |view, cx| {
-                    let found = view
-                        .canvas_list
-                        .update(cx, |list, cx| list.scroll_to_message(&jump.message_id, cx));
-                    view.mark_dirty_for(ChatViewDirtyReason::SearchJump);
-                    cx.notify();
-                    found
-                });
-                if !found {
-                    self.report_missing_jump_target(&channel, &jump.message_id, cx);
-                }
-            } else {
-                crate::log_ui!(
-                    debug,
-                    "Split-local message jump waiting for a matching ChatView: split_id={} channel={}",
-                    jump.split_id,
-                    channel
-                );
-                backend::push_pending_split_message_jump(
-                    jump.split_id,
-                    jump.channel,
-                    jump.message_id,
-                );
-            }
-        }
-
-        for jump in backend::drain_pending_search_jumps() {
-            processed = true;
-            let target = {
-                let app_state = self.app_state.read(cx);
-                find_open_tab_channel_target(app_state, &jump.channel)
-            };
-
-            let Some((tab_index, path, channel)) = target else {
-                crate::log_ui!(
-                    warn,
-                    "Search result target channel is not visible in any open tab: {}",
-                    jump.channel
-                );
-                self.overlay_manager.update(cx, |overlays, cx| {
-                    overlays.toast_info(
-                        format!(
-                            "#{} is no longer open",
-                            jump.channel.trim_start_matches('#')
-                        ),
-                        cx,
-                    );
-                });
-                continue;
-            };
-
-            self.activate_tab_split(tab_index, path.clone(), cx);
-
-            let Some((_resolved_channel, split_id)) = self.split_target_for_path(&path, cx) else {
-                backend::push_pending_search_jump(channel.clone(), jump.message_id.clone());
-                continue;
-            };
-
-            if let Some(chat_view) = self.chat_views.get(&split_id) {
-                let found = chat_view.update(cx, |view, cx| {
-                    let found = view
-                        .canvas_list
-                        .update(cx, |list, cx| list.scroll_to_message(&jump.message_id, cx));
-                    view.mark_dirty_for(ChatViewDirtyReason::SearchJump);
-                    cx.notify();
-                    found
-                });
-                if !found {
-                    self.report_missing_jump_target(&channel, &jump.message_id, cx);
-                }
-            } else {
-                crate::log_ui!(
-                    debug,
-                    "Search result target split has no chat view yet, retrying after tab/split activation: channel='{}' path={:?}",
-                    channel,
-                    path
-                );
-                backend::push_pending_search_jump(channel.clone(), jump.message_id.clone());
-            }
-        }
-
-        processed
-    }
-
     /// Tell the user a jump target is gone. A message still in the channel
     /// buffer is only not laid out yet, so that case stays silent.
     fn report_missing_jump_target(&self, channel: &str, message_id: &str, cx: &mut Context<Self>) {
@@ -4945,13 +3869,14 @@ impl EchoApp {
         });
     }
 
-    /// Update window dimensions and invalidate layout caches if changed
-    fn update_layout_caches(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// Persist the main window's maximized state and bounds when they change,
+    /// and tell the split layout the current width and split count.
+    fn sync_window_persistence(&mut self, window: &Window, cx: &mut Context<Self>) {
         let viewport_size = window.viewport_size();
         let window_width: f32 = viewport_size.width.into();
         let window_maximized = window.is_maximized();
 
-        if !crate::benchmark_ui_fixture::should_suppress_persistence() {
+        if !crate::bench::ui_fixture::should_suppress_persistence() {
             if self.last_persisted_window_maximized != window_maximized {
                 backend::settings::set_main_window_maximized(window_maximized);
                 self.last_persisted_window_maximized = window_maximized;
@@ -4981,11 +3906,7 @@ impl EchoApp {
     fn desired_window_title() -> String {
         let mention_count = backend::get_unread_global_mention_count();
         if backend::settings::get_show_mention_in_title() && mention_count > 0 {
-            let label = if mention_count > 99 {
-                "99+".to_string()
-            } else {
-                mention_count.to_string()
-            };
+            let label = crate::components::common::count_label::capped_count_label(mention_count);
             format!("({}) Echo", label)
         } else {
             "Echo".to_string()
@@ -5069,7 +3990,7 @@ impl EchoApp {
     }
 
     /// Render all overlays (modals, dropdowns, menus)
-    /// PERF: Only renders overlays that are actually open to avoid unnecessary allocations
+    /// Only renders overlays that are actually open to avoid unnecessary allocations
     fn render_all_overlays(
         &mut self,
         window: &mut Window,
@@ -5165,7 +4086,7 @@ impl EchoApp {
         }
 
         overlays.push(
-            self.render_settings_dropdown_backdrop(chrome_height, window, cx)
+            self.render_split_menu(chrome_height, window, cx)
                 .into_any_element(),
         );
         overlays.push(self.render_toast_manager(cx).into_any_element());
@@ -5267,12 +4188,15 @@ impl EchoApp {
         &mut self,
         layout: &SplitNode,
         highlights_enabled: bool,
-        window_width: f32,
-        window_height: f32,
+        window_extent: PaneExtent,
         chrome_height: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let PaneExtent {
+            width: window_width,
+            height: window_height,
+        } = window_extent;
         let unified_input_height = if self.split_layout.read(cx).is_unified_input_mode() {
             self.unified_input_target(cx)
                 .map(|target| target.metrics.total_height)
@@ -5287,7 +4211,7 @@ impl EchoApp {
             .min_h_0()
             .w_full()
             .overflow_hidden()
-            .child(self.render_main_content_fast(
+            .child(self.render_main_content(
                 layout,
                 window_width,
                 content_height,
@@ -5297,21 +4221,10 @@ impl EchoApp {
             ))
     }
 
-    /// Register all keyboard and mouse event handlers on the root div
-    fn register_event_handlers(
-        &mut self,
-        element: Stateful<Div>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        crate::event_handlers::register_event_handlers(self, element, window, cx)
-    }
-
     /// Startup marker for the first root render whose active split has chat
     /// rows to lay out.
-    fn record_first_chat_view_usable(&self, cx: &App) {
-        static RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if RECORDED.load(std::sync::atomic::Ordering::Relaxed) {
+    fn record_first_chat_view_usable(&mut self, cx: &App) {
+        if self.first_chat_view_usable_recorded {
             return;
         }
         let state = self.app_state.read(cx);
@@ -5323,21 +4236,21 @@ impl EchoApp {
                 .is_some_and(|chat| !chat.read(cx).messages.is_empty())
         });
         if has_rows {
-            RECORDED.store(true, std::sync::atomic::Ordering::Relaxed);
-            crate::startup_metrics::record("first_chat_view_usable");
+            self.first_chat_view_usable_recorded = true;
+            crate::diagnostics::startup_metrics::record(
+                crate::diagnostics::startup_metrics::StartupMarker::FirstChatViewUsable,
+            );
         }
     }
 
     /// Save tabs to disk
     pub fn save_tabs(&self, cx: &mut Context<Self>) {
-        if crate::benchmark_ui_fixture::should_suppress_persistence() {
-            return;
-        }
         config::queue_save_tabs(self.app_state.read(cx).tabs_for_persistence());
     }
 
-    /// PERF: Optimized main content that takes pre-extracted layout
-    fn render_main_content_fast(
+    /// The split tree beside (or under) the activity rail, for a layout the
+    /// caller already extracted from the active tab.
+    fn render_main_content(
         &mut self,
         layout: &SplitNode,
         available_width: f32,
@@ -5374,6 +4287,7 @@ impl EchoApp {
                 )
             });
             SplitRenderContext {
+                highlights_enabled,
                 is_dragging: layout_state.is_dragging_pane(),
                 add_split_mode: layout_state.is_add_split_mode_active() && !layout_locked,
                 resize_mode_active: layout_state.is_drag_mode_active() && !layout_locked,
@@ -5389,16 +4303,18 @@ impl EchoApp {
         let chat_height = crate::components::chat::canvas_renderer::layout::line_height();
         self.split_layout.update(cx, |manager, cx| {
             let split_input = !manager.is_unified_input_mode();
-            let active_split = layout.get_split_id_at_path(manager.get_active_split_path());
+            let active_split = layout.split_id_at_path(manager.get_active_split_path());
             manager.update_split_minimums(layout, |split_id, channel, header_collapsed| {
                 let header = if header_collapsed { 0.0 } else { header_height };
                 let chrome = self.split_vertical_chrome(
-                    split_id,
-                    channel,
-                    header,
-                    split_input,
-                    split_id.is_some() && split_id == active_split,
-                    120.0,
+                    SplitChromeQuery {
+                        split_id,
+                        channel,
+                        header_height: header,
+                        show_input: split_input,
+                        is_active: split_id.is_some() && split_id == active_split,
+                        pane_width: 120.0,
+                    },
                     cx,
                 );
                 let context_slack = if split_input {
@@ -5410,19 +4326,20 @@ impl EchoApp {
             });
         });
 
-        let split_start = crate::fps_profiler::phase_timer();
+        let split_start = crate::diagnostics::fps_profiler::phase_timer();
         let mut path = Vec::with_capacity(8);
         let split_tree = self.render_split_tree(
             layout,
             &mut path,
-            content_width,
-            available_height,
-            highlights_enabled,
+            PaneExtent {
+                width: content_width,
+                height: available_height,
+            },
             &split_ctx,
             window,
             cx,
         );
-        crate::fps_profiler::record_phase_since("split_tree", split_start);
+        crate::diagnostics::fps_profiler::record_phase_since("split_tree", split_start);
 
         let activity_sidebar = if activity_open {
             let sidebar = self
@@ -5474,15 +4391,14 @@ impl EchoApp {
         &mut self,
         node: &SplitNode,
         path: &mut Vec<usize>,
-        available_width: f32,
-        available_height: f32,
-        highlights_enabled: bool,
+        extent: PaneExtent,
         split_ctx: &SplitRenderContext,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let available_width = available_width.max(0.0);
-        let available_height = available_height.max(0.0);
+        let available_width = extent.width.max(0.0);
+        let available_height = extent.height.max(0.0);
+        let highlights_enabled = split_ctx.highlights_enabled;
 
         let path_key = SplitLayoutManager::path_key(path);
         self.split_layout.update(cx, |layout, _| {
@@ -5516,11 +4432,10 @@ impl EchoApp {
                             .inset_0()
                             .border_1()
                             .border_color(colors::accent())
-                            .child(self.render_drop_zone_overlay(
+                            .child(SplitLayoutManager::render_drop_zone_overlay(
                                 drop_zone,
                                 available_width,
                                 available_height,
-                                cx,
                             ))
                             .into_any_element(),
                     )
@@ -5542,21 +4457,25 @@ impl EchoApp {
                     && !is_placeholder(ch)
                 {
                     return self.render_cached_split_leaf(
-                        split_id,
-                        ch,
-                        path.clone(),
-                        available_width,
-                        available_height,
+                        SplitLeaf {
+                            split_id,
+                            channel: ch,
+                            path: path.clone(),
+                            header_collapsed: *header_collapsed,
+                        },
+                        PaneExtent {
+                            width: available_width,
+                            height: available_height,
+                        },
                         highlights_enabled,
-                        *header_collapsed,
                         overlay,
-                        window,
                         cx,
                     );
                 }
 
                 let pane = if let Some(ch) = ch.as_deref() {
-                    self.render_chat_pane(
+                    crate::components::chat::render_chat_pane(
+                        self,
                         ch,
                         path.clone(),
                         available_width,
@@ -5579,7 +4498,7 @@ impl EchoApp {
                 let entity = cx.entity().clone();
 
                 div()
-                    .id(("split-leaf", path_key.as_u64()))
+                    .id(("split-leaf", path_key.stable_hash()))
                     .w(px(available_width))
                     .h(px(available_height))
                     .min_h_0()
@@ -5619,7 +4538,7 @@ impl EchoApp {
                 children,
                 ..
             } => {
-                let split_arm_start = crate::fps_profiler::phase_timer();
+                let split_arm_start = crate::diagnostics::fps_profiler::phase_timer();
                 let child_count = children.len();
                 let handle_count = child_count.saturating_sub(1);
                 use crate::managers::{HANDLE_HIT_PADDING, HANDLE_HIT_SIZE, HANDLE_VISUAL_SIZE};
@@ -5700,9 +4619,10 @@ impl EchoApp {
                     elements.push(self.render_split_tree(
                         child,
                         path,
-                        child_width,
-                        child_height,
-                        highlights_enabled,
+                        PaneExtent {
+                            width: child_width,
+                            height: child_height,
+                        },
                         split_ctx,
                         window,
                         cx,
@@ -5713,7 +4633,7 @@ impl EchoApp {
                         let handle_id = {
                             use std::hash::{Hash, Hasher};
                             let mut hasher = ahash::AHasher::default();
-                            parent_key.as_u64().hash(&mut hasher);
+                            parent_key.stable_hash().hash(&mut hasher);
                             idx.hash(&mut hasher);
                             hasher.finish()
                         };
@@ -5880,7 +4800,10 @@ impl EchoApp {
                     }
                 }
 
-                crate::fps_profiler::record_phase_since("split_handles", split_arm_start);
+                crate::diagnostics::fps_profiler::record_phase_since(
+                    "split_handles",
+                    split_arm_start,
+                );
 
                 match orientation {
                     SplitOrientation::Vertical => div()
@@ -5908,158 +4831,6 @@ impl EchoApp {
                 }
             }
         }
-    }
-
-    fn render_activity_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        let (panel, mentions, whispers) = {
-            let state = self.app_state.read(cx);
-            (
-                state.activity_panel,
-                state.cached_mentions.clone(),
-                state.cached_whispers.clone(),
-            )
-        };
-        let mention_count = backend::get_unread_global_mention_count();
-        let unread_whispers = whispers.iter().fold(0u32, |total, thread| {
-            total.saturating_add(thread.unread_count)
-        });
-        let events = match panel.section {
-            ActivitySection::All | ActivitySection::Events => backend::get_recent_twitch_events(50),
-            ActivitySection::Mentions | ActivitySection::Whispers => Vec::new(),
-        };
-        let event_count = backend::get_unread_twitch_event_count();
-        let unread_activity_count = mention_count
-            .saturating_add(unread_whispers as usize)
-            .saturating_add(event_count);
-
-        let content = match panel.section {
-            ActivitySection::All => {
-                let app_state_for_read = self.app_state.clone();
-                let app_state_for_clear = self.app_state.clone();
-                crate::components::sidebars::render_combined_activity_content(
-                    mentions,
-                    whispers,
-                    events,
-                    unread_activity_count,
-                    move |cx: &mut Context<Self>| {
-                        backend::mark_all_activity_read();
-                        app_state_for_read.update(cx, |state, cx| state.refresh_activity(cx));
-                    },
-                    move |cx: &mut Context<Self>| {
-                        backend::clear_all_activity();
-                        app_state_for_clear.update(cx, |state, cx| state.refresh_activity(cx));
-                    },
-                    cx,
-                )
-                .into_any_element()
-            }
-            ActivitySection::Mentions => {
-                let app_state = self.app_state.clone();
-                crate::components::sidebars::render_mentions_activity_content(
-                    mentions,
-                    move |cx: &mut Context<Self>| {
-                        backend::clear_global_mentions();
-                        app_state.update(cx, |state, cx| state.refresh_activity(cx));
-                    },
-                    cx,
-                )
-                .into_any_element()
-            }
-            ActivitySection::Whispers => {
-                let app_state = self.app_state.clone();
-                crate::components::sidebars::render_whispers_activity_content(
-                    whispers,
-                    move |cx: &mut Context<Self>| {
-                        backend::mark_all_whisper_threads_read();
-                        app_state.update(cx, |state, cx| state.refresh_activity(cx));
-                    },
-                    cx,
-                )
-                .into_any_element()
-            }
-            ActivitySection::Events => {
-                self.render_activity_events_content(panel.event_filter, events, cx)
-            }
-        };
-
-        let app_state_for_select = self.app_state.clone();
-        let app_state_for_close = self.app_state.clone();
-        crate::components::sidebars::render_activity_sidebar(
-            width,
-            panel.section,
-            mention_count,
-            unread_whispers,
-            event_count,
-            content,
-            move |section, cx: &mut Context<Self>| {
-                app_state_for_select
-                    .update(cx, |state, cx| state.select_activity_section(section, cx));
-            },
-            move |cx: &mut Context<Self>| {
-                app_state_for_close.update(cx, |state, cx| state.close_activity(cx));
-            },
-            cx,
-        )
-        .into_any_element()
-    }
-
-    /// Clear unread Activity attention using the visible state of mounted chat canvases.
-    ///
-    /// Runs at UI-poll cadence, so it is gated twice: nothing can be cleared while
-    /// both unread sets are empty, and an unchanged viewport cannot clear anything
-    /// the pass that produced the same key did not already clear. The unread counts
-    /// are part of the key so newly arrived attention always re-harvests.
-    fn mark_observed_activity_read(&mut self, cx: &Context<Self>) -> bool {
-        let unread_mentions = backend::get_unread_global_mention_count();
-        let unread_events = backend::get_unread_twitch_event_count();
-        if unread_mentions == 0 && unread_events == 0 {
-            self.activity_read_visibility_key = None;
-            return false;
-        }
-
-        let mut key = {
-            let mut hasher = FxHasher::default();
-            unread_mentions.hash(&mut hasher);
-            unread_events.hash(&mut hasher);
-            hasher.finish()
-        };
-        for (split_id, chat_view) in &self.chat_views {
-            let mut hasher = FxHasher::default();
-            split_id.hash(&mut hasher);
-            chat_view
-                .read(cx)
-                .canvas_list
-                .read(cx)
-                .visibility_generation()
-                .hash(&mut hasher);
-            key ^= hasher.finish();
-        }
-        if self.activity_read_visibility_key == Some(key) {
-            return false;
-        }
-        self.activity_read_visibility_key = Some(key);
-
-        let mut visible_mentions: Vec<(&str, &str)> = Vec::new();
-        let mut live_following_channels = Vec::new();
-
-        for chat_view in self.chat_views.values() {
-            let view = chat_view.read(cx);
-            let list = view.canvas_list.read(cx);
-            if unread_mentions > 0 {
-                visible_mentions.extend(
-                    list.visible_message_ids()
-                        .iter()
-                        .map(|message_id| (view.channel.as_str(), message_id.as_ref())),
-                );
-            }
-            if unread_events > 0 && list.is_live_following() {
-                live_following_channels.push(view.channel.clone());
-            }
-        }
-
-        let mentions = backend::mark_visible_global_mentions_read(&visible_mentions);
-        let events = backend::mark_recent_twitch_events_read_for_channels(&live_following_channels);
-        mentions || events
     }
 
     /// Get or create a ChatView entity for the given split.
@@ -6228,40 +4999,15 @@ impl EchoApp {
         }
     }
 
-    fn render_chat_pane(
-        &mut self,
-        channel: &str,
-        path: Vec<usize>,
-        available_width: f32,
-        available_height: f32,
-        highlights_enabled: bool,
-        header_collapsed: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        crate::components::chat::render_chat_pane(
-            self,
+    fn split_vertical_chrome(&self, query: SplitChromeQuery<'_>, cx: &App) -> SplitVerticalChrome {
+        let SplitChromeQuery {
+            split_id,
             channel,
-            path,
-            available_width,
-            available_height,
-            highlights_enabled,
-            header_collapsed,
-            window,
-            cx,
-        )
-    }
-
-    fn split_vertical_chrome(
-        &self,
-        split_id: Option<SplitId>,
-        channel: &str,
-        header_height: f32,
-        show_input: bool,
-        is_active: bool,
-        pane_width: f32,
-        cx: &App,
-    ) -> SplitVerticalChrome {
+            header_height,
+            show_input,
+            is_active,
+            pane_width,
+        } = query;
         let pane = split_id.and_then(|split_id| self.split_panes.get(&split_id));
         let input = if show_input {
             split_id.map_or(config::CHAT_INPUT_HEIGHT_PX, |split_id| {
@@ -6320,19 +5066,20 @@ impl EchoApp {
 
     fn render_cached_split_leaf(
         &mut self,
-        split_id: SplitId,
-        channel: &str,
-        path: Vec<usize>,
-        available_width: f32,
-        available_height: f32,
+        leaf: SplitLeaf<'_>,
+        extent: PaneExtent,
         highlights_enabled: bool,
-        header_collapsed: bool,
         overlay: Option<AnyElement>,
-        _window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pane_width = available_width.max(0.0);
-        let pane_height = available_height.max(0.0);
+        let SplitLeaf {
+            split_id,
+            channel,
+            path,
+            header_collapsed,
+        } = leaf;
+        let pane_width = extent.width.max(0.0);
+        let pane_height = extent.height.max(0.0);
         let path_key = SplitLayoutManager::path_key(&path);
         let path_key_for_canvas = path_key.clone();
         let bounds_entity = cx.entity().clone();
@@ -6386,12 +5133,14 @@ impl EchoApp {
             main_split_header_height(compact_split_header)
         };
         let chrome = self.split_vertical_chrome(
-            Some(split_id),
-            channel,
-            header_height,
-            show_split_input,
-            is_active,
-            pane_width,
+            SplitChromeQuery {
+                split_id: Some(split_id),
+                channel,
+                header_height,
+                show_input: show_split_input,
+                is_active,
+                pane_width,
+            },
             cx,
         );
         let input_height = chrome.input;
@@ -6403,7 +5152,7 @@ impl EchoApp {
             let info = app_state.stream_info.get(channel).and_then(|i| i.as_ref());
             (
                 info.is_some_and(|info| info.is_live),
-                stream_info_gate_hash(info),
+                backend::stream_info_gate_hash(info),
                 crate::backend::live_uptime_minutes(info),
             )
         };
@@ -6798,8 +5547,8 @@ impl EchoApp {
             let app_state = self.app_state.read(cx);
             let active_tab = app_state.active_tab();
             (
-                active_tab.layout.get_split_id_at_path(&path),
-                active_tab.layout.get_channel_at_path(&path),
+                active_tab.layout.split_id_at_path(&path),
+                active_tab.layout.channel_at_path(&path),
                 app_state.active_tab_idx,
                 active_tab
                     .reopen_anchor_for_path(&path)
@@ -6895,7 +5644,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_split_id_at_path(&path);
+            .split_id_at_path(&path);
         let pending_previous = split_id.and_then(|split_id| {
             self.app_state
                 .read(cx)
@@ -6926,7 +5675,7 @@ impl EchoApp {
                     Some(trimmed.clone())
                 };
                 if let Some(concrete_channel) = concrete_channel
-                    && !crate::benchmark_ui_fixture::disposable_workspace_enabled()
+                    && !crate::bench::ui_fixture::disposable_workspace_enabled()
                 {
                     if !backend::whispers::is_whispers_channel(&concrete_channel) {
                         backend::preload_channel_emotes_predictive(&concrete_channel);
@@ -7015,7 +5764,7 @@ impl EchoApp {
     ) {
         let (changed, split_id) = self.app_state.update(cx, |state, _| {
             let tab = state.active_tab_mut();
-            let split_id = tab.layout.get_split_id_at_path(&path);
+            let split_id = tab.layout.split_id_at_path(&path);
             let changed =
                 std::sync::Arc::make_mut(&mut tab.layout).set_deleted_mode_at_path(&path, mode);
             (changed, split_id)
@@ -7083,7 +5832,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_node_at_path(&block_path)
+            .node_at_path(&block_path)
             .filter(|node| node.grid_band_split_ratio().is_some())
             .cloned()
             .and_then(|mut grid| {
@@ -7188,7 +5937,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_node_at_path(&path)
+            .node_at_path(&path)
         {
             Some(SplitNode::Split { children, .. }) => children.len(),
             _ => return,
@@ -7200,11 +5949,7 @@ impl EchoApp {
                 .child_minimum_extents(&path, child_count, &orientation);
 
         let applied_pixels = self.app_state.update(cx, |state, _cx| {
-            let tab = state.active_tab_mut();
-            if tab.is_locked {
-                return 0.0;
-            }
-            std::sync::Arc::make_mut(&mut tab.layout).adjust_ratio_with_minimums_applied(
+            state.active_tab_mut().adjust_ratio(
                 &path,
                 child_idx,
                 delta_pixels / extent,
@@ -7273,7 +6018,7 @@ impl EchoApp {
                 .read(cx)
                 .active_tab()
                 .layout
-                .get_split_id_at_path(&path);
+                .split_id_at_path(&path);
 
             self.overlay_manager
                 .read(cx)
@@ -7690,22 +6435,11 @@ impl EchoApp {
         let pane_drag = layout.pane_drag().cloned();
         let cursor_position = layout.cursor_position();
 
-        self.split_tree_renderer.update(cx, |renderer, _cx| {
-            renderer.render_drag_ghost(pane_drag.as_ref(), cursor_position)
-        })
-    }
-
-    /// Render drop zone overlay when dragging over a split
-    fn render_drop_zone_overlay(
-        &self,
-        zone: Option<DropZone>,
-        width: f32,
-        height: f32,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        self.split_tree_renderer.update(cx, |renderer, _cx| {
-            renderer.render_drop_zone_overlay(zone, width, height)
-        })
+        match pane_drag {
+            Some(drag) => SplitLayoutManager::render_drag_ghost(cursor_position, &drag.channel)
+                .into_any_element(),
+            None => div().into_any_element(),
+        }
     }
 
     /// Render the Ctrl+Alt split overlay for the hovered split.
@@ -7875,7 +6609,7 @@ impl EchoApp {
             .read(cx)
             .active_tab()
             .layout
-            .get_channel_at_path(&path)
+            .channel_at_path(&path)
             .unwrap_or_default();
         let draggable = !is_placeholder(&channel);
 
@@ -7935,683 +6669,6 @@ impl EchoApp {
         AnyView::from(settings_state).into_any_element()
     }
 
-    /// Render split settings dropdown as app-level overlay
-    /// Uses split_hit_areas for dynamic positioning that follows resize
-    fn render_settings_dropdown_backdrop(
-        &mut self,
-        chrome_height: f32,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let Some((path_key, channel)) =
-            self.overlay_manager.read(cx).open_settings_dropdown.clone()
-        else {
-            return div().into_any_element();
-        };
-
-        crate::components::overlays::clear_global_tooltip();
-
-        let bounds = self.split_layout.read(cx).hit_area_for(&path_key);
-        let Some(bounds) = bounds else {
-            self.overlay_manager
-                .update(cx, |overlays, _| overlays.close_all_split_settings());
-            return div().into_any_element();
-        };
-
-        let compact_split_header = backend::settings::get_compact_split_header();
-        let header_height = main_split_header_height(compact_split_header);
-        let header_collapsed = self
-            .app_state
-            .read(cx)
-            .active_tab()
-            .layout
-            .header_collapsed_at_path(&path_key.to_vec())
-            .unwrap_or(false);
-
-        let custom_player_path = crate::backend::settings::get_use_custom_player()
-            .then(|| {
-                crate::backend::settings::get_custom_player_path()
-                    .filter(|path| !path.trim().is_empty())
-            })
-            .flatten();
-        let shortcut_for = |action: crate::backend::hotkeys::HotkeyAction| {
-            crate::backend::hotkeys::get_binding(action)
-                .map(|binding| SharedString::from(binding.to_display()))
-        };
-
-        let deleted_mode_override = self
-            .app_state
-            .read(cx)
-            .active_tab()
-            .layout
-            .deleted_mode_at_path(&path_key.to_vec());
-        let is_whispers = backend::whispers::is_whispers_channel(&channel);
-        let mut rows: Vec<SplitMenuRow> = vec![
-            SplitMenuRow {
-                action: SplitMenuAction::ToggleHeader,
-                label: if header_collapsed {
-                    "Show header".into()
-                } else {
-                    "Hide header".into()
-                },
-                shortcut: None,
-            },
-            SplitMenuRow {
-                action: SplitMenuAction::AddSplit,
-                label: "Add split to right".into(),
-                shortcut: shortcut_for(crate::backend::hotkeys::HotkeyAction::NewSplit),
-            },
-            SplitMenuRow {
-                action: SplitMenuAction::ChangeChannel,
-                label: "Change channel".into(),
-                shortcut: shortcut_for(crate::backend::hotkeys::HotkeyAction::ChangeChannel),
-            },
-            SplitMenuRow {
-                action: SplitMenuAction::LiveFollowedChannels,
-                label: "Live followed channels…".into(),
-                shortcut: None,
-            },
-        ];
-        if !is_whispers {
-            rows.extend([
-                SplitMenuRow {
-                    action: SplitMenuAction::OpenChatters,
-                    label: "Open chatters".into(),
-                    shortcut: None,
-                },
-                SplitMenuRow {
-                    action: SplitMenuAction::OpenChannelPopup,
-                    label: "Open channel popup".into(),
-                    shortcut: None,
-                },
-                SplitMenuRow {
-                    action: SplitMenuAction::ModLog,
-                    label: "Mod Log".into(),
-                    shortcut: None,
-                },
-                SplitMenuRow {
-                    action: SplitMenuAction::CycleDeletedMode,
-                    label: match deleted_mode_override {
-                        Some(mode) => format!("Deleted: {}", deleted_mode_label(mode)).into(),
-                        None => format!(
-                            "Deleted: Default ({})",
-                            deleted_mode_label(backend::settings::get_deleted_message_mode())
-                        )
-                        .into(),
-                    },
-                    shortcut: None,
-                },
-            ]);
-        }
-        if !is_whispers && custom_player_path.is_some() {
-            rows.push(SplitMenuRow {
-                action: SplitMenuAction::OpenCustomPlayer,
-                label: "Open with Custom Player".into(),
-                shortcut: None,
-            });
-        }
-        if !is_whispers {
-            rows.push(SplitMenuRow {
-                action: SplitMenuAction::OpenStreamlink,
-                label: "Open with Streamlink".into(),
-                shortcut: None,
-            });
-        }
-        rows.push(SplitMenuRow {
-            action: SplitMenuAction::CloseSplit,
-            label: "Close split".into(),
-            shortcut: shortcut_for(crate::backend::hotkeys::HotkeyAction::CloseSplit),
-        });
-
-        let viewport = window.viewport_size();
-        let (intrinsic_width, shortcut_column) = measure_split_menu_width(&rows, window);
-        let dropdown_fit = crate::utils::fit_overlay_to_viewport(
-            viewport,
-            intrinsic_width.clamp(SPLIT_MENU_MIN_WIDTH_PX, SPLIT_MENU_MAX_WIDTH_PX),
-            SPLIT_MENU_MAX_HEIGHT_PX,
-            8.0,
-        );
-        let dropdown_width = dropdown_fit.width;
-        let show_shortcuts = shortcut_column <= 0.0
-            || dropdown_width
-                >= MenuMetrics::ITEM_PADDING_X * 2.0
-                    + SPLIT_MENU_BORDER_PX
-                    + SPLIT_MENU_MIN_LABEL_PX
-                    + shortcut_column;
-        let horizontal_inset = if header_collapsed { 8.0 } else { 28.0 };
-        let vertical_offset = if header_collapsed {
-            40.0
-        } else {
-            header_height + 4.0
-        };
-        let dropdown_x: f32 =
-            (bounds.origin.x + bounds.size.width - px(dropdown_width + horizontal_inset)).into();
-        let dropdown_y: f32 = (bounds.origin.y + px(vertical_offset)).into();
-
-        let clamped_x = crate::utils::clamp_overlay_axis(
-            dropdown_x,
-            dropdown_width,
-            f32::from(viewport.width),
-            dropdown_fit.margin_x,
-        );
-        let clamped_y = crate::utils::clamp_overlay_axis(
-            dropdown_y.max(chrome_height + dropdown_fit.margin_y),
-            dropdown_fit.height,
-            f32::from(viewport.height),
-            dropdown_fit.margin_y,
-        );
-
-        div()
-            .id("settings-dropdown-overlay")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .occlude()
-            .on_mouse_move(|_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-            .on_scroll(|_, _, cx| cx.stop_propagation())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.overlay_manager
-                        .update(cx, |o, _| o.close_all_split_settings());
-                    cx.notify();
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-            .child({
-                let menu = self.chrome_menu_host(cx);
-                let nav = menu.nav.clone();
-                let app = cx.entity();
-                let actions: Vec<MenuAction> = rows
-                    .iter()
-                    .map(|row| {
-                        let path = path_key.to_vec();
-                        let ch = channel.clone();
-                        let player_path = custom_player_path.clone();
-                        let action = row.action;
-                        let app = app.clone();
-                        Rc::new(move |window: &mut Window, cx: &mut App| {
-                            app.update(cx, |this, cx| {
-                                match action {
-                                    SplitMenuAction::ToggleHeader => {
-                                        this.set_split_header_collapsed(
-                                            path.clone(),
-                                            !header_collapsed,
-                                            cx,
-                                        );
-                                    }
-                                    SplitMenuAction::AddSplit => {
-                                        this.add_empty_split(
-                                            path.clone(),
-                                            AddSplitDirection::Right,
-                                            cx,
-                                        );
-                                    }
-                                    SplitMenuAction::ChangeChannel => {
-                                        this.set_active_split(path.clone(), cx);
-                                        let _ = this.start_change_active_split_channel(cx);
-                                    }
-                                    SplitMenuAction::LiveFollowedChannels => {
-                                        this.overlay_manager
-                                            .update(cx, |o, _| o.close_all_split_settings());
-                                        let source = this
-                                            .app_state
-                                            .read(cx)
-                                            .active_tab()
-                                            .layout
-                                            .get_split_id_at_path(&path);
-                                        this.open_live_followed_switcher(source, window, cx);
-                                        return;
-                                    }
-                                    SplitMenuAction::OpenChatters => {
-                                        backend::open_chatter_list_async(ch.clone());
-                                    }
-                                    SplitMenuAction::OpenChannelPopup => {
-                                        crate::components::chat::open_channel_popup(
-                                            ch.clone(),
-                                            this.app_state.clone(),
-                                            cx,
-                                        );
-                                    }
-                                    SplitMenuAction::ModLog => this.open_mod_log(cx),
-                                    SplitMenuAction::CycleDeletedMode => {
-                                        this.set_split_deleted_mode(
-                                            path.clone(),
-                                            next_deleted_mode(deleted_mode_override),
-                                            cx,
-                                        );
-                                        // Stay open so the label shows the new mode.
-                                        return;
-                                    }
-                                    SplitMenuAction::OpenCustomPlayer => {
-                                        if let Some(player_path) = player_path.clone() {
-                                            backend::commands::launch_stream_player(
-                                                &ch,
-                                                backend::commands::StreamPlayer::Custom(
-                                                    player_path,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                    SplitMenuAction::OpenStreamlink => {
-                                        backend::commands::launch_stream_player(
-                                            &ch,
-                                            backend::commands::StreamPlayer::Streamlink,
-                                        );
-                                    }
-                                    SplitMenuAction::CloseSplit => {
-                                        this.overlay_manager
-                                            .update(cx, |o, _| o.close_all_split_settings());
-                                        this.close_pane(path.clone(), cx);
-                                        cx.notify();
-                                        return;
-                                    }
-                                }
-                                this.overlay_manager
-                                    .update(cx, |o, _| o.close_all_split_settings());
-                                cx.notify();
-                            });
-                        }) as MenuAction
-                    })
-                    .collect();
-                menu_panel()
-                    .id("split-settings-dropdown-panel")
-                    .absolute()
-                    .left(px(clamped_x))
-                    .top(px(clamped_y))
-                    .w(px(dropdown_width))
-                    .max_h(px(dropdown_fit.height))
-                    .overflow_y_scroll()
-                    .overflow_x_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .menu_keyboard(&menu.focus, &nav, actions.clone(), menu.close_handler())
-                    .children(rows.into_iter().zip(actions).enumerate().map(
-                        |(row_index, (row, action))| {
-                            menu_item(("split-menu-item", row_index), row_index, &nav, action)
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_size(px(MenuMetrics::ITEM_TEXT))
-                                        .text_color(colors::text_primary())
-                                        .child(row.label),
-                                )
-                                .when_some(
-                                    row.shortcut.filter(|_| show_shortcuts),
-                                    |item, shortcut| {
-                                        item.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .whitespace_nowrap()
-                                                .text_size(px(MenuMetrics::SECONDARY_TEXT))
-                                                .text_color(colors::text_muted())
-                                                .child(shortcut),
-                                        )
-                                    },
-                                )
-                        },
-                    ))
-            })
-            .into_any_element()
-    }
-
-    fn render_notification_event_row(
-        event: backend::TwitchEvent,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let title = backend::twitch_event_title(&event.event_type).to_string();
-        let body = backend::format_twitch_event_text(&event);
-        let event_timestamp = event.timestamp;
-        let dismiss_timestamp = event.timestamp;
-        let timestamp = crate::utils::format_sidebar_timestamp(event.timestamp);
-        let event_channel = event.channel.clone();
-        let automod_message_id = pending_automod_message_id(&event);
-        let suspicious_user_target = suspicious_user_notification_target(&event);
-        let channel = if event.channel.is_empty() {
-            "Twitch".to_string()
-        } else {
-            event.channel.to_string()
-        };
-        let copy_text = crate::components::sidebars::format_activity_copy_text(
-            "Event", &title, &channel, &body,
-        );
-        let copy_action_id = {
-            let mut hasher = FxHasher::default();
-            event_timestamp.hash(&mut hasher);
-            copy_text.hash(&mut hasher);
-            format!("activity-event-{}-copy", hasher.finish())
-        };
-
-        let row = div()
-            .id(SharedString::from(format!(
-                "activity-event-{event_timestamp}"
-            )))
-            .w_full()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(colors::border())
-            .on_right_click(cx.listener(move |_this, _, _window, cx| {
-                backend::remove_recent_twitch_event(event_timestamp);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors::text_primary())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(colors::text_muted())
-                            .child(div().max_w(px(120.0)).truncate().child(channel))
-                            .when(!timestamp.is_empty(), |s| {
-                                s.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_color(colors::text_muted())
-                                        .child(timestamp),
-                                )
-                            })
-                            .child(crate::components::sidebars::render_activity_copy_action(
-                                copy_action_id,
-                                copy_text,
-                            ))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "dismiss-activity-event-{dismiss_timestamp}"
-                                    )))
-                                    .role(Role::Button)
-                                    .aria_label("Dismiss event")
-                                    .on_hover(crate::components::overlays::text_tooltip_on_hover(
-                                        format!("dismiss-activity-event-{dismiss_timestamp}"),
-                                        "Dismiss".to_string(),
-                                    ))
-                                    // 24 px hit area in the 18 px slot it always had.
-                                    .size(px(Spacing::XXL))
-                                    .m(px(-Spacing::XS_PLUS / 2.0))
-                                    .rounded(Radii::sm())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(colors::bg_hover()))
-                                    .on_activate(cx.listener(move |_this, _event, _window, cx| {
-                                        backend::remove_recent_twitch_event(dismiss_timestamp);
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(colors::text_muted())
-                                            .child(crate::icons::CLOSE_GLYPH),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .pt_1()
-                    .text_sm()
-                    .text_color(colors::text_secondary())
-                    .child(body),
-            )
-            .when_some(automod_message_id, move |row, message_id| {
-                row.child(
-                    div()
-                        .pt_2()
-                        .flex()
-                        .gap_2()
-                        .child(automod_action_button(
-                            "Allow",
-                            message_id.clone(),
-                            true,
-                            event_timestamp,
-                        ))
-                        .child(automod_action_button(
-                            "Deny",
-                            message_id,
-                            false,
-                            event_timestamp,
-                        )),
-                )
-            })
-            .when_some(
-                suspicious_user_target,
-                move |row, (target_channel, user_login, user_id, status)| {
-                    let is_restricted = status.eq_ignore_ascii_case("restricted");
-                    let is_monitored = status.eq_ignore_ascii_case("active_monitoring")
-                        || status.eq_ignore_ascii_case("monitored");
-                    let actions = div().pt_2().flex().gap_2();
-                    let actions = if is_restricted {
-                        actions
-                            .child(suspicious_user_action_button(
-                                "Monitor",
-                                target_channel.clone(),
-                                user_login.clone(),
-                                user_id.clone(),
-                                backend::commands::helix::SuspiciousUserAction::Monitor,
-                                event_timestamp,
-                            ))
-                            .child(suspicious_user_action_button(
-                                "Clear",
-                                target_channel,
-                                user_login,
-                                user_id,
-                                backend::commands::helix::SuspiciousUserAction::Clear,
-                                event_timestamp,
-                            ))
-                    } else if is_monitored {
-                        actions
-                            .child(suspicious_user_action_button(
-                                "Restrict",
-                                target_channel.clone(),
-                                user_login.clone(),
-                                user_id.clone(),
-                                backend::commands::helix::SuspiciousUserAction::Restrict,
-                                event_timestamp,
-                            ))
-                            .child(suspicious_user_action_button(
-                                "Clear",
-                                target_channel,
-                                user_login,
-                                user_id,
-                                backend::commands::helix::SuspiciousUserAction::Clear,
-                                event_timestamp,
-                            ))
-                    } else {
-                        actions
-                            .child(suspicious_user_action_button(
-                                "Monitor",
-                                target_channel.clone(),
-                                user_login.clone(),
-                                user_id.clone(),
-                                backend::commands::helix::SuspiciousUserAction::Monitor,
-                                event_timestamp,
-                            ))
-                            .child(suspicious_user_action_button(
-                                "Restrict",
-                                target_channel,
-                                user_login,
-                                user_id,
-                                backend::commands::helix::SuspiciousUserAction::Restrict,
-                                event_timestamp,
-                            ))
-                    };
-                    row.child(actions)
-                },
-            );
-
-        if event_channel.is_empty() {
-            row.into_any_element()
-        } else {
-            row.cursor_pointer()
-                .hover(|s| s.bg(colors::bg_hover()))
-                .on_activate(cx.listener(move |this, _, _window, cx| {
-                    this.focus_notification_channel(&event_channel, cx);
-                    this.app_state.update(cx, |state, cx| {
-                        state.close_activity(cx);
-                    });
-                }))
-                .into_any_element()
-        }
-    }
-
-    fn focus_notification_channel(&mut self, channel: &str, cx: &mut Context<Self>) -> bool {
-        let channel = channel.trim_start_matches('#').to_lowercase();
-        if channel.is_empty() {
-            return false;
-        }
-
-        let target = {
-            let app_state = self.app_state.read(cx);
-            find_open_tab_channel_target(app_state, &channel)
-        };
-
-        let Some((tab_index, path, _resolved_channel)) = target else {
-            crate::log_ui!(
-                warn,
-                "Notification target channel is not visible in any open tab: {}",
-                channel
-            );
-            return false;
-        };
-
-        self.activate_tab_split(tab_index, path, cx);
-        true
-    }
-
-    fn render_activity_events_content(
-        &mut self,
-        notification_filter: backend::ui_actions::NotificationFilter,
-        mut events: Vec<backend::TwitchEvent>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (description, empty_text) = match notification_filter {
-            backend::ui_actions::NotificationFilter::All => {
-                ("Recent channel events", "No recent channel events")
-            }
-            backend::ui_actions::NotificationFilter::Automod => {
-                ("AutoMod review", "No recent AutoMod messages")
-            }
-        };
-        if matches!(
-            notification_filter,
-            backend::ui_actions::NotificationFilter::Automod
-        ) {
-            events.retain(is_automod_notification_event);
-        }
-        let has_events = !events.is_empty();
-        let content = if events.is_empty() {
-            div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .p_6()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(colors::text_muted())
-                        .child(empty_text),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .id("activity-event-list")
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .overflow_y_scroll()
-                .children(
-                    events
-                        .into_iter()
-                        .map(|event| Self::render_notification_event_row(event, cx)),
-                )
-                .into_any_element()
-        };
-
-        div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(38.0))
-                    .w_full()
-                    .px_3()
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(colors::border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(colors::text_muted())
-                            .child(description),
-                    )
-                    .when(has_events, |toolbar| {
-                        toolbar.child(
-                            div()
-                                .id("clear-activity-events")
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(colors::text_muted())
-                                .cursor_pointer()
-                                .hover(|style| style.text_color(colors::text_secondary()))
-                                .on_activate(cx.listener(move |_this, _, _, cx| {
-                                    match notification_filter {
-                                        backend::ui_actions::NotificationFilter::All => {
-                                            backend::clear_recent_twitch_events();
-                                        }
-                                        backend::ui_actions::NotificationFilter::Automod => {
-                                            backend::clear_recent_automod_events();
-                                        }
-                                    }
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                }))
-                                .child("Clear"),
-                        )
-                    }),
-            )
-            .child(content)
-            .into_any_element()
-    }
-
     /// Render login modal overlay
     fn render_login_modal(
         &self,
@@ -8625,7 +6682,7 @@ impl EchoApp {
             return div().into_any_element();
         }
 
-        LoginModal::render_with_entity(login_modal_state, window.viewport_size(), cx)
+        crate::components::auth::render_login_modal(login_modal_state, window.viewport_size(), cx)
     }
 }
 

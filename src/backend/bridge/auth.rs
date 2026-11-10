@@ -37,10 +37,7 @@ pub fn logout() {
 
 /// Get current auth state
 pub fn get_auth_state() -> AuthState {
-    crate::backend::auth::AUTH_STATE
-        .read_or_recover()
-        .clone()
-        .into()
+    crate::backend::auth::AUTH_STATE.read_or_recover().clone()
 }
 
 /// Check if authenticated

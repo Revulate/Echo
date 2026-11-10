@@ -1,4 +1,4 @@
-use crate::{Emote, EmoteProvider};
+use crate::{Emote, EmoteProvider, EmoteScope, emote_scope};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -56,6 +56,11 @@ impl From<Arc<Emote>> for EmoteView {
 }
 
 impl EmoteView {
+    /// Where this emote can be used.
+    pub fn scope(&self) -> EmoteScope<'_> {
+        emote_scope(self.channel.as_deref())
+    }
+
     pub fn matches_backend(&self, other: &Emote) -> bool {
         self.id == other.id
             && self.name == other.name
@@ -82,15 +87,11 @@ impl EmoteView {
     }
 
     pub fn url_shared(&self, selected: &str) -> Arc<str> {
-        if self.url.as_ref() == selected {
-            return Arc::clone(&self.url);
-        }
-        for candidate in [&self.url_1x, &self.url_2x, &self.url_4x] {
-            if let Some(url) = candidate.as_ref().filter(|url| url.as_ref() == selected) {
-                return Arc::clone(url);
-            }
-        }
-        Arc::from(selected)
+        crate::model::shared_variant_url(
+            &self.url,
+            [&self.url_1x, &self.url_2x, &self.url_4x],
+            selected,
+        )
     }
 }
 

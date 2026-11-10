@@ -3,9 +3,8 @@
 //! The canvas renderer's data model, hit testing, and 7TV name-paint recipe are
 //! independent of Echo's settings, theme, and cache runtimes: they only need
 //! GPUI's geometry and text primitives. Keeping them here lets the render
-//! policies compile and be tested without the application shell, while the
-//! application-facing modules under `src/components/chat/canvas_renderer/`
-//! remain compatibility facades over this crate.
+//! policies compile and be tested without the application shell. The
+//! application binds its settings and services through [`ports`].
 
 pub mod font_metrics;
 pub mod hit_mapping;

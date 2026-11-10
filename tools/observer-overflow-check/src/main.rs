@@ -1,15 +1,13 @@
+//! Contract: when a chat observer's bounded event queue overflows
+//! (`src/state/chat_observer.rs`), it keeps the newest events, reports the drop and
+//! forces a refresh from the backend snapshot (`chat_observer_recovery.rs`).
+
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 
-#[macro_export]
-macro_rules! log_irc {
-    ($level:ident, $fmt:literal $(, $arg:expr_2021)* $(,)?) => {{
-        let _ = stringify!($level);
-        let _ = format_args!($fmt $(, $arg)*);
-    }};
-}
+pub(crate) use check_support::category_log as log_irc;
 
 mod backend {
     use super::*;

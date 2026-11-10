@@ -88,7 +88,9 @@ impl Default for CompletionContext {
     }
 }
 
+/// `(spellings, description)` of a command option, e.g. `("--duration, -d", "Poll duration")`.
 pub type CommandOptionSpec = (&'static str, &'static str);
+/// `(value, description)` of one accepted argument value, e.g. `("60", "60 seconds")`.
 pub type CommandValueSpec = (&'static str, &'static str);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,51 +131,54 @@ pub struct CommandArgumentContext {
     pub kind: CommandArgumentKind,
 }
 
-impl CommandArgumentContext {
-    pub fn query(&self) -> String {
-        match self.kind {
-            CommandArgumentKind::Channel => format!(
-                "{} {}{}",
-                self.command, COMMAND_CHANNEL_QUERY_PREFIX, self.prefix
-            ),
-            CommandArgumentKind::MessageId => format!(
-                "{} {}{}",
-                self.command, COMMAND_MESSAGE_QUERY_PREFIX, self.prefix
-            ),
-            CommandArgumentKind::Option => format!("{} {}", self.command, self.prefix),
-            CommandArgumentKind::PredictionOutcome => format!(
-                "{} {}{}",
-                self.command, COMMAND_PREDICTION_OUTCOME_QUERY_PREFIX, self.prefix
-            ),
-            CommandArgumentKind::User => format!(
-                "{} {}{}",
-                self.command, COMMAND_USER_QUERY_PREFIX, self.prefix
-            ),
-            CommandArgumentKind::Value => format!(
-                "{} {}{}",
-                self.command, COMMAND_VALUE_QUERY_PREFIX, self.prefix
-            ),
+impl CommandArgumentKind {
+    /// Kinds whose query carries a marker prefix, in the order
+    /// [`command_argument_kind_from_query`] tests them.
+    const PREFIXED: [Self; 5] = [
+        Self::Channel,
+        Self::MessageId,
+        Self::PredictionOutcome,
+        Self::User,
+        Self::Value,
+    ];
+
+    /// The marker written between the command and the typed fragment of an
+    /// argument query. Options carry none: the fragment itself starts with `-`.
+    pub fn query_prefix(self) -> &'static str {
+        match self {
+            Self::Channel => COMMAND_CHANNEL_QUERY_PREFIX,
+            Self::MessageId => COMMAND_MESSAGE_QUERY_PREFIX,
+            Self::Option => "",
+            Self::PredictionOutcome => COMMAND_PREDICTION_OUTCOME_QUERY_PREFIX,
+            Self::User => COMMAND_USER_QUERY_PREFIX,
+            Self::Value => COMMAND_VALUE_QUERY_PREFIX,
         }
+    }
+}
+
+impl CommandArgumentContext {
+    /// `"{command} {marker}{prefix}"`, decoded again by
+    /// [`command_argument_kind_from_query`].
+    pub fn query(&self) -> String {
+        format!(
+            "{} {}{}",
+            self.command,
+            self.kind.query_prefix(),
+            self.prefix
+        )
     }
 }
 
 pub fn command_argument_kind_from_query(query: &str) -> Option<CommandArgumentKind> {
     let (_, argument_query) = query.split_once(' ')?;
-    if argument_query.starts_with(COMMAND_CHANNEL_QUERY_PREFIX) {
-        Some(CommandArgumentKind::Channel)
-    } else if argument_query.starts_with(COMMAND_MESSAGE_QUERY_PREFIX) {
-        Some(CommandArgumentKind::MessageId)
-    } else if argument_query.starts_with(COMMAND_PREDICTION_OUTCOME_QUERY_PREFIX) {
-        Some(CommandArgumentKind::PredictionOutcome)
-    } else if argument_query.starts_with(COMMAND_USER_QUERY_PREFIX) {
-        Some(CommandArgumentKind::User)
-    } else if argument_query.starts_with(COMMAND_VALUE_QUERY_PREFIX) {
-        Some(CommandArgumentKind::Value)
-    } else if argument_query.starts_with('-') {
-        Some(CommandArgumentKind::Option)
-    } else {
-        None
-    }
+    CommandArgumentKind::PREFIXED
+        .into_iter()
+        .find(|kind| argument_query.starts_with(kind.query_prefix()))
+        .or_else(|| {
+            argument_query
+                .starts_with('-')
+                .then_some(CommandArgumentKind::Option)
+        })
 }
 
 #[derive(Clone, Copy, Debug)]

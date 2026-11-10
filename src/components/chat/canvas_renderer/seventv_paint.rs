@@ -432,118 +432,6 @@ fn cache_gpu_mask(key: CompositeKey, mask: Arc<GpuPaintMask>) {
     drop(retired);
 }
 
-#[cfg(test)]
-mod composite_cache_state_tests {
-    use super::*;
-    use core::prelude::v1::test;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    fn test_key(id: u64) -> CompositeKey {
-        CompositeKey {
-            recipe_hash: id,
-            text_hash: 0,
-            font_size_bits: 0,
-            line_height_bits: 0,
-            scale_bits: 0,
-            fill_image_id: 0,
-            layer: CompositeLayer::Full,
-        }
-    }
-
-    fn test_overlay(width: u32, height: u32) -> OverlaySprite {
-        OverlaySprite {
-            image: Arc::new(CompositeRenderImage(Arc::new(RenderImage::new(vec![
-                Frame::new(RgbaImage::new(width, height)),
-            ])))),
-            offset_x: 0.0,
-            offset_y: 0.0,
-            width: width as f32,
-            height: height as f32,
-        }
-    }
-
-    #[test]
-    fn poison_replaces_inconsistent_cache_with_empty_state() {
-        let cache = Mutex::new(CompositeCache::empty());
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let mut cache = cache.lock().expect("test cache should start healthy");
-            cache.total_bytes = 123;
-            panic!("poison test cache");
-        }));
-
-        assert!(cache.is_poisoned());
-        let (cache_guard, retired) = lock_composite_cache(&cache);
-        assert!(cache_guard.entries.is_empty());
-        assert_eq!(cache_guard.total_bytes, 0);
-        drop(cache_guard);
-        assert_eq!(retired.as_ref().map(|cache| cache.total_bytes), Some(123));
-        drop(retired);
-        assert!(!cache.is_poisoned());
-
-        let (cache_guard, retired) = lock_composite_cache(&cache);
-        assert!(retired.is_none());
-        assert!(cache_guard.entries.is_empty());
-        assert_eq!(cache_guard.total_bytes, 0);
-    }
-
-    #[test]
-    fn replacement_retires_old_owner_and_preserves_accounting() {
-        let mut cache = CompositeCache::empty();
-        let first = test_overlay(1, 1);
-        let old_owner = Arc::downgrade(&first.image);
-
-        assert!(cache.insert(test_key(1), first).is_empty());
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.total_bytes, 4);
-
-        let retired = cache.insert(test_key(1), test_overlay(1, 1));
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.total_bytes, 4);
-        assert_eq!(retired.len(), 1);
-        assert!(old_owner.upgrade().is_some());
-
-        drop(retired);
-        assert!(old_owner.upgrade().is_none());
-    }
-
-    #[test]
-    fn budget_eviction_honors_lru_promotion() {
-        let mut cache = CompositeCache::empty();
-        let byte_budget = 64;
-        for id in 0..16 {
-            assert!(
-                cache
-                    .insert_with_budget(test_key(id), test_overlay(1, 1), byte_budget)
-                    .is_empty()
-            );
-        }
-        assert!(cache.entries.get(&test_key(0)).is_some());
-
-        let retired = cache.insert_with_budget(test_key(16), test_overlay(1, 1), byte_budget);
-        assert_eq!(retired.len(), 1);
-        assert!(cache.entries.peek(&test_key(0)).is_some());
-        assert!(cache.entries.peek(&test_key(1)).is_none());
-        assert!(cache.total_bytes <= byte_budget);
-    }
-
-    #[test]
-    fn oversized_entry_does_not_displace_working_set() {
-        let mut cache = CompositeCache::empty();
-        let byte_budget = 64;
-        assert!(
-            cache
-                .insert_with_budget(test_key(1), test_overlay(1, 1), byte_budget)
-                .is_empty()
-        );
-
-        let retired = cache.insert_with_budget(test_key(2), test_overlay(1, 2), byte_budget);
-        assert_eq!(retired.len(), 1);
-        assert!(cache.entries.peek(&test_key(1)).is_some());
-        assert!(cache.entries.peek(&test_key(2)).is_none());
-        assert_eq!(cache.total_bytes, 4);
-    }
-}
-
 /// Resolve (composite or fetch from cache) the exact paint overlay for a shaped
 /// username line. Image-texture paints still produce a `currentColor`
 /// composite while their source frame downloads/decodes, then naturally move
@@ -646,9 +534,8 @@ pub fn overlay_for_line(
 
 /// `ECHO_GPU_NAME_PAINT=0` composites every name paint on the CPU.
 fn gpu_name_paint_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("ECHO_GPU_NAME_PAINT").map_or(true, |value| value.trim() != "0")
-    });
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| echo_core::env::flag_or("ECHO_GPU_NAME_PAINT", true));
     *ENABLED
 }
 
@@ -941,23 +828,19 @@ fn resolve_fill_images(paint: &SevenTvNamePaint) -> (SmallVec<[Option<Arc<Render
 
         let animated = layer.image_is_animated || is_animated_url(url);
         if animated {
-            if let Some((image, _, frame_idx)) =
-                image_cache::get_current_animated_render_image_with_metadata_and_frame(url)
+            if let Some(frame) = image_cache::animated_frame(url, image_cache::FrameQuery::Current)
             {
                 ANIMATED_FRAME.hash(&mut identity);
                 url.hash(&mut identity);
-                frame_idx.hash(&mut identity);
-                images.push(Some(image));
+                frame.index.hash(&mut identity);
+                images.push(Some(frame.image));
                 continue;
             }
             if matches!(
                 image_cache::get_animated_cache_state(url),
                 image_cache::AnimatedCacheState::NotLoaded
             ) {
-                image_cache::trigger_animated_decode_with_source(
-                    url,
-                    image_cache::PreloadSource::VisibleChat,
-                );
+                image_cache::trigger_animated_decode(url, image_cache::PreloadSource::VisibleChat);
             }
         }
         if let Some(image) = image_cache::get_cached_render_image(url) {
@@ -967,10 +850,7 @@ fn resolve_fill_images(paint: &SevenTvNamePaint) -> (SmallVec<[Option<Arc<Render
             continue;
         }
 
-        image_cache::trigger_preload_single_with_source(
-            url,
-            image_cache::PreloadSource::VisibleChat,
-        );
+        image_cache::trigger_preload_single(url, image_cache::PreloadSource::VisibleChat);
         NO_TEXTURE.hash(&mut identity);
         images.push(None);
     }
@@ -1716,5 +1596,117 @@ fn box_blur_vertical(src: &[f32], dst: &mut [f32], width: usize, height: usize, 
                 acc -= src[(y - radius) * width + x];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod composite_cache_state_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn test_key(id: u64) -> CompositeKey {
+        CompositeKey {
+            recipe_hash: id,
+            text_hash: 0,
+            font_size_bits: 0,
+            line_height_bits: 0,
+            scale_bits: 0,
+            fill_image_id: 0,
+            layer: CompositeLayer::Full,
+        }
+    }
+
+    fn test_overlay(width: u32, height: u32) -> OverlaySprite {
+        OverlaySprite {
+            image: Arc::new(CompositeRenderImage(Arc::new(RenderImage::new(vec![
+                Frame::new(RgbaImage::new(width, height)),
+            ])))),
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: width as f32,
+            height: height as f32,
+        }
+    }
+
+    #[test]
+    fn poison_replaces_inconsistent_cache_with_empty_state() {
+        let cache = Mutex::new(CompositeCache::empty());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let mut cache = cache.lock().expect("test cache should start healthy");
+            cache.total_bytes = 123;
+            panic!("poison test cache");
+        }));
+
+        assert!(cache.is_poisoned());
+        let (cache_guard, retired) = lock_composite_cache(&cache);
+        assert!(cache_guard.entries.is_empty());
+        assert_eq!(cache_guard.total_bytes, 0);
+        drop(cache_guard);
+        assert_eq!(retired.as_ref().map(|cache| cache.total_bytes), Some(123));
+        drop(retired);
+        assert!(!cache.is_poisoned());
+
+        let (cache_guard, retired) = lock_composite_cache(&cache);
+        assert!(retired.is_none());
+        assert!(cache_guard.entries.is_empty());
+        assert_eq!(cache_guard.total_bytes, 0);
+    }
+
+    #[test]
+    fn replacement_retires_old_owner_and_preserves_accounting() {
+        let mut cache = CompositeCache::empty();
+        let first = test_overlay(1, 1);
+        let old_owner = Arc::downgrade(&first.image);
+
+        assert!(cache.insert(test_key(1), first).is_empty());
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.total_bytes, 4);
+
+        let retired = cache.insert(test_key(1), test_overlay(1, 1));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.total_bytes, 4);
+        assert_eq!(retired.len(), 1);
+        assert!(old_owner.upgrade().is_some());
+
+        drop(retired);
+        assert!(old_owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn budget_eviction_honors_lru_promotion() {
+        let mut cache = CompositeCache::empty();
+        let byte_budget = 64;
+        for id in 0..16 {
+            assert!(
+                cache
+                    .insert_with_budget(test_key(id), test_overlay(1, 1), byte_budget)
+                    .is_empty()
+            );
+        }
+        assert!(cache.entries.get(&test_key(0)).is_some());
+
+        let retired = cache.insert_with_budget(test_key(16), test_overlay(1, 1), byte_budget);
+        assert_eq!(retired.len(), 1);
+        assert!(cache.entries.peek(&test_key(0)).is_some());
+        assert!(cache.entries.peek(&test_key(1)).is_none());
+        assert!(cache.total_bytes <= byte_budget);
+    }
+
+    #[test]
+    fn oversized_entry_does_not_displace_working_set() {
+        let mut cache = CompositeCache::empty();
+        let byte_budget = 64;
+        assert!(
+            cache
+                .insert_with_budget(test_key(1), test_overlay(1, 1), byte_budget)
+                .is_empty()
+        );
+
+        let retired = cache.insert_with_budget(test_key(2), test_overlay(1, 2), byte_budget);
+        assert_eq!(retired.len(), 1);
+        assert!(cache.entries.peek(&test_key(1)).is_some());
+        assert!(cache.entries.peek(&test_key(2)).is_none());
+        assert_eq!(cache.total_bytes, 4);
     }
 }

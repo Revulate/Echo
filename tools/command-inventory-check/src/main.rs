@@ -1,3 +1,8 @@
+//! Contract: every command dispatched in `src/backend/commands/mod.rs` has an
+//! autocomplete spec, and the local, suspicious-user and poll/prediction option
+//! inventories match that file's source text.
+
+use check_support::{FIXTURE_HEADER, assert_fixture};
 use std::collections::BTreeSet;
 
 const COMMANDS_MOD: &str = include_str!("../../../src/backend/commands/mod.rs");
@@ -86,40 +91,40 @@ fn main() {
         "completeprediction outcome completion",
     );
 
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
     print_set_row("command_autocomplete_spec_count", &specs);
     print_set_row("command_dispatch_arm_count", &dispatch);
-    print_fixture(
+    assert_fixture(
         "command_dispatch_specs_missing",
-        &missing_specs.join("|"),
+        missing_specs.join("|"),
         "",
     );
-    print_fixture(
+    assert_fixture(
         "command_poll_option_inventory",
-        &option_summary("POLL_COMMAND_OPTIONS", POLL_OPTIONS),
+        option_summary("POLL_COMMAND_OPTIONS", POLL_OPTIONS),
         "--title|--choice|--duration|--points",
     );
-    print_fixture(
+    assert_fixture(
         "command_prediction_option_inventory",
-        &option_summary("PREDICTION_COMMAND_OPTIONS", PREDICTION_OPTIONS),
+        option_summary("PREDICTION_COMMAND_OPTIONS", PREDICTION_OPTIONS),
         "--title|--choice|--duration",
     );
-    print_fixture(
+    assert_fixture(
         "command_completeprediction_option_inventory",
-        &option_summary(
+        option_summary(
             "COMPLETE_PREDICTION_COMMAND_OPTIONS",
             COMPLETE_PREDICTION_OPTIONS,
         ),
         "--choice|--index",
     );
-    print_fixture(
+    assert_fixture(
         "command_suspicious_user_inventory",
-        &presence_summary(&specs, &dispatch, SUSPICIOUS_USER_COMMANDS),
+        presence_summary(&specs, &dispatch, SUSPICIOUS_USER_COMMANDS),
         "automod:spec+dispatch|lowtrust:spec+dispatch|monitor:spec+dispatch|restrict:spec+dispatch|unmonitor:spec+dispatch|unrestrict:spec+dispatch",
     );
-    print_fixture(
+    assert_fixture(
         "command_local_inventory",
-        &presence_summary(&specs, &dispatch, LOCAL_COMMANDS),
+        presence_summary(&specs, &dispatch, LOCAL_COMMANDS),
         "clearmessages:spec+dispatch|copy:spec+dispatch|debug-args:spec+dispatch|debug-disable-logfile:spec+dispatch|debug-enable-logfile:spec+dispatch|debug-env:spec+dispatch|debug-relaunch-with-logfile:spec+dispatch|fakemsg:spec+dispatch|follow:spec+dispatch|openurl:spec+dispatch|popout:spec+dispatch|popup:spec+dispatch|r:spec+dispatch|reply:spec+dispatch|requests:spec+dispatch|streamlink:spec+dispatch|themefile:spec+dispatch|themefile-export:spec+dispatch|uptime:spec+dispatch|user:spec+dispatch|usercard:spec+dispatch|w:spec+dispatch",
     );
 }
@@ -246,17 +251,5 @@ fn string_literals(source: &str) -> Vec<&str> {
 }
 
 fn print_set_row(name: &str, values: &BTreeSet<String>) {
-    let joined = values.iter().cloned().collect::<Vec<_>>().join("|");
-    println!("fixture,{name},{},{}", values.len(), checksum(&joined));
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
-}
-
-fn checksum(value: &str) -> u64 {
-    value
-        .bytes()
-        .fold(0u64, |sum, byte| sum.wrapping_add(byte as u64))
+    println!("count,{name},{}", values.len());
 }

@@ -102,8 +102,8 @@ fn execute_custom_hotkey_action(app: &mut EchoApp, command: &str, cx: &mut Conte
         let active_tab = app_state.active_tab();
         active_tab
             .layout
-            .get_channel_at_path(&active_path)
-            .zip(active_tab.layout.get_split_id_at_path(&active_path))
+            .channel_at_path(&active_path)
+            .zip(active_tab.layout.split_id_at_path(&active_path))
     };
 
     let Some((target_channel, split_id)) = target else {
@@ -122,8 +122,7 @@ fn execute_custom_hotkey_action(app: &mut EchoApp, command: &str, cx: &mut Conte
         .chat_input_renderer
         .read(cx)
         .input_manager
-        .input_texts
-        .get(&split_id)
+        .draft(split_id)
         .cloned()
         .unwrap_or_default();
     let username = backend::settings::get_username().unwrap_or_default();
@@ -144,12 +143,7 @@ fn execute_custom_hotkey_action(app: &mut EchoApp, command: &str, cx: &mut Conte
 /// Register all event handlers for the application.
 ///
 /// This includes keyboard shortcuts, mouse handlers, and modifier tracking.
-pub fn register_event_handlers(
-    _app: &mut EchoApp,
-    element: Stateful<Div>,
-    _window: &mut Window,
-    cx: &mut Context<EchoApp>,
-) -> Stateful<Div> {
+pub fn register_event_handlers(element: Stateful<Div>, cx: &mut Context<EchoApp>) -> Stateful<Div> {
     element
         .can_drop({
             let app = cx.weak_entity();
@@ -183,39 +177,6 @@ pub fn register_event_handlers(
             );
             cx.notify();
         }))
-        .on_action(
-            cx.listener(|this, _: &crate::app::actions::OpenSettings, _window, cx| {
-                this.open_settings(None, cx);
-            }),
-        )
-        .on_action(
-            cx.listener(|this, _: &crate::app::actions::OpenSearch, _window, cx| {
-                open_search_for_active_tab(this, cx);
-            }),
-        )
-        .on_action(
-            cx.listener(|this, _: &crate::app::actions::CloseTab, _window, cx| {
-                dismiss_tab_transients(this, cx);
-                this.close_current_tab(cx);
-            }),
-        )
-        .on_action(
-            cx.listener(|this, _: &crate::app::actions::NextTab, _window, cx| {
-                dismiss_tab_transients(this, cx);
-                this.next_tab(cx);
-            }),
-        )
-        .on_action(
-            cx.listener(|this, _: &crate::app::actions::PrevTab, _window, cx| {
-                dismiss_tab_transients(this, cx);
-                this.prev_tab(cx);
-            }),
-        )
-        .on_action(
-            cx.listener(|this, _: &crate::app::actions::FocusInput, window, cx| {
-                this.focus_input(window, cx);
-            }),
-        )
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             frame_rate_controller::record_interaction();
 
@@ -227,10 +188,7 @@ pub fn register_event_handlers(
                 .split_layout
                 .update(cx, |layout, _| layout.update_modifiers(ctrl, alt));
             let pause_changed = this.sync_chat_pause_modifiers(
-                ctrl,
-                alt,
-                event.keystroke.modifiers.shift,
-                event.keystroke.modifiers.platform,
+                &event.keystroke.modifiers,
                 window.is_window_active(),
                 cx,
             );
@@ -569,7 +527,7 @@ pub fn register_event_handlers(
                     .read(cx)
                     .active_tab()
                     .layout
-                    .get_split_id_at_path(&path);
+                    .split_id_at_path(&path);
                 if let Some(split_id) = split_id
                     && this
                         .chat_input_renderer
@@ -616,7 +574,7 @@ pub fn register_event_handlers(
                     .read(cx)
                     .active_tab()
                     .layout
-                    .get_split_id_at_path(&active_path);
+                    .split_id_at_path(&active_path);
                 active_split_id
                     .and_then(|split_id| this.split_panes.get(&split_id))
                     .is_some_and(|pane| pane.read(cx).focus_handle.is_focused(window))
@@ -646,8 +604,9 @@ pub fn register_event_handlers(
                 }
             }
 
-            let (has_mentions_sidebar, has_whispers_sidebar) =
-                this.app_state.read(cx).activity_hotkey_scope();
+            let app_state = this.app_state.read(cx);
+            let has_mentions_sidebar = app_state.activity_section_open(ActivitySection::Mentions);
+            let has_whispers_sidebar = app_state.activity_section_open(ActivitySection::Whispers);
             let hotkey_context = HotkeyMatchContext {
                 allow_global: true,
                 has_active_split: get_active_channel(this, cx).is_some(),
@@ -726,10 +685,7 @@ pub fn register_event_handlers(
             });
 
             let pause_changed = this.sync_chat_pause_modifiers(
-                ctrl,
-                alt,
-                event.keystroke.modifiers.shift,
-                event.keystroke.modifiers.platform,
+                &event.keystroke.modifiers,
                 window.is_window_active(),
                 cx,
             );
@@ -753,14 +709,8 @@ pub fn register_event_handlers(
                     changed
                 });
 
-                let pause_changed = this.sync_chat_pause_modifiers(
-                    ctrl,
-                    alt,
-                    event.modifiers.shift,
-                    event.modifiers.platform,
-                    window.is_window_active(),
-                    cx,
-                );
+                let pause_changed =
+                    this.sync_chat_pause_modifiers(&event.modifiers, window.is_window_active(), cx);
                 if mode_changed || pause_changed {
                     cx.notify();
                 }
@@ -802,14 +752,8 @@ pub fn register_event_handlers(
                 (changed, layout.is_dragging_pane())
             });
 
-            let pause_changed = this.sync_chat_pause_modifiers(
-                ctrl,
-                alt,
-                modifiers.shift,
-                modifiers.platform,
-                window.is_window_active(),
-                cx,
-            );
+            let pause_changed =
+                this.sync_chat_pause_modifiers(&modifiers, window.is_window_active(), cx);
             if mode_changed || pause_changed || tooltip_moved {
                 cx.notify();
             }
@@ -831,10 +775,9 @@ pub fn register_event_handlers(
         )
 }
 
-/// Dispatch a hotkey action to the appropriate handler
+/// Dispatch a hotkey action to the appropriate handler.
 ///
-/// This function is the central dispatcher for all hotkey actions.
-/// It was extracted from EchoApp to reduce app.rs LOC.
+/// This is the central dispatcher for all hotkey actions.
 pub fn dispatch_hotkey_action(
     app: &mut EchoApp,
     action: HotkeyAction,
@@ -1261,7 +1204,7 @@ pub fn dispatch_hotkey_action(
 
             cx.spawn(async move |_this, cx| {
                 cx.update(|cx| {
-                    crate::components::overlay::toggle_overlay_window(channel, cx);
+                    crate::components::streamer_overlay::toggle_overlay_window(channel, cx);
                 });
             })
             .detach();
@@ -1449,7 +1392,7 @@ fn get_active_channel(app: &EchoApp, cx: &Context<EchoApp>) -> Option<String> {
         .read(cx)
         .active_tab()
         .layout
-        .get_channel_at_path(active_path)
+        .channel_at_path(active_path)
 }
 
 fn get_normalized_active_channel(app: &EchoApp, cx: &Context<EchoApp>) -> Option<String> {

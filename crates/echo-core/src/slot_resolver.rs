@@ -6,9 +6,8 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use echo_emote_core::{
-    Emote, EmoteProvider, normalize_channel_key, twitch_emote_url, twitch_emote_url_with_scale,
-};
+use crate::channel_identity::normalize_channel_key;
+use echo_emote_core::{Emote, EmoteProvider, twitch_emote_url, twitch_emote_url_with_scale};
 use echo_text_core::{EmojiStyle, get_emoji_url};
 
 use crate::slot::MessageSlot;

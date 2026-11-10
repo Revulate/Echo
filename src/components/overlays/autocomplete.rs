@@ -8,7 +8,7 @@
 //! Features fuzzy search with word boundary bonuses, compact emote previews,
 //! and quiet provider/scope labels.
 
-use super::emote_picker_core::{
+use super::emote_picker::{
     EmoteScope, EmoteSearchIndex, RankedEmote, build_picker_emoji_emotes,
     emote_display_url_at_height,
 };
@@ -17,6 +17,7 @@ use crate::backend::commands::{
     COMMAND_AUTOCOMPLETE_SPECS, CommandArgumentCompletion, CommandAutocompleteSpec,
     CommandValueSpec,
 };
+use crate::backend::irc::ObservedChatter;
 use crate::backend::{self, EmoteProvider};
 use crate::cache::disk_layer::MediaSourceId;
 use crate::cache::loader as image_cache;
@@ -406,82 +407,42 @@ impl Autocomplete {
     }
 
     /// Return the uncapped, frozen candidate set used by inline Tab
-    /// completion. This deliberately differs from the compact visual popup:
-    /// cycling is prefix-only, de-duplicates provider aliases
-    /// by insertion text, puts emotes before users, and keeps bare usernames
-    /// bare instead of adding `@`.
+    /// completion for the open popup state. See [`Self::tab_candidates`].
     pub fn inline_tab_candidates(&self) -> Vec<InlineTabCompletionCandidate> {
-        if self.state.ac_type != AutocompleteType::Tab
-            || self.state.channel.is_empty()
-            || self.state.query.chars().count() < 2
-        {
+        if self.state.ac_type != AutocompleteType::Tab {
             return Vec::new();
         }
+        collect_tab_candidates(
+            self.emote_search_index.as_ref(),
+            &self.state.channel,
+            &self.state.query,
+            self.state.context.replacement_range.start,
+        )
+    }
 
-        let query = self.state.query.to_lowercase();
-        let mut candidates = Vec::new();
-        let mut inserted_text = HashSet::new();
-
-        if let Some(index) = self.emote_search_index.as_ref() {
-            for ranked in index.rank_prefix(&self.state.query) {
-                debug_assert!(ranked.is_prefix_match);
-                let text = ranked.emote.name.to_string();
-                if inserted_text.insert(text.clone()) {
-                    candidates.push(InlineTabCompletionCandidate {
-                        text,
-                        is_emote: true,
-                    });
-                }
-            }
+    /// Build the inline Tab completion candidates for `context` in `channel`
+    /// without opening the popup: only the emote search index cache is
+    /// refreshed, the popup state and suggestions are left untouched.
+    ///
+    /// This deliberately differs from the compact visual popup: cycling is
+    /// prefix-only, de-duplicates provider aliases by insertion text, puts
+    /// emotes before users, and keeps bare usernames bare instead of adding
+    /// `@`.
+    pub fn tab_candidates(
+        &mut self,
+        channel: &str,
+        context: &CompletionContext,
+    ) -> Vec<InlineTabCompletionCandidate> {
+        if context.ac_type != AutocompleteType::Tab {
+            return Vec::new();
         }
-
-        if crate::backend::settings::get_tab_complete_usernames() {
-            let mut chatters =
-                backend::irc::get_ranked_chatters(&self.state.channel, &query, usize::MAX);
-            let broadcaster_login = self
-                .state
-                .channel
-                .trim_start_matches('#')
-                .to_ascii_lowercase();
-            if !broadcaster_login.is_empty()
-                && broadcaster_login.starts_with(&query)
-                && !chatters
-                    .iter()
-                    .any(|(login, _, _)| login.eq_ignore_ascii_case(&broadcaster_login))
-            {
-                chatters.push((
-                    broadcaster_login.clone(),
-                    self.state.channel.trim_start_matches('#').to_string(),
-                    None,
-                ));
-            }
-
-            let first_word = self.state.context.replacement_range.start == 0;
-            let comma = first_word && crate::backend::settings::get_mention_users_with_comma();
-            let mut seen_logins = HashSet::new();
-            for (login, display, _) in chatters {
-                let login_lower = login.to_lowercase();
-                if !seen_logins.insert(login_lower) {
-                    continue;
-                }
-                let mut text = if display.trim().is_empty() {
-                    login
-                } else {
-                    display
-                };
-                if comma {
-                    text.push(',');
-                }
-                if inserted_text.insert(text.clone()) {
-                    candidates.push(InlineTabCompletionCandidate {
-                        text,
-                        is_emote: false,
-                    });
-                }
-            }
-        }
-
-        candidates
+        self.ensure_emote_search_index(channel, context.ac_type, emote_generations(channel));
+        collect_tab_candidates(
+            self.emote_search_index.as_ref(),
+            channel,
+            &context.query,
+            context.replacement_range.start,
+        )
     }
 
     /// Refresh cached emote-backed suggestions without disturbing other autocomplete modes.
@@ -499,7 +460,7 @@ impl Autocomplete {
             return false;
         }
 
-        let generations = self.current_emote_generations();
+        let generations = emote_generations(&self.state.channel);
         if self.last_emote_generations == Some(generations)
             && self.suggestions_scale_bits
                 == crate::components::chat::canvas_renderer::layout_scale::current_bits()
@@ -534,9 +495,10 @@ impl Autocomplete {
             self.state.ac_type,
             AutocompleteType::Emote | AutocompleteType::Tab
         );
-        let emote_generations = emote_backed.then(|| self.current_emote_generations());
+        let emote_generations = emote_backed.then(|| emote_generations(&self.state.channel));
         if let Some(generations) = emote_generations {
-            self.ensure_emote_search_index(generations);
+            let channel = self.state.channel.clone();
+            self.ensure_emote_search_index(&channel, self.state.ac_type, generations);
         }
         self.suggestions = match self.state.ac_type {
             AutocompleteType::Emote => self.get_emote_suggestions(),
@@ -566,7 +528,7 @@ impl Autocomplete {
             };
             if suggestion.is_animated {
                 if image_cache::get_current_animated_render_image(url).is_none() {
-                    image_cache::trigger_animated_decode_media_with_source(
+                    image_cache::trigger_animated_decode_media(
                         url,
                         suggestion.media_identity.clone(),
                         image_cache::PreloadSource::AutocompleteVisible,
@@ -580,7 +542,7 @@ impl Autocomplete {
             }
         }
         if !stills.is_empty() {
-            image_cache::trigger_preload_media_with_source(
+            image_cache::trigger_preload_media(
                 stills,
                 image_cache::PreloadSource::AutocompleteVisible,
             );
@@ -611,45 +573,39 @@ impl Autocomplete {
         self.suggestion_revision = self.suggestion_revision.wrapping_add(1);
     }
 
-    fn current_emote_generations(&self) -> (u32, u32, u64, u64) {
-        let channel = if self.state.channel.is_empty() {
-            0
-        } else {
-            crate::backend::emotes::get_emote_cache_version(&self.state.channel)
-        };
-        let global = crate::backend::emotes::get_global_emote_version();
-        let user = crate::state::VersionRegistry::user_emote_version();
-        let layout = crate::backend::settings::get_layout_settings_version();
-        (channel, global, user, layout)
-    }
-
-    fn ensure_emote_search_index(&mut self, generations: (u32, u32, u64, u64)) {
-        if self.state.channel.is_empty() {
+    fn ensure_emote_search_index(
+        &mut self,
+        channel: &str,
+        ac_type: AutocompleteType,
+        generations: (u32, u32, u64, u64),
+    ) {
+        if channel.is_empty() {
             self.emote_search_index = None;
             self.emote_index_channel.clear();
             self.emote_index_generations = Some(generations);
             return;
         }
 
-        let include_emoji = self.state.ac_type == AutocompleteType::Emote
+        let include_emoji = ac_type == AutocompleteType::Emote
             && crate::backend::emotes::emote_provider_enabled(EmoteProvider::Emoji);
         if self.emote_index_generations == Some(generations)
             && self.emote_index_includes_emoji == include_emoji
-            && self.emote_index_channel == self.state.channel
+            && self.emote_index_channel == channel
             && self.emote_search_index.is_some()
         {
             return;
         }
 
-        let mut emotes = backend::get_all_emotes(&self.state.channel);
+        let mut emotes = backend::get_all_emotes(channel);
         if include_emoji {
             emotes.extend(build_picker_emoji_emotes(
                 crate::backend::settings::get_emoji_style(),
             ));
         }
         self.emote_index_includes_emoji = include_emoji;
-        self.emote_search_index = Some(EmoteSearchIndex::new(&self.state.channel, emotes));
-        self.emote_index_channel.clone_from(&self.state.channel);
+        self.emote_search_index = Some(EmoteSearchIndex::new(channel, emotes));
+        self.emote_index_channel.clear();
+        self.emote_index_channel.push_str(channel);
         self.emote_index_generations = Some(generations);
     }
 
@@ -681,22 +637,19 @@ impl Autocomplete {
             usize::MAX
         };
         let mut chatters = backend::irc::get_ranked_chatters(&self.state.channel, &query, limit);
-        let broadcaster_login = self
-            .state
-            .channel
-            .trim_start_matches('#')
-            .to_ascii_lowercase();
+        let broadcaster_login =
+            echo_core::channel_identity::normalize_channel_key(&self.state.channel);
         if !broadcaster_login.is_empty()
             && (query.is_empty() || broadcaster_login.starts_with(&query))
             && !chatters
                 .iter()
-                .any(|(login, _, _)| login.eq_ignore_ascii_case(&broadcaster_login))
+                .any(|chatter| chatter.login.eq_ignore_ascii_case(&broadcaster_login))
         {
-            chatters.push((
-                broadcaster_login.clone(),
-                self.state.channel.trim_start_matches('#').to_string(),
-                None,
-            ));
+            chatters.push(ObservedChatter {
+                login: broadcaster_login.clone(),
+                display_name: self.state.channel.trim_start_matches('#').to_string(),
+                color: None,
+            });
         }
 
         prioritize_exact_chatter_matches(&mut chatters, &query);
@@ -706,7 +659,12 @@ impl Autocomplete {
             .into_iter()
             .enumerate()
             .take(MAX_SUGGESTIONS)
-            .map(|(index, (login, display, color))| {
+            .map(|(index, chatter)| {
+                let ObservedChatter {
+                    login,
+                    display_name: display,
+                    color,
+                } = chatter;
                 let display = if display.trim().is_empty() {
                     login.clone()
                 } else {
@@ -931,11 +889,16 @@ impl Autocomplete {
             .into_iter()
             .enumerate()
             .take(MAX_SUGGESTIONS)
-            .map(|(index, (login, display, color))| AutocompleteSuggestion {
-                text: login.clone(),
+            .map(|(index, chatter)| AutocompleteSuggestion {
+                text: chatter.login.clone(),
                 image_url: None,
-                subtitle: command_user_subtitle(command, &login, &display, show_descriptions),
-                color,
+                subtitle: command_user_subtitle(
+                    command,
+                    &chatter.login,
+                    &chatter.display_name,
+                    show_descriptions,
+                ),
+                color: chatter.color,
                 provider: None,
                 emote_type: None,
                 is_animated: false,
@@ -1374,16 +1337,14 @@ fn command_matches_exact_query(command: &str, query: &str) -> bool {
             .is_some_and(|command| command.eq_ignore_ascii_case(query))
 }
 
-fn prioritize_exact_chatter_matches(
-    chatters: &mut [(String, String, Option<String>)],
-    query: &str,
-) {
+fn prioritize_exact_chatter_matches(chatters: &mut [ObservedChatter], query: &str) {
     if query.is_empty() {
         return;
     }
 
-    chatters.sort_by_key(|(login, display, _)| {
-        !(chatter_matches_exact_query(login, query) || chatter_matches_exact_query(display, query))
+    chatters.sort_by_key(|chatter| {
+        !(chatter_matches_exact_query(&chatter.login, query)
+            || chatter_matches_exact_query(&chatter.display_name, query))
     });
 }
 
@@ -1596,4 +1557,97 @@ fn command_entry(name: &str) -> Option<&'static CommandAutocompleteSpec> {
     COMMAND_AUTOCOMPLETE_SPECS
         .iter()
         .find(|command| command.name.eq_ignore_ascii_case(name))
+}
+
+/// Prefix-ranked emotes first, then (when enabled) chatters and the
+/// broadcaster, de-duplicated by inserted text. Queries shorter than two
+/// characters produce nothing.
+fn collect_tab_candidates(
+    emote_index: Option<&EmoteSearchIndex>,
+    channel: &str,
+    query_text: &str,
+    replacement_start: usize,
+) -> Vec<InlineTabCompletionCandidate> {
+    if channel.is_empty() || query_text.chars().count() < 2 {
+        return Vec::new();
+    }
+
+    let query = query_text.to_lowercase();
+    let mut candidates = Vec::new();
+    let mut inserted_text = HashSet::new();
+
+    if let Some(index) = emote_index {
+        for ranked in index.rank_prefix(query_text) {
+            debug_assert!(ranked.is_prefix_match);
+            let text = ranked.emote.name.to_string();
+            if inserted_text.insert(text.clone()) {
+                candidates.push(InlineTabCompletionCandidate {
+                    text,
+                    is_emote: true,
+                });
+            }
+        }
+    }
+
+    if crate::backend::settings::get_tab_complete_usernames() {
+        let mut chatters = backend::irc::get_ranked_chatters(channel, &query, usize::MAX);
+        let broadcaster_login = echo_core::channel_identity::normalize_channel_key(channel);
+        if !broadcaster_login.is_empty()
+            && broadcaster_login.starts_with(&query)
+            && !chatters
+                .iter()
+                .any(|chatter| chatter.login.eq_ignore_ascii_case(&broadcaster_login))
+        {
+            chatters.push(ObservedChatter {
+                login: broadcaster_login.clone(),
+                display_name: channel.trim_start_matches('#').to_string(),
+                color: None,
+            });
+        }
+
+        let first_word = replacement_start == 0;
+        let comma = first_word && crate::backend::settings::get_mention_users_with_comma();
+        let mut seen_logins = HashSet::new();
+        for ObservedChatter {
+            login,
+            display_name: display,
+            ..
+        } in chatters
+        {
+            let login_lower = login.to_lowercase();
+            if !seen_logins.insert(login_lower) {
+                continue;
+            }
+            let mut text = if display.trim().is_empty() {
+                login
+            } else {
+                display
+            };
+            if comma {
+                text.push(',');
+            }
+            if inserted_text.insert(text.clone()) {
+                candidates.push(InlineTabCompletionCandidate {
+                    text,
+                    is_emote: false,
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Version stamps that invalidate emote-backed suggestions for `channel`:
+/// channel emotes, global emotes, user emotes and layout settings.
+fn emote_generations(channel: &str) -> (u32, u32, u64, u64) {
+    let channel = if channel.is_empty() {
+        0
+    } else {
+        crate::backend::emotes::get_emote_cache_version(channel)
+    };
+    let global = crate::backend::emotes::get_global_emote_version();
+    let user = crate::state::VersionRegistry::user_emote_version();
+    let layout = crate::backend::settings::get_layout_settings_version();
+    (channel, global, user, layout)
 }

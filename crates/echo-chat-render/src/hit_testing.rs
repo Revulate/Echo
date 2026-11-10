@@ -30,7 +30,7 @@ const TARGET_CELL_COUNT: usize = 20;
 
 /// Spatial grid for efficient hitbox lookups
 /// Partitions the viewport into horizontal bands for O(n/k) search instead of O(n)
-/// PERF: Uses adaptive cell sizing based on viewport height
+/// Uses adaptive cell sizing based on viewport height
 #[derive(Debug)]
 pub struct HitboxGrid {
     /// Grid cells containing indices into hitboxes vec
@@ -92,7 +92,7 @@ impl Default for HitboxGrid {
 // ============================================================================
 
 /// Manager for tracking hitboxes during paint
-/// PERF: Caches hitboxes between frames when visible range hasn't changed
+/// Caches hitboxes between frames when visible range hasn't changed
 #[derive(Debug, Default)]
 pub struct HitboxManager {
     /// Active hitboxes from current frame
@@ -119,7 +119,7 @@ impl HitboxManager {
         Self::default()
     }
 
-    /// PERF: Check if cache is still valid for current view state
+    /// Check if cache is still valid for current view state
     /// Returns true if hitboxes don't need to be rebuilt
     /// Note: Scroll threshold removed - hitboxes store viewport-relative Y positions
     /// so they must be rebuilt on ANY scroll change to stay accurate for hit testing
@@ -138,7 +138,7 @@ impl HitboxManager {
             && !self.hitboxes.is_empty()
     }
 
-    /// PERF: Mark cache as valid for current state (call after rebuilding hitboxes)
+    /// Mark cache as valid for current state (call after rebuilding hitboxes)
     #[inline]
     pub fn validate_cache(&mut self, start: usize, end: usize, scroll: f32) {
         self.cached_visible_range = Some((start, end));

@@ -1,3 +1,5 @@
+//! Link-embed thumbnail modes and the sizes they render at.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

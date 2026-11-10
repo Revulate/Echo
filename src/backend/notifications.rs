@@ -316,10 +316,9 @@ pub fn notify_twitch_event(event: &TwitchEvent) {
         return;
     }
 
-    let shared_event_type: crate::backend::types::TwitchEventType = event.event_type.clone().into();
     let title = format!(
         "{} in #{}",
-        twitch_event_title_core(&shared_event_type),
+        twitch_event_title_core(&event.event_type),
         event.channel
     );
     let body = truncate_message(&twitch_event_notification_body(event), 100);
@@ -465,8 +464,7 @@ fn twitch_event_notification_body(event: &TwitchEvent) -> String {
 }
 
 fn shared_privacy_event_text(event: &TwitchEvent) -> String {
-    let shared_event: crate::backend::types::TwitchEvent = event.clone().into();
-    format_twitch_event_text_core(&shared_event, streamer_mode_twitch_event_privacy())
+    format_twitch_event_text_core(event, streamer_mode_twitch_event_privacy())
 }
 
 /// Internal function to send a notification
@@ -497,117 +495,119 @@ fn show_notification_blocking(title: &str, body: &str) -> bool {
         return false;
     }
 
-    #[cfg(target_os = "windows")]
+    deliver_notification(title, body)
+}
+
+#[cfg(target_os = "windows")]
+fn deliver_notification(title: &str, body: &str) -> bool {
+    use notify_rust::Notification;
+    match Notification::new()
+        .summary(title)
+        .body(body)
+        .appname("Echo")
+        .show()
     {
-        use notify_rust::Notification;
-        match Notification::new()
-            .summary(title)
-            .body(body)
-            .appname("Echo")
-            .show()
-        {
-            Ok(_) => {
-                update_delivery_state(Some("Windows toast notifications"), None);
-                return true;
-            }
-            Err(e) => {
-                let issue = format!("Windows toast delivery failed: {e}");
-                update_delivery_state(None, Some(issue.clone()));
-                crate::log_ui!(warn, "{}", issue);
-                return false;
-            }
+        Ok(_) => {
+            update_delivery_state(Some("Windows toast notifications"), None);
+            true
+        }
+        Err(e) => {
+            let issue = format!("Windows toast delivery failed: {e}");
+            update_delivery_state(None, Some(issue.clone()));
+            crate::log_ui!(warn, "{}", issue);
+            false
         }
     }
+}
 
-    #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
+fn deliver_notification(title: &str, body: &str) -> bool {
+    match std::process::Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "display notification \"{}\" with title \"{}\"",
+                body.replace("\"", "\\\""),
+                title.replace("\"", "\\\"")
+            ),
+        ])
+        .spawn()
     {
-        match std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!(
-                    "display notification \"{}\" with title \"{}\"",
-                    body.replace("\"", "\\\""),
-                    title.replace("\"", "\\\"")
-                ),
-            ])
-            .spawn()
-        {
-            Ok(_) => {
-                update_delivery_state(Some("macOS Notification Center"), None);
-                return true;
-            }
-            Err(e) => {
-                let issue = format!("osascript delivery failed: {e}");
-                update_delivery_state(None, Some(issue.clone()));
-                crate::log_ui!(warn, "{}", issue);
-                return false;
-            }
+        Ok(_) => {
+            update_delivery_state(Some("macOS Notification Center"), None);
+            true
+        }
+        Err(e) => {
+            let issue = format!("osascript delivery failed: {e}");
+            update_delivery_state(None, Some(issue.clone()));
+            crate::log_ui!(warn, "{}", issue);
+            false
         }
     }
+}
 
-    #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+fn deliver_notification(title: &str, body: &str) -> bool {
+    use notify_rust::{Hint, Notification};
+    // The summary is plain text, but the body is markup. The desktop-entry
+    // hint files the notification under Echo's launcher entry, which gives
+    // Plasma its icon and per-app notification settings.
+    let body = if server_parses_body_markup() {
+        echo_core::notification_text::escape_notification_markup(body)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    match Notification::new()
+        .summary(title)
+        .body(&body)
+        .appname("Echo")
+        .hint(Hint::DesktopEntry(crate::identity::APP_ID.to_string()))
+        .show()
     {
-        use notify_rust::{Hint, Notification};
-        // The summary is plain text, but the body is markup. The desktop-entry
-        // hint files the notification under Echo's launcher entry, which gives
-        // Plasma its icon and per-app notification settings.
-        let body = if server_parses_body_markup() {
-            echo_core::notification_text::escape_notification_markup(body)
-        } else {
-            std::borrow::Cow::Borrowed(body)
-        };
-        match Notification::new()
-            .summary(title)
-            .body(&body)
-            .appname("Echo")
-            .hint(Hint::DesktopEntry(crate::identity::APP_ID.to_string()))
-            .show()
-        {
-            Ok(_) => {
-                update_delivery_state(Some("notify-rust"), None);
-                return true;
-            }
-            Err(e) => {
-                let notify_rust_error = format!("notify-rust delivery failed: {e}");
-                match std::process::Command::new("notify-send")
-                    .arg("--app-name=Echo")
-                    .arg(format!(
-                        "--hint=string:desktop-entry:{}",
-                        crate::identity::APP_ID
-                    ))
-                    .arg("--")
-                    .args([title, body.as_ref()])
-                    .spawn()
-                {
-                    Ok(_) => {
-                        update_delivery_state(
-                            Some("notify-send"),
-                            Some(format!("{notify_rust_error}; fell back to notify-send")),
-                        );
-                        crate::log_ui!(debug, "{}", notify_rust_error);
-                        return true;
-                    }
-                    Err(fallback_error) => {
-                        let issue = format!(
-                            "{notify_rust_error}; notify-send fallback failed: {fallback_error}"
-                        );
-                        update_delivery_state(None, Some(issue.clone()));
-                        crate::log_ui!(warn, "{}", issue);
-                        return false;
-                    }
+        Ok(_) => {
+            update_delivery_state(Some("notify-rust"), None);
+            true
+        }
+        Err(e) => {
+            let notify_rust_error = format!("notify-rust delivery failed: {e}");
+            match std::process::Command::new("notify-send")
+                .arg("--app-name=Echo")
+                .arg(format!(
+                    "--hint=string:desktop-entry:{}",
+                    crate::identity::APP_ID
+                ))
+                .arg("--")
+                .args([title, body.as_ref()])
+                .spawn()
+            {
+                Ok(_) => {
+                    update_delivery_state(
+                        Some("notify-send"),
+                        Some(format!("{notify_rust_error}; fell back to notify-send")),
+                    );
+                    crate::log_ui!(debug, "{}", notify_rust_error);
+                    true
+                }
+                Err(fallback_error) => {
+                    let issue = format!(
+                        "{notify_rust_error}; notify-send fallback failed: {fallback_error}"
+                    );
+                    update_delivery_state(None, Some(issue.clone()));
+                    crate::log_ui!(warn, "{}", issue);
+                    false
                 }
             }
         }
     }
+}
 
-    #[allow(unreachable_code)]
-    {
-        update_delivery_state(
-            None,
-            Some("Unsupported desktop notification platform".to_string()),
-        );
-        false
-    }
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn deliver_notification(_title: &str, _body: &str) -> bool {
+    update_delivery_state(
+        None,
+        Some("Unsupported desktop notification platform".to_string()),
+    );
+    false
 }
 
 /// Whether the notification server renders bodies as markup (Plasma, GNOME,

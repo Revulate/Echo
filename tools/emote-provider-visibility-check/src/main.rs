@@ -1,6 +1,8 @@
-use echo_emote_core::visibility::{
-    EmoteProviderVisibility, EmoteProviderVisibilityKey, emote_provider_visible,
-};
+//! Contract: which emote providers stay visible for each provider-visibility
+//! setting in `crates/echo-emote-core/src/visibility.rs`.
+
+use echo_emote_core::EmoteProvider;
+use echo_emote_core::visibility::{EmoteProviderVisibility, emote_provider_visible};
 
 fn main() {
     let cases = [
@@ -45,11 +47,11 @@ fn main() {
     ];
 
     let providers = [
-        ("twitch", EmoteProviderVisibilityKey::Twitch),
-        ("7tv", EmoteProviderVisibilityKey::SevenTv),
-        ("bttv", EmoteProviderVisibilityKey::Bttv),
-        ("ffz", EmoteProviderVisibilityKey::Ffz),
-        ("emoji", EmoteProviderVisibilityKey::Emoji),
+        ("twitch", EmoteProvider::Twitch),
+        ("7tv", EmoteProvider::SevenTV),
+        ("bttv", EmoteProvider::BTTV),
+        ("ffz", EmoteProvider::FFZ),
+        ("emoji", EmoteProvider::Emoji),
     ];
 
     println!("case,provider,visible");

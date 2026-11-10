@@ -28,7 +28,7 @@ pub(super) struct VisibleMediaPlan {
     pub(super) emote_requests: Vec<VisibleEmoteRequest>,
     pub(super) animated_emote_requests: Vec<VisibleEmoteRequest>,
     pub(super) embed_requests: Vec<VisibleEmbedRequest>,
-    /// PERF: carried as `SharedString` (cheap clones from the layout's `ImagePaintCommand.url`).
+    /// Carried as `SharedString` (cheap clones from the layout's `ImagePaintCommand.url`).
     /// Owned `String`s are only materialized at the loader dispatch boundary, after
     /// dedup collapses repeated emote URLs across visible rows.
     pub(super) static_image_urls: Vec<SharedString>,
@@ -132,7 +132,7 @@ pub(super) fn trigger_visible_preload(
         .collect();
     image_cache::record_displayed_media_requests(&owned_requests);
     crate::backend::metrics::record_emote_stage(metric_stage, std::time::Duration::ZERO, url_count);
-    image_cache::trigger_preload_media_with_source(owned_requests, source);
+    image_cache::trigger_preload_media(owned_requests, source);
     url_count
 }
 
@@ -149,7 +149,7 @@ pub(super) fn trigger_visible_url_preload(
     urls.dedup();
     let url_count = urls.len();
     crate::backend::metrics::record_emote_stage(metric_stage, std::time::Duration::ZERO, url_count);
-    image_cache::trigger_preload_with_source(std::mem::take(urls), source);
+    image_cache::trigger_preload(std::mem::take(urls), source);
     url_count
 }
 
@@ -174,7 +174,7 @@ pub(super) fn trigger_visible_animated_preload(
     image_cache::record_displayed_media_requests(&owned_requests);
     crate::backend::metrics::record_emote_stage(metric_stage, std::time::Duration::ZERO, url_count);
     for request in owned_requests {
-        image_cache::trigger_animated_decode_request_with_source(request, source);
+        image_cache::trigger_animated_decode_request(request, source);
     }
     crate::log_cache!(
         trace,

@@ -128,7 +128,7 @@ impl Element for ChatViewportElement {
         cx: &mut App,
     ) {
         let paint_bounds = prepaint.bounds;
-        let paint_emit_start = RenderTimer::start(crate::fps_profiler::is_enabled());
+        let paint_emit_start = RenderTimer::start(crate::diagnostics::fps_profiler::is_enabled());
         let mut animation_slots = self.animation_slots.borrow_mut();
         let mut sink = AnimationSlotSink {
             slots: &mut animation_slots,
@@ -172,9 +172,11 @@ impl Element for ChatViewportElement {
             );
         });
         let paint_emit_elapsed = paint_emit_start.elapsed();
-        if crate::fps_profiler::is_enabled() {
-            crate::fps_profiler::record_canvas_paint_nanos(paint_emit_elapsed.as_nanos() as u64);
-            crate::fps_profiler::record_phase("paint_emit", paint_emit_elapsed);
+        if crate::diagnostics::fps_profiler::is_enabled() {
+            crate::diagnostics::fps_profiler::record_canvas_paint_nanos(
+                paint_emit_elapsed.as_nanos() as u64,
+            );
+            crate::diagnostics::fps_profiler::record_phase("paint_emit", paint_emit_elapsed);
         }
     }
 }
@@ -189,6 +191,12 @@ fn row_intersects_viewport(
     const RASTER_MARGIN: f32 = 2.0;
     may_paint_outside_row_bounds
         || (row_y < viewport_height + RASTER_MARGIN && row_y + row_height > -RASTER_MARGIN)
+}
+
+impl Styled for ChatViewportElement {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
 }
 
 #[cfg(test)]
@@ -210,11 +218,5 @@ mod tests {
     fn retains_rows_with_unbounded_name_paint_overflow() {
         assert!(row_intersects_viewport(-20.0, 10.0, 100.0, true));
         assert!(row_intersects_viewport(110.0, 10.0, 100.0, true));
-    }
-}
-
-impl Styled for ChatViewportElement {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style
     }
 }

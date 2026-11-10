@@ -27,32 +27,10 @@ pub const NO_VIDEO_BADGE_URL: &str =
     "https://static-cdn.jtvnw.net/badges/v1/199a0dba-58f3-494e-a7fc-1fa0a1001fb8/3";
 pub const BTTV_PRO_BADGE_KEY: &str = "bttv-pro:subscriber";
 
-pub fn badge_key_name(badge_key: &str) -> &str {
-    badge_key
-        .split_once('/')
-        .or_else(|| badge_key.split_once(':'))
-        .map(|(name, _)| name)
-        .unwrap_or(badge_key)
-}
-
-pub fn badge_name_matches(name: &str, expected: &str) -> bool {
-    name.eq_ignore_ascii_case(expected)
-        || (is_lead_moderator_badge_name(name) && is_lead_moderator_badge_name(expected))
-}
-
-pub fn badge_key_matches(badge_key: &str, expected: &str) -> bool {
-    badge_name_matches(badge_key, expected)
-        || badge_name_matches(badge_key_name(badge_key), expected)
-}
-
-pub fn is_lead_moderator_badge_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("lead_moderator") || name.eq_ignore_ascii_case("lead-moderator")
-}
-
-pub fn is_moderator_badge_key(badge_key: &str) -> bool {
-    let name = badge_key_name(badge_key);
-    badge_name_matches(name, "moderator") || is_lead_moderator_badge_name(name)
-}
+pub use echo_core::badge_key::{
+    badge_key_matches, badge_key_name, badge_name_matches, is_lead_moderator_badge_name,
+    is_moderator_badge_key,
+};
 
 pub fn external_badge_provider_for_key(badge_key: &str) -> Option<ExternalBadgeProvider> {
     const BTTV_PRO_PREFIXES: &[&str] = &[

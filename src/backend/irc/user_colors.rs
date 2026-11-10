@@ -68,11 +68,11 @@ struct UserColorOverridesFile {
 }
 
 fn get_user_color_cache_path() -> Option<std::path::PathBuf> {
-    crate::benchmark_profile::config_root().map(|d| d.join(USER_COLOR_CACHE_FILE))
+    crate::storage_roots::config_root().map(|d| d.join(USER_COLOR_CACHE_FILE))
 }
 
 fn get_user_color_overrides_path() -> Option<std::path::PathBuf> {
-    crate::benchmark_profile::config_root().map(|d| d.join(USER_COLOR_OVERRIDES_FILE))
+    crate::storage_roots::config_root().map(|d| d.join(USER_COLOR_OVERRIDES_FILE))
 }
 
 fn normalize_user_color_login(login: &str) -> String {

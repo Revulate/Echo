@@ -1,5 +1,4 @@
 //! Emote provider integrations (7TV, BTTV, FFZ, Twitch)
-#![allow(clippy::await_holding_lock)]
 
 use crate::backend::lock_utils::{MutexExt, RwLockExt};
 use arc_swap::ArcSwap;
@@ -22,10 +21,35 @@ use crate::backend::retry::{
     retry_helix_get_str, server_retry_wait,
 };
 use crate::backend::twitch_api::HelixAuthExt;
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
+use std::num::NonZeroU32;
 
+use echo_core::channel_identity::{channel_key_cow, normalize_channel_key};
+pub(crate) use echo_emote_core::PERSONAL_SEVENTV_CHANNEL;
+pub use echo_emote_core::{Emote, EmoteCategory, EmoteProvider};
+
+pub mod benchmark_hooks;
 pub mod personal;
 pub mod refresh;
 pub mod seventv_eventapi;
+
+mod bttv;
+mod ffz;
+mod lookup;
+mod publication;
+mod seventv;
+mod twitch;
+use bttv::*;
+use ffz::*;
+pub use lookup::*;
+pub use publication::*;
+use seventv::*;
+use twitch::*;
 
 static INITIAL_CATALOGS_READY: AtomicBool = AtomicBool::new(false);
 static INITIAL_CATALOGS_READY_NOTIFY: LazyLock<tokio::sync::Notify> =
@@ -41,6 +65,54 @@ pub(crate) enum DiskCacheParts {
     /// The signed-in account's user emotes. These hydrate only for the
     /// validated owner, so startup loads them after auth initialization.
     User,
+}
+
+/// What [`EmoteCache::load_from_disk_scoped`] hydrated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DiskCacheLoad {
+    /// The global sets were loaded.
+    pub(crate) global: bool,
+    /// The signed-in account's user emotes were loaded.
+    pub(crate) user: bool,
+    /// Number of channel sets loaded.
+    pub(crate) channels: usize,
+}
+
+/// Run `task` on a named OS thread with its own current-thread runtime.
+///
+/// `running` is the caller's already-claimed "worker is up" flag; it is
+/// cleared when the thread exits for any reason, or right away when the thread
+/// or its runtime cannot be created.
+fn spawn_runtime_thread<F, Fut>(name: &'static str, running: &'static AtomicBool, task: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    struct RunningGuard(&'static AtomicBool);
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _guard = RunningGuard(running);
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(task()),
+                Err(error) => {
+                    crate::log_emotes!(error, "Failed to create the {} runtime: {}", name, error);
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        running.store(false, Ordering::SeqCst);
+        crate::log_emotes!(error, "Failed to spawn the {} thread: {}", name, error);
+    }
 }
 
 pub(crate) fn mark_initial_catalogs_ready() {
@@ -84,57 +156,6 @@ fn build_emote_http_client() -> reqwest::Client {
 fn truncate_for_log(s: &str, max_bytes: usize) -> &str {
     &s[..s.floor_char_boundary(max_bytes)]
 }
-
-static SEVENTV_USER_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(build_seventv_user_http_client));
-
-fn build_seventv_user_http_client() -> reqwest::Client {
-    match crate::backend::http::client_builder()
-        .timeout(Duration::from_secs(20))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(4)
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!("Failed to create 7TV user HTTP client: {e}");
-            crate::backend::http::timed_client(Duration::from_secs(20))
-        }
-    }
-}
-
-static SEVENTV_EMOTE_SET_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(build_seventv_emote_set_http_client));
-
-fn build_seventv_emote_set_http_client() -> reqwest::Client {
-    match crate::backend::http::client_builder()
-        .timeout(Duration::from_secs(25))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(4)
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!("Failed to create 7TV emote-set HTTP client: {e}");
-            crate::backend::http::timed_client(Duration::from_secs(25))
-        }
-    }
-}
-
-use governor::{
-    Quota, RateLimiter,
-    clock::DefaultClock,
-    middleware::NoOpMiddleware,
-    state::{InMemoryState, NotKeyed},
-};
-use std::num::NonZeroU32;
-
-/// Rate limiter for 7TV API requests (10 req/s - conservative, actual limit higher)
-static SEVENTV_LIMITER: LazyLock<
-    RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>,
-> = LazyLock::new(|| RateLimiter::direct(Quota::per_second(NonZeroU32::new(10).unwrap())));
 
 /// Rate limiter for BTTV API requests (5 req/s - BTTV has stricter limits)
 static BTTV_LIMITER: LazyLock<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>> =
@@ -183,7 +204,6 @@ const SEVENTV_GLOBAL_FETCH_CACHE_TTL_SECS: u64 = 45;
 const SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS: u64 = 30 * 60;
 const SEVENTV_CHANNEL_FETCH_CACHE_TTL_SECS: u64 = 20;
 const SEVENTV_CHANNEL_FETCH_CACHE_MAX_ENTRIES: usize = 512;
-pub(crate) const PERSONAL_SEVENTV_CHANNEL: &str = "personal:7tv";
 const CHANNEL_MISS_REFRESH_COOLDOWN_SECS: u64 = 300;
 /// Refresh delay after a provider failed with no cached emotes to carry over.
 const CHANNEL_PROVIDER_FAILURE_RETRY_SECS: u64 = 60;
@@ -193,17 +213,9 @@ const CHANNEL_PROVIDER_FAILURE_RETRY_SECS: u64 = 60;
 /// the mixed-case candidate heuristic (`unresolved_emote_refresh_candidate`),
 /// and the once-per-hour per-token gate keep this from stampeding providers
 /// on ordinary chat words — 7TV EventAPI remains the primary update path.
-/// Opt out with `ECHO_EMOTE_MISS_REFRESH=0` (also accepts `false`/`off`);
-/// unset or `1` = on.
-static CHANNEL_MISS_REFRESH_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    !matches!(
-        std::env::var("ECHO_EMOTE_MISS_REFRESH")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("0") | Some("false") | Some("off")
-    )
-});
+/// On unless `ECHO_EMOTE_MISS_REFRESH` is set to an off value (for example `0`).
+static CHANNEL_MISS_REFRESH_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| echo_core::env::flag_or("ECHO_EMOTE_MISS_REFRESH", true));
 
 /// How long after a channel open/load the open watchdog waits before checking
 /// whether the channel ever gained a lookup entry, and self-healing if not.
@@ -247,148 +259,99 @@ fn record_emote_stage_timed(stage: &str, started_at: Instant, items: usize) -> D
     elapsed
 }
 
-fn record_7tv_deferred_watchdog(scope: &str, event: &str) {
-    let (counter, stage) = match (scope, event) {
-        ("global", "scheduled") => (
-            &SEVENTV_DEFERRED_GLOBAL_SCHEDULED,
-            "emotes.7tv.deferred.global.scheduled",
-        ),
-        ("global", "started") => (
-            &SEVENTV_DEFERRED_GLOBAL_STARTED,
-            "emotes.7tv.deferred.global.started",
-        ),
-        ("global", "completed") => (
-            &SEVENTV_DEFERRED_GLOBAL_COMPLETED,
-            "emotes.7tv.deferred.global.completed",
-        ),
-        ("global", "failed") => (
-            &SEVENTV_DEFERRED_GLOBAL_FAILED,
-            "emotes.7tv.deferred.global.failed",
-        ),
-        ("global", "timeout") => (
-            &SEVENTV_DEFERRED_GLOBAL_TIMEOUT,
-            "emotes.7tv.deferred.global.timeout",
-        ),
-        ("global", "join_failed") => (
-            &SEVENTV_DEFERRED_GLOBAL_JOIN_FAILED,
-            "emotes.7tv.deferred.global.join_failed",
-        ),
-        ("channel", "scheduled") => (
-            &SEVENTV_DEFERRED_CHANNEL_SCHEDULED,
-            "emotes.7tv.deferred.channel.scheduled",
-        ),
-        ("channel", "started") => (
-            &SEVENTV_DEFERRED_CHANNEL_STARTED,
-            "emotes.7tv.deferred.channel.started",
-        ),
-        ("channel", "completed") => (
-            &SEVENTV_DEFERRED_CHANNEL_COMPLETED,
-            "emotes.7tv.deferred.channel.completed",
-        ),
-        ("channel", "failed") => (
-            &SEVENTV_DEFERRED_CHANNEL_FAILED,
-            "emotes.7tv.deferred.channel.failed",
-        ),
-        ("channel", "timeout") => (
-            &SEVENTV_DEFERRED_CHANNEL_TIMEOUT,
-            "emotes.7tv.deferred.channel.timeout",
-        ),
-        ("channel", "join_failed") => (
-            &SEVENTV_DEFERRED_CHANNEL_JOIN_FAILED,
-            "emotes.7tv.deferred.channel.join_failed",
-        ),
-        _ => return,
-    };
-
-    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    crate::backend::metrics::record_emote_event(stage);
-    record_emote_stage_duration(stage, Duration::ZERO, 1);
-
-    let (scheduled, started, completed, failed, timed_out, join_failed) = if scope == "global" {
-        (
-            SEVENTV_DEFERRED_GLOBAL_SCHEDULED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_GLOBAL_STARTED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_GLOBAL_COMPLETED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_GLOBAL_FAILED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_GLOBAL_TIMEOUT.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_GLOBAL_JOIN_FAILED.load(Ordering::Relaxed),
-        )
-    } else {
-        (
-            SEVENTV_DEFERRED_CHANNEL_SCHEDULED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_CHANNEL_STARTED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_CHANNEL_COMPLETED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_CHANNEL_FAILED.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_CHANNEL_TIMEOUT.load(Ordering::Relaxed),
-            SEVENTV_DEFERRED_CHANNEL_JOIN_FAILED.load(Ordering::Relaxed),
-        )
-    };
-
-    crate::log_perf!(
-        debug,
-        scope = scope,
-        event = event,
-        count,
-        scheduled,
-        started,
-        completed,
-        failed,
-        timed_out,
-        join_failed,
-        "7TV deferred watchdog event"
-    );
+/// Which 7TV fetch a deferred-refresh watchdog event belongs to.
+#[derive(Clone, Copy)]
+enum DeferredScope {
+    Global,
+    Channel,
 }
 
-#[derive(Clone)]
-struct SevenTVGlobalFetchCacheEntry {
-    fetched_at: Instant,
-    emotes: SevenTvGlobalFetchResult,
+/// Lifecycle of a deferred 7TV fetch: scheduled after the synchronous fetch
+/// timed out, started, then completed, failed, timed out again, or lost
+/// to a task join failure.
+#[derive(Clone, Copy)]
+enum DeferredEvent {
+    Scheduled,
+    Started,
+    Completed,
+    Failed,
+    Timeout,
+    JoinFailed,
 }
 
-type SevenTvGlobalFetchResult = Arc<Vec<Arc<Emote>>>;
-
-#[derive(Clone)]
-struct SevenTVChannelFetchCacheEntry {
-    fetched_at: Instant,
-    result: SevenTvChannelFetchResult,
-}
-
-#[derive(Clone)]
-pub(crate) enum SevenTvExactSetFetchOutcome {
-    Present {
-        emotes: Vec<Arc<Emote>>,
-        emote_set_id: Option<String>,
-    },
-    TerminallyAbsent {
-        emote_set_id: String,
-    },
-}
-
-impl SevenTvExactSetFetchOutcome {
-    #[inline]
-    fn emote_count(&self) -> usize {
+impl DeferredScope {
+    fn as_str(self) -> &'static str {
         match self {
-            Self::Present { emotes, .. } => emotes.len(),
-            Self::TerminallyAbsent { .. } => 0,
+            Self::Global => "global",
+            Self::Channel => "channel",
+        }
+    }
+
+    fn counters(self) -> &'static [AtomicU64; DeferredEvent::COUNT] {
+        static GLOBAL: [AtomicU64; DeferredEvent::COUNT] = [const { AtomicU64::new(0) }; 6];
+        static CHANNEL: [AtomicU64; DeferredEvent::COUNT] = [const { AtomicU64::new(0) }; 6];
+        match self {
+            Self::Global => &GLOBAL,
+            Self::Channel => &CHANNEL,
         }
     }
 }
 
-type SevenTvChannelFetchPayload = (
-    SevenTvExactSetFetchOutcome,
-    Option<seventv_eventapi::SevenTvChannelSubscription>,
-);
-type SevenTvChannelFetchResult = Arc<SevenTvChannelFetchPayload>;
+impl DeferredEvent {
+    const COUNT: usize = 6;
 
-/// Short-lived 7TV fetch caches used to coalesce bursts from sync/deferred refresh paths.
-static SEVENTV_GLOBAL_FETCH_CACHE: LazyLock<RwLock<Option<SevenTVGlobalFetchCacheEntry>>> =
-    LazyLock::new(|| RwLock::new(None));
-static SEVENTV_GLOBAL_FETCH_IN_FLIGHT: LazyLock<Mutex<Option<Arc<tokio::sync::Notify>>>> =
-    LazyLock::new(|| Mutex::new(None));
-static SEVENTV_CHANNEL_FETCH_CACHE: LazyLock<DashMap<String, SevenTVChannelFetchCacheEntry>> =
-    LazyLock::new(DashMap::new);
-static SEVENTV_CHANNEL_FETCH_IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+            Self::JoinFailed => "join_failed",
+        }
+    }
+
+    fn stage(self, scope: DeferredScope) -> &'static str {
+        match (scope, self) {
+            (DeferredScope::Global, Self::Scheduled) => "emotes.7tv.deferred.global.scheduled",
+            (DeferredScope::Global, Self::Started) => "emotes.7tv.deferred.global.started",
+            (DeferredScope::Global, Self::Completed) => "emotes.7tv.deferred.global.completed",
+            (DeferredScope::Global, Self::Failed) => "emotes.7tv.deferred.global.failed",
+            (DeferredScope::Global, Self::Timeout) => "emotes.7tv.deferred.global.timeout",
+            (DeferredScope::Global, Self::JoinFailed) => "emotes.7tv.deferred.global.join_failed",
+            (DeferredScope::Channel, Self::Scheduled) => "emotes.7tv.deferred.channel.scheduled",
+            (DeferredScope::Channel, Self::Started) => "emotes.7tv.deferred.channel.started",
+            (DeferredScope::Channel, Self::Completed) => "emotes.7tv.deferred.channel.completed",
+            (DeferredScope::Channel, Self::Failed) => "emotes.7tv.deferred.channel.failed",
+            (DeferredScope::Channel, Self::Timeout) => "emotes.7tv.deferred.channel.timeout",
+            (DeferredScope::Channel, Self::JoinFailed) => "emotes.7tv.deferred.channel.join_failed",
+        }
+    }
+}
+
+fn record_seventv_deferred_watchdog(scope: DeferredScope, event: DeferredEvent) {
+    let counters = scope.counters();
+    let stage = event.stage(scope);
+    let count = counters[event as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    crate::backend::metrics::record_emote_event(stage);
+    record_emote_stage_duration(stage, Duration::ZERO, 1);
+
+    let load = |event: DeferredEvent| counters[event as usize].load(Ordering::Relaxed);
+    crate::log_perf!(
+        debug,
+        scope = scope.as_str(),
+        event = event.as_str(),
+        count,
+        scheduled = load(DeferredEvent::Scheduled),
+        started = load(DeferredEvent::Started),
+        completed = load(DeferredEvent::Completed),
+        failed = load(DeferredEvent::Failed),
+        timed_out = load(DeferredEvent::Timeout),
+        join_failed = load(DeferredEvent::JoinFailed),
+        "7TV deferred watchdog event"
+    );
+}
+
 static SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT: LazyLock<DashMap<String, Instant>> =
     LazyLock::new(DashMap::new);
 static SEVENTV_CHANNEL_SYNC_TIMEOUT_GLOBAL_LAST_AT: LazyLock<Mutex<Option<Instant>>> =
@@ -434,18 +397,6 @@ fn claim_seventv_sync_probe() -> bool {
 pub static SEVENTV_GLOBAL_SET_ID: LazyLock<RwLock<Option<String>>> =
     LazyLock::new(|| RwLock::new(None));
 
-static SEVENTV_DEFERRED_GLOBAL_SCHEDULED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_GLOBAL_STARTED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_GLOBAL_COMPLETED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_GLOBAL_FAILED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_GLOBAL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_GLOBAL_JOIN_FAILED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_CHANNEL_SCHEDULED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_CHANNEL_STARTED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_CHANNEL_COMPLETED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_CHANNEL_FAILED: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_CHANNEL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
-static SEVENTV_DEFERRED_CHANNEL_JOIN_FAILED: AtomicU64 = AtomicU64::new(0);
 static USER_EMOTES_DEFERRED_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Entry tracking a failed channel emote load for retry
@@ -498,7 +449,7 @@ pub static FAILED_CHANNELS: LazyLock<DashMap<String, FailedChannelEntry>> =
 
 /// Add a channel to the failed retry queue
 pub fn mark_channel_failed(channel_login: &str, channel_id: &str) {
-    let key = channel_login.to_lowercase();
+    let key = normalize_channel_key(channel_login);
     if crate::backend::irc::is_channel_closed(&key) {
         return;
     }
@@ -528,7 +479,7 @@ pub fn mark_channel_failed(channel_login: &str, channel_id: &str) {
 
 /// Remove a channel from the failed retry queue (called on successful load)
 pub fn clear_channel_failed(channel_login: &str) {
-    let key = channel_login.to_lowercase();
+    let key = normalize_channel_key(channel_login);
     if FAILED_CHANNELS.remove(&key).is_some() {
         crate::log_emotes!(
             info,
@@ -616,9 +567,7 @@ fn channel_disk_cache_fetched_at(is_fresh: bool, ttl: Duration) -> Instant {
             .unwrap_or_else(Instant::now);
     }
 
-    let grace_secs = std::env::var("ECHO_CHANNEL_STARTUP_REFRESH_GRACE_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
+    let grace_secs = echo_core::env::parsed("ECHO_CHANNEL_STARTUP_REFRESH_GRACE_SECS")
         .unwrap_or(CHANNEL_DISK_STALE_REFRESH_GRACE_SECS);
     let grace = Duration::from_secs(grace_secs).min(ttl.saturating_sub(Duration::from_secs(1)));
     Instant::now()
@@ -675,38 +624,6 @@ fn mark_emote_cache_dirty() {
 pub fn emote_cache_persist_generation() -> u64 {
     EMOTE_CACHE_PERSIST_GENERATION.load(Ordering::Acquire)
 }
-
-#[cfg(test)]
-mod catalog_pending_tests {
-    use super::*;
-    use core::prelude::v1::test;
-
-    #[test]
-    fn older_pending_guard_cannot_clear_newer_generation() {
-        let key = format!("catalog-pending-{}", std::process::id());
-        let older = ChannelCatalogPendingGuard::begin(key.clone());
-        let newer = ChannelCatalogPendingGuard::begin(key.clone());
-        drop(older);
-        assert!(
-            CHANNEL_CATALOG_PENDING
-                .get(&key)
-                .is_some_and(|token| token.load(Ordering::Acquire))
-        );
-        drop(newer);
-        assert!(!CHANNEL_CATALOG_PENDING.contains_key(&key));
-    }
-
-    #[test]
-    fn pending_guard_clears_when_deferred_owner_settles() {
-        let key = format!("catalog-deferred-{}", std::process::id());
-        let deferred_owner = ChannelCatalogPendingGuard::begin(key.clone());
-        assert!(CHANNEL_CATALOG_PENDING.contains_key(&key));
-        drop(deferred_owner);
-        assert!(!CHANNEL_CATALOG_PENDING.contains_key(&key));
-    }
-}
-
-pub use echo_emote_core::{Emote, EmoteProvider};
 
 /// Preferred emote URL for chat rendering quality.
 ///
@@ -779,11 +696,13 @@ pub fn media_source_id_for_url(
         emote.is_animated,
     );
 
-    Some(crate::cache::disk_layer::MediaSourceId::new_shared_labels(
-        provider,
-        Arc::clone(&emote.id),
-        variant,
-    ))
+    Some(
+        crate::cache::disk_layer::MediaSourceId::with_interned_provider(
+            provider,
+            Arc::clone(&emote.id),
+            variant,
+        ),
+    )
 }
 
 pub fn media_request_for_url(emote: &Emote, url: &str) -> crate::cache::loader::MediaRequest {
@@ -1002,23 +921,6 @@ struct CacheEntry {
 
 const INCREMENTAL_PROVIDER_DIFF_MAX_IDENTITIES: usize = 64;
 
-/// Production-code timing result for the provider-index evaluator.
-#[cfg(feature = "provider-index-bench")]
-pub struct ProviderIndexBenchResult {
-    pub entries: usize,
-    pub iterations: usize,
-    pub equivalent: bool,
-    pub full_median_ns: u64,
-    pub incremental_median_ns: u64,
-}
-
-#[cfg(feature = "provider-index-bench")]
-impl ProviderIndexBenchResult {
-    pub fn speedup(&self) -> f64 {
-        self.full_median_ns as f64 / self.incremental_median_ns as f64
-    }
-}
-
 struct ProviderIndexDiff {
     provider: EmoteProvider,
     changed_aliases: HashSet<Arc<str>>,
@@ -1041,7 +943,7 @@ pub enum LoadOutcome {
 pub struct EmoteCache {
     /// Global emotes from all providers
     global: RwLock<Option<CacheEntry>>,
-    /// Per-channel emotes (channel_id -> emotes)
+    /// Per-channel emotes, keyed by normalized channel login.
     channels: DashMap<String, CacheEntry>,
     /// User's subscription emotes (from all channels they're subscribed to)
     user_emotes: RwLock<Option<CacheEntry>>,
@@ -1066,6 +968,12 @@ pub struct EmoteCache {
     channel_emote_set_ids: DashMap<String, String>,
 }
 
+impl Default for EmoteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmoteCache {
     pub fn new() -> Self {
         Self {
@@ -1083,15 +991,7 @@ impl EmoteCache {
             channel_emote_set_ids: DashMap::new(),
         }
     }
-}
 
-impl Default for EmoteCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl EmoteCache {
     pub fn is_channel_loading(&self, channel: &str) -> bool {
         self.loading
             .lock_or_recover()
@@ -1450,7 +1350,7 @@ impl EmoteCache {
         };
 
         if outcome.changed > 0 {
-            invalidate_7tv_channel_fetch_cache(&cache_key);
+            invalidate_seventv_channel_fetch_cache(&cache_key);
             crate::cache::loader::invalidate_media_sources(source_invalidations).await;
             let rebuild_start = Instant::now();
             rebuild_emote_indices(&cache_key).await;
@@ -1487,7 +1387,7 @@ impl EmoteCache {
         let (outcome, source_invalidations) = outcome;
 
         if outcome.changed > 0 {
-            invalidate_7tv_global_fetch_cache();
+            invalidate_seventv_global_fetch_cache();
             crate::cache::loader::invalidate_media_sources(source_invalidations).await;
             let rebuild_start = Instant::now();
             rebuild_global_emote_index().await;
@@ -1763,18 +1663,18 @@ impl EmoteCache {
     }
 
     /// Set the OAuth token for Twitch API requests
-    pub async fn set_token(&self, token: String) {
+    pub fn set_token(&self, token: String) {
         *self.token.write_or_recover() = Some(token);
     }
 
     /// Clear the OAuth token (used when entering anonymous mode)
-    pub async fn clear_token(&self) {
+    pub fn clear_token(&self) {
         *self.token.write_or_recover() = None;
         crate::log_emotes!(info, "Token cleared");
     }
 
     /// Set the cache file path (call this when app starts with app_data_dir)
-    pub async fn set_cache_path(&self, path: PathBuf) {
+    pub fn set_cache_path(&self, path: PathBuf) {
         let mut cache_path = self.cache_path.write_or_recover();
         *cache_path = Some(path);
     }
@@ -1786,21 +1686,21 @@ impl EmoteCache {
         &self,
         allowed_channels: Option<HashSet<String>>,
         parts: DiskCacheParts,
-    ) -> (bool, bool, usize) {
+    ) -> DiskCacheLoad {
         let disk_user_request_generation =
             self.user_emote_request_generation.load(Ordering::SeqCst);
         let disk_auth_fence = crate::backend::auth::capture_authenticated_resource_fence();
         let allowed_channels = allowed_channels.map(|channels| {
             channels
                 .into_iter()
-                .map(|channel| channel.trim().trim_start_matches('#').to_ascii_lowercase())
+                .map(|channel| normalize_channel_key(channel.trim()))
                 .filter(|channel| !channel.is_empty())
                 .collect::<HashSet<_>>()
         });
 
         let Some(path) = self.cache_path.read_or_recover().as_ref().cloned() else {
             crate::log_emotes!(info, "No cache path set, skipping disk load");
-            return (false, false, 0);
+            return DiskCacheLoad::default();
         };
 
         let legacy_path = legacy_emote_cache_path(&path);
@@ -1863,7 +1763,7 @@ impl EmoteCache {
 
         let cache_file = match cache_result {
             Ok(Ok(cf)) => cf,
-            _ => return (false, false, 0),
+            _ => return DiskCacheLoad::default(),
         };
         let disk_user_owner_id = cache_file.user_emote_owner_id.clone();
         let (global_emotes, user_emotes, channel_emotes) = match parts {
@@ -2006,7 +1906,7 @@ impl EmoteCache {
         let mut loaded_channels = Vec::new();
         let hydrate_channels_start = Instant::now();
         for (channel, cached) in channel_emotes {
-            let cache_key = channel.to_lowercase();
+            let cache_key = normalize_channel_key(&channel);
             if let Some(allowed) = allowed_channels.as_ref()
                 && !allowed.contains(&cache_key)
             {
@@ -2105,7 +2005,7 @@ impl EmoteCache {
             };
             if !urls.is_empty() {
                 crate::log_emotes!(info, "Preloading {} global/user emote images", urls.len());
-                crate::cache::loader::trigger_preload_with_source(
+                crate::cache::loader::trigger_preload(
                     urls,
                     crate::cache::loader::PreloadSource::DiskCacheLoad,
                 );
@@ -2122,7 +2022,11 @@ impl EmoteCache {
             global_emote_count + user_emote_count + channel_emote_count,
         );
 
-        (global_loaded, user_loaded, channels_loaded)
+        DiskCacheLoad {
+            global: global_loaded,
+            user: user_loaded,
+            channels: channels_loaded,
+        }
     }
 
     /// Save current in-memory emotes to disk cache
@@ -2280,10 +2184,7 @@ impl EmoteCache {
                     stale_user_emotes.extend(entry.emotes_by_id.values().cloned());
                     let cached_has_twitch_sub_emotes = entry.emotes_by_id.values().any(|e| {
                         e.provider == EmoteProvider::Twitch
-                            && e.channel
-                                .as_deref()
-                                .map(|ch| ch.starts_with("sub:"))
-                                .unwrap_or(false)
+                            && matches!(e.scope(), echo_emote_core::EmoteScope::Subscription(_))
                     });
                     if cached_owner_matches_user
                         && !force_refresh
@@ -2413,7 +2314,7 @@ impl EmoteCache {
                 if sync_timeout_ms.is_some() {
                     match tokio::time::timeout(
                         Duration::from_millis(USER_SEVENTV_PERSONAL_SYNC_TIMEOUT_MS),
-                        fetch_7tv_personal_emotes(user_id),
+                        fetch_seventv_personal_emotes(user_id),
                     )
                     .await
                     {
@@ -2439,7 +2340,7 @@ impl EmoteCache {
                         }
                     }
                 } else {
-                    let result = fetch_7tv_personal_emotes(user_id).await;
+                    let result = fetch_seventv_personal_emotes(user_id).await;
                     let items = result
                         .as_ref()
                         .map(SevenTvExactSetFetchOutcome::emote_count)
@@ -2778,7 +2679,7 @@ impl EmoteCache {
         let (seventv, bttv, ffz, twitch) = tokio::join!(
             async {
                 let started_at = Instant::now();
-                let mut fetch_task = crate::backend::bridge::RUNTIME.spawn(fetch_7tv_global());
+                let mut fetch_task = crate::backend::bridge::RUNTIME.spawn(fetch_seventv_global());
                 match tokio::time::timeout(
                     Duration::from_millis(SEVENTV_GLOBAL_SYNC_TIMEOUT_MS),
                     &mut fetch_task,
@@ -2967,13 +2868,13 @@ impl EmoteCache {
         record_emote_stage_timed("emotes.global.load.total", total_start, loaded_count);
 
         if let Some(mut timed_out_fetch) = timed_out_global_fetch {
-            record_7tv_deferred_watchdog("global", "scheduled");
+            record_seventv_deferred_watchdog(DeferredScope::Global, DeferredEvent::Scheduled);
             crate::log_emotes!(
                 debug,
                 "Scheduling deferred apply from timed-out in-flight 7TV global task"
             );
             crate::backend::bridge::RUNTIME.spawn(async move {
-                record_7tv_deferred_watchdog("global", "started");
+                record_seventv_deferred_watchdog(DeferredScope::Global, DeferredEvent::Started);
                 crate::log_emotes!(debug, "Deferred global 7TV in-flight waiter started");
                 let deferred_fetch_start = Instant::now();
                 match tokio::time::timeout(
@@ -3001,7 +2902,10 @@ impl EmoteCache {
                             apply_start,
                             provider_count,
                         );
-                        record_7tv_deferred_watchdog("global", "completed");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::Completed,
+                        );
                     }
                     Ok(Ok(Err(err))) => {
                         record_emote_stage_timed(
@@ -3009,7 +2913,10 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("global", "failed");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::Failed,
+                        );
                         crate::log_emotes!(debug, "Deferred global 7TV fetch failed: {}", err);
                     }
                     Ok(Err(err)) => {
@@ -3018,7 +2925,10 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("global", "join_failed");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::JoinFailed,
+                        );
                         crate::log_emotes!(debug, "Deferred global 7TV join failed: {}", err);
                     }
                     Err(_) => {
@@ -3028,7 +2938,10 @@ impl EmoteCache {
                             0,
                         );
                         timed_out_fetch.abort();
-                        record_7tv_deferred_watchdog("global", "timeout");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::Timeout,
+                        );
                         crate::log_emotes!(
                             debug,
                             "Deferred global 7TV fetch timed out after {}s",
@@ -3038,17 +2951,17 @@ impl EmoteCache {
                 }
             });
         } else if defer_global_7tv_refresh {
-            record_7tv_deferred_watchdog("global", "scheduled");
+            record_seventv_deferred_watchdog(DeferredScope::Global, DeferredEvent::Scheduled);
             crate::log_emotes!(
                 debug,
                 "Scheduling deferred retry with new 7TV global fetch task"
             );
             crate::backend::bridge::RUNTIME.spawn(async move {
-                record_7tv_deferred_watchdog("global", "started");
+                record_seventv_deferred_watchdog(DeferredScope::Global, DeferredEvent::Started);
                 let deferred_fetch_start = Instant::now();
                 match tokio::time::timeout(
                     Duration::from_secs(SEVENTV_DEFERRED_FETCH_TIMEOUT_SECS),
-                    fetch_7tv_global(),
+                    fetch_seventv_global(),
                 )
                 .await
                 {
@@ -3071,7 +2984,10 @@ impl EmoteCache {
                             apply_start,
                             provider_count,
                         );
-                        record_7tv_deferred_watchdog("global", "completed");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::Completed,
+                        );
                     }
                     Ok(Err(err)) => {
                         record_emote_stage_timed(
@@ -3079,7 +2995,10 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("global", "failed");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::Failed,
+                        );
                         crate::log_emotes!(debug, "Deferred global 7TV fetch failed: {}", err);
                     }
                     Err(_) => {
@@ -3088,7 +3007,10 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("global", "timeout");
+                        record_seventv_deferred_watchdog(
+                            DeferredScope::Global,
+                            DeferredEvent::Timeout,
+                        );
                         crate::log_emotes!(
                             debug,
                             "Deferred global 7TV fetch timed out after {}s",
@@ -3154,7 +3076,7 @@ impl EmoteCache {
         token: Option<&str>,
         force_refresh: bool,
     ) -> Result<LoadOutcome, String> {
-        let cache_key = channel_login.to_lowercase();
+        let cache_key = normalize_channel_key(channel_login);
         let total_start = Instant::now();
 
         if !force_refresh {
@@ -3281,7 +3203,7 @@ impl EmoteCache {
         let (seventv, bttv, twitch, ffz_emotes) = tokio::join!(
             async {
                 let started_at = Instant::now();
-                let timeout_key = channel_login.to_ascii_lowercase();
+                let timeout_key = normalize_channel_key(channel_login);
                 if let Some(remaining) =
                     seventv_sync_cooldown_remaining(&timeout_key, Instant::now())
                 {
@@ -3299,7 +3221,7 @@ impl EmoteCache {
                     let seven_tv_channel_id = actual_id.clone();
                     let seven_tv_channel_login = channel_login.to_string();
                     let fetch_task = crate::backend::bridge::RUNTIME.spawn(async move {
-                        fetch_7tv_channel(&seven_tv_channel_id, &seven_tv_channel_login).await
+                        fetch_seventv_channel(&seven_tv_channel_id, &seven_tv_channel_login).await
                     });
                     return SevenTvChannelFetchState::TimedOut(fetch_task);
                 }
@@ -3318,7 +3240,7 @@ impl EmoteCache {
                     let seven_tv_channel_id = actual_id.clone();
                     let seven_tv_channel_login = channel_login.to_string();
                     let fetch_task = crate::backend::bridge::RUNTIME.spawn(async move {
-                        fetch_7tv_channel(&seven_tv_channel_id, &seven_tv_channel_login).await
+                        fetch_seventv_channel(&seven_tv_channel_id, &seven_tv_channel_login).await
                     });
                     return SevenTvChannelFetchState::TimedOut(fetch_task);
                 }
@@ -3326,7 +3248,7 @@ impl EmoteCache {
                 let seven_tv_channel_id = actual_id.clone();
                 let seven_tv_channel_login = channel_login.to_string();
                 let mut fetch_task = crate::backend::bridge::RUNTIME.spawn(async move {
-                    fetch_7tv_channel(&seven_tv_channel_id, &seven_tv_channel_login).await
+                    fetch_seventv_channel(&seven_tv_channel_id, &seven_tv_channel_login).await
                 });
                 match tokio::time::timeout(
                     Duration::from_millis(SEVENTV_CHANNEL_SYNC_TIMEOUT_MS),
@@ -3342,7 +3264,7 @@ impl EmoteCache {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&timeout_key);
                         let items = result
                             .as_ref()
-                            .map(|result| result.0.emote_count())
+                            .map(|result| result.outcome.emote_count())
                             .unwrap_or(0);
                         record_emote_stage_timed("emotes.channel.fetch.7tv", started_at, items);
                         SevenTvChannelFetchState::Ready(result)
@@ -3433,13 +3355,14 @@ impl EmoteCache {
         match seventv {
             SevenTvChannelFetchState::Ready(seventv_result) => match seventv_result {
                 Ok(shared) => match shared.as_ref() {
-                    (
-                        SevenTvExactSetFetchOutcome::Present {
-                            emotes,
-                            emote_set_id,
-                        },
+                    SevenTvChannelFetch {
+                        outcome:
+                            SevenTvExactSetFetchOutcome::Present {
+                                emotes,
+                                emote_set_id,
+                            },
                         subscription,
-                    ) => {
+                    } => {
                         if emotes.is_empty()
                             && emote_set_id.is_none()
                             && stale_7tv_fallback_count > 0
@@ -3503,10 +3426,10 @@ impl EmoteCache {
                             }
                         }
                     }
-                    (
-                        SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
+                    SevenTvChannelFetch {
+                        outcome: SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
                         subscription,
-                    ) => {
+                    } => {
                         if seventv_eventapi::retire_terminal_channel_fetch(
                             &cache_key,
                             emote_set_id,
@@ -3651,9 +3574,9 @@ impl EmoteCache {
         if let Some(mut timed_out_fetch) = timed_out_seventv_fetch {
             let deferred_channel_login = channel_login.to_string();
             let deferred_cache_key = cache_key.clone();
-            let deferred_timeout_key = channel_login.to_ascii_lowercase();
+            let deferred_timeout_key = normalize_channel_key(channel_login);
             let deferred_catalog_pending = catalog_pending.take();
-            record_7tv_deferred_watchdog("channel", "scheduled");
+            record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Scheduled);
             crate::log_emotes!(
                 debug,
                 "Scheduling deferred apply from timed-out in-flight 7TV task for {}",
@@ -3661,7 +3584,7 @@ impl EmoteCache {
             );
             crate::backend::bridge::RUNTIME.spawn(async move {
                 let _catalog_pending = deferred_catalog_pending;
-                record_7tv_deferred_watchdog("channel", "started");
+                record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Started);
                 crate::log_emotes!(
                     debug,
                     "Deferred in-flight 7TV waiter started for {}",
@@ -3675,13 +3598,13 @@ impl EmoteCache {
                 .await
                 {
                     Ok(Ok(Ok(shared))) => match shared.as_ref() {
-                    (
-                        SevenTvExactSetFetchOutcome::Present {
+                    SevenTvChannelFetch {
+                        outcome: SevenTvExactSetFetchOutcome::Present {
                             emotes,
                             emote_set_id,
                         },
                         subscription,
-                    ) => {
+                    } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         let fetched_count = emotes.len();
                         record_emote_stage_timed(
@@ -3710,12 +3633,12 @@ impl EmoteCache {
                             apply_start,
                             provider_count,
                         );
-                        record_7tv_deferred_watchdog("channel", "completed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Completed);
                     }
-                    (
-                        SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
+                    SevenTvChannelFetch {
+                        outcome: SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
                         subscription,
-                    ) => {
+                    } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         record_emote_stage_timed(
                             "emotes.channel.fetch.7tv.deferred",
@@ -3752,7 +3675,7 @@ impl EmoteCache {
                                 "emotes.channel.fetch.7tv.deferred_terminal_stale",
                             );
                         }
-                        record_7tv_deferred_watchdog("channel", "completed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Completed);
                     }
                     },
                     Ok(Ok(Err(err))) => {
@@ -3761,7 +3684,7 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("channel", "failed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Failed);
                         crate::log_emotes!(
                             debug,
                             "Deferred 7TV fetch still failed for {}: {}",
@@ -3775,7 +3698,7 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("channel", "join_failed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::JoinFailed);
                         crate::log_emotes!(
                             debug,
                             "Deferred 7TV join failed for {}: {}",
@@ -3790,7 +3713,7 @@ impl EmoteCache {
                             0,
                         );
                         timed_out_fetch.abort();
-                        record_7tv_deferred_watchdog("channel", "timeout");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Timeout);
                         crate::log_emotes!(
                             debug,
                             "Deferred 7TV fetch timed out for {} after {}s",
@@ -3803,10 +3726,10 @@ impl EmoteCache {
         } else if defer_seventv_refresh {
             let deferred_channel_login = channel_login.to_string();
             let deferred_cache_key = cache_key.clone();
-            let deferred_timeout_key = channel_login.to_ascii_lowercase();
+            let deferred_timeout_key = normalize_channel_key(channel_login);
             let deferred_actual_id = actual_id.clone();
             let deferred_catalog_pending = catalog_pending.take();
-            record_7tv_deferred_watchdog("channel", "scheduled");
+            record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Scheduled);
             crate::log_emotes!(
                 debug,
                 "Scheduling deferred retry with new 7TV fetch task for {}",
@@ -3814,22 +3737,22 @@ impl EmoteCache {
             );
             crate::backend::bridge::RUNTIME.spawn(async move {
                 let _catalog_pending = deferred_catalog_pending;
-                record_7tv_deferred_watchdog("channel", "started");
+                record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Started);
                 let deferred_fetch_start = Instant::now();
                 match tokio::time::timeout(
                     Duration::from_secs(SEVENTV_DEFERRED_FETCH_TIMEOUT_SECS),
-                    fetch_7tv_channel(&deferred_actual_id, &deferred_channel_login),
+                    fetch_seventv_channel(&deferred_actual_id, &deferred_channel_login),
                 )
                 .await
                 {
                     Ok(Ok(shared)) => match shared.as_ref() {
-                    (
-                        SevenTvExactSetFetchOutcome::Present {
+                    SevenTvChannelFetch {
+                        outcome: SevenTvExactSetFetchOutcome::Present {
                             emotes,
                             emote_set_id,
                         },
                         subscription,
-                    ) => {
+                    } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         let fetched_count = emotes.len();
                         record_emote_stage_timed(
@@ -3858,12 +3781,12 @@ impl EmoteCache {
                             apply_start,
                             provider_count,
                         );
-                        record_7tv_deferred_watchdog("channel", "completed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Completed);
                     }
-                    (
-                        SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
+                    SevenTvChannelFetch {
+                        outcome: SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
                         subscription,
-                    ) => {
+                    } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         record_emote_stage_timed(
                             "emotes.channel.fetch.7tv.deferred",
@@ -3900,7 +3823,7 @@ impl EmoteCache {
                                 "emotes.channel.fetch.7tv.deferred_terminal_stale",
                             );
                         }
-                        record_7tv_deferred_watchdog("channel", "completed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Completed);
                     }
                     },
                     Ok(Err(err)) => {
@@ -3909,7 +3832,7 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("channel", "failed");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Failed);
                         crate::log_emotes!(
                             debug,
                             "Deferred 7TV fetch still failed for {}: {}",
@@ -3923,7 +3846,7 @@ impl EmoteCache {
                             deferred_fetch_start,
                             0,
                         );
-                        record_7tv_deferred_watchdog("channel", "timeout");
+                        record_seventv_deferred_watchdog(DeferredScope::Channel, DeferredEvent::Timeout);
                         crate::log_emotes!(
                             debug,
                             "Deferred 7TV fetch timed out for {} after {}s",
@@ -3939,7 +3862,7 @@ impl EmoteCache {
     }
 
     /// Check if global emotes need refresh
-    pub async fn global_needs_refresh(&self) -> bool {
+    pub fn global_needs_refresh(&self) -> bool {
         let global = self.global.read_or_recover();
         match global.as_ref() {
             Some(entry) => Self::needs_refresh(entry, self.ttl),
@@ -3967,8 +3890,8 @@ impl EmoteCache {
 
     /// Get all emotes for a channel (channel-specific + user subscriptions + global)
     /// Returns Arc<Emote> references to avoid cloning ~1-2MB of emote data
-    pub fn get_all_emotes(&self, channel_id: &str) -> Vec<Arc<Emote>> {
-        let cache_key = normalized_channel_key(channel_id);
+    pub fn get_all_emotes(&self, channel_login: &str) -> Vec<Arc<Emote>> {
+        let cache_key = channel_key_cow(channel_login);
 
         let mut emote_map: HashMap<Arc<str>, Arc<Emote>> = HashMap::new();
 
@@ -4007,9 +3930,9 @@ impl EmoteCache {
     ///
     /// Unlike `get_all_emotes`, this preserves emotes that share the same display name but have
     /// different provider/id pairs. This avoids accidental collisions in picker tabs/history.
-    pub async fn get_all_emotes_unique(&self, channel_id: &str) -> Vec<Arc<Emote>> {
+    pub fn get_all_emotes_unique(&self, channel_login: &str) -> Vec<Arc<Emote>> {
         let started_at = Instant::now();
-        let cache_key = normalized_channel_key(channel_id);
+        let cache_key = channel_key_cow(channel_login);
         let global = self.global.read_or_recover();
         let user_emotes = self.user_emotes.read_or_recover();
         let channel_emotes = self.channels.get(cache_key.as_ref());
@@ -4109,7 +4032,7 @@ impl EmoteCache {
     }
 
     /// Get only global emotes (Arc references to avoid cloning)
-    pub async fn get_global_emotes(&self) -> Vec<Arc<Emote>> {
+    pub fn get_global_emotes(&self) -> Vec<Arc<Emote>> {
         let global = self.global.read_or_recover();
         if let Some(entry) = global.as_ref() {
             entry
@@ -4127,7 +4050,7 @@ impl EmoteCache {
 
     /// Get only channel-specific emotes (Arc references to avoid cloning)
     pub fn get_channel_emotes(&self, channel_login: &str) -> Vec<Arc<Emote>> {
-        let cache_key = channel_login.to_lowercase();
+        let cache_key = normalize_channel_key(channel_login);
         match self.channels.get(&cache_key) {
             Some(entry) => entry
                 .emotes
@@ -4148,7 +4071,7 @@ impl EmoteCache {
     /// If any provider row is hidden, rebuild from the visible exact records so
     /// a hidden folded winner cannot suppress a visible case-variant fallback.
     fn get_channel_index_snapshot(&self, channel_login: &str) -> (Vec<Arc<Emote>>, EmoteNameMap) {
-        let cache_key = normalized_channel_key(channel_login);
+        let cache_key = channel_key_cow(channel_login);
         let Some(entry) = self.channels.get(cache_key.as_ref()) else {
             return (Vec::new(), HashMap::new());
         };
@@ -4193,7 +4116,7 @@ impl EmoteCache {
     }
 
     /// Get only user's personal/subscription emotes (Arc references to avoid cloning)
-    pub async fn get_user_emotes(&self) -> Vec<Arc<Emote>> {
+    pub fn get_user_emotes(&self) -> Vec<Arc<Emote>> {
         let user = self.user_emotes.read_or_recover();
         if let Some(entry) = user.as_ref() {
             entry
@@ -4210,7 +4133,7 @@ impl EmoteCache {
     }
 
     /// Clear authenticated user-scoped emotes when Echo leaves authenticated mode.
-    pub async fn clear_user_emotes(&self) {
+    pub fn clear_user_emotes(&self) {
         self.revoke_user_emotes_residency();
     }
 
@@ -4242,223 +4165,6 @@ impl EmoteCache {
     }
 }
 
-#[derive(Deserialize)]
-struct SevenTVEmoteSet {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    emotes: Vec<SevenTVEmote>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SevenTVEmoteSetRefOrObject {
-    Full(SevenTVEmoteSet),
-    Id(String),
-}
-
-#[derive(Deserialize)]
-struct SevenTVEmote {
-    id: String,
-    name: String,
-    data: SevenTVEmoteData,
-}
-
-#[derive(Deserialize)]
-struct SevenTVEmoteData {
-    name: Option<String>,
-    host: SevenTVHost,
-    owner: Option<SevenTVOwner>,
-    #[serde(default)]
-    animated: bool,
-    #[serde(default)]
-    pub flags: u32,
-}
-
-#[derive(Deserialize)]
-struct SevenTVOwner {
-    display_name: Option<String>,
-    username: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SevenTVHost {
-    url: String,
-    files: Vec<SevenTVFile>,
-}
-
-#[derive(Deserialize)]
-struct SevenTVFile {
-    name: String,
-    format: String,
-    #[serde(default)]
-    frame_count: u32,
-    #[serde(default)]
-    width: u32,
-    #[serde(default)]
-    height: u32,
-}
-
-#[derive(Deserialize)]
-struct SevenTVUser {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    emote_set: Option<SevenTVEmoteSetRefOrObject>,
-    #[serde(default)]
-    emote_set_id: Option<String>,
-    #[serde(default)]
-    user: Option<SevenTVUserProfile>,
-}
-
-/// Reduced 7TV user shape for personal-set discovery. Unknown channel-set and
-/// identity fields are intentionally ignored by serde.
-#[derive(Deserialize)]
-struct SevenTVUserWithPersonalEmotes {
-    user: Option<SevenTVUserProfile>,
-}
-
-/// Reference to an emote set in user.emote_sets array
-#[derive(Deserialize)]
-struct SevenTVEmoteSetRef {
-    id: String,
-    #[serde(default)]
-    flags: u32,
-}
-
-/// User profile containing emote_sets array
-#[derive(Deserialize)]
-struct SevenTVUserProfile {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    emote_sets: Vec<SevenTVEmoteSetRef>,
-    #[serde(default)]
-    connections: Vec<SevenTVConnection>,
-}
-
-#[derive(Deserialize)]
-struct SevenTVConnection {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    platform: String,
-    #[serde(default)]
-    emote_set_id: Option<String>,
-}
-
-/// Normalize 7TV host URL once (often schemeless like "//cdn.7tv.app/...").
-/// Returns the base URL with trailing slash stripped for efficient appending.
-fn normalize_7tv_host(host_url: &str) -> String {
-    let trimmed = host_url.trim();
-    let base = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else if trimmed.starts_with("//") {
-        format!("https:{}", trimmed)
-    } else {
-        format!("https://{}", trimmed)
-    };
-    base.trim_end_matches('/').to_string()
-}
-
-/// Build 7TV image URL from pre-normalized base (avoids repeated normalization).
-#[inline]
-fn build_7tv_url_from_base(base: &str, file_name: &str) -> String {
-    let file = file_name.trim_start_matches('/');
-    let mut url = String::with_capacity(base.len() + 1 + file.len());
-    url.push_str(base);
-    url.push('/');
-    url.push_str(file);
-    url
-}
-
-/// Find 7TV resolution files (1x, 2x, 4x) from a host's file list.
-/// Returns (file_1x, file_2x, file_4x) - each may be None if not found.
-/// Prefers WebP (animated decode support), then PNG, then a supported partial match.
-fn find_7tv_resolution_files(
-    files: &[SevenTVFile],
-) -> (
-    Option<&SevenTVFile>,
-    Option<&SevenTVFile>,
-    Option<&SevenTVFile>,
-) {
-    let find_res = |scale: &str| {
-        files
-            .iter()
-            .find(|f| f.name == format!("{scale}.webp"))
-            .or_else(|| files.iter().find(|f| f.name == format!("{scale}.png")))
-            .or_else(|| {
-                files.iter().find(|f| {
-                    f.name.contains(scale)
-                        && matches!(
-                            f.format.to_ascii_uppercase().as_str(),
-                            "WEBP" | "PNG" | "GIF"
-                        )
-                })
-            })
-    };
-    (
-        find_res("1x"),
-        find_res("2x"),
-        find_res("4x").or_else(|| find_res("3x")),
-    )
-}
-
-#[inline]
-fn clone_cached_7tv_global(ttl: Duration) -> Option<SevenTvGlobalFetchResult> {
-    let cache = SEVENTV_GLOBAL_FETCH_CACHE.read_or_recover();
-    cache
-        .as_ref()
-        .filter(|entry| entry.fetched_at.elapsed() <= ttl)
-        .map(|entry| Arc::clone(&entry.emotes))
-}
-
-#[inline]
-fn clone_cached_7tv_channel(cache_key: &str, ttl: Duration) -> Option<SevenTvChannelFetchResult> {
-    SEVENTV_CHANNEL_FETCH_CACHE
-        .get(cache_key)
-        .filter(|entry| entry.fetched_at.elapsed() <= ttl)
-        .map(|entry| Arc::clone(&entry.result))
-}
-
-fn prune_7tv_channel_fetch_cache() {
-    let max_ttl = Duration::from_secs(SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS);
-    SEVENTV_CHANNEL_FETCH_CACHE.retain(|_, entry| entry.fetched_at.elapsed() <= max_ttl);
-    let len = SEVENTV_CHANNEL_FETCH_CACHE.len();
-    if len <= SEVENTV_CHANNEL_FETCH_CACHE_MAX_ENTRIES {
-        return;
-    }
-
-    let overflow = len - SEVENTV_CHANNEL_FETCH_CACHE_MAX_ENTRIES;
-    let keys_to_remove: Vec<String> = SEVENTV_CHANNEL_FETCH_CACHE
-        .iter()
-        .take(overflow)
-        .map(|entry| entry.key().clone())
-        .collect();
-    for key in keys_to_remove {
-        SEVENTV_CHANNEL_FETCH_CACHE.remove(&key);
-    }
-}
-
-fn invalidate_7tv_global_fetch_cache() {
-    *SEVENTV_GLOBAL_FETCH_CACHE.write_or_recover() = None;
-}
-
-fn invalidate_7tv_channel_fetch_cache(channel_login: &str) {
-    let channel_key = normalize_channel_key(channel_login);
-    let suffix = format!(":{}", channel_key);
-    SEVENTV_CHANNEL_FETCH_CACHE.retain(|key, _| !key.ends_with(&suffix));
-    SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&channel_key);
-}
-
-pub(crate) fn invalidate_7tv_fetch_cache_for_event(channel_login: Option<&str>, is_global: bool) {
-    if is_global {
-        invalidate_7tv_global_fetch_cache();
-    } else if let Some(channel) = channel_login {
-        invalidate_7tv_channel_fetch_cache(channel);
-    }
-}
-
 /// Channels whose in-progress manual reload already saw the 7TV fetch fail.
 static SEVENTV_MANUAL_RELOAD_FAILED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
@@ -4475,11 +4181,11 @@ pub(crate) async fn manual_reload_channel_emotes(
     channel_login: &str,
 ) -> (String, bool) {
     let cache_key = normalize_channel_key(channel_login);
-    invalidate_7tv_channel_fetch_cache(&cache_key);
+    invalidate_seventv_channel_fetch_cache(&cache_key);
 
     let seventv = match tokio::time::timeout(
         Duration::from_secs(SEVENTV_DEFERRED_FETCH_TIMEOUT_SECS),
-        fetch_7tv_channel(channel_id, &cache_key),
+        fetch_seventv_channel(channel_id, &cache_key),
     )
     .await
     {
@@ -4519,13 +4225,14 @@ pub(crate) async fn manual_reload_channel_emotes(
 
     if matches!(load, Ok(LoadOutcome::Coalesced))
         && let Ok(shared) = &seventv
-        && let (
-            SevenTvExactSetFetchOutcome::Present {
-                emotes,
-                emote_set_id,
-            },
+        && let SevenTvChannelFetch {
+            outcome:
+                SevenTvExactSetFetchOutcome::Present {
+                    emotes,
+                    emote_set_id,
+                },
             subscription,
-        ) = shared.as_ref()
+        } = shared.as_ref()
     {
         EMOTE_CACHE
             .apply_channel_provider_emotes(
@@ -4562,7 +4269,7 @@ pub(crate) async fn manual_reload_channel_emotes(
         })
     };
     let seventv_status = match &seventv {
-        Ok(shared) => match &shared.0 {
+        Ok(shared) => match &shared.outcome {
             SevenTvExactSetFetchOutcome::Present {
                 emotes,
                 emote_set_id: None,
@@ -4609,16 +4316,16 @@ fn format_manual_reload_status(
     }
 }
 
-pub(crate) fn seven_tv_dispatch_emote(
+pub(crate) fn seventv_dispatch_emote(
     value: &serde_json::Value,
     channel: Option<&str>,
 ) -> Option<Emote> {
-    serde_json::from_value::<SevenTVEmote>(value.clone())
+    serde_json::from_value::<SevenTvEmote>(value.clone())
         .ok()
-        .and_then(|emote| convert_7tv_emote(emote, channel))
+        .and_then(|emote| convert_seventv_emote(emote, channel))
 }
 
-pub(crate) async fn apply_7tv_channel_emote_patch(
+pub(crate) async fn apply_seventv_channel_emote_patch(
     channel_login: &str,
     patch: SevenTvEmoteSetPatch,
 ) -> Result<SevenTvPatchApplyOutcome, String> {
@@ -4627,19 +4334,19 @@ pub(crate) async fn apply_7tv_channel_emote_patch(
         .await
 }
 
-pub(crate) async fn apply_7tv_global_emote_patch(
+pub(crate) async fn apply_seventv_global_emote_patch(
     patch: SevenTvEmoteSetPatch,
 ) -> Result<SevenTvPatchApplyOutcome, String> {
     EMOTE_CACHE.apply_global_seventv_patch(patch).await
 }
 
-pub(crate) async fn apply_7tv_user_emote_patch(
+pub(crate) async fn apply_seventv_user_emote_patch(
     patch: SevenTvEmoteSetPatch,
 ) -> Result<SevenTvPatchApplyOutcome, String> {
     EMOTE_CACHE.apply_user_seventv_patch(patch).await
 }
 
-pub(crate) async fn clear_7tv_channel_emote_rows_if_set(
+pub(crate) async fn clear_seventv_channel_emote_rows_if_set(
     channel_login: &str,
     expected_set_id: &str,
 ) -> Option<usize> {
@@ -4669,7 +4376,7 @@ pub(crate) async fn force_refresh_user_emotes(user_id: &str, token: &str) -> Res
     Ok(())
 }
 
-pub(crate) async fn apply_7tv_channel_emote_rows(
+pub(crate) async fn apply_seventv_channel_emote_rows(
     channel_login: &str,
     emotes: Vec<Arc<Emote>>,
     emote_set_id: &str,
@@ -4690,13 +4397,15 @@ pub(crate) async fn apply_7tv_channel_emote_rows(
     count
 }
 
-pub(crate) async fn apply_7tv_global_emote_set(emotes: Vec<Arc<Emote>>) -> usize {
+pub(crate) async fn apply_seventv_global_emote_set(emotes: Vec<Arc<Emote>>) -> usize {
     EMOTE_CACHE
         .apply_global_provider_emotes(EmoteProvider::SevenTV, emotes)
         .await
 }
 
-pub(crate) async fn clear_7tv_global_emote_set_if_matches(expected_set_id: &str) -> Option<usize> {
+pub(crate) async fn clear_seventv_global_emote_set_if_matches(
+    expected_set_id: &str,
+) -> Option<usize> {
     {
         let mut current = SEVENTV_GLOBAL_SET_ID.write_or_recover();
         if current
@@ -4709,1960 +4418,13 @@ pub(crate) async fn clear_7tv_global_emote_set_if_matches(expected_set_id: &str)
             current.take();
         }
     }
-    Some(apply_7tv_global_emote_set(Vec::new()).await)
+    Some(apply_seventv_global_emote_set(Vec::new()).await)
 }
 
-pub(crate) async fn apply_7tv_user_emote_set(emotes: Vec<Arc<Emote>>) -> usize {
+pub(crate) async fn apply_seventv_user_emote_set(emotes: Vec<Arc<Emote>>) -> usize {
     EMOTE_CACHE
         .apply_user_provider_emotes(EmoteProvider::SevenTV, emotes)
         .await
-}
-
-async fn fetch_7tv_global() -> Result<SevenTvGlobalFetchResult, String> {
-    struct GlobalFetchInFlightGuard {
-        notify: Option<Arc<tokio::sync::Notify>>,
-    }
-
-    impl Drop for GlobalFetchInFlightGuard {
-        fn drop(&mut self) {
-            if let Some(notify) = self.notify.take() {
-                let mut in_flight = SEVENTV_GLOBAL_FETCH_IN_FLIGHT.lock_or_recover();
-                in_flight.take();
-                notify.notify_waiters();
-            }
-        }
-    }
-
-    let ttl = Duration::from_secs(SEVENTV_GLOBAL_FETCH_CACHE_TTL_SECS);
-
-    loop {
-        if let Some(cached) = clone_cached_7tv_global(ttl) {
-            record_emote_stage_duration(
-                "emotes.7tv.global.cache_hit",
-                Duration::ZERO,
-                cached.len(),
-            );
-            return Ok(cached);
-        }
-
-        let mut leader_guard: Option<GlobalFetchInFlightGuard> = None;
-        let existing_request = {
-            let mut in_flight = SEVENTV_GLOBAL_FETCH_IN_FLIGHT.lock_or_recover();
-            if let Some(existing) = in_flight.as_ref() {
-                // Created under the lock: `notify_waiters` stores no permit, so
-                // a future created after the leader finishes would never wake.
-                Some(Arc::clone(existing).notified_owned())
-            } else {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                *in_flight = Some(Arc::clone(&notify));
-                leader_guard = Some(GlobalFetchInFlightGuard {
-                    notify: Some(notify),
-                });
-                None
-            }
-        };
-
-        if let Some(wait_for) = existing_request {
-            let wait_start = Instant::now();
-            wait_for.await;
-            record_emote_stage_timed("emotes.7tv.global.wait_inflight", wait_start, 0);
-            continue;
-        }
-
-        let fetch_start = Instant::now();
-        let result = fetch_7tv_global_raw().await.map(Arc::new);
-        let item_count = result.as_ref().map(|emotes| emotes.len()).unwrap_or(0);
-        record_emote_stage_timed("emotes.7tv.global.network", fetch_start, item_count);
-
-        if let Ok(emotes) = &result {
-            let cache_store_start = Instant::now();
-            *SEVENTV_GLOBAL_FETCH_CACHE.write_or_recover() = Some(SevenTVGlobalFetchCacheEntry {
-                fetched_at: Instant::now(),
-                emotes: Arc::clone(emotes),
-            });
-            record_emote_stage_timed(
-                "emotes.7tv.global.cache_store",
-                cache_store_start,
-                emotes.len(),
-            );
-        }
-        drop(leader_guard);
-
-        return result;
-    }
-}
-
-async fn fetch_7tv_global_raw() -> Result<Vec<Arc<Emote>>, String> {
-    SEVENTV_LIMITER.until_ready().await;
-    let resp = fetch_with_retry_str(
-        &SEVENTV_EMOTE_SET_HTTP_CLIENT,
-        api::seventv::GLOBAL_EMOTES,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&SEVENTV_LIMITER),
-    )
-    .await?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "7TV global emotes returned status: {}",
-            resp.status()
-        ));
-    }
-    let set: SevenTVEmoteSet = resp.json().await.map_err(|e| e.to_string())?;
-    if let Some(ref set_id) = set.id {
-        *SEVENTV_GLOBAL_SET_ID.write_or_recover() = Some(set_id.clone());
-        seventv_eventapi::subscribe_global_set(set_id);
-    }
-    Ok(convert_7tv_emotes(set.emotes, None)
-        .into_iter()
-        .map(Arc::new)
-        .collect())
-}
-
-pub(crate) async fn fetch_7tv_emote_set_by_id(
-    set_id: &str,
-    channel_login: Option<&str>,
-) -> Result<SevenTvExactSetFetchOutcome, String> {
-    SEVENTV_LIMITER.until_ready().await;
-
-    let set_url = api::seventv::emote_set(set_id);
-    let set_resp = fetch_with_retry_str(
-        &SEVENTV_EMOTE_SET_HTTP_CLIENT,
-        &set_url,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&SEVENTV_LIMITER),
-    )
-    .await?;
-    let status = set_resp.status();
-    if status.as_u16() == 410 {
-        crate::backend::metrics::record_emote_event("7tv.set_fetch.terminal_absent");
-        crate::log_emotes!(
-            info,
-            "7TV emote set {} is terminally absent (HTTP {})",
-            set_id,
-            status
-        );
-        return Ok(SevenTvExactSetFetchOutcome::TerminallyAbsent {
-            emote_set_id: set_id.to_string(),
-        });
-    }
-    if !status.is_success() {
-        crate::backend::metrics::record_emote_event("7tv.set_fetch.http_preserved");
-        let error = format!(
-            "7TV emote set {} returned HTTP {}; preserving existing provider state",
-            set_id, status
-        );
-        crate::log_emotes!(warn, "{}", error);
-        return Err(error);
-    }
-
-    let set: SevenTVEmoteSet = set_resp.json().await.map_err(|e| e.to_string())?;
-    let emotes = convert_7tv_emotes(set.emotes, channel_login)
-        .into_iter()
-        .map(Arc::new)
-        .collect();
-    Ok(SevenTvExactSetFetchOutcome::Present {
-        emotes,
-        emote_set_id: set.id.or_else(|| Some(set_id.to_string())),
-    })
-}
-
-/// Fetches 7TV channel emotes and returns (emotes, emote_set_id)
-/// The emote_set_id is used for tracking changes and EventAPI subscriptions
-async fn fetch_7tv_channel(
-    channel_id: &str,
-    channel_login: &str,
-) -> Result<SevenTvChannelFetchResult, String> {
-    struct ChannelFetchInFlightGuard {
-        key: String,
-        notify: Option<Arc<tokio::sync::Notify>>,
-    }
-
-    impl Drop for ChannelFetchInFlightGuard {
-        fn drop(&mut self) {
-            if let Some(notify) = self.notify.take() {
-                let mut in_flight = SEVENTV_CHANNEL_FETCH_IN_FLIGHT.lock_or_recover();
-                in_flight.remove(&self.key);
-                notify.notify_waiters();
-            }
-        }
-    }
-
-    if SEVENTV_MANUAL_RELOAD_FAILED.contains(&normalize_channel_key(channel_login)) {
-        return Err("7TV fetch already failed during this manual reload".to_string());
-    }
-    let eventapi_updates_live = seventv_eventapi::channel_updates_are_live(channel_login);
-    let ttl = Duration::from_secs(if eventapi_updates_live {
-        SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS
-    } else {
-        SEVENTV_CHANNEL_FETCH_CACHE_TTL_SECS
-    });
-    let cache_key = format!("{}:{}", channel_id, channel_login.to_ascii_lowercase());
-
-    loop {
-        if let Some(cached) = clone_cached_7tv_channel(&cache_key, ttl) {
-            record_emote_stage_duration(
-                if eventapi_updates_live {
-                    "emotes.7tv.channel.cache_hit.eventapi_live"
-                } else {
-                    "emotes.7tv.channel.cache_hit.fallback_polling"
-                },
-                Duration::ZERO,
-                cached.0.emote_count(),
-            );
-            return Ok(cached);
-        }
-
-        let mut leader_guard: Option<ChannelFetchInFlightGuard> = None;
-        let existing_request = {
-            let mut in_flight = SEVENTV_CHANNEL_FETCH_IN_FLIGHT.lock_or_recover();
-            if let Some(existing) = in_flight.get(&cache_key) {
-                // Created under the lock; see the global fetch above.
-                Some(Arc::clone(existing).notified_owned())
-            } else {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                in_flight.insert(cache_key.clone(), Arc::clone(&notify));
-                leader_guard = Some(ChannelFetchInFlightGuard {
-                    key: cache_key.clone(),
-                    notify: Some(notify),
-                });
-                None
-            }
-        };
-
-        if let Some(wait_for) = existing_request {
-            let wait_start = Instant::now();
-            wait_for.await;
-            record_emote_stage_timed("emotes.7tv.channel.wait_inflight", wait_start, 0);
-            continue;
-        }
-
-        let fetch_start = Instant::now();
-        let result = fetch_7tv_channel_raw(channel_id, channel_login)
-            .await
-            .map(Arc::new);
-        let item_count = result
-            .as_ref()
-            .map(|result| result.0.emote_count())
-            .unwrap_or(0);
-        record_emote_stage_timed("emotes.7tv.channel.network", fetch_start, item_count);
-
-        if let Ok(shared_result) = &result {
-            let cache_store_start = Instant::now();
-            SEVENTV_CHANNEL_FETCH_CACHE.insert(
-                cache_key.clone(),
-                SevenTVChannelFetchCacheEntry {
-                    fetched_at: Instant::now(),
-                    result: Arc::clone(shared_result),
-                },
-            );
-            prune_7tv_channel_fetch_cache();
-            record_emote_stage_timed(
-                "emotes.7tv.channel.cache_store",
-                cache_store_start,
-                shared_result.0.emote_count(),
-            );
-        }
-        drop(leader_guard);
-
-        return result;
-    }
-}
-
-async fn fetch_7tv_channel_raw(
-    channel_id: &str,
-    channel_login: &str,
-) -> Result<SevenTvChannelFetchPayload, String> {
-    SEVENTV_LIMITER.until_ready().await;
-
-    let url = api::seventv::user(channel_id);
-    let resp = fetch_with_retry_str(
-        &SEVENTV_USER_HTTP_CLIENT,
-        &url,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&SEVENTV_LIMITER),
-    )
-    .await
-    .map_err(|e| {
-        crate::log_emotes!(
-            debug,
-            "7TV channel emotes unavailable for {} ({}): {} - will retry on next refresh",
-            channel_login,
-            channel_id,
-            e
-        );
-        e
-    })?;
-
-    if !resp.status().is_success() {
-        return Ok((
-            SevenTvExactSetFetchOutcome::Present {
-                emotes: vec![],
-                emote_set_id: None,
-            },
-            None,
-        ));
-    }
-
-    let user: SevenTVUser = resp.json().await.map_err(|e| e.to_string())?;
-    let subscription_identity = seven_tv_channel_subscription_identity(&user, channel_id);
-
-    match user.emote_set {
-        Some(SevenTVEmoteSetRefOrObject::Full(set)) => {
-            if set.emotes.is_empty()
-                && let Some(set_id) = set.id.clone().or_else(|| user.emote_set_id.clone())
-            {
-                crate::log_emotes!(
-                    debug,
-                    "7TV user payload for {} had empty emote_set object, fetching set {} separately",
-                    channel_login,
-                    set_id
-                );
-                let outcome = fetch_7tv_emote_set_by_id(&set_id, Some(channel_login)).await?;
-                let subscription =
-                    seven_tv_channel_subscription_from_identity(&subscription_identity, &set_id);
-                return Ok((outcome, subscription));
-            }
-
-            let emote_set_id = set.id.clone().or(user.emote_set_id.clone());
-            let subscription = emote_set_id.as_deref().and_then(|set_id| {
-                seven_tv_channel_subscription_from_identity(&subscription_identity, set_id)
-            });
-            let emotes = convert_7tv_emotes(set.emotes, Some(channel_login))
-                .into_iter()
-                .map(Arc::new)
-                .collect();
-            Ok((
-                SevenTvExactSetFetchOutcome::Present {
-                    emotes,
-                    emote_set_id,
-                },
-                subscription,
-            ))
-        }
-        Some(SevenTVEmoteSetRefOrObject::Id(set_id)) => {
-            crate::log_emotes!(
-                debug,
-                "7TV user payload for {} returned emote_set as id {}, fetching separately",
-                channel_login,
-                set_id
-            );
-            let outcome = fetch_7tv_emote_set_by_id(&set_id, Some(channel_login)).await?;
-            let subscription =
-                seven_tv_channel_subscription_from_identity(&subscription_identity, &set_id);
-            Ok((outcome, subscription))
-        }
-        None => {
-            if let Some(set_id) = user.emote_set_id {
-                crate::log_emotes!(
-                    debug,
-                    "7TV user payload for {} returned emote_set_id {}, fetching separately",
-                    channel_login,
-                    set_id
-                );
-                let outcome = fetch_7tv_emote_set_by_id(&set_id, Some(channel_login)).await?;
-                let subscription =
-                    seven_tv_channel_subscription_from_identity(&subscription_identity, &set_id);
-                Ok((outcome, subscription))
-            } else {
-                crate::log_emotes!(
-                    debug,
-                    "7TV user payload for {} had no emote_set or emote_set_id",
-                    channel_login
-                );
-                Ok((
-                    SevenTvExactSetFetchOutcome::Present {
-                        emotes: vec![],
-                        emote_set_id: None,
-                    },
-                    None,
-                ))
-            }
-        }
-    }
-}
-
-fn seven_tv_channel_subscription_identity(
-    user: &SevenTVUser,
-    channel_id: &str,
-) -> Option<(String, usize)> {
-    let profile = user.user.as_ref()?;
-    let user_id = profile
-        .id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .or_else(|| user.id.as_deref().filter(|id| !id.is_empty()))?;
-    let connection_index = seven_tv_twitch_connection_index(user, profile, channel_id)?;
-    Some((user_id.to_string(), connection_index))
-}
-
-fn seven_tv_twitch_connection_index(
-    user: &SevenTVUser,
-    profile: &SevenTVUserProfile,
-    channel_id: &str,
-) -> Option<usize> {
-    let twitch_connections: Vec<_> = profile
-        .connections
-        .iter()
-        .enumerate()
-        .filter(|(_, connection)| connection.platform.eq_ignore_ascii_case("TWITCH"))
-        .collect();
-
-    if let Some((index, _)) = twitch_connections
-        .iter()
-        .find(|(_, connection)| connection.id == channel_id)
-    {
-        return Some(*index);
-    }
-
-    let target_set_id = user
-        .emote_set
-        .as_ref()
-        .and_then(seven_tv_emote_set_ref_id)
-        .or(user.emote_set_id.as_deref())
-        .filter(|set_id| !set_id.is_empty());
-
-    if let Some(target_set_id) = target_set_id
-        && let Some((index, _)) = twitch_connections.iter().find(|(_, connection)| {
-            connection
-                .emote_set_id
-                .as_deref()
-                .is_some_and(|set_id| set_id == target_set_id)
-        })
-    {
-        return Some(*index);
-    }
-
-    if twitch_connections.len() == 1 {
-        return Some(twitch_connections[0].0);
-    }
-
-    None
-}
-
-fn seven_tv_emote_set_ref_id(value: &SevenTVEmoteSetRefOrObject) -> Option<&str> {
-    match value {
-        SevenTVEmoteSetRefOrObject::Full(set) => set.id.as_deref(),
-        SevenTVEmoteSetRefOrObject::Id(set_id) if !set_id.is_empty() => Some(set_id.as_str()),
-        SevenTVEmoteSetRefOrObject::Id(_) => None,
-    }
-}
-
-fn seven_tv_channel_subscription_from_identity(
-    identity: &Option<(String, usize)>,
-    emote_set_id: &str,
-) -> Option<seventv_eventapi::SevenTvChannelSubscription> {
-    if emote_set_id.is_empty() {
-        return None;
-    }
-    let (user_id, connection_index) = identity.as_ref()?;
-    Some(seventv_eventapi::SevenTvChannelSubscription {
-        user_id: user_id.clone(),
-        emote_set_id: emote_set_id.to_string(),
-        connection_index: *connection_index,
-    })
-}
-
-/// Fetch 7TV personal emotes for a user
-/// Personal emotes are a 7TV subscriber feature that allows up to 5 emotes to be used globally
-/// They are stored in a separate emote set with flags == 4 (Personal flag)
-async fn fetch_7tv_personal_emotes(
-    twitch_user_id: &str,
-) -> Result<SevenTvExactSetFetchOutcome, String> {
-    crate::log_emotes!(
-        info,
-        "Fetching 7TV personal emotes for Twitch user: {}",
-        twitch_user_id
-    );
-
-    let url = api::seventv::user(twitch_user_id);
-    let resp = fetch_with_retry_str(
-        &SEVENTV_USER_HTTP_CLIENT,
-        &url,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&SEVENTV_LIMITER),
-    )
-    .await
-    .map_err(|e| {
-        crate::log_emotes!(info, "7TV personal emotes unavailable: {}", e);
-        e
-    })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        if status.as_u16() == 404 {
-            return Err("User not found on 7TV".to_string());
-        }
-        return Err(format!("7TV API returned status: {}", status));
-    }
-
-    let user_data: SevenTVUserWithPersonalEmotes = resp.json().await.map_err(|e| {
-        crate::log_emotes!(info, "Failed to parse 7TV user response: {}", e);
-        e.to_string()
-    })?;
-
-    let personal_set_id = user_data
-        .user
-        .and_then(|u| u.emote_sets.into_iter().find(|s| s.flags == 4))
-        .map(|s| s.id);
-
-    let Some(set_id) = personal_set_id else {
-        crate::log_emotes!(
-            info,
-            "No personal emote set found for user {}",
-            twitch_user_id
-        );
-        return Ok(SevenTvExactSetFetchOutcome::Present {
-            emotes: vec![],
-            emote_set_id: None,
-        });
-    };
-
-    crate::log_emotes!(
-        info,
-        "Found personal emote set ID: {} for user {}",
-        set_id,
-        twitch_user_id
-    );
-
-    fetch_7tv_emote_set_by_id(&set_id, Some(PERSONAL_SEVENTV_CHANNEL)).await
-}
-
-fn convert_7tv_emotes(emotes: Vec<SevenTVEmote>, channel: Option<&str>) -> Vec<Emote> {
-    emotes
-        .into_iter()
-        .filter_map(|emote| convert_7tv_emote(emote, channel))
-        .collect()
-}
-
-fn convert_7tv_emote(e: SevenTVEmote, channel: Option<&str>) -> Option<Emote> {
-    let (file_1x, file_2x, file_4x) = find_7tv_resolution_files(&e.data.host.files);
-
-    let default_file = file_1x
-        .or(file_2x)
-        .or(file_4x)
-        .or_else(|| e.data.host.files.first())?;
-
-    let original_name = e.data.name.filter(|orig| orig != &e.name);
-
-    let creator_name = e
-        .data
-        .owner
-        .and_then(|owner| owner.display_name.or(owner.username));
-
-    let base_url = normalize_7tv_host(&e.data.host.url);
-    let default_url = build_7tv_url_from_base(&base_url, &default_file.name);
-
-    // Prefer the smallest available source for logical dimensions, but fall
-    // through when that file has missing/invalid geometry. Keep width/height
-    // paired: a partial provider dimension is not authoritative.
-    let dimension_candidates = [
-        file_1x.map(|file| (file, 1u32)),
-        file_2x.map(|file| (file, 2u32)),
-        file_4x.map(|file| {
-            (
-                file,
-                if file.name.starts_with("3x.") || file.name.starts_with("3x_") {
-                    3
-                } else {
-                    4
-                },
-            )
-        }),
-    ];
-    let (width, height) = dimension_candidates
-        .into_iter()
-        .flatten()
-        .chain(e.data.host.files.iter().filter_map(|file| {
-            let (tier, suffix) = file.name.split_once('x')?;
-            if !suffix.starts_with('.') && !suffix.starts_with('_') {
-                return None;
-            }
-            let scale = match tier {
-                "1" => 1,
-                "2" => 2,
-                "3" => 3,
-                "4" => 4,
-                _ => return None,
-            };
-            Some((file, scale))
-        }))
-        .find_map(|(file, scale)| {
-            (file.width > 0 && file.height > 0).then(|| {
-                (
-                    (file.width as f32 / scale as f32).round().max(1.0) as u32,
-                    (file.height as f32 / scale as f32).round().max(1.0) as u32,
-                )
-            })
-        })
-        .map_or((None, None), |(width, height)| (Some(width), Some(height)));
-    let is_animated = e.data.animated
-        || (e.data.flags & 1) != 0
-        || default_file.frame_count > 1
-        || default_file.format.eq_ignore_ascii_case("GIF");
-
-    Some(Emote {
-        id: Arc::from(e.id.clone()),
-        name: Arc::from(e.name),
-        url: Arc::from(default_url),
-        provider: EmoteProvider::SevenTV,
-        channel: channel.map(Arc::from),
-        original_name: original_name.map(Arc::from),
-        creator_name: creator_name.map(Arc::from),
-        twitch_owner_login: None,
-        twitch_owner_id: None,
-        twitch_emote_type: None,
-        url_1x: file_1x.map(|f| Arc::from(build_7tv_url_from_base(&base_url, &f.name))),
-        url_2x: file_2x.map(|f| Arc::from(build_7tv_url_from_base(&base_url, &f.name))),
-        url_4x: file_4x.map(|f| Arc::from(build_7tv_url_from_base(&base_url, &f.name))),
-        zero_width: (e.data.flags & 256) != 0,
-        is_animated,
-        width,
-        height,
-    })
-}
-
-#[derive(Deserialize)]
-struct BTTVEmote {
-    id: String,
-    code: String,
-    #[serde(default)]
-    animated: bool,
-    #[serde(default)]
-    width: Option<u32>,
-    #[serde(default)]
-    height: Option<u32>,
-}
-
-#[derive(Deserialize)]
-struct BTTVChannelResponse {
-    #[serde(rename = "channelEmotes")]
-    channel_emotes: Vec<BTTVEmote>,
-    #[serde(rename = "sharedEmotes")]
-    shared_emotes: Vec<BTTVEmote>,
-}
-
-async fn fetch_bttv_global() -> Result<Vec<Emote>, String> {
-    BTTV_LIMITER.until_ready().await;
-    let resp = fetch_with_retry_str(
-        &EMOTE_HTTP_CLIENT,
-        api::bttv::GLOBAL_EMOTES,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&BTTV_LIMITER),
-    )
-    .await?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "BTTV global emotes returned status: {}",
-            resp.status()
-        ));
-    }
-    let emotes: Vec<BTTVEmote> = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(convert_bttv_emotes(emotes, None))
-}
-
-async fn fetch_bttv_channel(channel_id: &str, channel_login: &str) -> Result<Vec<Emote>, String> {
-    BTTV_LIMITER.until_ready().await;
-
-    let url = api::bttv::channel(channel_id);
-    let resp = fetch_with_retry_str(
-        &EMOTE_HTTP_CLIENT,
-        &url,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&BTTV_LIMITER),
-    )
-    .await?;
-
-    // BTTV answers 404 for a channel that has never set up BTTV emotes.
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(vec![]);
-    }
-    if !resp.status().is_success() {
-        return Err(format!(
-            "BTTV channel API returned status: {}",
-            resp.status()
-        ));
-    }
-
-    let response: BTTVChannelResponse = resp.json().await.map_err(|e| e.to_string())?;
-
-    let mut emotes = convert_bttv_emotes(response.channel_emotes, Some(channel_login));
-    emotes.extend(convert_bttv_emotes(
-        response.shared_emotes,
-        Some(channel_login),
-    ));
-    Ok(emotes)
-}
-
-/// Build BTTV emote CDN URL for a given scale (1x, 2x, 3x).
-#[inline]
-fn bttv_emote_url(id: &str, scale: &str) -> String {
-    const BTTV_CDN: &str = "https://cdn.betterttv.net/emote";
-    format!("{BTTV_CDN}/{id}/{scale}")
-}
-
-fn convert_bttv_emotes(emotes: Vec<BTTVEmote>, channel: Option<&str>) -> Vec<Emote> {
-    emotes
-        .into_iter()
-        .map(|e| {
-            let is_animated = e.animated;
-            let (width, height) = match (e.width, e.height) {
-                (Some(width), Some(height)) if width > 0 && height > 0 => {
-                    (Some(width), Some(height))
-                }
-                _ => (None, None),
-            };
-            Emote {
-                id: Arc::from(e.id.clone()),
-                name: Arc::from(e.code),
-                url: Arc::from(bttv_emote_url(&e.id, "1x")),
-                provider: EmoteProvider::BTTV,
-                channel: channel.map(Arc::from),
-                original_name: None,
-                creator_name: None,
-                twitch_owner_login: None,
-                twitch_owner_id: None,
-                twitch_emote_type: None,
-                url_1x: Some(Arc::from(bttv_emote_url(&e.id, "1x"))),
-                url_2x: Some(Arc::from(bttv_emote_url(&e.id, "2x"))),
-                url_4x: Some(Arc::from(bttv_emote_url(&e.id, "3x"))),
-                zero_width: false,
-                is_animated,
-                width,
-                height,
-            }
-        })
-        .collect()
-}
-
-#[derive(Deserialize)]
-struct FFZGlobalResponse {
-    #[serde(default)]
-    default_sets: Vec<i64>,
-    #[serde(default)]
-    sets: HashMap<String, FFZEmoteSet>,
-}
-
-#[derive(Deserialize)]
-struct FFZRoomResponse {
-    room: Option<FFZRoom>,
-    sets: HashMap<String, FFZEmoteSet>,
-}
-
-/// FFZ sends `null` (not an omitted key) for a room without custom badge
-/// artwork, e.g. `"mod_urls": null` beside a custom `vip_badge`.
-#[derive(Deserialize)]
-struct FFZRoom {
-    twitch_id: i64,
-    #[serde(default, deserialize_with = "deserialize_null_as_default")]
-    mod_urls: HashMap<String, String>,
-    #[serde(default, deserialize_with = "deserialize_null_as_default")]
-    vip_badge: HashMap<String, String>,
-    #[serde(default, deserialize_with = "deserialize_null_as_default")]
-    user_badge_ids: HashMap<String, Vec<serde_json::Value>>,
-}
-
-fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-#[derive(Deserialize, Default)]
-struct FFZEmoteSet {
-    #[serde(default)]
-    emoticons: Vec<FFZEmote>,
-}
-
-#[derive(Deserialize)]
-struct FFZEmote {
-    #[serde(default)]
-    id: i64,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    urls: HashMap<String, String>,
-    /// FFZ exposes animated variants in a parallel URL map. When present,
-    /// these are the actual animated assets; the regular `urls` map may still
-    /// contain static fallbacks.
-    #[serde(default, deserialize_with = "deserialize_ffz_animated_urls")]
-    animated: HashMap<String, String>,
-    #[serde(default)]
-    width: Option<u32>,
-    #[serde(default)]
-    height: Option<u32>,
-}
-
-async fn fetch_ffz_global() -> Result<Vec<Emote>, String> {
-    FFZ_LIMITER.until_ready().await;
-    let resp = fetch_with_retry_str(
-        &EMOTE_HTTP_CLIENT,
-        api::ffz::GLOBAL_EMOTES,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&FFZ_LIMITER),
-    )
-    .await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("FFZ API returned status: {}", resp.status()));
-    }
-
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read FFZ response: {}", e))?;
-
-    let response: FFZGlobalResponse = serde_json::from_str(&body).map_err(|e| {
-        crate::log_emotes!(
-            debug,
-            "FFZ parse error: {}. Response preview: {}",
-            e,
-            truncate_for_log(&body, 500)
-        );
-        format!("Failed to parse FFZ response: {}", e)
-    })?;
-
-    let total_emotes: usize = response
-        .default_sets
-        .iter()
-        .filter_map(|id| response.sets.get(&id.to_string()))
-        .map(|set| set.emoticons.len())
-        .sum();
-    let mut emotes = Vec::with_capacity(total_emotes);
-    for set_id in &response.default_sets {
-        if let Some(set) = response.sets.get(&set_id.to_string()) {
-            emotes.extend(convert_ffz_emotes(&set.emoticons, None));
-        }
-    }
-    crate::log_emotes!(info, "Loaded {} global FFZ emotes", emotes.len());
-    Ok(emotes)
-}
-
-/// Fetch FFZ channel data and return both emotes and Twitch user ID
-async fn fetch_ffz_channel_with_id(
-    channel_login: &str,
-) -> Result<(Vec<Emote>, Option<String>), String> {
-    let Some(response) = fetch_ffz_room(channel_login).await? else {
-        publish_ffz_room_badges(channel_login, None);
-        return Ok((vec![], None));
-    };
-
-    publish_ffz_room_badges(channel_login, response.room.as_ref());
-    let twitch_id = response
-        .room
-        .as_ref()
-        .map(|room| room.twitch_id.to_string());
-
-    let total_emotes: usize = response.sets.values().map(|set| set.emoticons.len()).sum();
-    let mut emotes = Vec::with_capacity(total_emotes);
-    for set in response.sets.values() {
-        emotes.extend(convert_ffz_emotes(&set.emoticons, Some(channel_login)));
-    }
-    Ok((emotes, twitch_id))
-}
-
-async fn fetch_ffz_room(channel_login: &str) -> Result<Option<FFZRoomResponse>, String> {
-    FFZ_LIMITER.until_ready().await;
-
-    let url = api::ffz::room(channel_login);
-    let resp = fetch_with_retry_str(
-        &EMOTE_HTTP_CLIENT,
-        &url,
-        EMOTE_MAX_RETRY_AFTER,
-        Some(&FFZ_LIMITER),
-    )
-    .await?;
-
-    if !resp.status().is_success() {
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        return Err(format!("FFZ room API returned status: {}", resp.status()));
-    }
-
-    let response: FFZRoomResponse = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(Some(response))
-}
-
-fn publish_ffz_room_badges(channel_login: &str, room: Option<&FFZRoom>) {
-    let moderator_url = room.and_then(|room| preferred_ffz_room_badge_url(&room.mod_urls));
-    let vip_url = room.and_then(|room| preferred_ffz_room_badge_url(&room.vip_badge));
-    let badges_by_user_id = room
-        .map(|room| invert_ffz_channel_badge_users(&room.user_badge_ids))
-        .unwrap_or_default();
-
-    crate::backend::badges::TWITCH_BADGE_CACHE.publish_ffz_channel_badges(
-        channel_login,
-        moderator_url,
-        vip_url,
-        badges_by_user_id,
-    );
-}
-
-fn schedule_ffz_room_badge_hydration(channel_login: &str) {
-    if !crate::backend::settings::get_show_ffz_badges()
-        || crate::backend::badges::TWITCH_BADGE_CACHE
-            .has_ffz_channel_badge_state_sync(channel_login)
-    {
-        return;
-    }
-
-    let channel_login = channel_login
-        .trim()
-        .trim_start_matches('#')
-        .to_ascii_lowercase();
-    if channel_login.is_empty() || !FFZ_ROOM_BADGE_HYDRATIONS.insert(channel_login.clone()) {
-        return;
-    }
-
-    crate::backend::bridge::RUNTIME.spawn(async move {
-        match fetch_ffz_room(&channel_login).await {
-            Ok(response) => {
-                publish_ffz_room_badges(
-                    &channel_login,
-                    response
-                        .as_ref()
-                        .and_then(|response| response.room.as_ref()),
-                );
-            }
-            Err(error) => {
-                crate::log_cache!(
-                    warn,
-                    channel = channel_login,
-                    %error,
-                    "Failed to hydrate FFZ room badges beside fresh channel emote cache"
-                );
-            }
-        }
-        FFZ_ROOM_BADGE_HYDRATIONS.remove(&channel_login);
-    });
-}
-
-async fn fetch_ffz_channel(channel_login: &str) -> Result<Vec<Emote>, String> {
-    let (emotes, _) = fetch_ffz_channel_with_id(channel_login).await?;
-    Ok(emotes)
-}
-
-/// Normalize FFZ URL (often protocol-relative like "//cdn.frankerfacez.com/...").
-fn normalize_ffz_url(urls: &HashMap<String, String>, key: &str) -> Option<String> {
-    urls.get(key).map(|u| {
-        if u.starts_with("//") {
-            format!("https:{}", u)
-        } else {
-            u.clone()
-        }
-    })
-}
-
-fn preferred_ffz_room_badge_url(urls: &HashMap<String, String>) -> Option<String> {
-    normalize_ffz_url(urls, "4")
-        .or_else(|| normalize_ffz_url(urls, "2"))
-        .or_else(|| normalize_ffz_url(urls, "1"))
-}
-
-fn invert_ffz_channel_badge_users(
-    assignments: &HashMap<String, Vec<serde_json::Value>>,
-) -> HashMap<String, Vec<u64>> {
-    let mut by_user_id: HashMap<String, Vec<u64>> = HashMap::new();
-    for (badge_id, users) in assignments {
-        let Ok(badge_id) = badge_id.parse::<u64>() else {
-            continue;
-        };
-        for user in users {
-            let user_id = user
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| user.as_u64().map(|id| id.to_string()));
-            let Some(user_id) = user_id.filter(|id| !id.is_empty()) else {
-                continue;
-            };
-            let badges = by_user_id.entry(user_id).or_default();
-            if !badges.contains(&badge_id) {
-                badges.push(badge_id);
-            }
-        }
-    }
-    for badges in by_user_id.values_mut() {
-        badges.sort_unstable();
-    }
-    by_user_id
-}
-
-#[inline]
-fn url_looks_animated(url: &str) -> bool {
-    #[inline]
-    fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle))
-    }
-
-    let bytes = url.as_bytes();
-    bytes
-        .get(bytes.len().saturating_sub(4)..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".gif"))
-        || contains_ascii_case_insensitive(bytes, b"/animated/")
-        || contains_ascii_case_insensitive(bytes, b"_animated.")
-        || contains_ascii_case_insensitive(bytes, b"format=gif")
-}
-
-fn deserialize_ffz_animated_urls<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_object()
-        .map(|object| {
-            object
-                .iter()
-                .filter_map(|(key, value)| value.as_str().map(|url| (key.clone(), url.to_owned())))
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-fn convert_ffz_emotes(emotes: &[FFZEmote], channel: Option<&str>) -> Vec<Emote> {
-    emotes
-        .iter()
-        .filter_map(|e| {
-            let has_animated_map = !e.animated.is_empty();
-            let animated_variant = |key: &str| {
-                normalize_ffz_url(&e.animated, key)
-                    .or_else(|| normalize_ffz_url(&e.animated, "2"))
-                    .or_else(|| normalize_ffz_url(&e.animated, "1"))
-                    .or_else(|| normalize_ffz_url(&e.animated, "4"))
-            };
-            let url_1x = animated_variant("1").or_else(|| normalize_ffz_url(&e.urls, "1"));
-            let url_2x = animated_variant("2").or_else(|| normalize_ffz_url(&e.urls, "2"));
-            let url_4x = animated_variant("4").or_else(|| normalize_ffz_url(&e.urls, "4"));
-
-            let default_url = url_1x.clone().or(url_2x.clone()).or(url_4x.clone())?;
-
-            let is_animated = has_animated_map
-                || [url_1x.as_deref(), url_2x.as_deref(), url_4x.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(url_looks_animated)
-                || url_looks_animated(&default_url);
-            let (width, height) = match (e.width, e.height) {
-                (Some(width), Some(height)) if width > 0 && height > 0 => {
-                    (Some(width), Some(height))
-                }
-                _ => (None, None),
-            };
-            Some(Emote {
-                id: Arc::from(e.id.to_string()),
-                name: Arc::from(e.name.clone()),
-                url: Arc::from(default_url),
-                provider: EmoteProvider::FFZ,
-                channel: channel.map(Arc::from),
-                original_name: None,
-                creator_name: None,
-                twitch_owner_login: None,
-                twitch_owner_id: None,
-                twitch_emote_type: None,
-                url_1x: url_1x.map(Arc::from),
-                url_2x: url_2x.map(Arc::from),
-                url_4x: url_4x.map(Arc::from),
-                zero_width: false,
-                is_animated,
-                width,
-                height,
-            })
-        })
-        .collect()
-}
-
-#[derive(Deserialize)]
-struct TwitchEmotesResponse {
-    data: Vec<TwitchEmote>,
-}
-
-#[derive(Deserialize)]
-struct TwitchEmote {
-    id: String,
-    name: String,
-    images: TwitchEmoteImages,
-    #[serde(default)]
-    emote_type: String,
-    #[serde(default)]
-    format: Vec<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct TwitchEmoteImages {
-    #[serde(default)]
-    url_1x: String,
-    url_2x: String,
-    #[serde(default)]
-    url_4x: String,
-}
-
-const TWITCH_EMOTE_CDN_TEMPLATE: &str =
-    "https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}";
-
-fn twitch_emote_variant_url(template: &str, id: &str, is_animated: bool, scale: &str) -> String {
-    template
-        .replace("{{id}}", id)
-        .replace(
-            "{{format}}",
-            if is_animated { "animated" } else { "static" },
-        )
-        .replace("{{theme_mode}}", "dark")
-        .replace("{{scale}}", scale)
-}
-
-/// Fetch Twitch channel emotes (subscriber emotes) using Helix API
-/// Requires an OAuth token with user:read:emotes or channel:read:emotes scope
-pub async fn fetch_twitch_channel_emotes(
-    channel_id: &str,
-    token: Option<&str>,
-    channel_login: &str,
-) -> Result<Vec<Emote>, String> {
-    let Some(initial_token) = token else {
-        return Ok(vec![]);
-    };
-
-    let url = api::twitch::channel_emotes(channel_id);
-    let mut token_to_use = initial_token.to_string();
-
-    let mut resp = retry_helix_get_str(
-        &EMOTE_HTTP_CLIENT,
-        &url,
-        CLIENT_ID,
-        &token_to_use,
-        EMOTE_MAX_RETRY_AFTER,
-    )
-    .await?;
-
-    if matches!(resp.status().as_u16(), 401 | 403) {
-        crate::log_emotes!(
-            warn,
-            "Twitch channel emotes unauthorized for {} (status {}), attempting token refresh",
-            channel_login,
-            resp.status()
-        );
-        match crate::backend::auth::refresh_and_save_tokens().await {
-            Ok(new_token) => {
-                token_to_use = new_token;
-                resp = retry_helix_get_str(
-                    &EMOTE_HTTP_CLIENT,
-                    &url,
-                    CLIENT_ID,
-                    &token_to_use,
-                    EMOTE_MAX_RETRY_AFTER,
-                )
-                .await?;
-            }
-            Err(err) => {
-                return Err(format!(
-                    "token refresh failed after status {}: {}",
-                    resp.status(),
-                    err
-                ));
-            }
-        }
-    }
-
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Helix channel emotes returned status: {}",
-            resp.status()
-        ));
-    }
-
-    let response: TwitchEmotesResponse = resp.json().await.map_err(|e| e.to_string())?;
-
-    let emotes: Vec<Emote> = response
-        .data
-        .into_iter()
-        .map(|e| {
-            let is_animated = e.format.iter().any(|f| f == "animated");
-            let (url_1x, url_2x, url_4x) = if is_animated {
-                (
-                    twitch_emote_variant_url(TWITCH_EMOTE_CDN_TEMPLATE, &e.id, true, "1.0"),
-                    twitch_emote_variant_url(TWITCH_EMOTE_CDN_TEMPLATE, &e.id, true, "2.0"),
-                    twitch_emote_variant_url(TWITCH_EMOTE_CDN_TEMPLATE, &e.id, true, "3.0"),
-                )
-            } else {
-                (e.images.url_1x, e.images.url_2x, e.images.url_4x)
-            };
-            Emote {
-                id: Arc::from(e.id.clone()),
-                name: Arc::from(e.name),
-                url: Arc::from(url_1x.clone()),
-                provider: EmoteProvider::Twitch,
-                channel: Some(Arc::from(channel_login)),
-                original_name: None,
-                creator_name: None,
-                twitch_owner_login: Some(Arc::from(channel_login)),
-                twitch_owner_id: Some(Arc::from(channel_id)),
-                twitch_emote_type: Some(Arc::from(if e.emote_type.is_empty() {
-                    "subscriptions"
-                } else {
-                    e.emote_type.as_str()
-                })),
-                url_1x: Some(Arc::from(url_1x)),
-                url_2x: Some(Arc::from(url_2x)),
-                url_4x: Some(Arc::from(url_4x)),
-                zero_width: false,
-                is_animated,
-                width: Some(echo_emote_core::twitch_base_dimensions(&e.id).0),
-                height: Some(echo_emote_core::twitch_base_dimensions(&e.id).1),
-            }
-        })
-        .collect();
-
-    Ok(emotes)
-}
-
-#[derive(Deserialize, Debug)]
-struct TwitchUserEmote {
-    id: String,
-    name: String,
-    #[serde(default)]
-    owner_id: String,
-    #[serde(default)]
-    emote_type: String,
-    #[serde(default)]
-    format: Vec<String>,
-}
-
-/// Fetch all emotes the user has access to (subscriptions, bits, follower emotes)
-/// Fetch the user's Twitch emotes. The flag is `false` when pagination stopped
-/// early after errors, so the caller can keep its previous set alongside the
-/// partial result instead of replacing it.
-pub async fn fetch_twitch_user_emotes(
-    user_id: &str,
-    token: &str,
-) -> Result<(Vec<Emote>, bool), String> {
-    crate::log_emotes!(debug, "Fetching user emotes for user_id: {}", user_id);
-    let mut complete = true;
-    let mut all_raw_emotes = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut template = String::new();
-    let mut page_num = 0;
-
-    let pagination_backoff = || {
-        backon::ExponentialBuilder::default()
-            .with_min_delay(std::time::Duration::from_millis(1000))
-            .with_max_delay(std::time::Duration::from_secs(30))
-            .with_max_times(7)
-            .with_jitter()
-    };
-
-    let mut rate_limit_remaining: Option<u32> = None;
-    let mut consecutive_errors = 0;
-    let fetch_started = Instant::now();
-
-    loop {
-        if page_num > 0 {
-            let adaptive_delay = if consecutive_errors > 0 {
-                Some(std::time::Duration::from_millis(
-                    2000 * (consecutive_errors as u64),
-                ))
-            } else if rate_limit_remaining.map(|r| r < 50).unwrap_or(false) {
-                Some(std::time::Duration::from_millis(1000))
-            } else {
-                None
-            };
-            if let Some(delay) = adaptive_delay {
-                tokio::time::sleep(delay).await;
-            }
-        }
-        page_num += 1;
-
-        let mut url = api::twitch::user_emotes(user_id);
-        if let Some(ref c) = cursor {
-            url.push_str(&format!("&after={}", urlencoding::encode(c)));
-        }
-
-        crate::log_emotes!(trace, "User emotes URL (page {}): {}", page_num, url);
-
-        let resp = (|| {
-            let url = url.clone();
-            let token = token.to_string();
-            async move { EMOTE_HTTP_CLIENT.get(&url).helix_auth(&token).send().await }
-        })
-        .retry(pagination_backoff())
-        .when(is_reqwest_transient)
-        .await;
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                consecutive_errors += 1;
-                crate::log_emotes!(
-                    warn,
-                    "Request error on page {} (attempt {}): {}",
-                    page_num,
-                    consecutive_errors,
-                    e
-                );
-                if cursor.is_none() {
-                    return Err(e.to_string());
-                }
-                if consecutive_errors < 3 {
-                    crate::log_emotes!(info, "Retrying page {} after delay...", page_num);
-                    page_num -= 1;
-                    continue;
-                }
-                crate::log_emotes!(
-                    warn,
-                    "Pagination failed on page {} after {} errors, continuing with {} emotes from previous pages",
-                    page_num,
-                    consecutive_errors,
-                    all_raw_emotes.len()
-                );
-                complete = false;
-                break;
-            }
-        };
-
-        if let Some(remaining) = resp.headers().get("ratelimit-remaining")
-            && let Ok(val) = remaining.to_str().unwrap_or("").parse::<u32>()
-        {
-            rate_limit_remaining = Some(val);
-            if val < 100 {
-                crate::log_emotes!(debug, "Rate limit remaining: {} (page {})", val, page_num);
-            }
-        }
-
-        let status = resp.status();
-        crate::log_emotes!(trace, "User emotes response status: {}", status);
-
-        if status.as_u16() == 429 {
-            // Page 1 fails fast: the caller keeps the previous set.
-            if cursor.is_none() {
-                return Err(format!("Twitch API rate limited ({})", status));
-            }
-            consecutive_errors += 1;
-            let wait = server_retry_wait(resp.headers()).unwrap_or(Duration::from_secs(5));
-            let within_budget = wait <= USER_EMOTES_RATE_LIMIT_MAX_WAIT
-                && fetch_started.elapsed() + wait <= USER_EMOTES_RATE_LIMIT_BUDGET;
-            if consecutive_errors < 3 && within_budget {
-                crate::log_emotes!(
-                    warn,
-                    "Rate limited on page {}, waiting {:?} before retry",
-                    page_num,
-                    wait
-                );
-                tokio::time::sleep(wait).await;
-                page_num -= 1;
-                continue;
-            }
-            crate::log_emotes!(
-                warn,
-                "Rate limited on page {} (wait {:?}), continuing with {} emotes",
-                page_num,
-                wait,
-                all_raw_emotes.len()
-            );
-            complete = false;
-            break;
-        }
-
-        if !status.is_success() {
-            let body = crate::backend::http::error_body(resp).await;
-            crate::log_emotes!(warn, "Failed to fetch user emotes: {} - {}", status, body);
-            if cursor.is_none() {
-                return Err(format!("Twitch API error: {} - {}", status, body));
-            }
-            complete = false;
-            break;
-        }
-
-        consecutive_errors = 0;
-
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => {
-                crate::log_emotes!(warn, "Failed to read response body: {}", e);
-                if cursor.is_none() {
-                    return Err(e.to_string());
-                }
-                complete = false;
-                break;
-            }
-        };
-
-        if cursor.is_none() {
-            crate::log_emotes!(
-                trace,
-                "Raw response sample: {}",
-                truncate_for_log(&body, 800)
-            );
-        }
-
-        #[derive(Deserialize)]
-        struct PaginatedResponse {
-            data: Vec<TwitchUserEmote>,
-            #[serde(default)]
-            template: String,
-            #[serde(default)]
-            pagination: Pagination,
-        }
-        #[derive(Deserialize, Default)]
-        struct Pagination {
-            cursor: Option<String>,
-        }
-
-        let response: PaginatedResponse = serde_json::from_str(&body).map_err(|e| {
-            crate::log_emotes!(warn, "Failed to parse user emotes response: {}", e);
-            crate::log_emotes!(debug, "Response body: {}", truncate_for_log(&body, 500));
-            e.to_string()
-        })?;
-
-        crate::log_emotes!(
-            trace,
-            "Received {} user emotes in this page",
-            response.data.len()
-        );
-
-        if cursor.is_none() && !response.data.is_empty() {
-            let first = &response.data[0];
-            crate::log_emotes!(
-                trace,
-                "First emote parsed: id={}, name={}, owner_id='{}'",
-                first.id,
-                first.name,
-                first.owner_id
-            );
-        }
-
-        if template.is_empty() && !response.template.is_empty() {
-            template = response.template;
-        }
-
-        all_raw_emotes.extend(response.data);
-
-        cursor = response.pagination.cursor;
-        if cursor.is_none() {
-            break;
-        }
-    }
-
-    let emote_types: HashSet<&str> = all_raw_emotes
-        .iter()
-        .map(|e| e.emote_type.as_str())
-        .collect();
-    crate::log_emotes!(
-        info,
-        "User emotes API returned {} emotes from {} pages with types: {:?}",
-        all_raw_emotes.len(),
-        page_num,
-        emote_types
-    );
-
-    let owner_ids: HashSet<String> = all_raw_emotes
-        .iter()
-        .filter(|e| {
-            let is_channel_emote = matches!(
-                e.emote_type.as_str(),
-                "subscriptions" | "follower" | "bitstier"
-            );
-            is_channel_emote
-                && !e.owner_id.is_empty()
-                && e.owner_id != "0"
-                && e.owner_id.chars().all(|c| c.is_ascii_digit())
-        })
-        .map(|e| e.owner_id.clone())
-        .collect();
-
-    let channel_emote_count = all_raw_emotes
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.emote_type.as_str(),
-                "subscriptions" | "follower" | "bitstier"
-            )
-        })
-        .count();
-
-    crate::log_emotes!(
-        info,
-        "Found {} channel-based emotes (sub/follower/bits) out of {} total, {} unique channel IDs to resolve",
-        channel_emote_count,
-        all_raw_emotes.len(),
-        owner_ids.len()
-    );
-
-    if owner_ids.is_empty() && channel_emote_count > 0 {
-        let sample: Vec<_> = all_raw_emotes
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.emote_type.as_str(),
-                    "subscriptions" | "follower" | "bitstier"
-                )
-            })
-            .take(3)
-            .collect();
-        for e in sample {
-            crate::log_emotes!(
-                debug,
-                "Sample channel emote: name={}, owner_id='{}', emote_type={}",
-                e.name,
-                e.owner_id,
-                e.emote_type
-            );
-        }
-    }
-
-    let owner_names = resolve_user_ids_to_names(&owner_ids, token).await;
-
-    let page_template = if template.is_empty() {
-        TWITCH_EMOTE_CDN_TEMPLATE
-    } else {
-        &template
-    };
-
-    let mut all_emotes = Vec::new();
-    for e in all_raw_emotes {
-        let is_animated = e.format.iter().any(|format| format == "animated");
-        let url_1x = twitch_emote_variant_url(page_template, &e.id, is_animated, "1.0");
-        let url_2x = twitch_emote_variant_url(page_template, &e.id, is_animated, "2.0");
-        let url_4x = twitch_emote_variant_url(page_template, &e.id, is_animated, "3.0");
-
-        let channel_value = match e.emote_type.as_str() {
-            "subscriptions" | "follower" | "bitstier" => {
-                let channel_name = if e.owner_id.is_empty() {
-                    crate::log_emotes!(
-                        debug,
-                        "Keeping emote '{}' with missing Twitch owner id",
-                        e.name
-                    );
-                    "unresolved".to_string()
-                } else if e.owner_id.chars().all(|c| c.is_ascii_digit()) {
-                    owner_names.get(&e.owner_id).cloned().unwrap_or_else(|| {
-                        crate::log_emotes!(
-                            debug,
-                            "Keeping emote '{}' with unresolved Twitch owner id '{}'",
-                            e.name,
-                            e.owner_id
-                        );
-                        format!("unresolved:{}", e.owner_id)
-                    })
-                } else {
-                    e.owner_id.clone()
-                };
-
-                format!("sub:{}", channel_name)
-            }
-            "prime" => "twitch:prime".to_string(),
-            "limitedtime" => "twitch:limited".to_string(),
-            "hypetrain" => "twitch:hypetrain".to_string(),
-            "rewards" => "twitch:rewards".to_string(),
-            "turbo" => "twitch:turbo".to_string(),
-            _ => continue,
-        };
-
-        all_emotes.push(Emote {
-            id: Arc::from(e.id.clone()),
-            name: Arc::from(e.name),
-            url: Arc::from(url_1x.clone()),
-            provider: EmoteProvider::Twitch,
-            channel: Some(Arc::from(channel_value)),
-            original_name: None,
-            creator_name: None,
-            twitch_owner_login: match e.emote_type.as_str() {
-                "subscriptions" | "follower" | "bitstier" => {
-                    if e.owner_id.chars().all(|c| c.is_ascii_digit()) {
-                        owner_names.get(&e.owner_id).cloned().map(Arc::from)
-                    } else if e.owner_id.is_empty() {
-                        None
-                    } else {
-                        Some(Arc::from(e.owner_id.clone()))
-                    }
-                }
-                _ => None,
-            },
-            twitch_owner_id: if e.owner_id.is_empty() {
-                None
-            } else {
-                Some(Arc::from(e.owner_id.clone()))
-            },
-            twitch_emote_type: if e.emote_type.is_empty() {
-                None
-            } else {
-                Some(Arc::from(e.emote_type.clone()))
-            },
-            url_1x: Some(Arc::from(url_1x)),
-            url_2x: Some(Arc::from(url_2x)),
-            url_4x: Some(Arc::from(url_4x)),
-            zero_width: false,
-            is_animated,
-            width: Some(echo_emote_core::twitch_base_dimensions(&e.id).0),
-            height: Some(echo_emote_core::twitch_base_dimensions(&e.id).1),
-        });
-    }
-
-    crate::log_emotes!(
-        info,
-        "Total user (subscription) emotes after filtering: {}",
-        all_emotes.len()
-    );
-    Ok((all_emotes, complete))
-}
-
-/// Resolve Twitch user IDs to display names
-async fn resolve_user_ids_to_names(ids: &HashSet<String>, token: &str) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-
-    if ids.is_empty() {
-        return result;
-    }
-
-    let ids_vec: Vec<&String> = ids.iter().collect();
-    for chunk in ids_vec.chunks(100) {
-        let id_params: Vec<String> = chunk.iter().map(|id| format!("id={}", id)).collect();
-        let url = api::twitch::users(&id_params);
-
-        crate::log_emotes!(
-            trace,
-            "Resolving {} user IDs, URL: {}",
-            chunk.len(),
-            truncate_for_log(&url, 200)
-        );
-
-        let resp = retry_helix_get(
-            &EMOTE_HTTP_CLIENT,
-            &url,
-            CLIENT_ID,
-            token,
-            EMOTE_MAX_RETRY_AFTER,
-        )
-        .await;
-
-        match resp {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    #[derive(Deserialize)]
-                    struct UsersResponse {
-                        data: Vec<UserInfo>,
-                    }
-                    #[derive(Deserialize)]
-                    struct UserInfo {
-                        id: String,
-                        display_name: String,
-                    }
-
-                    match resp.json::<UsersResponse>().await {
-                        Ok(users_resp) => {
-                            crate::log_emotes!(
-                                info,
-                                "Got {} users from API",
-                                users_resp.data.len()
-                            );
-                            for user in users_resp.data {
-                                result.insert(user.id, user.display_name);
-                            }
-                        }
-                        Err(e) => {
-                            crate::log_emotes!(warn, "Failed to parse users response: {}", e);
-                        }
-                    }
-                } else {
-                    let body = crate::backend::http::error_body(resp).await;
-                    crate::log_emotes!(
-                        warn,
-                        "Users API failed: {} - {}",
-                        status,
-                        truncate_for_log(&body, 200)
-                    );
-                }
-            }
-            Err(e) => {
-                crate::log_emotes!(warn, "Failed to fetch users: {}", e);
-            }
-        }
-    }
-
-    crate::log_emotes!(info, "Resolved {} user IDs to names", result.len());
-    result
-}
-
-/// Fetch Twitch global emotes using Helix API
-pub async fn fetch_twitch_global_emotes(token: Option<&str>) -> Result<Vec<Emote>, String> {
-    let Some(token) = token else {
-        return Ok(vec![]);
-    };
-
-    let resp = retry_helix_get_str(
-        &EMOTE_HTTP_CLIENT,
-        api::twitch::GLOBAL_EMOTES,
-        CLIENT_ID,
-        token,
-        EMOTE_MAX_RETRY_AFTER,
-    )
-    .await?;
-
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Helix global emotes returned status: {}",
-            resp.status()
-        ));
-    }
-
-    let response: TwitchEmotesResponse = resp.json().await.map_err(|e| e.to_string())?;
-
-    let emotes: Vec<Emote> = response
-        .data
-        .into_iter()
-        .map(|e| {
-            let is_animated = e.format.iter().any(|f| f == "animated");
-            let (url_1x, url_2x, url_4x) = if is_animated {
-                (
-                    twitch_emote_variant_url(TWITCH_EMOTE_CDN_TEMPLATE, &e.id, true, "1.0"),
-                    twitch_emote_variant_url(TWITCH_EMOTE_CDN_TEMPLATE, &e.id, true, "2.0"),
-                    twitch_emote_variant_url(TWITCH_EMOTE_CDN_TEMPLATE, &e.id, true, "3.0"),
-                )
-            } else {
-                (e.images.url_1x, e.images.url_2x, e.images.url_4x)
-            };
-            Emote {
-                id: Arc::from(e.id.clone()),
-                name: Arc::from(e.name),
-                url: Arc::from(url_1x.clone()),
-                provider: EmoteProvider::Twitch,
-                channel: None,
-                original_name: None,
-                creator_name: None,
-                twitch_owner_login: None,
-                twitch_owner_id: None,
-                twitch_emote_type: if e.emote_type.is_empty() {
-                    None
-                } else {
-                    Some(Arc::from(e.emote_type))
-                },
-                url_1x: Some(Arc::from(url_1x)),
-                url_2x: Some(Arc::from(url_2x)),
-                url_4x: Some(Arc::from(url_4x)),
-                zero_width: false,
-                is_animated,
-                width: Some(echo_emote_core::twitch_base_dimensions(&e.id).0),
-                height: Some(echo_emote_core::twitch_base_dimensions(&e.id).1),
-            }
-        })
-        .collect();
-
-    Ok(emotes)
-}
-
-/// Emotes indexed by channel for fast iteration (channel_login -> Vec<Arc<Emote>>)
-pub static EMOTE_BY_CHANNEL: LazyLock<RwLock<HashMap<String, Vec<Arc<Emote>>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-static CHANNEL_EMOTE_CATALOG_VERSIONS: LazyLock<DashMap<String, u32>> = LazyLock::new(DashMap::new);
-static PROVIDER_VISIBILITY_GENERATION: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_VISIBILITY_APPLY_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-/// Stable per-channel derived-index publication slot.
-///
-/// The registry below is only copied when a channel receives its first slot.
-/// Every subsequent replacement (including an empty removal tombstone) swaps
-/// this slot's shared inner lookup in place. Readers never touch the writer
-/// epoch or commit lock.
-pub struct ChannelEmotePublication {
-    epoch: AtomicU64,
-    tombstoned: AtomicBool,
-    commit_lock: Mutex<()>,
-    lookup: ArcSwap<EmoteNameMap>,
-}
-
-impl ChannelEmotePublication {
-    fn new() -> Self {
-        Self {
-            epoch: AtomicU64::new(0),
-            tombstoned: AtomicBool::new(false),
-            commit_lock: Mutex::new(()),
-            lookup: ArcSwap::from_pointee(HashMap::new()),
-        }
-    }
-
-    #[inline]
-    fn begin_rebuild(&self) -> u64 {
-        self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
-    }
-
-    #[inline]
-    fn invalidate(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-    }
-
-    #[inline]
-    pub(crate) fn lookup_snapshot(&self) -> Arc<EmoteNameMap> {
-        self.lookup.load_full()
-    }
-}
-
-/// Mark a channel publication active at the explicit connection boundary.
-pub fn activate_channel_emotes(channel: &str) {
-    let cache_key = normalize_channel_key(channel);
-    let publication = channel_emote_publication(&cache_key);
-    let _commit = publication.commit_lock.lock_or_recover();
-    publication.invalidate();
-    publication.tombstoned.store(false, Ordering::Release);
-}
-
-/// Lock-free channel lookup registry. Entries intentionally remain after a
-/// removal as empty tombstone slots so an already-running rebuild cannot
-/// recreate a closed channel's derived indices. The outer map is cloned only
-/// when a channel is registered for the first time; all ordinary publications
-/// update the slot's inner [`ArcSwap`] instead.
-pub static EMOTE_LOOKUP_MAPS: LazyLock<ArcSwap<HashMap<String, Arc<ChannelEmotePublication>>>> =
-    LazyLock::new(|| ArcSwap::from_pointee(HashMap::new()));
-
-#[inline]
-fn channel_emote_publication(cache_key: &str) -> Arc<ChannelEmotePublication> {
-    if let Some(publication) = EMOTE_LOOKUP_MAPS.load().get(cache_key) {
-        return Arc::clone(publication);
-    }
-
-    let candidate = Arc::new(ChannelEmotePublication::new());
-    EMOTE_LOOKUP_MAPS.rcu(|publications| {
-        if publications.contains_key(cache_key) {
-            return Arc::clone(publications);
-        }
-        let mut updated = (**publications).clone();
-        updated.insert(cache_key.to_string(), Arc::clone(&candidate));
-        Arc::new(updated)
-    });
-
-    EMOTE_LOOKUP_MAPS
-        .load()
-        .get(cache_key)
-        .cloned()
-        .expect("channel publication slot registered")
-}
-
-#[inline]
-fn channel_emote_publication_if_registered(
-    cache_key: &str,
-) -> Option<Arc<ChannelEmotePublication>> {
-    EMOTE_LOOKUP_MAPS.load().get(cache_key).cloned()
-}
-
-/// Drop a closed channel's renderer vector and replace its lookup with an empty
-/// tombstone. Safe to call even if the channel is reopened later — the stable
-/// slot receives a newer epoch and publishes normally on the next provider load.
-pub fn remove_channel_emotes(channel: &str) {
-    let cache_key = normalize_channel_key(channel);
-    FAILED_CHANNELS.remove(&cache_key);
-    if CHANNEL_CATALOG_PENDING.remove(&cache_key).is_some() {
-        EMOTE_CACHE.channels.remove(&cache_key);
-        EMOTE_CACHE.channel_emote_set_ids.remove(&cache_key);
-    } else {
-        retain_closed_channel_catalog(&cache_key);
-    }
-    let publication = channel_emote_publication(&cache_key);
-    publication.invalidate();
-    let _commit = publication.commit_lock.lock_or_recover();
-    publication.tombstoned.store(true, Ordering::Release);
-    EMOTE_BY_CHANNEL.write_or_recover().remove(&cache_key);
-
-    publication.lookup.store(Arc::new(HashMap::new()));
-}
-
-const MAX_CLOSED_CHANNEL_CATALOGS: usize = 32;
-
-static CLOSED_CHANNEL_CATALOGS: LazyLock<Mutex<std::collections::VecDeque<String>>> =
-    LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
-
-fn retain_closed_channel_catalog(cache_key: &str) {
-    let evicted: Vec<String> = {
-        let mut closed = CLOSED_CHANNEL_CATALOGS.lock_or_recover();
-        closed.retain(|key| key != cache_key && crate::backend::irc::is_channel_closed(key));
-        closed.push_back(cache_key.to_string());
-        let excess = closed.len().saturating_sub(MAX_CLOSED_CHANNEL_CATALOGS);
-        closed.drain(..excess).collect()
-    };
-    for key in evicted {
-        if crate::backend::irc::is_channel_closed(&key) {
-            EMOTE_CACHE.channels.remove(&key);
-            EMOTE_CACHE.channel_emote_set_ids.remove(&key);
-        }
-    }
-}
-
-fn trigger_open_channel_preload(cache_key: &str) {
-    if !crate::backend::irc::is_channel_closed(cache_key) {
-        crate::cache::loader::trigger_channel_preload(cache_key);
-    }
-}
-
-/// True when the channel has a non-empty fast-lookup entry, i.e. tokenization can
-/// currently resolve its emotes. Used by the recovery paths (staggered-load retry,
-/// open watchdog) to decide whether a lookup gap still needs healing.
-pub fn channel_has_lookup_entry(channel: &str) -> bool {
-    let cache_key = normalize_channel_key(channel);
-    channel_emote_publication_if_registered(&cache_key)
-        .is_some_and(|publication| !publication.lookup_snapshot().is_empty())
-}
-
-/// Whether a channel has a catalog safe to use for one-time history parsing.
-/// A non-empty partial FFZ/BTTV lookup is insufficient while a cold channel's
-/// deferred 7TV fetch remains pending; an authoritative empty cache entry is
-/// safe and prevents waiting forever for a channel with no provider emotes.
-pub fn channel_catalog_ready_for_history(channel: &str) -> bool {
-    let cache_key = normalize_channel_key(channel);
-    let Some(entry) = EMOTE_CACHE.channels.get(&cache_key) else {
-        return false;
-    };
-    if CHANNEL_CATALOG_PENDING
-        .get(&cache_key)
-        .is_some_and(|token| token.load(Ordering::Acquire))
-    {
-        return false;
-    }
-    entry.emotes_by_id.len() == 0 || channel_has_lookup_entry(&cache_key)
-}
-
-/// True while a cold channel's initial provider publication is incomplete.
-/// History uses this to await the existing owner instead of restarting a
-/// partial catalog load after its short retry backdate.
-pub fn channel_initial_catalog_pending(channel: &str) -> bool {
-    let cache_key = normalize_channel_key(channel);
-    CHANNEL_CATALOG_PENDING
-        .get(&cache_key)
-        .is_some_and(|token| token.load(Ordering::Acquire))
-}
-
-/// One-shot open watchdog: roughly [`CHANNEL_OPEN_EMOTE_WATCHDOG_SECS`] after a
-/// channel open/load is kicked off, if the channel still has no lookup entry,
-/// self-heal. Rebuilds the index from cached metadata when it is resident (the
-/// common reopen case, where the entry was pruned on close) and only re-triggers
-/// a full network load when the cache is empty too. Runs on the durable runtime.
-pub fn spawn_channel_open_emote_watchdog(channel: &str) {
-    let channel_key = normalize_channel_key(channel);
-    if channel_key.is_empty()
-        || channel_key == "whisper"
-        || crate::benchmark_ui_fixture::is_fixture_channel(&channel_key)
-    {
-        return;
-    }
-    crate::backend::bridge::get_runtime().spawn(async move {
-        tokio::time::sleep(Duration::from_secs(CHANNEL_OPEN_EMOTE_WATCHDOG_SECS)).await;
-        if channel_has_lookup_entry(&channel_key) {
-            return;
-        }
-        crate::log_emotes!(
-            warn,
-            "[HEAL] {} has no emote lookup map {}s after open; self-healing",
-            channel_key,
-            CHANNEL_OPEN_EMOTE_WATCHDOG_SECS
-        );
-        if EMOTE_CACHE.channel_emote_count(&channel_key) > 0 {
-            rebuild_emote_indices(&channel_key).await;
-        } else {
-            crate::backend::bridge::preload_channel_emotes_predictive(&channel_key);
-        }
-    });
 }
 
 /// Global emotes list for easy iteration
@@ -6677,32 +4439,17 @@ pub static GLOBAL_EMOTES_LOOKUP: LazyLock<ArcSwap<EmoteNameMap>> =
 pub static USER_EMOTES_LOOKUP: LazyLock<ArcSwap<EmoteNameMap>> =
     LazyLock::new(|| ArcSwap::from_pointee(HashMap::new()));
 
-/// Normalize channel login/key for emote lookups.
-/// Accepts values like "#ChannelName" and returns lowercase login form.
-pub use echo_emote_core::{normalize_channel_key, normalized_channel_key};
-
 #[inline]
 pub fn emote_provider_enabled(provider: EmoteProvider) -> bool {
     use crate::backend::emote_provider_visibility::{
-        EmoteProviderVisibility, EmoteProviderVisibilityKey, emote_provider_visible,
+        EmoteProviderVisibility, emote_provider_visible,
     };
 
-    let key = match provider {
-        EmoteProvider::Twitch => EmoteProviderVisibilityKey::Twitch,
-        EmoteProvider::SevenTV => EmoteProviderVisibilityKey::SevenTv,
-        EmoteProvider::BTTV => EmoteProviderVisibilityKey::Bttv,
-        EmoteProvider::FFZ => EmoteProviderVisibilityKey::Ffz,
-        EmoteProvider::Emoji => EmoteProviderVisibilityKey::Emoji,
-    };
-    if matches!(
-        key,
-        EmoteProviderVisibilityKey::Twitch | EmoteProviderVisibilityKey::Emoji
-    ) {
-        return emote_provider_visible(key, EmoteProviderVisibility::default());
+    if matches!(provider, EmoteProvider::Twitch | EmoteProvider::Emoji) {
+        return true;
     }
-
     emote_provider_visible(
-        key,
+        provider,
         EmoteProviderVisibility {
             seventv: crate::backend::settings::get_enable_seventv_emotes(),
             bttv: crate::backend::settings::get_enable_bttv_emotes(),
@@ -6776,7 +4523,7 @@ pub fn schedule_channel_refresh_on_unresolved(channel: &str, token: &str) {
     let channel_key = normalize_channel_key(channel);
     if channel_key.is_empty()
         || channel_key == "whisper"
-        || crate::benchmark_ui_fixture::is_fixture_channel(&channel_key)
+        || crate::bench::ui_fixture::is_fixture_channel(&channel_key)
     {
         return;
     }
@@ -6911,551 +4658,6 @@ fn has_camel_hump(token: &str) -> bool {
     })
 }
 
-/// Update the dual-index caches from EmoteCache
-pub async fn rebuild_emote_indices(channel_login: &str) {
-    rebuild_emote_indices_inner(channel_login).await;
-}
-
-/// Publish a channel snapshot while holding the channel writer lock.
-///
-/// This is the uncommon race fallback: building the authoritative snapshot
-/// inside the serialized writer section guarantees that a stale incremental or
-/// full rebuild cannot leave a cache mutation absent from the published index.
-fn publish_authoritative_channel_snapshot(cache_key: &str) -> usize {
-    publish_authoritative_channel_snapshot_with_hook(cache_key, |_| {})
-}
-
-fn publish_authoritative_channel_snapshot_with_hook(
-    cache_key: &str,
-    after_begin: impl FnOnce(&Arc<ChannelEmotePublication>),
-) -> usize {
-    let publication = channel_emote_publication(cache_key);
-    let _commit = publication.commit_lock.lock_or_recover();
-    publication.begin_rebuild();
-    after_begin(&publication);
-    if publication.tombstoned.load(Ordering::Acquire) {
-        EMOTE_BY_CHANNEL.write_or_recover().remove(cache_key);
-        publication.lookup.store(Arc::new(HashMap::new()));
-        clear_channel_pending(cache_key);
-        publication.invalidate();
-        return 0;
-    }
-    let (emotes, lookup) = EMOTE_CACHE.get_channel_index_snapshot(cache_key);
-    let emote_name_count = lookup.len();
-    EMOTE_BY_CHANNEL
-        .write_or_recover()
-        .insert(cache_key.to_string(), emotes);
-    publication.lookup.store(Arc::new(lookup));
-    clear_channel_pending(cache_key);
-    publication.invalidate();
-    emote_name_count
-}
-
-async fn publish_channel_provider_diff(channel_login: &str, diff: ProviderIndexDiff) {
-    if [
-        EmoteProvider::Twitch,
-        EmoteProvider::SevenTV,
-        EmoteProvider::BTTV,
-        EmoteProvider::FFZ,
-        EmoteProvider::Emoji,
-    ]
-    .into_iter()
-    .any(|provider| !emote_provider_enabled(provider))
-    {
-        rebuild_emote_indices(channel_login).await;
-        return;
-    }
-
-    let cache_key = normalize_channel_key(channel_login);
-    let publication = channel_emote_publication(&cache_key);
-    let publication_epoch = publication.begin_rebuild();
-    let mut lookup = (*publication.lookup_snapshot()).clone();
-    let provider_emotes = if let Some(entry) = EMOTE_CACHE.channels.get(&cache_key) {
-        for alias in &diff.changed_aliases {
-            if let Some(emote) = entry.emotes.get(alias.as_ref()) {
-                lookup.insert(Arc::clone(alias), Arc::clone(emote));
-            } else {
-                lookup.remove(alias.as_ref());
-            }
-        }
-        entry
-            .emotes_by_id
-            .0
-            .get(&diff.provider)
-            .into_iter()
-            .flat_map(|map| map.values().flatten())
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        rebuild_emote_indices(channel_login).await;
-        return;
-    };
-
-    let published = {
-        let _commit = publication.commit_lock.lock_or_recover();
-        if publication.epoch.load(Ordering::Acquire) != publication_epoch
-            || publication.tombstoned.load(Ordering::Acquire)
-        {
-            false
-        } else {
-            let mut by_channel = EMOTE_BY_CHANNEL.write_or_recover();
-            let emotes = by_channel.entry(cache_key.clone()).or_default();
-            emotes.retain(|emote| emote.provider != diff.provider);
-            emotes.extend(provider_emotes);
-            publication.lookup.store(Arc::new(lookup));
-            clear_channel_pending(&cache_key);
-            true
-        }
-    };
-
-    if !published {
-        let emote_name_count = publish_authoritative_channel_snapshot(&cache_key);
-        crate::log_emotes!(
-            debug,
-            "Rebuilt stale incremental channel emote publication for {} (epoch {}, names={})",
-            cache_key,
-            publication_epoch,
-            emote_name_count
-        );
-    }
-
-    increment_channel_catalog_version(&cache_key);
-}
-
-async fn rebuild_emote_indices_inner(channel_login: &str) {
-    let cache_key = normalize_channel_key(channel_login);
-    let publication = channel_emote_publication(&cache_key);
-    let publication_epoch = publication.begin_rebuild();
-
-    let (emotes, lookup) = EMOTE_CACHE.get_channel_index_snapshot(channel_login);
-    let emote_name_count = lookup.len();
-
-    let audit_channel = std::env::var("ECHO_AUDIT_CHANNEL").ok();
-    let audit_tokens = std::env::var("ECHO_AUDIT_EMOTES").ok();
-    if audit_channel
-        .as_deref()
-        .map(normalize_channel_key)
-        .as_deref()
-        == Some(cache_key.as_str())
-        && let Some(tokens_csv) = audit_tokens
-    {
-        for token in tokens_csv
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            match lookup.get(token) {
-                Some(emote) => crate::log_emotes!(
-                    info,
-                    "[AUDIT] channel={} token='{}' -> HIT provider={:?} id={} url={}",
-                    cache_key,
-                    token,
-                    emote.provider,
-                    emote.id,
-                    emote.url
-                ),
-                None => crate::log_emotes!(
-                    info,
-                    "[AUDIT] channel={} token='{}' -> MISS",
-                    cache_key,
-                    token
-                ),
-            }
-        }
-    }
-
-    let published = {
-        let _commit = publication.commit_lock.lock_or_recover();
-        if publication.epoch.load(Ordering::Acquire) != publication_epoch
-            || publication.tombstoned.load(Ordering::Acquire)
-        {
-            crate::log_emotes!(
-                debug,
-                "Discarding stale channel emote index publication for {} (epoch {})",
-                cache_key,
-                publication_epoch
-            );
-            false
-        } else {
-            EMOTE_BY_CHANNEL
-                .write_or_recover()
-                .insert(cache_key.clone(), emotes);
-
-            publication.lookup.store(Arc::new(lookup));
-
-            clear_channel_pending(&cache_key);
-            true
-        }
-    };
-
-    if !published {
-        let recovered_name_count = publish_authoritative_channel_snapshot(&cache_key);
-        crate::log_emotes!(
-            debug,
-            "Recovered stale channel emote index publication for {} (epoch {}, names={})",
-            cache_key,
-            publication_epoch,
-            recovered_name_count
-        );
-    }
-
-    crate::log_emotes!(
-        info,
-        "rebuild_emote_indices for {}: {} emotes loaded, preserving resident rows",
-        cache_key,
-        emote_name_count
-    );
-    increment_channel_catalog_version(&cache_key);
-}
-
-fn emote_lookup_changed(previous: &EmoteNameMap, replacement: &EmoteNameMap) -> bool {
-    previous.len() != replacement.len()
-        || previous.iter().any(|(name, previous_emote)| {
-            replacement
-                .get(name.as_ref())
-                .is_none_or(|replacement_emote| !Arc::ptr_eq(previous_emote, replacement_emote))
-        })
-}
-
-/// Update global emote indices
-pub async fn rebuild_global_emote_index() {
-    let emotes = EMOTE_CACHE.get_global_emotes().await;
-
-    let mut lookup: EmoteNameMap = HashMap::with_capacity(emotes.len() * 2);
-    for emote in &emotes {
-        EmoteCache::insert_emote_name_keys(&mut lookup, Arc::clone(emote));
-    }
-
-    let emote_count = lookup.len();
-
-    crate::log_emotes!(
-        info,
-        "Global emote index rebuilt: {} emotes registered",
-        emote_count
-    );
-
-    let previous_lookup = GLOBAL_EMOTES_LOOKUP.load_full();
-    let replacement_lookup = Arc::new(lookup);
-    let effective_lookup_changed = emote_lookup_changed(&previous_lookup, &replacement_lookup);
-    *GLOBAL_EMOTES_LIST.write_or_recover() = emotes;
-    GLOBAL_EMOTES_LOOKUP.store(replacement_lookup);
-
-    if effective_lookup_changed {
-        crate::state::VersionRegistry::bump_global_emote_version();
-        publish_emote_metadata_change();
-    }
-}
-
-/// Update user emote indices (personal 7TV, subscriptions)
-pub async fn rebuild_user_emote_index() {
-    let emotes = EMOTE_CACHE.get_user_emotes().await;
-
-    let mut lookup: EmoteNameMap = HashMap::with_capacity(emotes.len() * 2);
-    for emote in &emotes {
-        EmoteCache::insert_emote_name_keys(&mut lookup, Arc::clone(emote));
-    }
-
-    let previous_lookup = USER_EMOTES_LOOKUP.load_full();
-    let replacement_lookup = Arc::new(lookup);
-    let effective_lookup_changed = emote_lookup_changed(&previous_lookup, &replacement_lookup);
-    USER_EMOTES_LOOKUP.store(replacement_lookup);
-
-    if effective_lookup_changed {
-        crate::state::VersionRegistry::bump_user_emote_version();
-        publish_emote_metadata_change();
-    }
-}
-
-/// The provider catalogs used to tokenize one message. Capturing these once
-/// keeps token resolution internally consistent and avoids an additional
-/// registry/slot atomic load for every word in a chat message.
-pub struct EmoteLookupSnapshot {
-    /// The sender's 7TV personal emotes, for other chatters' messages.
-    personal: Option<Arc<EmoteNameMap>>,
-    channel: Option<Arc<EmoteNameMap>>,
-    /// The signed-in account's personal and subscription emotes, for its own text.
-    user: Option<Arc<EmoteNameMap>>,
-    global: Arc<EmoteNameMap>,
-}
-
-/// Author of the text being tokenized. A sender's 7TV personal emotes apply
-/// only to that sender's messages, and the signed-in account's own personal
-/// and subscription emotes only to its own messages.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EmoteSender<'a> {
-    pub user_id: Option<&'a str>,
-    pub login: Option<&'a str>,
-}
-
-impl<'a> EmoteSender<'a> {
-    /// Text with no chatter author, such as system rows.
-    pub const NONE: Self = Self {
-        user_id: None,
-        login: None,
-    };
-
-    pub fn new(user_id: Option<&'a str>, login: &'a str) -> Self {
-        Self {
-            user_id: user_id.filter(|id| !id.is_empty()),
-            login: Some(login).filter(|login| !login.is_empty()),
-        }
-    }
-
-    fn is_signed_in_account(&self) -> bool {
-        self.login
-            .is_some_and(crate::backend::settings::is_signed_in_username)
-            || self
-                .user_id
-                .is_some_and(crate::backend::auth::is_active_authenticated_user_id)
-    }
-}
-
-/// Capture the lookup catalogs for composer resolution, which is always the
-/// signed-in account's own text. The channel key is normalized here so the
-/// snapshot preserves the defensive behavior of the public lookup wrappers.
-pub fn snapshot_emote_lookups(channel: &str) -> EmoteLookupSnapshot {
-    let mut snapshot = snapshot_emote_lookups_for_sender(channel, EmoteSender::NONE);
-    snapshot.user = Some(USER_EMOTES_LOOKUP.load_full());
-    snapshot
-}
-
-/// Capture the lookup catalogs for one message written by `sender`.
-pub fn snapshot_emote_lookups_for_sender(
-    channel: &str,
-    sender: EmoteSender<'_>,
-) -> EmoteLookupSnapshot {
-    let channel_key = normalize_channel_key(channel);
-    let channel = channel_emote_publication_if_registered(&channel_key)
-        .map(|publication| publication.lookup_snapshot());
-    let (personal, user) = if sender.user_id.is_none() && sender.login.is_none() {
-        (None, None)
-    } else if sender.is_signed_in_account() {
-        (None, Some(USER_EMOTES_LOOKUP.load_full()))
-    } else {
-        (sender.user_id.and_then(personal::lookup_for_user), None)
-    };
-    EmoteLookupSnapshot {
-        personal,
-        channel,
-        user,
-        global: GLOBAL_EMOTES_LOOKUP.load_full(),
-    }
-}
-
-/// Get emote by name from a previously captured lookup snapshot, permitting a
-/// case-folded fallback for non-tokenizer callers.
-pub fn get_emote_fast_lowercased_from_snapshot(
-    snapshot: &EmoteLookupSnapshot,
-    name: &str,
-) -> Option<Arc<Emote>> {
-    let folded_name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-        Some(name.to_ascii_lowercase())
-    } else {
-        None
-    };
-
-    if let Some(lookup) = snapshot.channel.as_deref() {
-        if let Some(emote) = lookup.get(name)
-            && emote_visible(emote)
-        {
-            return Some(Arc::clone(emote));
-        }
-        if let Some(ref folded) = folded_name
-            && let Some(emote) = lookup.get(folded.as_str())
-            && emote_visible(emote)
-        {
-            return Some(Arc::clone(emote));
-        }
-    }
-
-    if let Some(user) = snapshot.user.as_deref() {
-        if let Some(emote) = user.get(name)
-            && emote_visible(emote)
-        {
-            return Some(Arc::clone(emote));
-        }
-        if let Some(ref folded) = folded_name
-            && let Some(emote) = user.get(folded.as_str())
-            && emote_visible(emote)
-        {
-            return Some(Arc::clone(emote));
-        }
-    }
-
-    if let Some(emote) = snapshot.global.get(name)
-        && emote_visible(emote)
-    {
-        return Some(Arc::clone(emote));
-    }
-    if let Some(ref folded) = folded_name
-        && let Some(emote) = snapshot.global.get(folded.as_str())
-        && emote_visible(emote)
-    {
-        return Some(Arc::clone(emote));
-    }
-
-    None
-}
-
-/// PERF: Get emote by name with a channel key. This compatibility wrapper
-/// captures a snapshot for the one lookup; message tokenizers should pass one
-/// snapshot to the `_from_snapshot` variants instead.
-pub fn get_emote_fast_lowercased(channel_key_lowercase: &str, name: &str) -> Option<Arc<Emote>> {
-    get_emote_fast_lowercased_from_snapshot(&snapshot_emote_lookups(channel_key_lowercase), name)
-}
-
-/// Get emote by exact case-sensitive name with pre-normalized channel key.
-///
-/// Unlike `get_emote_fast_lowercased`, this never falls back to case-folded
-/// lookups. Chat tokenization should use this path to preserve emote
-/// case-sensitivity semantics.
-pub fn get_emote_fast_case_sensitive_from_snapshot(
-    snapshot: &EmoteLookupSnapshot,
-    name: &str,
-) -> Option<Arc<Emote>> {
-    let exact = |lookup: &EmoteNameMap| {
-        lookup
-            .get(name)
-            .filter(|emote| emote.name.as_ref() == name && emote_visible(emote))
-            .cloned()
-    };
-    if let Some(emote) = snapshot.personal.as_deref().and_then(exact) {
-        return Some(emote);
-    }
-    if let Some(emote) = snapshot.channel.as_deref().and_then(exact) {
-        return Some(emote);
-    }
-    if let Some(emote) = snapshot.user.as_deref().and_then(exact) {
-        return Some(emote);
-    }
-
-    if let Some(emote) = snapshot.global.get(name)
-        && emote.name.as_ref() == name
-        && emote_visible(emote)
-    {
-        return Some(Arc::clone(emote));
-    }
-
-    None
-}
-
-/// Exact case-sensitive compatibility wrapper for one-off consumers.
-pub fn get_emote_fast_case_sensitive(
-    channel_key_lowercase: &str,
-    name: &str,
-) -> Option<Arc<Emote>> {
-    get_emote_fast_case_sensitive_from_snapshot(
-        &snapshot_emote_lookups(channel_key_lowercase),
-        name,
-    )
-}
-
-/// Get a Twitch emote by exact Twitch emote ID using cache ID indices.
-///
-/// Lookup order mirrors name-based resolution precedence:
-/// channel -> user emotes -> global.
-pub fn get_twitch_emote_by_id_fast(
-    channel_key_lowercase: &str,
-    twitch_emote_id: &str,
-) -> Option<Arc<Emote>> {
-    if let Some(entry) = EMOTE_CACHE.channels.get(channel_key_lowercase)
-        && let Some(emote) = entry
-            .emotes_by_id
-            .get(twitch_emote_id, EmoteProvider::Twitch)
-    {
-        return Some(Arc::clone(emote));
-    }
-
-    let needs_normalize = channel_key_lowercase
-        .bytes()
-        .any(|b| b == b'#' || b.is_ascii_uppercase());
-    if needs_normalize {
-        let normalized = normalize_channel_key(channel_key_lowercase);
-        if normalized != channel_key_lowercase
-            && let Some(entry) = EMOTE_CACHE.channels.get(&normalized)
-            && let Some(emote) = entry
-                .emotes_by_id
-                .get(twitch_emote_id, EmoteProvider::Twitch)
-        {
-            return Some(Arc::clone(emote));
-        }
-    }
-
-    let user = EMOTE_CACHE.user_emotes.read_or_recover();
-    if let Some(entry) = user.as_ref()
-        && let Some(emote) = entry
-            .emotes_by_id
-            .get(twitch_emote_id, EmoteProvider::Twitch)
-    {
-        return Some(Arc::clone(emote));
-    }
-    drop(user);
-
-    let global = EMOTE_CACHE.global.read_or_recover();
-    if let Some(entry) = global.as_ref()
-        && let Some(emote) = entry
-            .emotes_by_id
-            .get(twitch_emote_id, EmoteProvider::Twitch)
-    {
-        return Some(Arc::clone(emote));
-    }
-
-    None
-}
-
-/// Get a Twitch emote by exact ID from any cached Helix-backed source (channel/user/global).
-///
-/// This is useful for tooltip enrichment when the render path only has a reduced emote instance
-/// but we want to recover exact owner/type metadata from the same cache data the emote picker uses.
-pub fn get_twitch_emote_by_id_any_cached(twitch_emote_id: &str) -> Option<Arc<Emote>> {
-    let user = EMOTE_CACHE.user_emotes.read_or_recover();
-    if let Some(entry) = user.as_ref()
-        && let Some(emote) = entry
-            .emotes_by_id
-            .get(twitch_emote_id, EmoteProvider::Twitch)
-    {
-        return Some(Arc::clone(emote));
-    }
-    drop(user);
-
-    for entry in EMOTE_CACHE.channels.iter() {
-        if let Some(emote) = entry
-            .value()
-            .emotes_by_id
-            .get(twitch_emote_id, EmoteProvider::Twitch)
-        {
-            return Some(Arc::clone(emote));
-        }
-    }
-
-    let global = EMOTE_CACHE.global.read_or_recover();
-    if let Some(entry) = global.as_ref()
-        && let Some(emote) = entry
-            .emotes_by_id
-            .get(twitch_emote_id, EmoteProvider::Twitch)
-    {
-        return Some(Arc::clone(emote));
-    }
-
-    None
-}
-
-/// Get all emotes for a channel from dual-index (Arc references for O(1) cloning)
-pub fn get_channel_emotes_fast(channel_login: &str) -> Vec<Arc<Emote>> {
-    let cache_key = normalize_channel_key(channel_login);
-    EMOTE_BY_CHANNEL
-        .read_or_recover()
-        .get(&cache_key)
-        .map(|emotes| {
-            emotes
-                .iter()
-                .filter(|emote| emote_visible(emote))
-                .map(Arc::clone)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[inline]
 fn publish_emote_metadata_change() {
     mark_emote_cache_dirty();
@@ -7551,89 +4753,6 @@ pub fn get_global_emote_version() -> u32 {
     crate::state::VersionRegistry::global_emote_version() as u32
 }
 
-/// Install a tiny process-local emote set for the opt-in native completion
-/// interaction harness. Synthetic fixture channels never persist this cache.
-pub(crate) fn seed_completion_emotes_for_benchmark(channel_login: &str) -> bool {
-    if !crate::benchmark_ui_fixture::is_fixture_channel(channel_login) {
-        return false;
-    }
-
-    let cache_key = normalize_channel_key(channel_login);
-    let channel: Arc<str> = Arc::from(channel_login);
-    let mut emotes = HashMap::new();
-    let mut emotes_by_id = EmoteIdentityMap::default();
-    for (index, name) in crate::benchmark_ui_fixture::COMPLETION_EMOTES
-        .iter()
-        .enumerate()
-    {
-        let id: Arc<str> = Arc::from(format!("echo-fixture-completion-{index}"));
-        let url: Arc<str> = Arc::from(format!(
-            "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/2.0",
-            25 + index
-        ));
-        EmoteCache::insert_emote_into_maps(
-            &mut emotes,
-            &mut emotes_by_id,
-            Emote {
-                id,
-                name: Arc::from(*name),
-                url: Arc::clone(&url),
-                provider: EmoteProvider::Twitch,
-                channel: Some(Arc::clone(&channel)),
-                original_name: None,
-                creator_name: None,
-                twitch_owner_login: Some(Arc::clone(&channel)),
-                twitch_owner_id: None,
-                twitch_emote_type: None,
-                url_1x: Some(Arc::clone(&url)),
-                url_2x: Some(url),
-                url_4x: None,
-                zero_width: false,
-                is_animated: false,
-                width: Some(28),
-                height: Some(28),
-            },
-        );
-    }
-
-    let lookup = Arc::new(emotes.clone());
-    let publication = channel_emote_publication(&cache_key);
-    let publication_epoch = publication.begin_rebuild();
-    EMOTE_CACHE.channels.insert(
-        cache_key.clone(),
-        CacheEntry {
-            emotes,
-            emotes_by_id,
-            fetched_at: Instant::now(),
-        },
-    );
-    let _commit = publication.commit_lock.lock_or_recover();
-    if publication.epoch.load(Ordering::Acquire) != publication_epoch {
-        return false;
-    }
-    publication.lookup.store(lookup);
-    increment_channel_version(channel_login);
-    true
-}
-
-pub(crate) fn clear_completion_emotes_for_benchmark(channel_login: &str) -> bool {
-    if !crate::benchmark_ui_fixture::is_enabled() {
-        return false;
-    }
-    let cache_key = normalize_channel_key(channel_login);
-    let publication = channel_emote_publication(&cache_key);
-    publication.invalidate();
-    let _commit = publication.commit_lock.lock_or_recover();
-    let removed = EMOTE_CACHE.channels.remove(&cache_key).is_some();
-    publication.lookup.store(Arc::new(HashMap::new()));
-    if removed {
-        increment_channel_version(channel_login);
-    }
-    removed
-}
-
-pub use echo_emote_core::EmoteCategory;
-
 pub fn group_emotes_into_categories(
     emotes: Vec<Arc<Emote>>,
     channel_login: &str,
@@ -7649,7 +4768,7 @@ pub fn group_emotes_into_categories(
 pub async fn get_categorized_emotes(channel_login: &str) -> Vec<EmoteCategory> {
     let total_start = Instant::now();
     let unique_fetch_start = Instant::now();
-    let emotes = EMOTE_CACHE.get_all_emotes_unique(channel_login).await;
+    let emotes = EMOTE_CACHE.get_all_emotes_unique(channel_login);
     record_emote_stage_timed(
         "emotes.categorize.fetch_unique",
         unique_fetch_start,
@@ -7672,127 +4791,6 @@ pub async fn get_categorized_emotes(channel_login: &str) -> Vec<EmoteCategory> {
     );
     record_emote_stage_timed("emotes.categorize.total", total_start, categories.len());
     categories
-}
-
-/// Measure the actual production full and incremental provider-index paths.
-#[cfg(feature = "provider-index-bench")]
-pub fn benchmark_provider_index_refresh(iterations: usize) -> ProviderIndexBenchResult {
-    fn fixture_emote(provider: EmoteProvider, index: usize, name: Arc<str>) -> Arc<Emote> {
-        let id: Arc<str> = Arc::from(format!("{provider:?}-{index}"));
-        Arc::new(Emote {
-            url: Arc::from(format!("https://example.invalid/{id}")),
-            id,
-            name,
-            provider,
-            channel: None,
-            original_name: None,
-            creator_name: None,
-            twitch_owner_login: None,
-            twitch_owner_id: None,
-            twitch_emote_type: None,
-            url_1x: None,
-            url_2x: None,
-            url_4x: None,
-            zero_width: false,
-            is_animated: false,
-            width: Some(28),
-            height: Some(28),
-        })
-    }
-
-    fn median(mut values: Vec<u64>) -> u64 {
-        values.sort_unstable();
-        values[values.len() / 2]
-    }
-
-    let providers = [
-        EmoteProvider::Twitch,
-        EmoteProvider::FFZ,
-        EmoteProvider::BTTV,
-        EmoteProvider::SevenTV,
-    ];
-    let initial = providers.into_iter().flat_map(|provider| {
-        (0..1025).map(move |index| {
-            let name = if index == 12 {
-                Arc::from("Collision")
-            } else {
-                Arc::from(format!("{provider:?}_{index}"))
-            };
-            fixture_emote(provider, index, name)
-        })
-    });
-    let emotes_by_id = initial.collect::<EmoteIdentityMap>();
-    let mut initial_entry = CacheEntry {
-        emotes: HashMap::new(),
-        emotes_by_id,
-        fetched_at: Instant::now(),
-    };
-    EmoteCache::rebuild_name_map_from_identities(&mut initial_entry);
-    let replacement = (0..1025)
-        .filter(|index| *index != 40)
-        .map(|index| {
-            let name: Arc<str> = match index {
-                12 => Arc::from("RenamedCollision"),
-                41 => Arc::from("HUH"),
-                _ => Arc::from(format!("SevenTV_{index}")),
-            };
-            fixture_emote(EmoteProvider::SevenTV, index, name)
-        })
-        .chain([fixture_emote(
-            EmoteProvider::SevenTV,
-            1025,
-            Arc::from("huh"),
-        )])
-        .collect::<Vec<_>>();
-
-    let iterations = iterations.max(1);
-    let mut full_samples = Vec::with_capacity(iterations);
-    let mut incremental_samples = Vec::with_capacity(iterations);
-    let mut equivalent = true;
-    for _ in 0..iterations {
-        let mut full = initial_entry.clone();
-        let full_started = Instant::now();
-        let previous_provider = full
-            .emotes_by_id
-            .0
-            .remove(&EmoteProvider::SevenTV)
-            .unwrap_or_default();
-        for emote in &replacement {
-            let emote = find_emote_alias(&previous_provider, &emote.id, &emote.name)
-                .filter(|previous| previous.as_ref() == emote.as_ref())
-                .cloned()
-                .unwrap_or_else(|| Arc::clone(emote));
-            full.emotes_by_id.insert(emote);
-        }
-        EmoteCache::rebuild_name_map_from_identities(&mut full);
-        full_samples.push(full_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
-
-        let mut incremental = initial_entry.clone();
-        let incremental_started = Instant::now();
-        let incremental_diff = EmoteCache::replace_provider_rows_incrementally(
-            &mut incremental,
-            EmoteProvider::SevenTV,
-            replacement.iter().cloned(),
-        )
-        .expect("benchmark fixture must remain inside the incremental threshold");
-        incremental_samples.push(
-            incremental_started
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-
-        equivalent &= incremental.emotes == full.emotes
-            && incremental_diff.provider == EmoteProvider::SevenTV;
-    }
-
-    ProviderIndexBenchResult {
-        entries: initial_entry.emotes_by_id.len(),
-        iterations,
-        equivalent,
-        full_median_ns: median(full_samples),
-        incremental_median_ns: median(incremental_samples),
-    }
 }
 
 #[cfg(test)]
@@ -8017,7 +5015,7 @@ mod provider_index_tests {
         let layout_version_before = crate::state::VersionRegistry::channel_emote_version(&channel);
         let catalog_version_before = get_emote_cache_version(&channel);
 
-        apply_7tv_channel_emote_patch(
+        apply_seventv_channel_emote_patch(
             &channel,
             SevenTvEmoteSetPatch {
                 added: vec![
@@ -8069,7 +5067,7 @@ mod provider_index_tests {
                 ..Default::default()
             });
 
-        apply_7tv_channel_emote_patch(
+        apply_seventv_channel_emote_patch(
             &channel,
             SevenTvEmoteSetPatch {
                 removed: vec![SevenTvEmoteIdentity {
@@ -8134,7 +5132,7 @@ mod provider_index_tests {
             EmoteSender::NONE,
             &rustc_hash::FxHashMap::default(),
         );
-        apply_7tv_channel_emote_rows(
+        apply_seventv_channel_emote_rows(
             &channel,
             vec![emote(EmoteProvider::SevenTV, "set-lol", "SETLOL")],
             "set-session",
@@ -8157,7 +5155,7 @@ mod provider_index_tests {
         };
 
         assert_eq!(
-            clear_7tv_channel_emote_rows_if_set(&channel, "set-session").await,
+            clear_seventv_channel_emote_rows_if_set(&channel, "set-session").await,
             Some(1)
         );
         assert_eq!(retained.id.as_ref(), "set-lol");
@@ -8344,7 +5342,7 @@ mod provider_index_tests {
         let cache_key = format!("123:{channel}");
         SEVENTV_CHANNEL_FETCH_CACHE.insert(
             cache_key.clone(),
-            SevenTVChannelFetchCacheEntry {
+            SevenTvChannelFetchCacheEntry {
                 fetched_at: Instant::now(),
                 result: Arc::new((
                     SevenTvExactSetFetchOutcome::Present {
@@ -8356,11 +5354,11 @@ mod provider_index_tests {
             },
         );
         let live_window = Duration::from_secs(SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS);
-        assert!(clone_cached_7tv_channel(&cache_key, live_window).is_some());
+        assert!(clone_cached_seventv_channel(&cache_key, live_window).is_some());
 
-        invalidate_7tv_channel_fetch_cache("#Manual-Reload-Cache-Bypass");
+        invalidate_seventv_channel_fetch_cache("#Manual-Reload-Cache-Bypass");
 
-        assert!(clone_cached_7tv_channel(&cache_key, live_window).is_none());
+        assert!(clone_cached_seventv_channel(&cache_key, live_window).is_none());
     }
 
     #[test]
@@ -8377,5 +5375,35 @@ mod provider_index_tests {
             format_manual_reload_status(Err("HTTP 503"), 2, 0),
             "Channel emotes reloaded (BetterTTV 2, FrankerFaceZ 0). Failed to fetch 7TV channel emotes: HTTP 503"
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_pending_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn older_pending_guard_cannot_clear_newer_generation() {
+        let key = format!("catalog-pending-{}", std::process::id());
+        let older = ChannelCatalogPendingGuard::begin(key.clone());
+        let newer = ChannelCatalogPendingGuard::begin(key.clone());
+        drop(older);
+        assert!(
+            CHANNEL_CATALOG_PENDING
+                .get(&key)
+                .is_some_and(|token| token.load(Ordering::Acquire))
+        );
+        drop(newer);
+        assert!(!CHANNEL_CATALOG_PENDING.contains_key(&key));
+    }
+
+    #[test]
+    fn pending_guard_clears_when_deferred_owner_settles() {
+        let key = format!("catalog-deferred-{}", std::process::id());
+        let deferred_owner = ChannelCatalogPendingGuard::begin(key.clone());
+        assert!(CHANNEL_CATALOG_PENDING.contains_key(&key));
+        drop(deferred_owner);
+        assert!(!CHANNEL_CATALOG_PENDING.contains_key(&key));
     }
 }

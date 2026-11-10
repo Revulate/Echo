@@ -1,5 +1,5 @@
 [package]
-name = "echo-animation-decode-check"
+name = "animation-decode-check"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,10 +7,10 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "echo-animation-decode-check"
+name = "animation-decode-check"
 path = "src/main.rs"
 test = false
 
 [dependencies]
 echo_gpui = { path = "../.." }
-zstd = "0.14"
+zstd.workspace = true

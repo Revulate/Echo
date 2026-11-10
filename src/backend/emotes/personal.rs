@@ -159,7 +159,7 @@ fn request_set(set_id: Arc<str>, user_id: Arc<str>) {
                 .acquire()
                 .await
                 .expect("personal emote set semaphore is never closed");
-            super::fetch_7tv_emote_set_by_id(&set_id, Some(PERSONAL_SEVENTV_CHANNEL)).await
+            super::fetch_seventv_emote_set_by_id(&set_id, Some(PERSONAL_SEVENTV_CHANNEL)).await
         };
         let emotes = match loaded {
             Ok(SevenTvExactSetFetchOutcome::Present { emotes, .. }) => emotes,

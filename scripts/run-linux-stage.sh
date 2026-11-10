@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Run one named harness stage: print START/PASS/FAIL/TIMEOUT records, emit a
+# heartbeat with a child-process snapshot, write its output to --log, and stop a
+# timed-out or interrupted process group with TERM, then KILL. test-linux.sh and
+# test-linux-tools.sh run every compile, test and tool stage through it.
 set -euo pipefail
 
 usage() {

@@ -1,8 +1,6 @@
 //! Color palette for Echo GPUI
 //!
-//! Based on the Flutter app's color system.
-//! Uses GPUI's Hsla color type.
-//! Colors are now dynamic - they read from settings.
+//! Colors are GPUI `Hsla` values resolved from the current theme settings.
 
 use crate::backend::settings;
 use gpui::{Hsla, Rgba};
@@ -276,30 +274,46 @@ fn cached_palette() -> Rc<settings::GeneratedPalette> {
     })
 }
 
+/// The generated custom-theme palette entries a color can follow.
+#[derive(Clone, Copy)]
+enum PaletteSlot {
+    BgVoid,
+    BgSurface,
+    BgPlate,
+    BgElevated,
+    BgHover,
+    TextPrimary,
+    TextSecondary,
+    TextMuted,
+    Border,
+}
+
+impl PaletteSlot {
+    fn hex(self, palette: &settings::GeneratedPalette) -> &str {
+        match self {
+            Self::BgVoid => &palette.bg_void,
+            Self::BgSurface => &palette.bg_surface,
+            Self::BgPlate => &palette.bg_plate,
+            Self::BgElevated => &palette.bg_elevated,
+            Self::BgHover => &palette.bg_hover,
+            Self::TextPrimary => &palette.text_primary,
+            Self::TextSecondary => &palette.text_secondary,
+            Self::TextMuted => &palette.text_muted,
+            Self::Border => &palette.border,
+        }
+    }
+}
+
 /// Get a color from the generated custom theme palette
-fn custom_color(field: &str, fallback: Hsla) -> Hsla {
-    let palette = cached_palette();
-    let hex = match field {
-        "bg_void" => &palette.bg_void,
-        "bg_surface" => &palette.bg_surface,
-        "bg_plate" => &palette.bg_plate,
-        "bg_elevated" => &palette.bg_elevated,
-        "bg_hover" => &palette.bg_hover,
-        "text_primary" => &palette.text_primary,
-        "text_secondary" => &palette.text_secondary,
-        "text_muted" => &palette.text_muted,
-        "border" => &palette.border,
-        "border_strong" => &palette.border_strong,
-        _ => return fallback,
-    };
-    hex_to_hsla(hex).unwrap_or(fallback)
+fn custom_color(slot: PaletteSlot, fallback: Hsla) -> Hsla {
+    hex_to_hsla(slot.hex(&cached_palette())).unwrap_or(fallback)
 }
 
 /// Dispatch color based on current theme.
 /// Reduces boilerplate in individual color functions.
-/// For colors that support custom theme, pass the custom_field name.
+/// For colors that support custom theme, pass the palette slot they follow.
 #[inline]
-fn theme_color(dark: Hsla, light: Hsla, midnight: Hsla, custom_field: Option<&str>) -> Hsla {
+fn theme_color(dark: Hsla, light: Hsla, midnight: Hsla, custom_field: Option<PaletteSlot>) -> Hsla {
     match current_theme() {
         ThemeMode::Dark => dark,
         ThemeMode::Light => light,
@@ -351,7 +365,11 @@ fn apply_window_background_transparency(color: Hsla, transparent_alpha: f32) -> 
 
 /// Variant for colors where Dark and Midnight share the same value
 #[inline]
-fn theme_color_dark_midnight(dark_midnight: Hsla, light: Hsla, custom_field: Option<&str>) -> Hsla {
+fn theme_color_dark_midnight(
+    dark_midnight: Hsla,
+    light: Hsla,
+    custom_field: Option<PaletteSlot>,
+) -> Hsla {
     theme_color(dark_midnight, light, dark_midnight, custom_field)
 }
 
@@ -362,7 +380,7 @@ pub fn bg_void() -> Hsla {
             hsla(0.0, 0.0, 0.02, 1.0),
             hsla(0.0, 0.0, 0.96, 1.0),
             hsla(240.0 / 360.0, 0.15, 0.01, 1.0),
-            Some("bg_void"),
+            Some(PaletteSlot::BgVoid),
         ),
         0.28,
     )
@@ -375,7 +393,7 @@ pub fn bg_surface() -> Hsla {
             hsla(0.0, 0.0, 0.06, 1.0),
             hsla(0.0, 0.0, 1.0, 1.0),
             hsla(240.0 / 360.0, 0.12, 0.05, 1.0),
-            Some("bg_surface"),
+            Some(PaletteSlot::BgSurface),
         ),
         0.84,
     )
@@ -596,7 +614,7 @@ pub fn bg_plate() -> Hsla {
             hsla(0.0, 0.0, 0.04, 1.0),
             hsla(0.0, 0.0, 0.98, 1.0),
             hsla(240.0 / 360.0, 0.10, 0.03, 1.0),
-            Some("bg_plate"),
+            Some(PaletteSlot::BgPlate),
         ),
         0.86,
     )
@@ -609,7 +627,7 @@ pub fn bg_elevated() -> Hsla {
             hsla(0.0, 0.0, 0.08, 1.0),
             hsla(0.0, 0.0, 1.0, 1.0),
             hsla(240.0 / 360.0, 0.12, 0.08, 1.0),
-            Some("bg_elevated"),
+            Some(PaletteSlot::BgElevated),
         ),
         0.9,
     )
@@ -633,7 +651,7 @@ pub fn bg_hover() -> Hsla {
         hsla(0.0, 0.0, 0.10, 1.0),
         hsla(0.0, 0.0, 0.95, 1.0),
         hsla(240.0 / 360.0, 0.10, 0.12, 1.0),
-        Some("bg_hover"),
+        Some(PaletteSlot::BgHover),
     )
 }
 
@@ -650,7 +668,7 @@ pub fn inherited_text_primary() -> Hsla {
     theme_color_dark_midnight(
         hsla(0.0, 0.0, 1.0, 1.0),
         hsla(0.0, 0.0, 0.08, 1.0),
-        Some("text_primary"),
+        Some(PaletteSlot::TextPrimary),
     )
 }
 
@@ -691,7 +709,7 @@ pub fn text_secondary() -> Hsla {
     theme_color_dark_midnight(
         hsla(0.0, 0.0, 0.75, 1.0),
         hsla(0.0, 0.0, 0.34, 1.0),
-        Some("text_secondary"),
+        Some(PaletteSlot::TextSecondary),
     )
 }
 
@@ -712,7 +730,7 @@ pub fn text_muted() -> Hsla {
     theme_color_dark_midnight(
         hsla(0.0, 0.0, 0.52, 1.0),
         hsla(0.0, 0.0, 0.43, 1.0),
-        Some("text_muted"),
+        Some(PaletteSlot::TextMuted),
     )
 }
 
@@ -802,7 +820,7 @@ pub fn border() -> Hsla {
         hsla(240.0 / 360.0, 0.04, 0.23, 1.0),
         hsla(0.0, 0.0, 0.72, 1.0),
         hsla(240.0 / 360.0, 0.10, 0.24, 1.0),
-        Some("border"),
+        Some(PaletteSlot::Border),
     )
 }
 

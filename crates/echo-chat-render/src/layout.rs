@@ -36,7 +36,7 @@ pub const WIDTH_BUCKET_PX: f32 = 8.0;
 
 /// Quantize width down to 8px buckets for layout caching.
 ///
-/// PERF: 8px buckets provide ~1.5x more cache hits vs 4px with minimal visual impact.
+/// Wider buckets reuse more cached layouts while a resize is in progress.
 /// Correctness: we quantize *down* (floor) so cached layouts never assume a width
 /// larger than the actual container. This prevents right-edge clipping/overdraw
 /// when the container shrinks but remains within the same bucket.
@@ -57,8 +57,8 @@ pub fn width_from_quantized(quantized_width: u32) -> f32 {
 }
 
 /// Cache key combining message ID, quantized width, and timestamp visibility for layout caching.
-/// PERF: Allows reusing cached layouts when resizing back to a previous width
-/// PERF: Uses SharedString for O(1) clone (Arc-backed) vs O(n) String clone
+/// Allows reusing cached layouts when resizing back to a previous width
+/// Uses SharedString for O(1) clone (Arc-backed) vs O(n) String clone
 /// NOTE: show_timestamp affects header visibility, so each variant needs separate layouts.
 ///
 /// Timestamp *shape* is deliberately not a key field. Every compiled-formatter
@@ -88,7 +88,7 @@ impl LayoutCacheKey {
     }
 
     /// Create a cache key from a SharedString (zero-allocation fast path)
-    /// PERF: Use this when the message_id is already a SharedString to avoid allocation
+    /// Use this when the message_id is already a SharedString to avoid allocation
     #[inline]
     pub fn from_shared(
         message_id: SharedString,
@@ -103,7 +103,7 @@ impl LayoutCacheKey {
     }
 
     /// Create a cache key from a SharedString and pre-quantized width.
-    /// PERF: Lets hot render loops quantize once per frame instead of once per row.
+    /// Lets hot render loops quantize once per frame instead of once per row.
     #[inline]
     pub fn from_shared_quantized(
         message_id: SharedString,
@@ -119,14 +119,13 @@ impl LayoutCacheKey {
 }
 
 // ============================================================================
-// Layout Constants (Kinetic Obsidian Design System)
+// Layout Constants
 // ============================================================================
 
 /// Base line height for messages (at Normal density)
 pub const LINE_HEIGHT_BASE: f32 = 26.0;
 
-/// Get current line height based on density and font scale settings
-/// PERF: Called during layout, cached per-message
+/// Current line height for the chat density and font scale settings.
 #[inline]
 pub fn line_height() -> f32 {
     LINE_HEIGHT_BASE * ports::chat_density_multiplier() * ports::font_scale()
@@ -140,9 +139,6 @@ pub const MESSAGE_PADDING_LEFT: f32 = 6.0;
 
 /// Horizontal padding on right side of message
 pub const MESSAGE_PADDING_RIGHT: f32 = 12.0;
-
-/// Alias for MESSAGE_PADDING_VERTICAL (commonly used shorthand)
-pub const MESSAGE_PADDING: f32 = MESSAGE_PADDING_VERTICAL;
 
 /// Gap after timestamp before badges/username (about one space width)
 pub const TIMESTAMP_GAP: f32 = 4.0;
@@ -179,7 +175,7 @@ pub fn badge_margin_right() -> f32 {
 pub const EMOTE_SIZE_BASE: f32 = 28.0;
 
 /// Get current emote size based on settings scale factor
-/// PERF: Called during layout, not every frame
+/// Called during layout, not every frame
 #[inline]
 pub fn emote_size() -> f32 {
     // Emotes should track the text scale so they stay visually consistent with the font size.
@@ -416,7 +412,7 @@ pub enum LowTrustTreatment {
 /// Enables O(1) render time - just iterate segments and paint.
 #[derive(Clone, Debug)]
 pub struct CanvasMessageLayout {
-    /// PERF: Pre-computed SharedString for GPUI element ID (avoids clone per frame)
+    /// Pre-computed SharedString for GPUI element ID (avoids clone per frame)
     pub message_id_shared: SharedString,
 
     /// Total computed height in pixels
@@ -436,7 +432,7 @@ pub struct CanvasMessageLayout {
 
     /// Pre-computed direct paint commands for the unified message canvas.
     ///
-    /// PERF: Avoids scanning `segments` and allocating temporary Vecs every frame.
+    /// Avoids scanning `segments` and allocating temporary Vecs every frame.
     pub text_paint_commands: SmallVec<[TextPaintCommand; 4]>,
     pub image_paint_commands: Vec<ImagePaintCommand>,
 
@@ -482,7 +478,7 @@ pub struct CanvasMessageLayout {
     pub emote_version_at_creation: u64,
 
     /// Count of animated emotes in this message (for render optimization)
-    /// PERF: When > 0, message needs per-animation-tick updates.
+    /// When > 0, message needs per-animation-tick updates.
     /// When 0, message can skip work during animation-only frames.
     pub animated_emote_count: u8,
 
@@ -501,7 +497,7 @@ pub struct CanvasMessageLayout {
     /// final visible geometry because their text widths can differ from GPUI shaping.
     pub uses_window_text_metrics: bool,
 
-    /// PERF: Whether segments contain non-canvas element types (InlineBox, EmbedPreview, ReplyIndicator).
+    /// Whether segments contain non-canvas element types (InlineBox, EmbedPreview, ReplyIndicator).
     /// When false, render_message_at_position can skip the O(segments) iteration loop entirely.
     /// Most messages are text+images only, so this saves per-message per-frame branching.
     pub has_element_segments: bool,
@@ -530,13 +526,13 @@ pub struct CanvasMessageLayout {
 impl CanvasMessageLayout {
     /// Create a new empty layout
     pub fn new(message_id: impl Into<SharedString>, channel: &str) -> Self {
-        // PERF: Accept already-shared IDs from production messages instead of
+        // Accept already-shared IDs from production messages instead of
         // forcing an Arc<str> -> String -> SharedString copy during every build.
         let message_id_shared = message_id.into();
         let channel_arc = Arc::from(channel);
         Self {
             message_id_shared,
-            height: line_height() + MESSAGE_PADDING * 2.0,
+            height: line_height() + MESSAGE_PADDING_VERTICAL * 2.0,
             segments: Vec::new(),
             shaped_lines: Vec::new(),
             text_paint_commands: SmallVec::new(),
@@ -1279,97 +1275,6 @@ impl LayeredEmote {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    /// Thousands of layouts stay cached, so their inline size is a RAM budget.
-    /// Before the layout lists moved to exact-size `Vec`s these were 12,096,
-    /// 688 and 1,120 bytes.
-    #[test]
-    fn cached_layout_types_stay_compact() {
-        use std::mem::size_of;
-        let layout = size_of::<super::CanvasMessageLayout>();
-        let segment = size_of::<super::LayoutSegment>();
-        let line = size_of::<super::ShapedLineData>();
-        eprintln!("CanvasMessageLayout={layout} LayoutSegment={segment} ShapedLineData={line}");
-        assert!(layout <= 1_024, "CanvasMessageLayout is {layout} bytes");
-        assert!(segment <= 256, "LayoutSegment is {segment} bytes");
-        assert!(line <= 832, "ShapedLineData is {line} bytes");
-    }
-    use super::*;
-
-    #[test]
-    fn layered_emote_layers_are_bottom_centered() {
-        let mut emote = LayeredEmote::new("base".into(), "base".into(), 24.0, 24.0, false, None);
-        emote.add_overlay("overlay".into(), "overlay".into(), 12.0, 12.0, false, None);
-
-        let layers = emote.into_positioned_layers(100.0, 200.0);
-
-        assert_eq!(layers.len(), 2);
-        assert!((layers[0].x - 100.0).abs() < 0.001);
-        assert!((layers[0].y - 200.0).abs() < 0.001);
-        assert!((layers[1].x - 106.0).abs() < 0.001);
-        assert!((layers[1].y - 212.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn emote_dimensions_scale_logical_native_geometry() {
-        let (wide_w, wide_h) = calculate_emote_dimensions(Some(168), Some(28), 28.0);
-        assert!((wide_w - 168.0).abs() < 0.001);
-        assert!((wide_h - 28.0).abs() < 0.001);
-
-        let (tall_w, tall_h) = calculate_emote_dimensions(Some(28), Some(56), 42.0);
-        assert!((tall_w - 42.0).abs() < 0.001);
-        assert!((tall_h - 84.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn content_fingerprint_tracks_in_place_edits_but_not_row_parity() {
-        let message = echo_core::message::ChatMessage {
-            id: Arc::from("row"),
-            content: Arc::from("original text"),
-            structure_hash: 7,
-            ..Default::default()
-        };
-        let original = message_content_fingerprint(&message);
-        assert_eq!(original, message_content_fingerprint(&message.clone()));
-
-        let mut parity = message.clone();
-        parity.flags.is_alternate_row = !parity.flags.is_alternate_row;
-        assert_eq!(original, message_content_fingerprint(&parity));
-
-        let mut placeholder = message.clone();
-        placeholder.content = Arc::from("<message deleted>");
-        placeholder.structure_hash = 8;
-        assert_ne!(original, message_content_fingerprint(&placeholder));
-
-        let mut struck = message.clone();
-        struck.flags.is_deleted = true;
-        assert_ne!(original, message_content_fingerprint(&struck));
-
-        // A split's presentation of the same deleted row must not share a layout.
-        let mut collapsed = struck.clone();
-        collapsed.flags.deleted_presentation = echo_core::message::DeletedPresentation::Collapsed;
-        assert_ne!(
-            message_content_fingerprint(&struck),
-            message_content_fingerprint(&collapsed)
-        );
-
-        let mut highlighted = message;
-        highlighted.flags.highlight_type = Some(echo_core::message::HighlightType::Mention);
-        assert_ne!(original, message_content_fingerprint(&highlighted));
-
-        let mut layout = CanvasMessageLayout::new("row", "channel");
-        layout.content_fingerprint = original;
-        assert!(layout.is_stale_for_message(original ^ 1));
-    }
-
-    #[test]
-    fn animated_url_suffix_check_does_not_split_characters() {
-        assert!(!is_animated_url("https://example.com/\u{20ac}\u{20ac}"));
-        assert!(is_animated_url("https://example.com/\u{20ac}.GIF"));
-    }
-}
-
 /// Pre-shaped line data
 #[derive(Clone, Debug)]
 pub struct ShapedLineData {
@@ -1378,11 +1283,11 @@ pub struct ShapedLineData {
 
     /// GPUI-ready styling runs, used for painting and element rendering.
     ///
-    /// PERF: Avoids rebuilding `TextRun` structs every paint.
+    /// Avoids rebuilding `TextRun` structs every paint.
     pub gpui_runs: SmallVec<[TextRun; 4]>,
     /// Stable hash of GPUI text runs for direct-paint shaped-line cache keys.
     ///
-    /// PERF: Computing this once at layout time avoids rebuilding style keys on
+    /// Computing this once at layout time avoids rebuilding style keys on
     /// each animation repaint.
     pub gpui_runs_hash: u64,
 
@@ -1632,7 +1537,7 @@ pub enum HitboxKind {
 /// - WebP from BTTV: May be animated (BTTV uses WebP for both)
 /// - Twitch emote CDN: May return animated GIFs (no extension in URL)
 ///
-/// PERF: Uses case-insensitive comparisons without String allocation
+/// Uses case-insensitive comparisons without String allocation
 pub fn is_animated_url(url: &str) -> bool {
     // GIFs are always animated
     if ends_with_ignore_case(url, ".gif") {
@@ -1695,4 +1600,95 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
         .as_bytes()
         .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Thousands of layouts stay cached, so their inline size is a RAM budget.
+    /// Before the layout lists moved to exact-size `Vec`s these were 12,096,
+    /// 688 and 1,120 bytes.
+    #[test]
+    fn cached_layout_types_stay_compact() {
+        use std::mem::size_of;
+        let layout = size_of::<super::CanvasMessageLayout>();
+        let segment = size_of::<super::LayoutSegment>();
+        let line = size_of::<super::ShapedLineData>();
+        eprintln!("CanvasMessageLayout={layout} LayoutSegment={segment} ShapedLineData={line}");
+        assert!(layout <= 1_024, "CanvasMessageLayout is {layout} bytes");
+        assert!(segment <= 256, "LayoutSegment is {segment} bytes");
+        assert!(line <= 832, "ShapedLineData is {line} bytes");
+    }
+    use super::*;
+
+    #[test]
+    fn layered_emote_layers_are_bottom_centered() {
+        let mut emote = LayeredEmote::new("base".into(), "base".into(), 24.0, 24.0, false, None);
+        emote.add_overlay("overlay".into(), "overlay".into(), 12.0, 12.0, false, None);
+
+        let layers = emote.into_positioned_layers(100.0, 200.0);
+
+        assert_eq!(layers.len(), 2);
+        assert!((layers[0].x - 100.0).abs() < 0.001);
+        assert!((layers[0].y - 200.0).abs() < 0.001);
+        assert!((layers[1].x - 106.0).abs() < 0.001);
+        assert!((layers[1].y - 212.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn emote_dimensions_scale_logical_native_geometry() {
+        let (wide_w, wide_h) = calculate_emote_dimensions(Some(168), Some(28), 28.0);
+        assert!((wide_w - 168.0).abs() < 0.001);
+        assert!((wide_h - 28.0).abs() < 0.001);
+
+        let (tall_w, tall_h) = calculate_emote_dimensions(Some(28), Some(56), 42.0);
+        assert!((tall_w - 42.0).abs() < 0.001);
+        assert!((tall_h - 84.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn content_fingerprint_tracks_in_place_edits_but_not_row_parity() {
+        let message = echo_core::message::ChatMessage {
+            id: Arc::from("row"),
+            content: Arc::from("original text"),
+            structure_hash: 7,
+            ..Default::default()
+        };
+        let original = message_content_fingerprint(&message);
+        assert_eq!(original, message_content_fingerprint(&message.clone()));
+
+        let mut parity = message.clone();
+        parity.flags.is_alternate_row = !parity.flags.is_alternate_row;
+        assert_eq!(original, message_content_fingerprint(&parity));
+
+        let mut placeholder = message.clone();
+        placeholder.content = Arc::from("<message deleted>");
+        placeholder.structure_hash = 8;
+        assert_ne!(original, message_content_fingerprint(&placeholder));
+
+        let mut struck = message.clone();
+        struck.flags.is_deleted = true;
+        assert_ne!(original, message_content_fingerprint(&struck));
+
+        // A split's presentation of the same deleted row must not share a layout.
+        let mut collapsed = struck.clone();
+        collapsed.flags.deleted_presentation = echo_core::message::DeletedPresentation::Collapsed;
+        assert_ne!(
+            message_content_fingerprint(&struck),
+            message_content_fingerprint(&collapsed)
+        );
+
+        let mut highlighted = message;
+        highlighted.flags.highlight_type = Some(echo_core::message::HighlightType::Mention);
+        assert_ne!(original, message_content_fingerprint(&highlighted));
+
+        let mut layout = CanvasMessageLayout::new("row", "channel");
+        layout.content_fingerprint = original;
+        assert!(layout.is_stale_for_message(original ^ 1));
+    }
+
+    #[test]
+    fn animated_url_suffix_check_does_not_split_characters() {
+        assert!(!is_animated_url("https://example.com/\u{20ac}\u{20ac}"));
+        assert!(is_animated_url("https://example.com/\u{20ac}.GIF"));
+    }
 }

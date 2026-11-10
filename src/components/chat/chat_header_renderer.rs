@@ -1,13 +1,9 @@
-//! Chat Header Renderer Entity - Extracted from app.rs monolith
-//!
-//! This entity handles unified header rendering for chat splits:
+//! The unified header of a chat split:
 //! - Channel name and stream status
 //! - Stream title (when live)
 //! - Metadata: game, uptime, viewer count
 //! - Settings dropdown and close button
 //! - Drag-to-split gesture support
-//!
-//! Extracted from app.rs to reduce its size from 4,856 lines.
 #![allow(clippy::too_many_arguments)]
 
 use super::chat_settings_bar::{active_room_state_label_count, render_chat_settings_tags_inline};
@@ -508,7 +504,7 @@ impl PinnedHeaderToggle {
     }
 }
 
-/// Entity for rendering chat headers with stream info caching
+/// Stateless entity whose context the header's listeners are created in.
 pub struct ChatHeaderRenderer {}
 
 impl ChatHeaderRenderer {
@@ -516,47 +512,9 @@ impl ChatHeaderRenderer {
         Self {}
     }
 
-    /// PERF: Render with pre-fetched stream info (no blocking API calls)
+    /// Render the unified header for a chat split from already-fetched
+    /// stream info; it never waits on the network.
     pub fn render_fast(
-        &mut self,
-        channel: &str,
-        path: &[usize],
-        available_width: f32,
-        stream_info: Option<&crate::backend::StreamInfo>,
-        is_placeholder: bool,
-        drag_mode_active: bool,
-        split_settings_open: bool,
-        compact_one_line: bool,
-        is_active_split: bool,
-        layout_locked: bool,
-        mod_mode: bool,
-        pinned: Option<PinnedHeaderToggle>,
-        app: Entity<crate::app::EchoApp>,
-        overlay_manager: Entity<OverlayManager>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        self.render_unified_header(
-            channel,
-            path,
-            available_width,
-            stream_info,
-            is_placeholder,
-            drag_mode_active,
-            split_settings_open,
-            compact_one_line,
-            is_active_split,
-            layout_locked,
-            mod_mode,
-            pinned,
-            app,
-            overlay_manager,
-            cx,
-        )
-    }
-
-    /// Render the unified header for a chat split
-    #[allow(clippy::too_many_arguments)]
-    fn render_unified_header(
         &mut self,
         channel: &str,
         path: &[usize],
@@ -584,11 +542,11 @@ impl ChatHeaderRenderer {
         let channel_for_chatters = std::sync::Arc::clone(&shared_channel);
         let channel_for_settings = std::sync::Arc::clone(&shared_channel);
         let channel_for_context_menu = std::sync::Arc::clone(&shared_channel);
-        let chatters_tooltip_source = format!("header-chatters-{}", path_key.as_u64());
-        let add_split_tooltip_source = format!("header-add-split-{}", path_key.as_u64());
-        let settings_tooltip_source = format!("header-actions-{}", path_key.as_u64());
-        let hide_tooltip_source = format!("header-hide-{}", path_key.as_u64());
-        let close_tooltip_source = format!("header-close-{}", path_key.as_u64());
+        let chatters_tooltip_source = format!("header-chatters-{}", path_key.stable_hash());
+        let add_split_tooltip_source = format!("header-add-split-{}", path_key.stable_hash());
+        let settings_tooltip_source = format!("header-actions-{}", path_key.stable_hash());
+        let hide_tooltip_source = format!("header-hide-{}", path_key.stable_hash());
+        let close_tooltip_source = format!("header-close-{}", path_key.stable_hash());
         let shared_path: std::sync::Arc<[usize]> = path.into();
         let path_for_drag = std::sync::Arc::clone(&shared_path);
         let path_for_add_split = std::sync::Arc::clone(&shared_path);
@@ -604,7 +562,7 @@ impl ChatHeaderRenderer {
         let app_for_context_menu = app.clone();
         let overlay_manager_for_context_menu = overlay_manager.clone();
 
-        let header_tooltip_source = format!("header-stream-info-{}", path_key.as_u64());
+        let header_tooltip_source = format!("header-stream-info-{}", path_key.stable_hash());
         let band = HeaderWidthBand::for_width(available_width);
         let show_chatters_button = band.shows_chatters_button()
             && !is_placeholder
@@ -614,7 +572,7 @@ impl ChatHeaderRenderer {
         let show_close_button = band.shows_close_button() && !layout_locked;
         let pinned =
             pinned.filter(|_| !is_placeholder && !backend::whispers::is_whispers_channel(channel));
-        let pin_tooltip_source = format!("header-pin-{}", path_key.as_u64());
+        let pin_tooltip_source = format!("header-pin-{}", path_key.stable_hash());
         let header_height = main_split_header_height(compact_one_line);
         let header_padding_x = if compact_one_line { 4.0 } else { 8.0 };
         let action_button_size = if compact_one_line { 24.0 } else { 28.0 };
@@ -637,8 +595,8 @@ impl ChatHeaderRenderer {
             - actions_width
             - mod_chip_width)
             .max(0.0);
-        let feedback_path_key = path_key.as_u64();
-        let feedback_header_enabled = crate::benchmark_ui_fixture::feedback_ui_enabled();
+        let feedback_path_key = path_key.stable_hash();
+        let feedback_header_enabled = crate::bench::ui_fixture::feedback_ui_enabled();
 
         div()
             .on_children_prepainted(move |child_bounds, _window, _cx| {
@@ -654,7 +612,7 @@ impl ChatHeaderRenderer {
                             let actions_left: f32 = actions.origin.x.into();
                             info_right > actions_left + 0.5
                         });
-                crate::benchmark_ui_fixture::publish_feedback_header(feedback_path_key, overlap);
+                crate::bench::ui_fixture::publish_feedback_header(feedback_path_key, overlap);
             })
             .id(ElementId::Name(
                 format!("unified-header-{}", path_key).into(),
@@ -737,7 +695,7 @@ impl ChatHeaderRenderer {
             )
             .child(
                 div()
-                    .id(("header-info-row", path_key.as_u64()))
+                    .id(("header-info-row", path_key.stable_hash()))
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -767,7 +725,7 @@ impl ChatHeaderRenderer {
                         let app = app.clone();
                         actions.child(
                             small_icon_button_style(compact_one_line)
-                                .id(("pinned-chat-btn", path_key.as_u64()))
+                                .id(("pinned-chat-btn", path_key.stable_hash()))
                                 .role(Role::Button)
                                 .aria_label(if bubble_open {
                                     "Hide pinned message"
@@ -830,7 +788,7 @@ impl ChatHeaderRenderer {
                     .when(show_chatters_button, |actions| {
                         actions.child(
                             small_icon_button_style(compact_one_line)
-                                .id(("chatters-btn", path_key_for_chatters.as_u64()))
+                                .id(("chatters-btn", path_key_for_chatters.stable_hash()))
                                 .role(Role::Button)
                                 .aria_label("Open chatters")
                                 .hover(|style| {
@@ -874,7 +832,7 @@ impl ChatHeaderRenderer {
                     .when(show_add_split_button, |actions| {
                         actions.child(
                             small_icon_button_style(compact_one_line)
-                                .id(("add-split-btn", path_key_for_add_split.as_u64()))
+                                .id(("add-split-btn", path_key_for_add_split.stable_hash()))
                                 .role(Role::Button)
                                 .aria_label("Add split to right")
                                 .hover(|style| {
@@ -924,7 +882,7 @@ impl ChatHeaderRenderer {
                     })
                     .child(
                         small_icon_button_style(compact_one_line)
-                            .id(("hide-header-btn", path_key_for_hide.as_u64()))
+                            .id(("hide-header-btn", path_key_for_hide.stable_hash()))
                             .role(Role::Button)
                             .aria_label("Hide header")
                             .hover(|style| {
@@ -962,7 +920,7 @@ impl ChatHeaderRenderer {
                     )
                     .child(
                         small_icon_button_style(compact_one_line)
-                            .id(("settings-btn", path_key_for_settings.as_u64()))
+                            .id(("settings-btn", path_key_for_settings.stable_hash()))
                             .role(Role::Button)
                             .aria_label("Split actions")
                             .when(split_settings_open, |button| {
@@ -1014,7 +972,7 @@ impl ChatHeaderRenderer {
                     .when(show_close_button, |actions| {
                         actions.child(
                             small_icon_button_style(compact_one_line)
-                                .id(("close-split-btn", path_key.as_u64()))
+                                .id(("close-split-btn", path_key.stable_hash()))
                                 .role(Role::Button)
                                 .aria_label("Close split")
                                 .hover(|style| {

@@ -50,11 +50,11 @@ impl SteamEmbedProvider {
         let response = match STEAM_HTTP_CLIENT.get(endpoint).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                tracing::debug!(status = %response.status(), "Steam appdetails request failed");
+                crate::log_net!(debug, status = %response.status(), "Steam appdetails request failed");
                 return basic_metadata(link_info, Some(app_id), provider_label);
             }
             Err(error) => {
-                tracing::debug!("Steam appdetails request failed: {error}");
+                crate::log_net!(debug, "Steam appdetails request failed: {error}");
                 return basic_metadata(link_info, Some(app_id), provider_label);
             }
         };

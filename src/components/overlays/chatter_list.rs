@@ -11,6 +11,7 @@ use super::{
     ContextMenuState,
     traits::{Openable, OverlayPointerIsolation},
 };
+use crate::backend::ui_actions::ChatterListSource;
 use crate::components::common::mod_buttons::{ModButtonStyle, render_mod_button};
 use crate::components::overlays::text_tooltip_on_hover;
 use crate::components::ui::ButtonExt;
@@ -44,7 +45,8 @@ pub struct ChatterListState {
     pub channel: String,
     pub chatters: Arc<Vec<Chatter>>,
     pub total_count: usize,
-    pub source: String,
+    /// `None` until a load reports where its rows came from.
+    pub source: Option<ChatterListSource>,
     pub search_query: String,
     pub sort_mode: ChatterListSortMode,
     /// Whether the shared snapshot already uses the default login ordering.
@@ -155,15 +157,15 @@ impl ChatterList {
         if !preserve_view_state {
             let observed = crate::backend::get_recent_chatters(&self.state.channel, usize::MAX)
                 .into_iter()
-                .map(|(username, display_name, _)| Chatter {
-                    username,
-                    display_name,
+                .map(|chatter| Chatter {
+                    username: chatter.login,
+                    display_name: chatter.display_name,
                     user_id: String::new(),
                 })
                 .collect::<Vec<_>>();
             self.state.total_count = observed.len();
             self.state.chatters = Arc::new(observed);
-            self.state.source = "observed".to_string();
+            self.state.source = Some(ChatterListSource::Observed);
             self.state.login_sorted = false;
         }
         if !preserve_view_state {
@@ -175,17 +177,20 @@ impl ChatterList {
         cx.notify();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_loaded(
-        &mut self,
-        channel: String,
-        chatters: Arc<Vec<Chatter>>,
-        total_count: usize,
-        source: String,
-        login_sorted: bool,
-        is_loading: bool,
-        cx: &mut Context<Self>,
-    ) {
+    /// Open (or refresh) the list with a fetched snapshot. Only the loaded
+    /// fields of `loaded` are used (channel, chatters, total count, source,
+    /// login ordering, loading flag); search, sort and error stay owned by the
+    /// list.
+    pub fn open_loaded(&mut self, loaded: ChatterListState, cx: &mut Context<Self>) {
+        let ChatterListState {
+            channel,
+            chatters,
+            total_count,
+            source,
+            login_sorted,
+            is_loading,
+            ..
+        } = loaded;
         let preserve_view_state =
             self.state.is_open && self.state.channel.eq_ignore_ascii_case(&channel);
         self.focus_pending |= !self.state.is_open;
@@ -213,7 +218,7 @@ impl ChatterList {
     pub fn set_load_error(
         &mut self,
         channel: &str,
-        source: Option<String>,
+        source: Option<ChatterListSource>,
         error: String,
         cx: &mut Context<Self>,
     ) {
@@ -223,9 +228,7 @@ impl ChatterList {
 
         self.state.is_open = true;
         self.state.is_loading = false;
-        if self.state.source.is_empty()
-            && let Some(source) = source.filter(|source| !source.is_empty())
-        {
+        if self.state.source.is_none() {
             self.state.source = source;
         }
         self.state.error = Some(error);
@@ -296,11 +299,11 @@ impl ChatterList {
     }
 
     fn labels(&self) -> ChatterListLabels {
-        chatter_list_labels(&self.state.source)
+        chatter_list_labels(self.source_kind())
     }
 
     fn source_kind(&self) -> ChatterListSourceKind {
-        chatter_list_source_kind(&self.state.source)
+        chatter_list_source_kind(self.state.source)
     }
 }
 
@@ -330,10 +333,9 @@ impl Render for ChatterList {
         let source_kind = self.source_kind();
         let has_search_query = !search_query.is_empty();
         let hide_chatter_details = crate::backend::streamer_mode::should_hide_user_card_details();
-        let source_label = if self.state.source.is_empty() {
-            labels.title.to_string()
-        } else {
-            self.state.source.clone()
+        let source_label = match self.state.source {
+            Some(source) => source.label(),
+            None => labels.title,
         };
         let status_text = if self.state.is_loading {
             if total > 0 {
@@ -367,7 +369,7 @@ impl Render for ChatterList {
             } else {
                 format!("Couldn't load chatters: {err}")
             }
-        } else if self.state.source.is_empty() {
+        } else if self.state.source.is_none() {
             if has_search_query {
                 format!("Showing {} of {} matching {}", count, total, labels.plural)
             } else {
@@ -385,7 +387,7 @@ impl Render for ChatterList {
             )
         };
         let refresh_channel = self.state.channel.clone();
-        let refresh_source = self.state.source.clone();
+        let refresh_source = self.state.source;
         let viewport = window.viewport_size();
         let viewport_height: f32 = viewport.height.into();
         let panel_fit = crate::utils::fit_overlay_to_viewport(viewport, 360.0, 620.0, 8.0);
@@ -454,7 +456,7 @@ impl Render for ChatterList {
                                     .border_color(colors::border_subtle())
                                     .text_xs()
                                     .text_color(colors::text_secondary())
-                                    .child(source_label.clone()),
+                                    .child(source_label),
                             )
                             .child(
                                 div()
@@ -473,7 +475,7 @@ impl Render for ChatterList {
                                     })
                                     .when(!self.state.is_loading, |button| {
                                         let refresh_channel = refresh_channel.clone();
-                                        let refresh_source = refresh_source.clone();
+
                                         button
                                             .cursor_pointer()
                                             .hover(|s| s.bg(colors::bg_hover()))
@@ -481,7 +483,7 @@ impl Render for ChatterList {
                                                 crate::backend::push_ui_action(
                                                     crate::backend::UiAction::RefreshChatterList {
                                                         channel: refresh_channel.clone(),
-                                                        source: refresh_source.clone(),
+                                                        source: refresh_source,
                                                     },
                                                 );
                                             }))
@@ -975,8 +977,8 @@ struct ChatterListLabels {
     no_matches: &'static str,
 }
 
-fn chatter_list_labels(source: &str) -> ChatterListLabels {
-    match chatter_list_source_kind(source) {
+fn chatter_list_labels(kind: ChatterListSourceKind) -> ChatterListLabels {
+    match kind {
         ChatterListSourceKind::Moderators => ChatterListLabels {
             title: "Moderators",
             plural: "moderators",
@@ -1001,12 +1003,12 @@ fn chatter_list_labels(source: &str) -> ChatterListLabels {
     }
 }
 
-fn chatter_list_source_kind(source: &str) -> ChatterListSourceKind {
-    if source.eq_ignore_ascii_case("Twitch moderators") {
-        ChatterListSourceKind::Moderators
-    } else if source.eq_ignore_ascii_case("Twitch VIPs") {
-        ChatterListSourceKind::Vips
-    } else {
-        ChatterListSourceKind::Chatters
+fn chatter_list_source_kind(source: Option<ChatterListSource>) -> ChatterListSourceKind {
+    match source {
+        Some(ChatterListSource::Moderators) => ChatterListSourceKind::Moderators,
+        Some(ChatterListSource::Vips) => ChatterListSourceKind::Vips,
+        Some(ChatterListSource::Twitch | ChatterListSource::Observed) | None => {
+            ChatterListSourceKind::Chatters
+        }
     }
 }

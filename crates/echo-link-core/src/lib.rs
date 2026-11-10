@@ -158,6 +158,27 @@ pub struct LinkInfo {
     pub post_id: Option<String>,
 }
 
+impl LinkInfo {
+    /// A link of `link_type` with no provider-specific id; detectors set the
+    /// one id their link type carries with struct-update syntax.
+    pub fn new(link_type: LinkType, url: impl Into<String>, provider_name: Option<String>) -> Self {
+        Self {
+            link_type,
+            url: url.into(),
+            provider_name,
+            clip_id: None,
+            vod_id: None,
+            channel_login: None,
+            seventv_emote_id: None,
+            seventv_user_id: None,
+            video_id: None,
+            tweet_id: None,
+            subreddit: None,
+            post_id: None,
+        }
+    }
+}
+
 /// Loading state for embed metadata
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum EmbedLoadState {
@@ -227,37 +248,19 @@ pub fn get_link_type(url: &str) -> LinkInfo {
 
     // Check for direct images first
     if IMAGE_EXTENSIONS.is_match(url) {
-        return LinkInfo {
-            link_type: LinkType::Image,
-            url: url.to_string(),
-            provider_name: provider_name.clone().or_else(|| Some("Image".to_string())),
-            clip_id: None,
-            vod_id: None,
-            channel_login: None,
-            seventv_emote_id: None,
-            seventv_user_id: None,
-            video_id: None,
-            tweet_id: None,
-            subreddit: None,
-            post_id: None,
-        };
+        return LinkInfo::new(
+            LinkType::Image,
+            url,
+            provider_name.clone().or_else(|| Some("Image".to_string())),
+        );
     }
 
     if VIDEO_EXTENSIONS.is_match(url) {
-        return LinkInfo {
-            link_type: LinkType::Video,
-            url: url.to_string(),
-            provider_name: provider_name.clone().or_else(|| Some("Video".to_string())),
-            clip_id: None,
-            vod_id: None,
-            channel_login: None,
-            seventv_emote_id: None,
-            seventv_user_id: None,
-            video_id: None,
-            tweet_id: None,
-            subreddit: None,
-            post_id: None,
-        };
+        return LinkInfo::new(
+            LinkType::Video,
+            url,
+            provider_name.clone().or_else(|| Some("Video".to_string())),
+        );
     }
 
     if let Ok(parsed) = url::Url::parse(url) {
@@ -285,20 +288,7 @@ pub fn get_link_type(url: &str) -> LinkInfo {
     }
 
     // Default to generic
-    LinkInfo {
-        link_type: LinkType::Generic,
-        url: url.to_string(),
-        provider_name,
-        clip_id: None,
-        vod_id: None,
-        channel_login: None,
-        seventv_emote_id: None,
-        seventv_user_id: None,
-        video_id: None,
-        tweet_id: None,
-        subreddit: None,
-        post_id: None,
-    }
+    LinkInfo::new(LinkType::Generic, url, provider_name)
 }
 
 /// Get YouTube thumbnail URL for a video ID
@@ -371,38 +361,19 @@ pub fn provider_name_for_url(url: &str) -> Option<String> {
 /// Keep Spotify's URL classifier in its provider module, so central routing
 /// and the oEmbed fetcher accept exactly the same narrow public URL surface.
 fn detect_spotify_from_url(parsed: &url::Url, original_url: &str) -> Option<LinkInfo> {
-    parse_spotify_resource_url(parsed.as_str()).map(|_| LinkInfo {
-        link_type: LinkType::Spotify,
-        url: original_url.to_string(),
-        provider_name: Some("Spotify".to_string()),
-        clip_id: None,
-        vod_id: None,
-        channel_login: None,
-        seventv_emote_id: None,
-        seventv_user_id: None,
-        video_id: None,
-        tweet_id: None,
-        subreddit: None,
-        post_id: None,
-    })
+    parse_spotify_resource_url(parsed.as_str())
+        .map(|_| LinkInfo::new(LinkType::Spotify, original_url, Some("Spotify".to_string())))
 }
 
 /// Keep Steam-family URL classification in its provider module so central
 /// routing and the public appdetails fetcher accept exactly the same path set.
 fn detect_steam_from_url(parsed: &url::Url, original_url: &str) -> Option<LinkInfo> {
-    parse_steam_app_url(parsed.as_str()).map(|(source, _)| LinkInfo {
-        link_type: LinkType::Steam,
-        url: original_url.to_string(),
-        provider_name: Some(source.provider_label().to_string()),
-        clip_id: None,
-        vod_id: None,
-        channel_login: None,
-        seventv_emote_id: None,
-        seventv_user_id: None,
-        video_id: None,
-        tweet_id: None,
-        subreddit: None,
-        post_id: None,
+    parse_steam_app_url(parsed.as_str()).map(|(source, _)| {
+        LinkInfo::new(
+            LinkType::Steam,
+            original_url,
+            Some(source.provider_label().to_string()),
+        )
     })
 }
 
@@ -432,18 +403,8 @@ fn detect_youtube_from_url(parsed: &url::Url, original_url: &str) -> Option<Link
     }?;
 
     Some(LinkInfo {
-        link_type: LinkType::YouTube,
-        url: original_url.to_string(),
-        provider_name: Some("YouTube".to_string()),
-        clip_id: None,
-        vod_id: None,
-        channel_login: None,
-        seventv_emote_id: None,
-        seventv_user_id: None,
         video_id: Some(video_id),
-        tweet_id: None,
-        subreddit: None,
-        post_id: None,
+        ..LinkInfo::new(LinkType::YouTube, original_url, Some("YouTube".to_string()))
     })
 }
 
@@ -457,32 +418,20 @@ fn detect_twitch_from_url(parsed: &url::Url, original_url: &str) -> Option<LinkI
                 twitch_clip_link_info(Some(clip_id), original_url)
             }
             ["videos", vod_id, ..] if is_numeric_segment(vod_id) => Some(LinkInfo {
-                link_type: LinkType::TwitchVod,
-                url: original_url.to_string(),
-                provider_name: Some("Twitch".to_string()),
-                clip_id: None,
                 vod_id: Some((*vod_id).to_string()),
-                channel_login: None,
-                seventv_emote_id: None,
-                seventv_user_id: None,
-                video_id: None,
-                tweet_id: None,
-                subreddit: None,
-                post_id: None,
+                ..LinkInfo::new(
+                    LinkType::TwitchVod,
+                    original_url,
+                    Some("Twitch".to_string()),
+                )
             }),
             [channel] if is_twitch_login(channel) => Some(LinkInfo {
-                link_type: LinkType::TwitchChannel,
-                url: original_url.to_string(),
-                provider_name: Some("Twitch".to_string()),
-                clip_id: None,
-                vod_id: None,
                 channel_login: Some(channel.to_ascii_lowercase()),
-                seventv_emote_id: None,
-                seventv_user_id: None,
-                video_id: None,
-                tweet_id: None,
-                subreddit: None,
-                post_id: None,
+                ..LinkInfo::new(
+                    LinkType::TwitchChannel,
+                    original_url,
+                    Some("Twitch".to_string()),
+                )
             }),
             _ => None,
         },
@@ -493,18 +442,12 @@ fn detect_twitch_from_url(parsed: &url::Url, original_url: &str) -> Option<LinkI
 fn twitch_clip_link_info(clip_id: Option<&str>, original_url: &str) -> Option<LinkInfo> {
     let clip_id = clip_id?.trim();
     (!clip_id.is_empty()).then(|| LinkInfo {
-        link_type: LinkType::TwitchClip,
-        url: original_url.to_string(),
-        provider_name: Some("Twitch".to_string()),
         clip_id: Some(clip_id.to_string()),
-        vod_id: None,
-        channel_login: None,
-        seventv_emote_id: None,
-        seventv_user_id: None,
-        video_id: None,
-        tweet_id: None,
-        subreddit: None,
-        post_id: None,
+        ..LinkInfo::new(
+            LinkType::TwitchClip,
+            original_url,
+            Some("Twitch".to_string()),
+        )
     })
 }
 
@@ -519,32 +462,16 @@ fn detect_seventv_from_url(parsed: &url::Url, original_url: &str) -> Option<Link
     let segments = path_segments(parsed);
     match segments.as_slice() {
         ["emotes", emote_id] if is_seventv_id(emote_id) => Some(LinkInfo {
-            link_type: LinkType::SevenTvEmote,
-            url: original_url.to_string(),
-            provider_name: Some("7TV".to_string()),
-            clip_id: None,
-            vod_id: None,
-            channel_login: None,
             seventv_emote_id: Some((*emote_id).to_string()),
-            seventv_user_id: None,
-            video_id: None,
-            tweet_id: None,
-            subreddit: None,
-            post_id: None,
+            ..LinkInfo::new(
+                LinkType::SevenTvEmote,
+                original_url,
+                Some("7TV".to_string()),
+            )
         }),
         ["users", user_id] if is_seventv_id(user_id) => Some(LinkInfo {
-            link_type: LinkType::SevenTvUser,
-            url: original_url.to_string(),
-            provider_name: Some("7TV".to_string()),
-            clip_id: None,
-            vod_id: None,
-            channel_login: None,
-            seventv_emote_id: None,
             seventv_user_id: Some((*user_id).to_string()),
-            video_id: None,
-            tweet_id: None,
-            subreddit: None,
-            post_id: None,
+            ..LinkInfo::new(LinkType::SevenTvUser, original_url, Some("7TV".to_string()))
         }),
         _ => None,
     }
@@ -565,18 +492,12 @@ fn detect_twitter_from_url(parsed: &url::Url, original_url: &str) -> Option<Link
         .to_string();
 
     Some(LinkInfo {
-        link_type: LinkType::Twitter,
-        url: original_url.to_string(),
-        provider_name: Some("Twitter/X".to_string()),
-        clip_id: None,
-        vod_id: None,
-        channel_login: None,
-        seventv_emote_id: None,
-        seventv_user_id: None,
-        video_id: None,
         tweet_id: Some(tweet_id),
-        subreddit: None,
-        post_id: None,
+        ..LinkInfo::new(
+            LinkType::Twitter,
+            original_url,
+            Some("Twitter/X".to_string()),
+        )
     })
 }
 
@@ -586,18 +507,8 @@ fn detect_reddit_from_url(parsed: &url::Url, original_url: &str) -> Option<LinkI
 
     match host.as_str() {
         "redd.it" => Some(LinkInfo {
-            link_type: LinkType::Reddit,
-            url: original_url.to_string(),
-            provider_name: Some("Reddit".to_string()),
-            clip_id: None,
-            vod_id: None,
-            channel_login: None,
-            seventv_emote_id: None,
-            seventv_user_id: None,
-            video_id: None,
-            tweet_id: None,
-            subreddit: None,
             post_id: segments.first().map(|segment| (*segment).to_string()),
+            ..LinkInfo::new(LinkType::Reddit, original_url, Some("Reddit".to_string()))
         }),
         "reddit.com" => {
             let subreddit = segments
@@ -613,18 +524,9 @@ fn detect_reddit_from_url(parsed: &url::Url, original_url: &str) -> Option<LinkI
                 })
                 .map(str::to_string)?;
             Some(LinkInfo {
-                link_type: LinkType::Reddit,
-                url: original_url.to_string(),
-                provider_name: Some("Reddit".to_string()),
-                clip_id: None,
-                vod_id: None,
-                channel_login: None,
-                seventv_emote_id: None,
-                seventv_user_id: None,
-                video_id: None,
-                tweet_id: None,
                 subreddit: Some(subreddit),
                 post_id: Some(post_id),
+                ..LinkInfo::new(LinkType::Reddit, original_url, Some("Reddit".to_string()))
             })
         }
         _ => None,

@@ -1,3 +1,6 @@
+//! Contract: the display action and placeholder text for each deleted-message mode
+//! in `src/backend/deleted_message_display.rs`.
+
 mod settings {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum DeletedMessageMode {

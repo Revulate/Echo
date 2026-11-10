@@ -293,13 +293,33 @@ impl LayoutRuntimeState {
         self.pending_layout_quantized_run_since = None;
     }
 
+    /// Restart the progressive stale-layout scan from the first row.
+    #[inline]
+    pub(super) fn reset_stale_scan(&mut self) {
+        self.stale_layout_refresh_cursor = 0;
+        self.stale_layout_refresh_pass_found_stale = false;
+    }
+
+    /// Mark layouts stale and restart the progressive stale-layout scan.
+    #[inline]
+    pub(super) fn mark_stale(&mut self) {
+        self.has_stale_layouts = true;
+        self.reset_stale_scan();
+    }
+
     /// Mark layouts stale and restart the progressive width refresh pass.
     #[inline]
     pub(super) fn restart_width_refresh(&mut self) {
-        self.has_stale_layouts = true;
+        self.mark_stale();
         self.refresh_missing_layouts_for_width = true;
-        self.stale_layout_refresh_cursor = 0;
-        self.stale_layout_refresh_pass_found_stale = false;
+    }
+
+    /// Drop pending stale and width refresh work; a full rebuild supersedes it.
+    #[inline]
+    pub(super) fn clear_stale_refresh(&mut self) {
+        self.has_stale_layouts = false;
+        self.refresh_missing_layouts_for_width = false;
+        self.reset_stale_scan();
     }
 }
 
@@ -416,7 +436,9 @@ pub(super) struct WakeState {
     /// Image-load waker ticks since the visible load signature last changed.
     pub(super) image_load_unchanged_ticks: u16,
     pub(super) has_async_layout_in_flight_last_frame: bool,
-    pub(super) tooltip_delay_wake_generation: u64,
+    /// Bumped whenever the hover target changes or is dropped, so a hover-link
+    /// metadata request started for an earlier target is discarded.
+    pub(super) hover_generation: u64,
     /// Cancellation epoch and liveness of the drag-selection edge-scroll loop.
     pub(super) selection_edge_scroll_generation: u64,
     pub(super) selection_edge_scroll_running: bool,
@@ -428,4 +450,12 @@ pub(super) struct WakeState {
     pub(super) stall_repaint_requested: bool,
     pub(super) window_visibility_subscription: Option<gpui::Subscription>,
     pub(super) window_activation_subscription: Option<gpui::Subscription>,
+}
+
+impl WakeState {
+    /// Invalidate work started for the previous hover target.
+    #[inline]
+    pub(super) fn bump_hover_generation(&mut self) {
+        self.hover_generation = self.hover_generation.wrapping_add(1);
+    }
 }

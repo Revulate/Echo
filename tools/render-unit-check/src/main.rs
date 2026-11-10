@@ -1,8 +1,12 @@
-#![allow(dead_code, unused_variables)]
+//! Contract: zero-width emote stacking in `src/backend/slots/render_units.rs`
+//! (enabled, disabled, leading overlay) and ASCII-art classification in
+//! `src/backend/ascii_art.rs`.
 
+use check_support::{FIXTURE_HEADER, assert_fixture};
 use std::sync::Arc;
 
 #[path = "../../../src/backend/ascii_art.rs"]
+#[allow(dead_code)] // collapse handling belongs to the renderer, not to this check
 mod ascii_art;
 
 mod backend {
@@ -11,7 +15,6 @@ mod backend {
 
         #[derive(Clone, Debug)]
         pub struct Emote {
-            pub id: Arc<str>,
             pub name: Arc<str>,
             pub zero_width: bool,
         }
@@ -25,7 +28,7 @@ use slots::render_units::{SlotRenderUnit, group_resolved_slots};
 use slots::resolver::ResolvedSlot;
 
 fn main() {
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
 
     print_ascii_art_fixtures();
 
@@ -37,17 +40,17 @@ fn main() {
         ],
         true,
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_enabled_unit_count",
         grouped.len().to_string(),
         "1",
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_enabled_stack",
         emote_stack_summary(&grouped),
         "base+[overlay-a,overlay-b]",
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_for_each_order",
         visited_emote_summary(&grouped),
         "base|overlay-a|overlay-b",
@@ -60,12 +63,12 @@ fn main() {
         ],
         false,
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_disabled_unit_count",
         disabled.len().to_string(),
         "2",
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_disabled_units",
         emote_stack_summary(&disabled),
         "base|overlay-a",
@@ -78,7 +81,7 @@ fn main() {
         ],
         true,
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_leading_overlay",
         emote_stack_summary(&leading_overlay),
         "leading-overlay|base",
@@ -92,12 +95,12 @@ fn main() {
         ],
         true,
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_text_breaks_stack",
         unit_kind_summary(&separated),
         "emote|text|emote",
     );
-    print_fixture(
+    assert_fixture(
         "zero_width_text_breaks_names",
         emote_stack_summary(&separated),
         "base|overlay-after-text",
@@ -122,12 +125,12 @@ fn main() {
         ],
         true,
     );
-    print_fixture(
+    assert_fixture(
         "render_unit_kind_mix",
         unit_kind_summary(&mixed),
         "url|mention|emoji|gif",
     );
-    print_fixture(
+    assert_fixture(
         "render_unit_substantive_count",
         mixed
             .iter()
@@ -136,7 +139,7 @@ fn main() {
             .to_string(),
         "4",
     );
-    print_fixture(
+    assert_fixture(
         "render_unit_url_visit",
         visited_url_summary(&mixed),
         "https://example.com#42",
@@ -145,44 +148,44 @@ fn main() {
 
 fn print_ascii_art_fixtures() {
     let ordinary = ascii_art::classify("ordinary chat with one ░ decoration");
-    print_fixture("ascii_short_decoration", art_kind_name(ordinary), "none");
+    assert_fixture("ascii_short_decoration", art_kind_name(ordinary), "none");
 
     let multiline = ascii_art::classify("========\n========\n========");
-    print_fixture(
+    assert_fixture(
         "ascii_multiline_repetition",
         art_kind_name(multiline),
         "collapsible-multiline",
     );
 
     let below_wrapped_threshold = ascii_art::classify(&"⣿".repeat(47));
-    print_fixture(
+    assert_fixture(
         "ascii_wrapped_below_threshold",
         art_kind_name(below_wrapped_threshold),
         "none",
     );
 
     let twitch_wrapped = ascii_art::classify(&"⣿".repeat(48));
-    print_fixture(
+    assert_fixture(
         "ascii_twitch_wrapped_braille",
         art_kind_name(twitch_wrapped),
         "twitch-wrapped",
     );
-    print_fixture(
+    assert_fixture(
         "ascii_twitch_wrapped_punctuation",
         art_kind_name(ascii_art::classify(&"/\\".repeat(24))),
         "twitch-wrapped",
     );
-    print_fixture(
+    assert_fixture(
         "ascii_wide_split_reference_width",
         twitch_wrapped.layout_width(720.0).to_string(),
         "340",
     );
-    print_fixture(
+    assert_fixture(
         "ascii_narrow_split_real_width",
         twitch_wrapped.layout_width(280.0).to_string(),
         "280",
     );
-    print_fixture(
+    assert_fixture(
         "ordinary_wide_split_real_width",
         ordinary.layout_width(720.0).to_string(),
         "720",
@@ -199,7 +202,6 @@ fn art_kind_name(kind: ascii_art::AsciiArtKind) -> &'static str {
 
 fn emote(name: &str, zero_width: bool) -> Arc<Emote> {
     Arc::new(Emote {
-        id: Arc::from(name),
         name: Arc::from(name),
         zero_width,
     })
@@ -257,14 +259,4 @@ fn visited_url_summary(units: &[SlotRenderUnit]) -> String {
         unit.for_each_url(|url, embed_id| urls.push(format!("{url}#{embed_id}")));
     }
     urls.join("|")
-}
-
-fn print_fixture(name: &str, actual: impl AsRef<str>, expected: &str) {
-    let actual = actual.as_ref();
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
-}
-
-fn checksum(value: &str) -> usize {
-    value.bytes().map(usize::from).sum()
 }

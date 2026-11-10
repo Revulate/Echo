@@ -1,3 +1,7 @@
+//! Benchmark: chat-search query compile and match cost in `echo_core::search`
+//! over 5,000 synthetic messages, after a smoke check of each query's match
+//! count. `scripts/bench/run-pgo-build.py` parses the CSV, including `checksum`.
+
 use echo_core::search::{SearchMessage, compile_search_query};
 use std::hint::black_box;
 use std::time::{Duration, Instant};

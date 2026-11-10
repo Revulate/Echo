@@ -52,7 +52,7 @@ pub fn install_platform_font_families(cx: &App) {
 
     let installed: std::collections::HashSet<String> =
         cx.text_system().all_font_names().into_iter().collect();
-    let kdeglobals = crate::benchmark_profile::external_config_dir()
+    let kdeglobals = crate::storage_roots::external_config_dir()
         .and_then(|dir| std::fs::read_to_string(dir.join("kdeglobals")).ok())
         .unwrap_or_default();
     let configured = |key| ini_value(&kdeglobals, "General", key).and_then(qt_font_family);

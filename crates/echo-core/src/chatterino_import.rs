@@ -1406,7 +1406,7 @@ fn flex(value: Option<&Value>) -> f64 {
 }
 
 fn normalize_twitch_login(name: &str) -> Option<String> {
-    let login = name.trim().trim_start_matches('#').to_ascii_lowercase();
+    let login = crate::channel_identity::normalize_channel_key(name.trim());
     let valid = (1..=25).contains(&login.len())
         && login
             .bytes()
@@ -1441,7 +1441,7 @@ pub fn layout_channel_key(layout: &SplitNode) -> Vec<String> {
         .channels()
         .into_iter()
         .filter(|channel| !crate::workspace::is_placeholder(channel))
-        .map(|channel| channel.trim_start_matches('#').to_ascii_lowercase())
+        .map(|channel| crate::channel_identity::normalize_channel_key(&channel))
         .collect();
     channels.sort_unstable();
     channels

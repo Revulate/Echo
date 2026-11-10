@@ -9,8 +9,10 @@ use std::sync::LazyLock;
 
 use dashmap::DashSet;
 
-/// Hash a URL to a u64 key for allocation-free DashMap/DashSet lookups.
-/// Uses ahash — same algorithm as `MemoryLayer::hash_url()`.
+/// Hash a URL to the u64 key every media layer uses for its maps.
+///
+/// The memory and frame layers and the loader all key by this one function,
+/// so a key computed in one place finds the entry stored by another.
 #[inline]
 pub fn url_key(url: &str) -> u64 {
     use std::hash::{Hash, Hasher};

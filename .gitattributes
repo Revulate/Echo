@@ -6,8 +6,12 @@
 # those payload lines as repository whitespace errors.
 *.patch whitespace=-blank-at-eof,-blank-at-eol
 
-# Keep docs, scripts and benchmark fixtures LF in every checkout. Shell scripts
-# must stay LF to run on Linux.
-docs/*.md text eol=lf
+# Keep Markdown, docs and their fixtures, scripts, CI workflows and benchmark
+# fixtures LF in every checkout, so Windows and Linux see the same bytes. Shell
+# scripts must stay LF to run on Linux.
+*.md text eol=lf
+docs/** text=auto eol=lf
 scripts/** text=auto eol=lf
 benchmarks/** text=auto eol=lf
+.github/** text=auto eol=lf
+Makefile text eol=lf

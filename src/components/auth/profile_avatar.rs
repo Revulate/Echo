@@ -1,8 +1,6 @@
 //! Reusable profile avatar component
 //!
 //! Renders a user's profile picture with fallback to initials.
-//!
-//! Note: Size variants for planned account switcher popout.
 
 use crate::theme::colors;
 use crate::theme::tokens::{Radii, RadiiPixels};

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Bounded happy-path runtime smoke on a real X11 or Wayland session: build the
+# debug Echo, launch it under an isolated profile, replay three fixture
+# messages, quit through GPUI and validate the runtime log and replay report.
+# Artifacts land under target/linux-app-smoke/. See docs/LINUX_DEVELOPMENT.md.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -9,6 +9,7 @@ pub mod decode;
 pub mod disk;
 pub mod frames;
 pub mod memory;
+pub mod persist;
 pub mod registry;
 pub mod warming;
 

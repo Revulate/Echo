@@ -1,3 +1,5 @@
+//! Paging and formatting for the Helix chatters list.
+
 use serde::Deserialize;
 use std::cmp::Ordering;
 

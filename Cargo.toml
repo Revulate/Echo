@@ -13,11 +13,62 @@ rust-version = "1.99.1"
 license = "MIT"
 repository = "https://github.com/Revulate/Echo"
 
+# Dependencies shared by more than one member. Members inherit them with
+# `<name>.workspace = true` and add their own features on top, so the features
+# listed here are the ones every user needs.
 [workspace.dependencies]
+# GPUI framework from Zed, pinned to one commit; `[patch]` at the end of this
+# file builds it from the local fork (docs/GPUI_FORK.md). build.rs and
+# scripts/setup-gpui-fork.* read the revision from these one-line entries.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3", features = ["wayland", "x11"] }
+reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
+
+ahash = "0.8"
+base64 = "0.23"
+bincode = { package = "cu-bincode", version = "2.0.2", features = ["serde"] }
+chrono = "0.4"
+criterion = { version = "0.8", features = ["html_reports"] }
+dashmap = "6"
+dirs = "6.0"
 emojis = "0.9"
+image = { version = "0.25", default-features = false }
+lru = "0.19"
+open = "5"
+parking_lot = "0.12"
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+ring = "0.17"
+rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+semver = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+smallvec = "1.13"
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+tempfile = "3.12"
+tokio = { version = "1", default-features = false }
+tracing = "0.1"
+twitch-irc = { version = "6.0.0", default-features = false }
+url = "2.5"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+windows = "0.62"
+zstd = "0.14"
+
+check-support = { path = "tools/check-support" }
+echo-autocomplete-core = { path = "crates/echo-autocomplete-core" }
+echo-cache-policy = { path = "crates/echo-cache-policy" }
+echo-chat-render = { path = "crates/echo-chat-render" }
+echo-core = { path = "crates/echo-core" }
+echo-cosmetics-core = { path = "crates/echo-cosmetics-core" }
+echo-emote-core = { path = "crates/echo-emote-core" }
+echo-link-core = { path = "crates/echo-link-core" }
+echo-media-cache = { path = "crates/echo-media-cache" }
+echo-render-core = { path = "crates/echo-render-core" }
+echo-text-core = { path = "crates/echo-text-core" }
+echo-update-core = { path = "tools/echo-update-core" }
 
 [package]
 name = "echo_gpui"
@@ -29,25 +80,20 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# GPUI framework from Zed (pinned to the current upstream main commit).
-gpui = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
-reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
-gpui_platform = {
-    git = "https://github.com/zed-industries/zed",
-    rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3",
-    features = ["wayland", "x11"],
-}
+gpui.workspace = true
+reqwest_client.workspace = true
+gpui_platform.workspace = true
 raw-window-handle = "0.6"
 
 # Async runtime (trimmed features for faster builds)
 # Required: rt-multi-thread, macros, sync, time, fs, net, io-util
-tokio = { version = "1", default-features = false, features = [
+tokio = { workspace = true, features = [
     "rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"
 ] }
 futures-util = "0.3"
 
 # Twitch IRC (used for connection management)
-twitch-irc = { version = "6.0.0", default-features = false, features = ["transport-tcp-rustls-native-roots"] }
+twitch-irc = { workspace = true, features = ["transport-tcp-rustls-native-roots"] }
 
 # WebSocket (for 7TV EventSub)
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-native-roots"] }
@@ -69,10 +115,10 @@ backon = "1.6"
 governor = "0.10"
 
 # Config directory paths
-dirs = "6.0"
+dirs.workspace = true
 
 # URL parsing
-url = "2.5"
+url.workspace = true
 
 # Unicode text handling (grapheme clusters for proper text wrapping)
 unicode-segmentation = "1.11"
@@ -84,35 +130,35 @@ emojis.workspace = true
 
 # Stable current persistence codec. Defaults are disabled so the desktop build
 # does not pull in heapless solely through Postcard's embedded-first defaults.
-postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+postcard.workspace = true
 # Bounded read-only compatibility for Echo's existing Bincode 2 payloads. This
 # maintained fork is wire-compatible with 2.0.1; no current writer may use it.
-bincode = { package = "cu-bincode", version = "2.0.2", features = ["serde"] }
+bincode.workspace = true
 
 # Compression (emote cache disk storage)
-zstd = "0.14"
+zstd.workspace = true
 
 # Serialization
-serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1.0"
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
 schemars = "1"  # JSON schema for GPUI actions
 
 # Image handling (only decoders needed for Twitch emotes/badges). Do not add
 # `avif`: that image-crate feature is an encoder, not a decoder. The native
 # decoder requires a system dav1d installation and is not release-portable.
-image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "webp"] }
+image = { workspace = true, features = ["png", "gif", "jpeg", "webp"] }
 
 # Caching
-lru = "0.19"
-dashmap = "6"
-parking_lot = "0.12"  # Fast RwLock for concurrent caches
+lru.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true  # Fast RwLock for concurrent caches
 crossbeam-channel = "0.5"  # MPMC channel for lock-free worker-pool job dispatch
 arc-swap = "1"  # Lock-free atomic Arc swapping for hot-path reads
-ahash = "0.8"  # Fast hashing for animation state
+ahash.workspace = true  # Fast hashing for animation state
 
 # Memory optimization
-smallvec = "1.13"
-rustc-hash = "2"  # Fast FxHashMap for hot-path integer/small-string keys
+smallvec.workspace = true
+rustc-hash.workspace = true  # Fast FxHashMap for hot-path integer/small-string keys
 
 # Asset embedding
 # include-exclude must be explicit: relying on feature unification lets a
@@ -126,32 +172,34 @@ sysinfo.workspace = true
 scraper = "0.29"
 
 # Utilities
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-tracing = "0.1"
+uuid.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-chrome = { version = "0.7", optional = true }
 # Heap profiler, only compiled under the `dhat-heap` feature.
 dhat = { version = "0.3", optional = true }
-regex = "1"
-echo-core = { path = "crates/echo-core" }
-echo-cache-policy = { path = "crates/echo-cache-policy" }
-echo-autocomplete-core = { path = "crates/echo-autocomplete-core" }
-echo-chat-render = { path = "crates/echo-chat-render" }
-echo-cosmetics-core = { path = "crates/echo-cosmetics-core" }
-echo-emote-core = { path = "crates/echo-emote-core" }
-echo-link-core = { path = "crates/echo-link-core" }
-echo-media-cache = { path = "crates/echo-media-cache" }
-echo-render-core = { path = "crates/echo-render-core" }
-echo-text-core = { path = "crates/echo-text-core" }
-urlencoding = "2"
-base64 = "0.23"
-ring = "0.17"
-semver = "1"
-echo-update-core = { path = "tools/echo-update-core" }
+regex.workspace = true
+urlencoding.workspace = true
+base64.workspace = true
+ring.workspace = true
+semver.workspace = true
+
+# Echo's own GPUI-free crates
+echo-core.workspace = true
+echo-cache-policy.workspace = true
+echo-autocomplete-core.workspace = true
+echo-chat-render.workspace = true
+echo-cosmetics-core.workspace = true
+echo-emote-core.workspace = true
+echo-link-core.workspace = true
+echo-media-cache.workspace = true
+echo-render-core.workspace = true
+echo-text-core.workspace = true
+echo-update-core.workspace = true
 
 # URL opening
-open = "5"
+open.workspace = true
 keyring-core = "1"
 
 # HTTP client (rustls for consistent cross-platform TLS)
@@ -166,7 +214,7 @@ reqwest = { workspace = true, features = ["json", "form", "multipart", "socks", 
 rustls.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Foundation", "Media_Control", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_WinRT", "Win32_Security", "Win32_Security_Cryptography", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
+windows = { workspace = true, features = ["Foundation", "Media_Control", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_WinRT", "Win32_Security", "Win32_Security_Cryptography", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
 windows-native-keyring-store = "1"
 
 # mimalloc: the Linux allocator, and on Windows behind `windows-mimalloc`. Its
@@ -182,7 +230,7 @@ arboard = "3"
 
 # Unix: SIGTERM/SIGINT/SIGHUP quit through GPUI's normal shutdown (main.rs).
 [target.'cfg(unix)'.dependencies]
-tokio = { version = "1", default-features = false, features = ["signal"] }
+tokio = { workspace = true, features = ["signal"] }
 libc = "0.2"
 
 # Linux: KWin scripting over D-Bus for always-on-top and taskbar attention
@@ -213,18 +261,16 @@ incremental = false # Prefer bounded disk usage over cached workspace codegen
 debug = "line-tables-only" # File/line backtraces without full variable/type symbols
 lto = false         # No link-time optimization
 
-# PERF: Optimize dependencies in dev builds for usable runtime performance
+# Optimize dependencies in dev builds for usable runtime performance
 # Your code stays unoptimized (fast compile), but gpui/image/etc are fast at runtime
 [profile.dev.package."*"]
 opt-level = 2       # Full optimization for all dependencies
 
-# Fast dev builds with Cranelift backend (nightly only, ~30-50% faster compile)
-# Usage: cargo +nightly build --profile dev-fast -Zcodegen-backend=cranelift
-# Or use alias: cargo fast
+# Dev build with incremental compilation, which `dev` leaves off to bound disk
+# use. Usage: cargo build --profile dev-fast
 [profile.dev-fast]
 inherits = "dev"
 incremental = true
-# Note: Cranelift doesn't support all optimizations, keep opt-level low
 
 # Test profile - prevents rustc stack overflow on large GPUI projects
 # Requires: RUST_MIN_STACK=268435456 cargo test
@@ -317,19 +363,17 @@ windows-mimalloc = []
 
 [dev-dependencies]
 # Temp files/directories for tests
-tempfile = "3.12"
+tempfile.workspace = true
 
 # Benchmarking
-[dev-dependencies.criterion]
-version = "0.8"
-features = ["html_reports", "async_tokio"]
+criterion = { workspace = true, features = ["async_tokio"] }
 
 [[bench]]
 name = "layout_bench"
 harness = false
 
 [[bench]]
-name = "filter_bench"
+name = "parse_bench"
 harness = false
 
 [[bench]]

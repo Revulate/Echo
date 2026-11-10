@@ -6,28 +6,21 @@
 //! - RTL/BiDi text support for Hebrew, Arabic, and mixed-direction text
 
 pub mod async_layout;
-pub mod bidi;
-pub mod eviction_cache;
-pub mod font_metrics;
+mod bounded_map;
 pub mod global_layout_cache;
-pub mod height_tree;
-pub mod hit_testing;
 pub mod layout;
 pub mod layout_mode;
 pub mod layout_scale;
-pub mod line_buffer;
 pub mod native_dimensions;
 pub mod painter;
-pub mod painter_async;
 pub mod relayout_trace;
-pub mod selection;
 pub mod seventv_paint;
-pub mod text_run_intern;
 pub mod text_shaping;
 pub mod tooltip;
+mod trace_span;
 
 pub(crate) use async_layout::layout_worker_diagnostics;
-pub use font_metrics::initialize_font_metrics;
+pub use echo_chat_render::font_metrics::initialize_font_metrics;
 pub use painter::CanvasMessageList;
 
 /// Install Echo's settings accessors into the GPUI-dependent render model.

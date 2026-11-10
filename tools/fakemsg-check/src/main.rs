@@ -1,13 +1,15 @@
+//! Contract: `/fakemsg` server-event parsing in `src/backend/fakemsg_core.rs`:
+//! NOTICE, USERNOTICE, WHISPER and numeric replies become system text with the
+//! right highlight, and ordinary PRIVMSG lines are not treated as server events.
+
 #[path = "../../../src/backend/fakemsg_core.rs"]
 mod fakemsg_core;
 
+use check_support::FIXTURE_HEADER;
 use fakemsg_core::{FakeIrcHighlight, parse_fake_irc_system_event};
-use std::hint::black_box;
-use std::time::Instant;
-
-const ITERS: usize = 200_000;
 
 fn main() {
+    println!("{FIXTURE_HEADER}");
     let samples = samples();
     for sample in &samples {
         let event = parse_fake_irc_system_event(sample.raw, "echo")
@@ -18,6 +20,7 @@ fn main() {
             "highlight mismatch for {}",
             sample.name
         );
+        println!("fixture,fakemsg_{},pass", sample.name);
     }
 
     assert!(
@@ -27,9 +30,6 @@ fn main() {
         )
         .is_none()
     );
-
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
-    bench_parse_and_convert(&samples);
 }
 
 struct Sample {
@@ -162,21 +162,4 @@ fn samples() -> Vec<Sample> {
             highlight: FakeIrcHighlight::None,
         },
     ]
-}
-
-fn bench_parse_and_convert(samples: &[Sample]) {
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..ITERS {
-        let sample = &samples[i % samples.len()];
-        let event = parse_fake_irc_system_event(black_box(sample.raw), black_box("echo")).unwrap();
-        checksum = checksum.wrapping_add(event.text.len() + event.highlight as usize);
-    }
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / ITERS as f64;
-    let units_per_second = ITERS as f64 / elapsed.as_secs_f64();
-    println!(
-        "parse,fakemsg_server_events,{},{:.2},{:.0},{}",
-        ITERS, ns_per_unit, units_per_second, checksum
-    );
 }

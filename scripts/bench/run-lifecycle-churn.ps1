@@ -1,3 +1,9 @@
+<#
+.SYNOPSIS
+Drive Echo's built-in lifecycle churn fixture (ECHO_BENCH_LIFECYCLE_CHURN)
+against a chat replay while sampling the process, and report private-memory,
+handle and thread slopes after the warm plateau and settling phases.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -24,23 +30,8 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
-function Resolve-RepoRoot { (Resolve-Path (Join-Path (Split-Path -Parent $PSCommandPath) "..\..")).Path }
-function Resolve-Executable([string]$Path) {
-    if (Test-Path $Path) { return (Resolve-Path $Path).Path }
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command) { return $command.Source }
-    throw "LaunchPath '$Path' was not found."
-}
-function Set-ProcessEnvironment([hashtable]$Previous, [string]$Name, [string]$Value) {
-    $Previous[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
-    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
-}
-function Restore-ProcessEnvironment([hashtable]$Previous) {
-    foreach ($entry in $Previous.GetEnumerator()) {
-        [Environment]::SetEnvironmentVariable([string]$entry.Key, $entry.Value, "Process")
-    }
-}
 function Get-LinearSlope([object[]]$Rows, [string]$Property) {
     if ($Rows.Count -lt 2) { return $null }
     $xs = @($Rows | ForEach-Object { [double]$_.elapsed_seconds })
@@ -58,7 +49,7 @@ function Get-LinearSlope([object[]]$Rows, [string]$Property) {
 }
 
 $repoRoot = Resolve-RepoRoot
-$launch = Resolve-Executable $LaunchPath
+$launch = Resolve-ExecutablePath -Path $LaunchPath -Label "LaunchPath"
 if ([string]::IsNullOrWhiteSpace($RunDir)) {
     $stamp = [DateTime]::Now.ToString("yyyyMMdd-HHmmss")
     $root = if ([string]::IsNullOrWhiteSpace($OutputRoot)) { Join-Path $repoRoot "benchmarks\results" } else { $OutputRoot }
@@ -98,7 +89,7 @@ try {
         ECHO_CHAT_REPLAY_REPORT = $replayReportPath
         ECHO_CHAT_REPLAY_CHANNEL = "echo-offline-fixture"
         ECHO_CHAT_REPLAY_CLEAR_CHANNEL = "1"
-    }).GetEnumerator()) { Set-ProcessEnvironment $previous ([string]$pair.Key) ([string]$pair.Value) }
+    }).GetEnumerator()) { Set-TemporaryEnv -Previous $previous -Name ([string]$pair.Key) -Value ([string]$pair.Value) }
 
     $start = @{ FilePath = $launch; PassThru = $true; RedirectStandardOutput = $stdoutPath; RedirectStandardError = $stderrPath }
     if ($LaunchArgument.Count -gt 0) { $start.ArgumentList = $LaunchArgument }
@@ -114,7 +105,7 @@ try {
             if (-not $process.WaitForExit($ExitWaitSeconds * 1000)) { $process.Kill($true); $process.WaitForExit() }
         }
     }
-    Restore-ProcessEnvironment $previous
+    Restore-Env -Previous $previous
 }
 
 if (-not (Test-Path $logPath)) { throw "Lifecycle driver did not produce $logPath" }

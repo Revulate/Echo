@@ -8,14 +8,15 @@
 use gpui::Hsla;
 use std::sync::OnceLock;
 
+/// Looks up the decoded pixel size of an image URL, if it has been decoded.
+pub type DecodedImageSizeFn = fn(&str) -> Option<(u32, u32)>;
+
 static FONT_SCALE: OnceLock<fn() -> f32> = OnceLock::new();
 static CHAT_DENSITY_MULTIPLIER: OnceLock<fn() -> f32> = OnceLock::new();
 static BADGE_SCALE: OnceLock<fn() -> f32> = OnceLock::new();
 static EMOTE_SCALE: OnceLock<fn() -> f32> = OnceLock::new();
 static CLIPBOARD_WRITER: OnceLock<fn(&str)> = OnceLock::new();
 static TEXT_PRIMARY: OnceLock<fn() -> Hsla> = OnceLock::new();
-type DecodedImageSizeFn = fn(&str) -> Option<(u32, u32)>;
-
 static DECODED_IMAGE_SIZE: OnceLock<DecodedImageSizeFn> = OnceLock::new();
 static BADGE_SET_PENDING: OnceLock<fn(&str) -> bool> = OnceLock::new();
 
@@ -53,7 +54,7 @@ pub fn install_text_primary(callback: fn() -> Hsla) {
 ///
 /// The root owns cache residency and animation-frame policy; the render model
 /// only receives an already-decoded, side-effect-free size probe.
-pub fn install_decoded_image_size(callback: fn(&str) -> Option<(u32, u32)>) {
+pub fn install_decoded_image_size(callback: DecodedImageSizeFn) {
     let _ = DECODED_IMAGE_SIZE.set(callback);
 }
 

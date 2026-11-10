@@ -1,4 +1,7 @@
-#![allow(clippy::await_holding_lock)]
+//! Twitch account authentication: the device-code login, token refresh and
+//! validation, account switching, and the credential generation that fences
+//! every account-scoped resource against a login, logout or switch that
+//! happened while it was loading.
 
 use super::badges::TWITCH_BADGE_CACHE;
 use super::constants::CLIENT_ID;
@@ -215,7 +218,10 @@ fn build_auth_client() -> reqwest::Client {
     {
         Ok(client) => client,
         Err(e) => {
-            tracing::error!("Failed to create Auth HTTP client with timeouts: {e}");
+            crate::log_auth!(
+                error,
+                "Failed to create Auth HTTP client with timeouts: {e}"
+            );
             http::timed_client(Duration::from_secs(30))
         }
     }
@@ -844,6 +850,148 @@ impl AuthenticatedUserResource {
     }
 }
 
+/// Polling stops: the attempt was superseded, or failed and its error was
+/// recorded for the login UI.
+struct LoginAbort;
+
+/// Continue only while `generation` is still the active login attempt;
+/// otherwise log `stale` and abort.
+fn ensure_login_current(generation: u64, stale: &str) -> Result<(), LoginAbort> {
+    if is_login_attempt_active(generation) {
+        Ok(())
+    } else {
+        crate::log_auth!(debug, "{stale}");
+        Err(LoginAbort)
+    }
+}
+
+fn fail_login(generation: u64, error: String) -> LoginAbort {
+    set_login_error_if_active(generation, error);
+    LoginAbort
+}
+
+/// Validate, identify and publish the token Twitch issued for an approved
+/// device code. Every await is followed by a check that the attempt is still
+/// current, so a cancelled or superseded login never publishes credentials.
+async fn complete_device_login(
+    generation: u64,
+    access_token: String,
+    refresh_token: Option<String>,
+    token_expires_in: u64,
+    scope: Vec<String>,
+) -> Result<(), LoginAbort> {
+    let scope_validation = if scope.is_empty() {
+        let validation = fetch_token_validation(&access_token).await;
+        ensure_login_current(generation, "Discarding stale login scope validation")?;
+        match validation {
+            Ok(Some(validation)) => require_core_oauth_scopes(&validation.scopes),
+            Ok(None) => {
+                Err("Login token failed Twitch validation after device-code approval".to_string())
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        require_core_oauth_scopes(&scope)
+    };
+
+    scope_validation.map_err(|error| fail_login(generation, error))?;
+
+    ensure_login_current(
+        generation,
+        "Discarding stale login success from superseded generation",
+    )?;
+
+    let user_result = fetch_authenticated_user(&access_token).await;
+    ensure_login_current(generation, "Discarding stale login identity response")?;
+    let user = user_result.map_err(|error| fail_login(generation, error))?;
+
+    ensure_login_current(
+        generation,
+        "Discarding stale login identity from superseded generation",
+    )?;
+
+    let token_expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 + token_expires_in as i64)
+        .ok();
+
+    let account = Account {
+        username: user.login.clone(),
+        display_name: user.display_name.clone(),
+        profile_image_url: user.profile_image_url.clone(),
+        token: access_token.clone(),
+        refresh_token: refresh_token.clone(),
+        client_id: CLIENT_ID.to_string(),
+        is_active: true,
+        token_expires_at,
+    };
+
+    let (blocked_users_auth_epoch, committed_credential_generation) = {
+        let _commit_guard = AUTH_CREDENTIAL_COMMIT_LOCK.lock_or_recover();
+        ensure_login_current(
+            generation,
+            "Discarding stale login before publishing credentials",
+        )?;
+
+        let blocked_users_auth_epoch = super::blocked_users::begin_auth_transition(false);
+        revoke_account_scoped_runtime_commit_held();
+        {
+            let mut settings = SETTINGS.lock_or_recover();
+            for acc in &mut settings.accounts {
+                acc.is_active = false;
+            }
+            settings.token = Some(access_token.clone());
+            settings.refresh_token = refresh_token;
+            settings.username = Some(user.login.clone());
+            settings.token_expires_at = token_expires_at;
+        }
+        upsert_account(account);
+        super::settings::set_anonymous_mode(false);
+        super::irc::reset_anonymous_mode();
+
+        {
+            let mut state = AUTH_STATE.write_or_recover();
+            state.authenticated = true;
+            state.username = Some(user.login.clone());
+            state.display_name = user.display_name.clone();
+            state.profile_image_url = user.profile_image_url.clone();
+            state.device_code = None;
+            state.user_code = None;
+            state.verification_uri = None;
+            state.error = None;
+            state.loading = false;
+            state.needs_reauth = false;
+        }
+        LOGIN_COMMITTED_GENERATION.store(generation, Ordering::SeqCst);
+        update_login_attempt_state(
+            generation,
+            LoginAttemptState::Succeeded {
+                display_name: user
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| user.login.clone()),
+            },
+        );
+        let committed_credential_generation = advance_credential_generation();
+        *ACTIVE_AUTH_USER_ID.write_or_recover() =
+            Some((committed_credential_generation, user.id.clone()));
+        crate::log_auth!(info, "Authenticated as {}", user.login);
+        broadcast_auth_event(AuthEvent::LoggedIn);
+        (blocked_users_auth_epoch, committed_credential_generation)
+    };
+
+    flush_settings_saves(Duration::from_secs(2));
+    clear_refresh_cooldown();
+    super::eventsub::reset_for_auth_change("login completed");
+
+    if !distribute_token_for_generation(&access_token, committed_credential_generation).await {
+        crate::log_auth!(debug, "Discarding stale post-login resource refresh");
+        return Err(LoginAbort);
+    }
+    spawn_user_scoped_resource_refresh(access_token, Some(user.id), blocked_users_auth_epoch, true);
+    Ok(())
+}
+
 async fn poll_for_token(device_code: String, interval: u64, expires_in: u64, generation: u64) {
     let client = AUTH_CLIENT.client();
     let start_time = std::time::Instant::now();
@@ -906,153 +1054,15 @@ async fn poll_for_token(device_code: String, interval: u64, expires_in: u64, gen
                         ..
                     }) = token_response
                     {
-                        let scope_validation = if scope.is_empty() {
-                            let validation = fetch_token_validation(&access_token).await;
-                            if !is_login_attempt_active(generation) {
-                                crate::log_auth!(debug, "Discarding stale login scope validation");
-                                break;
-                            }
-                            match validation {
-                                Ok(Some(validation)) => {
-                                    require_core_oauth_scopes(&validation.scopes)
-                                }
-                                Ok(None) => Err(
-                                    "Login token failed Twitch validation after device-code approval"
-                                        .to_string(),
-                                ),
-                                Err(error) => Err(error),
-                            }
-                        } else {
-                            require_core_oauth_scopes(&scope)
-                        };
-
-                        if let Err(error) = scope_validation {
-                            set_login_error_if_active(generation, error);
-                            break;
-                        }
-
-                        if !is_login_attempt_active(generation) {
-                            crate::log_auth!(
-                                debug,
-                                "Discarding stale login success from superseded generation"
-                            );
-                            break;
-                        }
-
-                        let user_result = fetch_authenticated_user(&access_token).await;
-                        if !is_login_attempt_active(generation) {
-                            crate::log_auth!(debug, "Discarding stale login identity response");
-                            break;
-                        }
-                        let user = match user_result {
-                            Ok(user) => user,
-                            Err(error) => {
-                                set_login_error_if_active(generation, error);
-                                break;
-                            }
-                        };
-
-                        if !is_login_attempt_active(generation) {
-                            crate::log_auth!(
-                                debug,
-                                "Discarding stale login identity from superseded generation"
-                            );
-                            break;
-                        }
-
-                        let token_expires_at = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64 + token_expires_in as i64)
-                            .ok();
-
-                        let account = Account {
-                            username: user.login.clone(),
-                            display_name: user.display_name.clone(),
-                            profile_image_url: user.profile_image_url.clone(),
-                            token: access_token.clone(),
-                            refresh_token: refresh_token.clone(),
-                            client_id: CLIENT_ID.to_string(),
-                            is_active: true,
-                            token_expires_at,
-                        };
-
-                        let (blocked_users_auth_epoch, committed_credential_generation) = {
-                            let _commit_guard = AUTH_CREDENTIAL_COMMIT_LOCK.lock_or_recover();
-                            if !is_login_attempt_active(generation) {
-                                crate::log_auth!(
-                                    debug,
-                                    "Discarding stale login before publishing credentials"
-                                );
-                                break;
-                            }
-
-                            let blocked_users_auth_epoch =
-                                super::blocked_users::begin_auth_transition(false);
-                            revoke_account_scoped_runtime_commit_held();
-                            {
-                                let mut settings = SETTINGS.lock_or_recover();
-                                for acc in &mut settings.accounts {
-                                    acc.is_active = false;
-                                }
-                                settings.token = Some(access_token.clone());
-                                settings.refresh_token = refresh_token;
-                                settings.username = Some(user.login.clone());
-                                settings.token_expires_at = token_expires_at;
-                            }
-                            upsert_account(account);
-                            super::settings::set_anonymous_mode(false);
-                            super::irc::reset_anonymous_mode();
-
-                            {
-                                let mut state = AUTH_STATE.write_or_recover();
-                                state.authenticated = true;
-                                state.username = Some(user.login.clone());
-                                state.display_name = user.display_name.clone();
-                                state.profile_image_url = user.profile_image_url.clone();
-                                state.device_code = None;
-                                state.user_code = None;
-                                state.verification_uri = None;
-                                state.error = None;
-                                state.loading = false;
-                                state.needs_reauth = false;
-                            }
-                            LOGIN_COMMITTED_GENERATION.store(generation, Ordering::SeqCst);
-                            update_login_attempt_state(
-                                generation,
-                                LoginAttemptState::Succeeded {
-                                    display_name: user
-                                        .display_name
-                                        .clone()
-                                        .unwrap_or_else(|| user.login.clone()),
-                                },
-                            );
-                            let committed_credential_generation = advance_credential_generation();
-                            *ACTIVE_AUTH_USER_ID.write_or_recover() =
-                                Some((committed_credential_generation, user.id.clone()));
-                            crate::log_auth!(info, "Authenticated as {}", user.login);
-                            broadcast_auth_event(AuthEvent::LoggedIn);
-                            (blocked_users_auth_epoch, committed_credential_generation)
-                        };
-
-                        flush_settings_saves(Duration::from_secs(2));
-                        clear_refresh_cooldown();
-                        super::eventsub::reset_for_auth_change("login completed");
-
-                        if !distribute_token_for_generation(
-                            &access_token,
-                            committed_credential_generation,
-                        )
-                        .await
-                        {
-                            crate::log_auth!(debug, "Discarding stale post-login resource refresh");
-                            break;
-                        }
-                        spawn_user_scoped_resource_refresh(
+                        // Success or abort, the attempt is over either way.
+                        let _ = complete_device_login(
+                            generation,
                             access_token,
-                            Some(user.id),
-                            blocked_users_auth_epoch,
-                            true,
-                        );
+                            refresh_token,
+                            token_expires_in,
+                            scope,
+                        )
+                        .await;
                         break;
                     }
                     // A 2xx without a usable token will not improve by polling again.
@@ -1571,10 +1581,26 @@ async fn fetch_token_validation(token: &str) -> Result<Option<ValidateTokenRespo
         .map_err(|e| format!("Failed to parse validate response: {}", e))
 }
 
+/// A failed token refresh. `permanent` means Twitch rejected the refresh token
+/// itself, so only a new login can recover.
+struct RefreshError {
+    message: String,
+    permanent: bool,
+}
+
+impl From<String> for RefreshError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            permanent: false,
+        }
+    }
+}
+
 /// Refresh the access token using a refresh token
-pub async fn refresh_access_token(
+async fn refresh_access_token(
     refresh_token: &str,
-) -> Result<(String, Option<String>, u64), String> {
+) -> Result<(String, Option<String>, u64), RefreshError> {
     let client = AUTH_CLIENT.client();
     let params = [
         ("client_id", CLIENT_ID),
@@ -1594,10 +1620,13 @@ pub async fn refresh_access_token(
         let body = sanitized_oauth_error(crate::backend::http::error_body(resp).await);
 
         if body.contains("Invalid refresh token") || body.contains("invalid_grant") {
-            return Err(format!("Permanent auth failure: {}", body));
+            return Err(RefreshError {
+                message: format!("Permanent auth failure: {}", body),
+                permanent: true,
+            });
         }
 
-        return Err(format!("Token refresh failed ({}): {}", status, body));
+        return Err(format!("Token refresh failed ({}): {}", status, body).into());
     }
 
     #[derive(Deserialize)]
@@ -1616,7 +1645,9 @@ pub async fn refresh_access_token(
 
     if data.scope.is_empty() {
         let Some(validation) = fetch_token_validation(&data.access_token).await? else {
-            return Err("Refreshed token failed Twitch validation".to_string());
+            return Err("Refreshed token failed Twitch validation"
+                .to_string()
+                .into());
         };
         require_core_oauth_scopes(&validation.scopes)?;
     } else {
@@ -1791,13 +1822,13 @@ async fn refresh_and_save_tokens_expected(
             }
             record_refresh_failure();
 
-            if e.contains("Permanent auth failure") || e.contains("invalid_grant") {
+            if e.permanent {
                 flag_needs_reauth();
                 super::blocked_users::reset_for_auth_change();
                 super::eventsub::reset_for_auth_change("token refresh permanently failed");
             }
 
-            Err(e)
+            Err(e.message)
         }
     }
 }
@@ -1831,7 +1862,7 @@ async fn distribute_token_for_generation(token: &str, expected_generation: u64) 
         return false;
     }
 
-    EMOTE_CACHE.set_token(token.to_string()).await;
+    EMOTE_CACHE.set_token(token.to_string());
     let current =
         credential_generation() == expected_generation && active_access_token_matches(token);
     if current {
@@ -1860,11 +1891,11 @@ pub(crate) async fn clear_distributed_token_for_generation(expected_generation: 
     if credential_generation() != expected_generation {
         return false;
     }
-    EMOTE_CACHE.clear_token().await;
+    EMOTE_CACHE.clear_token();
     if credential_generation() != expected_generation {
         return false;
     }
-    EMOTE_CACHE.clear_user_emotes().await;
+    EMOTE_CACHE.clear_user_emotes();
     credential_generation() == expected_generation
 }
 

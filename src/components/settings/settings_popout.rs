@@ -7,7 +7,7 @@
 //! degrading to read-only.
 
 use crate::backend::lock_utils::MutexExt;
-use crate::components::auth::{LoginModal, LoginModalState};
+use crate::components::auth::{LoginModalState, render_login_modal};
 use crate::components::settings::settings_surface::{
     SettingsChrome, SettingsOpenRequest, SettingsSurface, SettingsSurfaceHost,
     render_settings_surface, watch_appearance_changes,
@@ -24,9 +24,8 @@ static SETTINGS_POPOUT_OPEN: AtomicBool = AtomicBool::new(false);
 static SETTINGS_POPOUT_HANDLE: LazyLock<Mutex<Option<AnyWindowHandle>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Pending popout request. Carries the full destination plus any query being
-/// transferred from the modal; the runtime-only "selected section" static is
-/// gone now that navigation state is persisted properly.
+/// Pending popout request: the destination plus any query being transferred
+/// from the modal.
 static PENDING_SETTINGS_POPOUT: LazyLock<Mutex<Option<SettingsOpenRequest>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -285,7 +284,7 @@ impl Render for SettingsPopout {
 
         let surface = render_settings_surface(self, window, cx);
         let login_overlay =
-            LoginModal::render_with_entity(self.login_modal.clone(), window.viewport_size(), cx);
+            render_login_modal(self.login_modal.clone(), window.viewport_size(), cx);
 
         div()
             .id("settings-popout")

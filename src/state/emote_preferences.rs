@@ -244,5 +244,5 @@ fn persist_pending_preferences() {
 
 /// Get the path for emote preferences file
 pub fn get_prefs_path() -> PathBuf {
-    crate::benchmark_profile::emote_preferences_path()
+    crate::storage_roots::emote_preferences_path()
 }

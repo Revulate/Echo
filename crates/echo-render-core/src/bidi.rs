@@ -12,7 +12,7 @@ use unicode_bidi::{BidiClass, BidiInfo, bidi_class};
 
 /// Quick check if text contains any RTL characters
 ///
-/// PERF: Uses early exit on first RTL character for fast common case (LTR only)
+/// Uses early exit on first RTL character for fast common case (LTR only)
 /// Checks for:
 /// - Arabic (AL class)
 /// - Hebrew and other strong RTL (R class)
@@ -54,10 +54,10 @@ impl Default for BidiAnalysis {
 impl BidiAnalysis {
     /// Analyze text and compute visual reordering information
     ///
-    /// PERF: Fast path for pure LTR text (most common case)
+    /// Fast path for pure LTR text (most common case)
     pub fn new(text: &str) -> Self {
         // Fast path: if no RTL characters, skip full analysis.
-        // PERF: Return an EMPTY mapping to represent identity instead of
+        // Return an EMPTY mapping to represent identity instead of
         // materializing (0..n). For messages >64 chars this avoids a heap spill
         // out of the inline SmallVec. Consumers treat a length mismatch (here,
         // empty) as identity (see `ShapedLineData::logical_index_from_visual_boundary`).

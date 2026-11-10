@@ -1,14 +1,10 @@
-//! Chat Input Renderer Entity - Extracted from app.rs monolith
-//!
-//! This entity handles unified input rendering for chat splits:
+//! The composer of a chat split:
 //! - Chat input box with autocomplete integration
 //! - Context row (reply target / channel target)
 //! - Emote picker button
 //! - Send button (optional)
 //! - Typed emote indicators in the context row
 //! - Input text state management via InputManager
-//!
-//! Extracted from app.rs to reduce its size.
 #![allow(clippy::too_many_arguments)]
 
 use crate::backend;
@@ -162,7 +158,6 @@ struct DraftPreviewCacheKey {
 }
 
 impl DraftPreviewCacheKey {
-    #[allow(clippy::too_many_arguments)]
     fn matches(
         &self,
         raw_channel: &str,
@@ -207,17 +202,30 @@ struct DraftPreviewCacheEntry {
     preview: Arc<DraftPreview>,
 }
 
+/// The composer field `render_chat_input` built.
+struct RenderedComposer {
+    element: AnyElement,
+    /// Whether the draft preview paints animated emotes.
+    has_animated_draft_previews: bool,
+    /// The collapsed chat-modes popover, when open. The composer clips its own
+    /// overflow, so the popover has to be rendered as a sibling of it.
+    room_modes_popover: Option<AnyElement>,
+}
+
+/// What a composer listener or IME callback acts on: the app, and the
+/// channel, layout path and split the composer belongs to.
+#[derive(Clone)]
+struct ComposerTarget {
+    app: Entity<crate::app::EchoApp>,
+    channel: Arc<str>,
+    path: Arc<[usize]>,
+    split_id: SplitId,
+}
+
 #[derive(Clone, Copy)]
 struct ComposerPointerSelection {
     split_id: SplitId,
     anchor: usize,
-}
-
-#[derive(Clone)]
-struct ComposerImeTarget {
-    channel: Arc<str>,
-    path: Arc<[usize]>,
-    app: Entity<crate::app::EchoApp>,
 }
 
 struct ComposerInputHandler {
@@ -385,7 +393,7 @@ pub struct ChatInputRenderer {
     /// Platform text-input ownership for each composer. GPUI asks the active
     /// split's immutable handler for UTF-16 selection/composition state after
     /// that split registers `ElementInputHandler` during paint.
-    ime_targets: HashMap<SplitId, ComposerImeTarget>,
+    ime_targets: HashMap<SplitId, ComposerTarget>,
     ime_handlers: HashMap<SplitId, Entity<ComposerInputHandler>>,
     ime_active_split: Option<SplitId>,
     ime_marked_ranges: HashMap<SplitId, Range<usize>>,
@@ -914,8 +922,7 @@ impl ChatInputRenderer {
 
         let text = self
             .input_manager
-            .input_texts
-            .get(&split_id)
+            .draft(split_id)
             .cloned()
             .unwrap_or_default();
         let cursor = self.input_manager.cursor_for_split(split_id);
@@ -1122,7 +1129,7 @@ impl ChatInputRenderer {
             return app_state
                 .active_tab()
                 .layout
-                .get_split_id_at_path(layout.get_active_split_path())
+                .split_id_at_path(layout.get_active_split_path())
                 .into_iter()
                 .collect();
         }
@@ -1145,11 +1152,10 @@ impl ChatInputRenderer {
         let Some(notice) = state.notice() else {
             return;
         };
+        // Notices carry Twitch's own rejection prose; these phrasings describe
+        // a restriction that the eligibility line reports by itself.
         let notice = notice.to_ascii_lowercase();
-        if notice.starts_with("slow mode ·")
-            || notice.starts_with("timed out ·")
-            || notice.starts_with("banned from #")
-            || notice.contains("you are banned")
+        if notice.contains("you are banned")
             || notice.contains("you have been banned")
             || notice.contains("sender is banned")
             || notice.contains("user is banned")
@@ -1538,7 +1544,7 @@ impl ChatInputRenderer {
             return preview;
         }
 
-        let channel_key = crate::backend::emotes::normalize_channel_key(raw_channel);
+        let channel_key = echo_core::channel_identity::normalize_channel_key(raw_channel);
         let channel_emote_generation =
             crate::backend::emotes::get_emote_cache_version(&channel_key) as u64;
         let global_emote_generation = crate::state::VersionRegistry::global_emote_version();
@@ -1673,7 +1679,11 @@ impl ChatInputRenderer {
             .as_ref()
             .map(|reply| self.render_reply_context_bar(channel, split_id, reply, &app, cx));
         let autocomplete_a11y = Rc::new(RefCell::new(AutocompleteA11yTargets::default()));
-        let (chat_input, has_animated_draft_previews, room_modes_popover) = self.render_chat_input(
+        let RenderedComposer {
+            element: chat_input,
+            has_animated_draft_previews,
+            room_modes_popover,
+        } = self.render_chat_input(
             channel,
             path,
             input_focus,
@@ -1915,10 +1925,6 @@ impl ChatInputRenderer {
     }
 
     /// Render the chat input field with autocomplete support.
-    ///
-    /// Returns the composer element, whether it paints animated draft previews,
-    /// and the collapsed chat-modes popover when one is open (the composer
-    /// clips its own overflow, so the popover has to be a wrapper sibling).
     fn render_chat_input(
         &mut self,
         channel: &str,
@@ -1933,9 +1939,15 @@ impl ChatInputRenderer {
         autocomplete_a11y: Rc<RefCell<AutocompleteA11yTargets>>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> (AnyElement, bool, Option<AnyElement>) {
+    ) -> RenderedComposer {
         let channel_for_input: Arc<str> = Arc::from(channel);
         let path_for_input: Arc<[usize]> = Arc::from(path);
+        let target = ComposerTarget {
+            app: app.clone(),
+            channel: Arc::clone(&channel_for_input),
+            path: Arc::clone(&path_for_input),
+            split_id,
+        };
         if is_active_split
             && self
                 .composer_focus_subscriptions
@@ -1966,14 +1978,7 @@ impl ChatInputRenderer {
                 self.input_manager.commit_ime_composition(previous);
                 self.ime_marked_ranges.remove(&previous);
             }
-            self.ime_targets.insert(
-                split_id,
-                ComposerImeTarget {
-                    channel: Arc::clone(&channel_for_input),
-                    path: Arc::clone(&path_for_input),
-                    app: app.clone(),
-                },
-            );
+            self.ime_targets.insert(split_id, target.clone());
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 self.ime_handlers.entry(split_id)
             {
@@ -1984,7 +1989,7 @@ impl ChatInputRenderer {
         }
         let mut input_text = std::mem::take(&mut self.composer_draft_scratch);
         input_text.clear();
-        if let Some(draft) = self.input_manager.input_texts.get(&split_id) {
+        if let Some(draft) = self.input_manager.draft(split_id) {
             input_text.push_str(draft);
         }
         let cursor_position = self.input_manager.cursor_for_split(split_id);
@@ -2009,7 +2014,7 @@ impl ChatInputRenderer {
         } else {
             backend::irc::ensure_authenticated_send_ready()
                 .err()
-                .map(|error| Self::send_block_status_text(&error))
+                .map(|block| Self::send_block_status_text(&block))
         };
         let send_blocked = send_block_reason.is_some();
         let send_feedback = self
@@ -2120,7 +2125,7 @@ impl ChatInputRenderer {
         }
         let input_focus_for_click = input_focus.clone();
         let feedback_geometry_enabled =
-            is_active_split && crate::benchmark_ui_fixture::feedback_ui_enabled();
+            is_active_split && crate::bench::ui_fixture::feedback_ui_enabled();
         let composer_bounds_entity = cx.entity().clone();
         let composer_input_handler = self.ime_handlers.get(&split_id).cloned();
         let composer_input_focus = input_focus.clone();
@@ -2173,8 +2178,8 @@ impl ChatInputRenderer {
                     && actions_right <= shell_right + 0.5;
                 let clipped = text_height > composer_height + 0.5
                     || action_height > composer_height + 0.5;
-                crate::benchmark_ui_fixture::publish_feedback_composer(
-                    crate::benchmark_ui_fixture::FeedbackComposerSnapshot {
+                crate::bench::ui_fixture::publish_feedback_composer(
+                    crate::bench::ui_fixture::FeedbackComposerSnapshot {
                         line_count: visible_line_count,
                         composer_height,
                         text_height,
@@ -2322,8 +2327,7 @@ impl ChatInputRenderer {
                                                 &channel,
                                                 &path,
                                                 this.input_manager
-                                                    .input_texts
-                                                    .get(&split_id)
+                                                    .draft(split_id)
                                                     .cloned(),
                                                 cx,
                                             );
@@ -2361,8 +2365,7 @@ impl ChatInputRenderer {
                                         });
                                     let has_text = this
                                         .input_manager
-                                        .input_texts
-                                        .get(&split_id)
+                                        .draft(split_id)
                                         .is_some_and(|text| !text.is_empty());
                                     backend::push_ui_action(backend::UiAction::ShowContextMenu(
                                         ContextMenuState::open_composer(
@@ -2399,43 +2402,15 @@ impl ChatInputRenderer {
                                 )
                             })
                             .on_mouse_up(MouseButton::Left, {
-                                let app = app.clone();
-                                let channel = channel_for_input.clone();
-                                let path = path_for_input.clone();
+                                let target = target.clone();
                                 cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
-                                    if this.finish_composer_pointer_selection(split_id) {
-                                        Self::defer_autocomplete_refresh(
-                                            &app,
-                                            &channel,
-                                            &path,
-                                            this
-                                                .input_manager
-                                                .input_texts
-                                                .get(&split_id)
-                                                .cloned(),
-                                            cx,
-                                        );
-                                    }
+                                    this.end_composer_pointer_selection(&target, cx);
                                 })
                             })
                             .on_mouse_up_out(MouseButton::Left, {
-                                let app = app.clone();
-                                let channel = channel_for_input.clone();
-                                let path = path_for_input.clone();
+                                let target = target.clone();
                                 cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
-                                    if this.finish_composer_pointer_selection(split_id) {
-                                        Self::defer_autocomplete_refresh(
-                                            &app,
-                                            &channel,
-                                            &path,
-                                            this
-                                                .input_manager
-                                                .input_texts
-                                                .get(&split_id)
-                                                .cloned(),
-                                            cx,
-                                        );
-                                    }
+                                    this.end_composer_pointer_selection(&target, cx);
                                 })
                             })
                             .on_action({
@@ -2455,556 +2430,9 @@ impl ChatInputRenderer {
                                 })
                             })
                             .on_key_down({
-                                let channel = channel_for_input.clone();
-                                let path = path_for_input.clone();
-                                let app = app.clone();
+                                let target = target.clone();
                                 cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                                    {
-                                        let overlays = app.read(cx).overlay_manager.read(cx);
-                                        if overlays.context_menu.read(cx).is_open()
-                                            || overlays.quick_switcher.read(cx).is_open
-                                            || overlays.confirmation_modal.read(cx).state.is_open
-                                        {
-                                            return;
-                                        }
-                                    }
-
-                                    let is_active = {
-                                        let app = app.read(cx);
-                                        let layout = app.split_layout.read(cx);
-                                        layout.get_active_split_path() == path.as_ref()
-                                    };
-
-                                    if !is_active {
-                                        return;
-                                    }
-
-                                    // A pending multiline-paste prompt owns Escape unless IME text is marked.
-                                    if event.keystroke.key == "escape"
-                                        && (this.ime_marked_ranges.contains_key(&split_id)
-                                            || !this.multiline_pastes.contains_key(&split_id))
-                                    {
-                                        if event.is_held {
-                                            cx.stop_propagation();
-                                            return;
-                                        }
-                                        if this.handle_composer_escape(split_id, reply_visible, &app, cx) {
-                                            cx.stop_propagation();
-                                            return;
-                                        }
-                                    }
-
-                                    if event.keystroke.key == "enter" && this.ime_marked_ranges.contains_key(&split_id) {
-                                        cx.stop_propagation();
-                                        return;
-                                    }
-
-                                    let channel = channel.clone();
-                                    let path = path.clone();
-
-                                    let (
-                                        autocomplete_open,
-                                        ac_selected_idx,
-                                        ac_suggestion_count,
-                                        ac_suggestion_revision,
-                                        ac_type,
-                                        ac_query_chars,
-                                        ac_exact_match,
-                                    ) = {
-                                        let app_data = app.read(cx);
-                                        let ac =
-                                            app_data.overlay_manager.read(cx).autocomplete.read(cx);
-                                        (
-                                            ac.state.is_open,
-                                            ac.state.selected_index,
-                                            ac.suggestions.len(),
-                                            ac.suggestion_revision(),
-                                            ac.state.ac_type,
-                                            ac.state.query.chars().count(),
-                                            event.keystroke.key == "enter" && ac.selection_at(ac.suggestion_revision(), ac.state.selected_index)
-                                                .is_some_and(|selection| completion_matches_fragment(
-                                                    &selection.context.expected_fragment,
-                                                    &selection.text,
-                                                )),
-                                        )
-                                    };
-
-                                    this.reset_inline_tab_completion(split_id);
-
-
-                                    let alt = event.keystroke.modifiers.alt;
-                                    let shortcut_modifier = (event.keystroke.modifiers.control
-                                        || event.keystroke.modifiers.platform)
-                                        && !alt;
-                                    let plain_or_shift = !alt
-                                        && !event.keystroke.modifiers.control
-                                        && !event.keystroke.modifiers.platform;
-                                    if let Some(choice) = this.multiline_pastes.get_mut(&split_id) {
-                                        match event.keystroke.key.as_str() {
-                                            "up" | "down" if plain_or_shift => {
-                                                cx.stop_propagation();
-                                                let step = if event.keystroke.key == "up" { 2 } else { 1 };
-                                                choice.selected_index = (choice.selected_index + step) % 3;
-                                                cx.notify();
-                                                Self::defer_unified_input_notify(&app, cx);
-                                                return;
-                                            }
-                                            "enter" | "escape" => {
-                                                cx.stop_propagation();
-                                                if event.is_held { return; }
-                                                let id = choice.id;
-                                                let action = if event.keystroke.key == "escape" {
-                                                    MultilinePasteAction::Cancel
-                                                } else {
-                                                    match choice.selected_index {
-                                                        1 => MultilinePasteAction::SendLines,
-                                                        2 => MultilinePasteAction::Cancel,
-                                                        _ => MultilinePasteAction::OneLine,
-                                                    }
-                                                };
-                                                let app = app.clone();
-                                                cx.defer(move |cx| app.update(cx, |app, cx| app.resolve_multiline_paste(split_id, Some(id), action, cx)));
-                                                return;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    let paste_shortcut = event.keystroke.key.eq_ignore_ascii_case("v")
-                                        && shortcut_modifier;
-                                    if paste_shortcut {
-                                        cx.stop_propagation();
-                                        let uploader_config =
-                                            backend::settings::get_image_uploader_config();
-                                        let pasted = match Self::read_clipboard_paste(cx) {
-                                            Some(ClipboardPaste::Text(text)) => text,
-                                            Some(ClipboardPaste::Files(paths)) => {
-                                                let source = backend::image_uploader::ImageFileSource::Pasted;
-                                                // Only an all-image selection uploads;
-                                                // videos and mixed copies paste paths.
-                                                let all_images = paths.iter().all(|path| {
-                                                    backend::image_uploader::mime_type_for_image_path(path)
-                                                        .is_some_and(|mime| mime.starts_with("image/"))
-                                                });
-                                                if all_images && source.upload_enabled(&uploader_config) {
-                                                    app.update(cx, |app_instance, cx| {
-                                                        app_instance.confirm_or_upload_image_files(
-                                                            channel.to_string(),
-                                                            split_id,
-                                                            paths,
-                                                            source,
-                                                            cx,
-                                                        );
-                                                    });
-                                                    return;
-                                                }
-                                                paths
-                                                    .iter()
-                                                    .map(|path| path.display().to_string())
-                                                    .collect::<Vec<_>>()
-                                                    .join(" ")
-                                            }
-                                            None => String::new(),
-                                        };
-                                        let prefer_image =
-                                            pasted.is_empty() || event.keystroke.modifiers.shift;
-                                        if prefer_image
-                                            && uploader_config.enabled
-                                            && uploader_config.paste_upload_enabled
-                                        {
-                                            #[cfg(target_os = "linux")]
-                                            let read_image = {
-                                                let image = Self::clipboard_image(cx);
-                                                cx.background_spawn(async move {
-                                                    Self::decode_clipboard_image(image)
-                                                })
-                                            };
-                                            #[cfg(not(target_os = "linux"))]
-                                            let read_image = cx.background_spawn(async {
-                                                Self::read_clipboard_image_for_upload()
-                                            });
-                                            let app = app.clone();
-                                            let channel = channel.clone();
-                                            let path = path.clone();
-                                            cx.spawn(async move |this, cx| {
-                                                match read_image.await {
-                                                    Ok(Some((width, height, rgba))) => {
-                                                        let source_bytes = rgba.len() as u64;
-                                                        app.update(cx, |app_instance, cx| {
-                                                            app_instance.confirm_or_upload_pasted_image(
-                                                                channel.to_string(),
-                                                                split_id,
-                                                                width,
-                                                                height,
-                                                                rgba,
-                                                                source_bytes,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                    result => {
-                                                        if let Err(err) = result {
-                                                            tracing::debug!(
-                                                                "Clipboard image upload paste skipped: {err}"
-                                                            );
-                                                        }
-                                                        if !pasted.is_empty() {
-                                                            let _ = this.update(cx, |this, cx| {
-                                                                this.insert_pasted_text(
-                                                                    split_id, &pasted, &app,
-                                                                    &channel, &path, cx,
-                                                                );
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            })
-                                            .detach();
-                                            return;
-                                        }
-
-                                        if !pasted.is_empty() {
-                                            this.insert_pasted_text(
-                                                split_id, &pasted, &app, &channel, &path, cx,
-                                            );
-                                        }
-                                        return;
-                                    }
-
-                                    let composer_shortcut = shortcut_modifier
-                                        && (!event.keystroke.modifiers.shift
-                                            || event.keystroke.key.eq_ignore_ascii_case("z"));
-                                    if composer_shortcut {
-                                        let shortcut_key = event.keystroke.key.to_ascii_lowercase();
-                                        let mut should_refresh_autocomplete = false;
-                                        let mut reset_history_navigation = false;
-
-                                        match shortcut_key.as_str() {
-                                            "a" => {
-                                                should_refresh_autocomplete =
-                                                    this.input_manager.select_all(split_id);
-                                            }
-                                            "c" => {
-                                                if let Some(selected) =
-                                                    this.input_manager.copy_selection(split_id)
-                                                {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(selected),
-                                                    );
-                                                    cx.stop_propagation();
-                                                }
-                                                return;
-                                            }
-                                            "x" => {
-                                                if let Some(selected) =
-                                                    this.input_manager.cut_selection(split_id)
-                                                {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(selected),
-                                                    );
-                                                    should_refresh_autocomplete = true;
-                                                    reset_history_navigation = true;
-                                                }
-                                            }
-                                            "z" => {
-                                                should_refresh_autocomplete =
-                                                    if event.keystroke.modifiers.shift {
-                                                        this.input_manager.redo(split_id)
-                                                    } else {
-                                                        this.input_manager.undo(split_id)
-                                                    };
-                                                reset_history_navigation =
-                                                    should_refresh_autocomplete;
-                                            }
-                                            "y" => {
-                                                should_refresh_autocomplete =
-                                                    this.input_manager.redo(split_id);
-                                                reset_history_navigation =
-                                                    should_refresh_autocomplete;
-                                            }
-                                            _ => {}
-                                        }
-
-                                        if should_refresh_autocomplete {
-                                            if reset_history_navigation {
-                                                this.ime_marked_ranges.remove(&split_id);
-                                            }
-                                            this.reset_composer_affinity(split_id);
-                                            if reset_history_navigation {
-                                                this.input_manager.end_history_navigation(split_id);
-                                            }
-                                            Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                            cx.notify();
-                                        }
-
-                                        if matches!(
-                                            shortcut_key.as_str(),
-                                            "a" | "c" | "x" | "z" | "y"
-                                        ) {
-                                            cx.stop_propagation();
-                                            return;
-                                        }
-                                    }
-
-                                    if event.keystroke.key == "enter" && shortcut_modifier {
-                                        cx.stop_propagation();
-                                        if event.is_held {
-                                            return;
-                                        }
-                                        let app = app.clone();
-                                        let channel = channel.clone();
-                                        let path = path.clone();
-                                        let split_id = split_id;
-                                        let preserved_text = this.input_manager.text_for_split(split_id).to_string();
-                                        let preserved_cursor = this.input_manager.cursor_for_split(split_id);
-                                        cx.defer(move |cx| {
-                                            app.update(cx, |app_instance, cx| {
-                                                app_instance.send_message(cx);
-
-                                                let should_restore = !preserved_text
-                                                    .trim()
-                                                    .is_empty()
-                                                    && !app_instance
-                                                        .chat_input_renderer
-                                                        .read(cx)
-                                                        .input_manager
-                                                        .input_texts
-                                                        .contains_key(&split_id);
-                                                if should_restore {
-                                                    app_instance.chat_input_renderer.update(
-                                                        cx,
-                                                        |renderer, _| {
-                                                            renderer.input_manager.input_texts.insert(
-                                                                split_id,
-                                                                preserved_text.clone(),
-                                                            );
-                                                            renderer
-                                                                .input_manager
-                                                                .set_cursor_for_split(
-                                                                    split_id,
-                                                                    preserved_cursor,
-                                                                );
-                                                            renderer.reset_composer_affinity(split_id);
-                                                            renderer
-                                                                .input_manager
-                                                                .history_index
-                                                                .remove(&split_id);
-                                                            renderer
-                                                                .input_manager
-                                                                .temp_input
-                                                                .remove(&split_id);
-                                                        },
-                                                    );
-                                                    app_instance.update_autocomplete(
-                                                        &channel,
-                                                        &path,
-                                                        Some(&preserved_text),
-                                                        cx,
-                                                    );
-                                                    cx.notify();
-                                                }
-                                            });
-                                        });
-                                        return;
-                                    }
-
-                                    if event.keystroke.key == "enter"
-                                        && !event.keystroke.modifiers.shift
-                                        && !alt
-                                    {
-                                        cx.stop_propagation();
-                                        if event.is_held {
-                                            return;
-                                        }
-                                        let disposition = if ac_exact_match {
-                                            EnterKeyDisposition::SendInput
-                                        } else {
-                                            enter_key_disposition(
-                                                autocomplete_open,
-                                                ac_suggestion_count,
-                                                ac_type,
-                                                ac_query_chars,
-                                            )
-                                        };
-                                        let app = app.clone();
-                                        cx.defer(move |cx| {
-                                            app.update(cx, |app_instance, cx| {
-                                                let selection_accepted = match disposition {
-                                                    EnterKeyDisposition::AcceptSelection => {
-                                                        app_instance.accept_autocomplete(
-                                                            ac_suggestion_revision,
-                                                            ac_selected_idx,
-                                                            cx,
-                                                        )
-                                                    }
-                                                    EnterKeyDisposition::SendInput => false,
-                                                };
-                                                if selection_accepted {
-                                                    app_instance.chat_input_renderer.update(cx, |renderer, _| renderer.reset_composer_affinity(split_id));
-                                                }
-                                                if disposition.should_send_after_accept(
-                                                    selection_accepted,
-                                                ) {
-                                                    if autocomplete_open {
-                                                        app_instance
-                                                            .autocomplete(cx)
-                                                            .update(cx, |ac, _| ac.state.close());
-                                                    }
-                                                    app_instance.send_message(cx);
-                                                }
-                                            });
-                                        });
-                                        return;
-                                    }
-
-                                    let alt_word_delete = alt
-                                        && !event.keystroke.modifiers.control
-                                        && !event.keystroke.modifiers.platform
-                                        && matches!(event.keystroke.key.as_str(), "backspace" | "delete")
-                                        && backend::hotkeys::match_key_event(
-                                            event,
-                                            backend::hotkeys::HotkeyMatchContext {
-                                                allow_global: true,
-                                                has_active_split: true,
-                                                ..Default::default()
-                                            },
-                                            true,
-                                        )
-                                        .is_none();
-
-                                    if event.keystroke.key == "backspace" && (!alt || alt_word_delete) {
-                                        cx.stop_propagation();
-                                        if this.input_manager
-                                            .delete_backward(split_id, shortcut_modifier || alt_word_delete) {
-                                            this.reset_composer_affinity(split_id);
-                                        }
-                                        Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                        cx.notify();
-                                        return;
-                                    }
-
-                                    if event.keystroke.key == "delete" && (!alt || alt_word_delete) {
-                                        cx.stop_propagation();
-                                        if this.input_manager
-                                            .delete_forward(split_id, shortcut_modifier || alt_word_delete) {
-                                            this.reset_composer_affinity(split_id);
-                                        }
-                                        Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                        cx.notify();
-                                        return;
-                                    }
-
-                                    if event.keystroke.key == "left" && !alt {
-                                        cx.stop_propagation();
-                                        if this
-                                            .input_manager
-                                            .move_cursor_left(
-                                                split_id,
-                                                shortcut_modifier,
-                                                event.keystroke.modifiers.shift,
-                                            )
-                                        {
-                                            this.reset_composer_affinity(split_id);
-                                            Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                            cx.notify();
-                                        }
-                                        return;
-                                    }
-
-                                    if event.keystroke.key == "right" && !alt {
-                                        cx.stop_propagation();
-                                        if this
-                                            .input_manager
-                                            .move_cursor_right(
-                                                split_id,
-                                                shortcut_modifier,
-                                                event.keystroke.modifiers.shift,
-                                            )
-                                        {
-                                            this.reset_composer_affinity(split_id);
-                                            Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                            cx.notify();
-                                        }
-                                        return;
-                                    }
-
-                                    if matches!(event.keystroke.key.as_str(), "home" | "end") && !alt {
-                                        cx.stop_propagation();
-                                        let end = event.keystroke.key == "end";
-                                        if this.move_composer_line_edge(split_id, end, shortcut_modifier, event.keystroke.modifiers.shift, window) {
-                                            Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                            cx.notify();
-                                        }
-                                        return;
-                                    }
-
-                                    if event.keystroke.key == "up" && plain_or_shift {
-                                        cx.stop_propagation();
-                                        if autocomplete_open && ac_suggestion_count > 0 && !event.keystroke.modifiers.shift {
-                                            let new_idx = if ac_selected_idx == 0 {
-                                                ac_suggestion_count - 1
-                                            } else {
-                                                ac_selected_idx - 1
-                                            };
-                                            let app = app.clone();
-                                            cx.defer(move |cx| {
-                                                app.update(cx, |app_instance, cx| {
-                                                    app_instance.overlay_manager.update(
-                                                        cx,
-                                                        |om, cx| {
-                                                            om.autocomplete.update(cx, |ac, _| {
-                                                                ac.select_index_from_keyboard(
-                                                                    new_idx,
-                                                                );
-                                                            });
-                                                        },
-                                                    );
-                                                });
-                                            });
-                                            return;
-                                        }
-                                        let shift = event.keystroke.modifiers.shift;
-                                        let moved = this.move_composer_vertical(split_id, -1, shift, window);
-                                        let recalled = moved == Some(false) && !shift && this.input_manager.history_up(&channel, split_id).is_some();
-                                        if recalled { this.reset_composer_affinity(split_id); }
-                                        if moved == Some(true) || recalled {
-                                            Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                            cx.notify();
-                                        }
-                                        return;
-                                    }
-
-                                    if event.keystroke.key == "down" && plain_or_shift {
-                                        cx.stop_propagation();
-                                        if autocomplete_open && ac_suggestion_count > 0 && !event.keystroke.modifiers.shift {
-                                            let new_idx =
-                                                (ac_selected_idx + 1) % ac_suggestion_count;
-                                            let app = app.clone();
-                                            cx.defer(move |cx| {
-                                                app.update(cx, |app_instance, cx| {
-                                                    app_instance.overlay_manager.update(
-                                                        cx,
-                                                        |om, cx| {
-                                                            om.autocomplete.update(cx, |ac, _| {
-                                                                ac.select_index_from_keyboard(
-                                                                    new_idx,
-                                                                );
-                                                            });
-                                                        },
-                                                    );
-                                                });
-                                            });
-                                            return;
-                                        }
-                                        let shift = event.keystroke.modifiers.shift;
-                                        let moved = this.move_composer_vertical(split_id, 1, shift, window);
-                                        let recalled = moved == Some(false) && !shift && this.input_manager.history_down(&channel, split_id).is_some();
-                                        if recalled { this.reset_composer_affinity(split_id); }
-                                        if moved == Some(true) || recalled {
-                                            Self::defer_autocomplete_refresh(&app, &channel, &path, this.input_manager.input_texts.get(&split_id).cloned(), cx);
-                                            cx.notify();
-                                        }
-                                    }
-
+                                    this.on_composer_key_down(event, &target, reply_visible, window, cx);
                                 })
                             })
                             .when(show_context_row, |field| {
@@ -3141,9 +2569,9 @@ impl ChatInputRenderer {
                                                             } else {
                                                                 raw_y
                                                             };
-                                                            crate::benchmark_ui_fixture::publish_feedback_composer_pointer(
-                                                                crate::benchmark_ui_fixture::FeedbackComposerPointerSnapshot {
-                                                                    bounds: crate::benchmark_ui_fixture::FeedbackRect {
+                                                            crate::bench::ui_fixture::publish_feedback_composer_pointer(
+                                                                crate::bench::ui_fixture::FeedbackComposerPointerSnapshot {
+                                                                    bounds: crate::bench::ui_fixture::FeedbackRect {
                                                                         x: bounds.origin.x.into(),
                                                                         y: visible_y,
                                                                         width: bounds.size.width.into(),
@@ -3358,11 +2786,579 @@ impl ChatInputRenderer {
         });
 
         self.composer_draft_scratch = input_text;
-        (
-            input.into_any_element(),
+        RenderedComposer {
+            element: input.into_any_element(),
             has_animated_draft_previews,
-            popover,
-        )
+            room_modes_popover: popover,
+        }
+    }
+
+    /// Key handling for a split's composer: send, history, completion,
+    /// clipboard and caret movement. `reply_visible` is whether the reply
+    /// context row is showing, which Escape dismisses first.
+    fn on_composer_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        target: &ComposerTarget,
+        reply_visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = self;
+        let ComposerTarget {
+            app,
+            channel,
+            path,
+            split_id,
+        } = target;
+        let split_id = *split_id;
+        {
+            let overlays = app.read(cx).overlay_manager.read(cx);
+            if overlays.context_menu.read(cx).is_open()
+                || overlays.quick_switcher.read(cx).is_open
+                || overlays.confirmation_modal.read(cx).state.is_open
+            {
+                return;
+            }
+        }
+
+        let is_active = {
+            let app = app.read(cx);
+            let layout = app.split_layout.read(cx);
+            layout.get_active_split_path() == path.as_ref()
+        };
+
+        if !is_active {
+            return;
+        }
+
+        // A pending multiline-paste prompt owns Escape unless IME text is marked.
+        if event.keystroke.key == "escape"
+            && (this.ime_marked_ranges.contains_key(&split_id)
+                || !this.multiline_pastes.contains_key(&split_id))
+        {
+            if event.is_held {
+                cx.stop_propagation();
+                return;
+            }
+            if this.handle_composer_escape(split_id, reply_visible, app, cx) {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if event.keystroke.key == "enter" && this.ime_marked_ranges.contains_key(&split_id) {
+            cx.stop_propagation();
+            return;
+        }
+
+        let channel = channel.clone();
+        let path = path.clone();
+
+        let (
+            autocomplete_open,
+            ac_selected_idx,
+            ac_suggestion_count,
+            ac_suggestion_revision,
+            ac_type,
+            ac_query_chars,
+            ac_exact_match,
+        ) = {
+            let app_data = app.read(cx);
+            let ac = app_data.overlay_manager.read(cx).autocomplete.read(cx);
+            (
+                ac.state.is_open,
+                ac.state.selected_index,
+                ac.suggestions.len(),
+                ac.suggestion_revision(),
+                ac.state.ac_type,
+                ac.state.query.chars().count(),
+                event.keystroke.key == "enter"
+                    && ac
+                        .selection_at(ac.suggestion_revision(), ac.state.selected_index)
+                        .is_some_and(|selection| {
+                            completion_matches_fragment(
+                                &selection.context.expected_fragment,
+                                &selection.text,
+                            )
+                        }),
+            )
+        };
+
+        this.reset_inline_tab_completion(split_id);
+
+        let alt = event.keystroke.modifiers.alt;
+        let shortcut_modifier =
+            (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) && !alt;
+        let plain_or_shift =
+            !alt && !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform;
+        if let Some(choice) = this.multiline_pastes.get_mut(&split_id) {
+            match event.keystroke.key.as_str() {
+                "up" | "down" if plain_or_shift => {
+                    cx.stop_propagation();
+                    let step = if event.keystroke.key == "up" { 2 } else { 1 };
+                    choice.selected_index = (choice.selected_index + step) % 3;
+                    cx.notify();
+                    Self::defer_unified_input_notify(app, cx);
+                    return;
+                }
+                "enter" | "escape" => {
+                    cx.stop_propagation();
+                    if event.is_held {
+                        return;
+                    }
+                    let id = choice.id;
+                    let action = if event.keystroke.key == "escape" {
+                        MultilinePasteAction::Cancel
+                    } else {
+                        match choice.selected_index {
+                            1 => MultilinePasteAction::SendLines,
+                            2 => MultilinePasteAction::Cancel,
+                            _ => MultilinePasteAction::OneLine,
+                        }
+                    };
+                    let app = app.clone();
+                    cx.defer(move |cx| {
+                        app.update(cx, |app, cx| {
+                            app.resolve_multiline_paste(split_id, Some(id), action, cx)
+                        })
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let paste_shortcut = event.keystroke.key.eq_ignore_ascii_case("v") && shortcut_modifier;
+        if paste_shortcut {
+            cx.stop_propagation();
+            let uploader_config = backend::settings::get_image_uploader_config();
+            let pasted = match Self::read_clipboard_paste(cx) {
+                Some(ClipboardPaste::Text(text)) => text,
+                Some(ClipboardPaste::Files(paths)) => {
+                    let source = backend::image_uploader::ImageFileSource::Pasted;
+                    // Only an all-image selection uploads;
+                    // videos and mixed copies paste paths.
+                    let all_images = paths.iter().all(|path| {
+                        backend::image_uploader::mime_type_for_image_path(path)
+                            .is_some_and(|mime| mime.starts_with("image/"))
+                    });
+                    if all_images && source.upload_enabled(&uploader_config) {
+                        app.update(cx, |app_instance, cx| {
+                            app_instance.confirm_or_upload_image_files(
+                                channel.to_string(),
+                                split_id,
+                                paths,
+                                source,
+                                cx,
+                            );
+                        });
+                        return;
+                    }
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+                None => String::new(),
+            };
+            let prefer_image = pasted.is_empty() || event.keystroke.modifiers.shift;
+            if prefer_image && uploader_config.enabled && uploader_config.paste_upload_enabled {
+                #[cfg(target_os = "linux")]
+                let read_image = {
+                    let image = Self::clipboard_image(cx);
+                    cx.background_spawn(async move { Self::decode_clipboard_image(image) })
+                };
+                #[cfg(not(target_os = "linux"))]
+                let read_image =
+                    cx.background_spawn(async { Self::read_clipboard_image_for_upload() });
+                let app = app.clone();
+                let channel = channel.clone();
+                let path = path.clone();
+                cx.spawn(async move |this, cx| match read_image.await {
+                    Ok(Some((width, height, rgba))) => {
+                        let source_bytes = rgba.len() as u64;
+                        app.update(cx, |app_instance, cx| {
+                            app_instance.confirm_or_upload_pasted_image(
+                                channel.to_string(),
+                                split_id,
+                                crate::app::PastedImage {
+                                    width,
+                                    height,
+                                    rgba,
+                                    source_bytes,
+                                },
+                                cx,
+                            );
+                        });
+                    }
+                    result => {
+                        if let Err(err) = result {
+                            tracing::debug!("Clipboard image upload paste skipped: {err}");
+                        }
+                        if !pasted.is_empty() {
+                            let _ = this.update(cx, |this, cx| {
+                                this.insert_pasted_text(
+                                    split_id, &pasted, &app, &channel, &path, cx,
+                                );
+                            });
+                        }
+                    }
+                })
+                .detach();
+                return;
+            }
+
+            if !pasted.is_empty() {
+                this.insert_pasted_text(split_id, &pasted, app, &channel, &path, cx);
+            }
+            return;
+        }
+
+        let composer_shortcut = shortcut_modifier
+            && (!event.keystroke.modifiers.shift || event.keystroke.key.eq_ignore_ascii_case("z"));
+        if composer_shortcut {
+            let shortcut_key = event.keystroke.key.to_ascii_lowercase();
+            let mut should_refresh_autocomplete = false;
+            let mut reset_history_navigation = false;
+
+            match shortcut_key.as_str() {
+                "a" => {
+                    should_refresh_autocomplete = this.input_manager.select_all(split_id);
+                }
+                "c" => {
+                    if let Some(selected) = this.input_manager.copy_selection(split_id) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                "x" => {
+                    if let Some(selected) = this.input_manager.cut_selection(split_id) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                        should_refresh_autocomplete = true;
+                        reset_history_navigation = true;
+                    }
+                }
+                "z" => {
+                    should_refresh_autocomplete = if event.keystroke.modifiers.shift {
+                        this.input_manager.redo(split_id)
+                    } else {
+                        this.input_manager.undo(split_id)
+                    };
+                    reset_history_navigation = should_refresh_autocomplete;
+                }
+                "y" => {
+                    should_refresh_autocomplete = this.input_manager.redo(split_id);
+                    reset_history_navigation = should_refresh_autocomplete;
+                }
+                _ => {}
+            }
+
+            if should_refresh_autocomplete {
+                if reset_history_navigation {
+                    this.ime_marked_ranges.remove(&split_id);
+                }
+                this.reset_composer_affinity(split_id);
+                if reset_history_navigation {
+                    this.input_manager.end_history_navigation(split_id);
+                }
+                Self::defer_autocomplete_refresh(
+                    app,
+                    &channel,
+                    &path,
+                    this.input_manager.draft(split_id).cloned(),
+                    cx,
+                );
+                cx.notify();
+            }
+
+            if matches!(shortcut_key.as_str(), "a" | "c" | "x" | "z" | "y") {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        if event.keystroke.key == "enter" && shortcut_modifier {
+            cx.stop_propagation();
+            if event.is_held {
+                return;
+            }
+            let app = app.clone();
+            let channel = channel.clone();
+            let path = path.clone();
+            let preserved_text = this.input_manager.text_for_split(split_id).to_string();
+            let preserved_cursor = this.input_manager.cursor_for_split(split_id);
+            cx.defer(move |cx| {
+                app.update(cx, |app_instance, cx| {
+                    app_instance.send_message(cx);
+
+                    let should_restore = !preserved_text.trim().is_empty()
+                        && !app_instance
+                            .chat_input_renderer
+                            .read(cx)
+                            .input_manager
+                            .has_draft(split_id);
+                    if should_restore {
+                        app_instance.chat_input_renderer.update(cx, |renderer, _| {
+                            renderer
+                                .input_manager
+                                .set_draft_text(split_id, preserved_text.clone());
+                            renderer
+                                .input_manager
+                                .set_cursor_for_split(split_id, preserved_cursor);
+                            renderer.reset_composer_affinity(split_id);
+                            renderer.input_manager.drop_history_stash(split_id);
+                        });
+                        app_instance.update_autocomplete(
+                            &channel,
+                            &path,
+                            Some(&preserved_text),
+                            cx,
+                        );
+                        cx.notify();
+                    }
+                });
+            });
+            return;
+        }
+
+        if event.keystroke.key == "enter" && !event.keystroke.modifiers.shift && !alt {
+            cx.stop_propagation();
+            if event.is_held {
+                return;
+            }
+            let disposition = if ac_exact_match {
+                EnterKeyDisposition::SendInput
+            } else {
+                enter_key_disposition(
+                    autocomplete_open,
+                    ac_suggestion_count,
+                    ac_type,
+                    ac_query_chars,
+                )
+            };
+            let app = app.clone();
+            cx.defer(move |cx| {
+                app.update(cx, |app_instance, cx| {
+                    let selection_accepted =
+                        match disposition {
+                            EnterKeyDisposition::AcceptSelection => app_instance
+                                .accept_autocomplete(ac_suggestion_revision, ac_selected_idx, cx),
+                            EnterKeyDisposition::SendInput => false,
+                        };
+                    if selection_accepted {
+                        app_instance
+                            .chat_input_renderer
+                            .update(cx, |renderer, _| renderer.reset_composer_affinity(split_id));
+                    }
+                    if disposition.should_send_after_accept(selection_accepted) {
+                        if autocomplete_open {
+                            app_instance
+                                .autocomplete(cx)
+                                .update(cx, |ac, _| ac.state.close());
+                        }
+                        app_instance.send_message(cx);
+                    }
+                });
+            });
+            return;
+        }
+
+        let alt_word_delete = alt
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.platform
+            && matches!(event.keystroke.key.as_str(), "backspace" | "delete")
+            && backend::hotkeys::match_key_event(
+                event,
+                backend::hotkeys::HotkeyMatchContext {
+                    allow_global: true,
+                    has_active_split: true,
+                    ..Default::default()
+                },
+                true,
+            )
+            .is_none();
+
+        if event.keystroke.key == "backspace" && (!alt || alt_word_delete) {
+            cx.stop_propagation();
+            if this
+                .input_manager
+                .delete_backward(split_id, shortcut_modifier || alt_word_delete)
+            {
+                this.reset_composer_affinity(split_id);
+            }
+            Self::defer_autocomplete_refresh(
+                app,
+                &channel,
+                &path,
+                this.input_manager.draft(split_id).cloned(),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        if event.keystroke.key == "delete" && (!alt || alt_word_delete) {
+            cx.stop_propagation();
+            if this
+                .input_manager
+                .delete_forward(split_id, shortcut_modifier || alt_word_delete)
+            {
+                this.reset_composer_affinity(split_id);
+            }
+            Self::defer_autocomplete_refresh(
+                app,
+                &channel,
+                &path,
+                this.input_manager.draft(split_id).cloned(),
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        if event.keystroke.key == "left" && !alt {
+            cx.stop_propagation();
+            if this.input_manager.move_cursor_left(
+                split_id,
+                shortcut_modifier,
+                event.keystroke.modifiers.shift,
+            ) {
+                this.reset_composer_affinity(split_id);
+                Self::defer_autocomplete_refresh(
+                    app,
+                    &channel,
+                    &path,
+                    this.input_manager.draft(split_id).cloned(),
+                    cx,
+                );
+                cx.notify();
+            }
+            return;
+        }
+
+        if event.keystroke.key == "right" && !alt {
+            cx.stop_propagation();
+            if this.input_manager.move_cursor_right(
+                split_id,
+                shortcut_modifier,
+                event.keystroke.modifiers.shift,
+            ) {
+                this.reset_composer_affinity(split_id);
+                Self::defer_autocomplete_refresh(
+                    app,
+                    &channel,
+                    &path,
+                    this.input_manager.draft(split_id).cloned(),
+                    cx,
+                );
+                cx.notify();
+            }
+            return;
+        }
+
+        if matches!(event.keystroke.key.as_str(), "home" | "end") && !alt {
+            cx.stop_propagation();
+            let end = event.keystroke.key == "end";
+            if this.move_composer_line_edge(
+                split_id,
+                end,
+                shortcut_modifier,
+                event.keystroke.modifiers.shift,
+                window,
+            ) {
+                Self::defer_autocomplete_refresh(
+                    app,
+                    &channel,
+                    &path,
+                    this.input_manager.draft(split_id).cloned(),
+                    cx,
+                );
+                cx.notify();
+            }
+            return;
+        }
+
+        if event.keystroke.key == "up" && plain_or_shift {
+            cx.stop_propagation();
+            if autocomplete_open && ac_suggestion_count > 0 && !event.keystroke.modifiers.shift {
+                let new_idx = if ac_selected_idx == 0 {
+                    ac_suggestion_count - 1
+                } else {
+                    ac_selected_idx - 1
+                };
+                let app = app.clone();
+                cx.defer(move |cx| {
+                    app.update(cx, |app_instance, cx| {
+                        app_instance.overlay_manager.update(cx, |om, cx| {
+                            om.autocomplete.update(cx, |ac, _| {
+                                ac.select_index_from_keyboard(new_idx);
+                            });
+                        });
+                    });
+                });
+                return;
+            }
+            let shift = event.keystroke.modifiers.shift;
+            let moved = this.move_composer_vertical(split_id, -1, shift, window);
+            let recalled = moved == Some(false)
+                && !shift
+                && this.input_manager.history_up(&channel, split_id).is_some();
+            if recalled {
+                this.reset_composer_affinity(split_id);
+            }
+            if moved == Some(true) || recalled {
+                Self::defer_autocomplete_refresh(
+                    app,
+                    &channel,
+                    &path,
+                    this.input_manager.draft(split_id).cloned(),
+                    cx,
+                );
+                cx.notify();
+            }
+            return;
+        }
+
+        if event.keystroke.key == "down" && plain_or_shift {
+            cx.stop_propagation();
+            if autocomplete_open && ac_suggestion_count > 0 && !event.keystroke.modifiers.shift {
+                let new_idx = (ac_selected_idx + 1) % ac_suggestion_count;
+                let app = app.clone();
+                cx.defer(move |cx| {
+                    app.update(cx, |app_instance, cx| {
+                        app_instance.overlay_manager.update(cx, |om, cx| {
+                            om.autocomplete.update(cx, |ac, _| {
+                                ac.select_index_from_keyboard(new_idx);
+                            });
+                        });
+                    });
+                });
+                return;
+            }
+            let shift = event.keystroke.modifiers.shift;
+            let moved = this.move_composer_vertical(split_id, 1, shift, window);
+            let recalled = moved == Some(false)
+                && !shift
+                && this
+                    .input_manager
+                    .history_down(&channel, split_id)
+                    .is_some();
+            if recalled {
+                this.reset_composer_affinity(split_id);
+            }
+            if moved == Some(true) || recalled {
+                Self::defer_autocomplete_refresh(
+                    app,
+                    &channel,
+                    &path,
+                    this.input_manager.draft(split_id).cloned(),
+                    cx,
+                );
+                cx.notify();
+            }
+        }
     }
 
     /// The clipboard image a paste would upload. On Linux it must be read
@@ -3458,7 +3454,7 @@ impl ChatInputRenderer {
             app,
             channel,
             path,
-            self.input_manager.input_texts.get(&split_id).cloned(),
+            self.input_manager.draft(split_id).cloned(),
             cx,
         );
         cx.notify();
@@ -3502,6 +3498,20 @@ impl ChatInputRenderer {
             cx.notify();
         }
         changed
+    }
+
+    /// Finish a pointer drag selection in the composer and refresh
+    /// autocomplete for the caret it left behind.
+    fn end_composer_pointer_selection(&mut self, target: &ComposerTarget, cx: &mut Context<Self>) {
+        if self.finish_composer_pointer_selection(target.split_id) {
+            Self::defer_autocomplete_refresh(
+                &target.app,
+                &target.channel,
+                &target.path,
+                self.input_manager.draft(target.split_id).cloned(),
+                cx,
+            );
+        }
     }
 
     fn defer_autocomplete_refresh(
@@ -3867,16 +3877,17 @@ impl ChatInputRenderer {
         crate::utils::truncate_text(preview, max_chars)
     }
 
-    fn send_block_status_text(error: &str) -> &'static str {
-        let lower = error.to_ascii_lowercase();
-        if lower.contains("anonymously") {
-            "Anonymous chat active - switch back to your account to send"
-        } else if lower.contains("re-authenticated") || lower.contains("chat token") {
-            "Re-authentication required before sending"
-        } else if lower.contains("active twitch account") {
-            "Log in to Twitch to send messages"
-        } else {
-            "Twitch chat send is not available"
+    fn send_block_status_text(block: &backend::irc::SendBlock) -> &'static str {
+        use backend::irc::SendBlock;
+        match block {
+            SendBlock::Anonymous => "Anonymous chat active - switch back to your account to send",
+            SendBlock::NeedsReauth | SendBlock::NoChatToken { .. } => {
+                "Re-authentication required before sending"
+            }
+            SendBlock::NoAccount => "Log in to Twitch to send messages",
+            SendBlock::Reconnecting | SendBlock::Disconnected | SendBlock::ClientNotReady => {
+                "Twitch chat send is not available"
+            }
         }
     }
 
@@ -4166,17 +4177,17 @@ impl ChatInputRenderer {
         media_identity: Option<&crate::cache::disk_layer::MediaSourceId>,
     ) -> Option<Arc<RenderImage>> {
         if is_animated {
-            if let Some((render_image, metadata)) =
-                image_cache::get_current_animated_render_image_with_metadata(image_url)
+            if let Some(frame) =
+                image_cache::animated_frame(image_url, image_cache::FrameQuery::Current)
             {
-                crate::emote_renderer::register_visible_metadata(metadata);
-                return Some(render_image);
+                crate::emote_renderer::register_visible_metadata(frame.metadata);
+                return Some(frame.image);
             }
             if let Some(render_image) = image_cache::get_cached_render_image(image_url) {
                 return Some(render_image);
             }
 
-            image_cache::trigger_animated_decode_media_with_source(
+            image_cache::trigger_animated_decode_media(
                 image_url,
                 media_identity.cloned(),
                 image_cache::PreloadSource::AutocompleteVisible,
@@ -4189,7 +4200,7 @@ impl ChatInputRenderer {
         }
 
         if !image_cache::is_downloading(image_url) {
-            image_cache::trigger_preload_media_single_with_source(
+            image_cache::trigger_preload_media_single(
                 image_url,
                 media_identity.cloned(),
                 image_cache::PreloadSource::AutocompleteVisible,
@@ -4741,7 +4752,7 @@ impl ChatInputRenderer {
         self.ime_marked_ranges.remove(&split_id);
         self.reset_inline_tab_completion(split_id);
         self.input_manager.end_history_navigation(split_id);
-        self.input_manager.input_texts.get(&split_id).cloned()
+        self.input_manager.draft(split_id).cloned()
     }
 
     fn finish_native_text_edit(&mut self, split_id: SplitId, cx: &mut Context<Self>) {
@@ -4754,8 +4765,7 @@ impl ChatInputRenderer {
         };
         let current_text = self
             .input_manager
-            .input_texts
-            .get(&split_id)
+            .draft(split_id)
             .cloned()
             .unwrap_or_default();
         cx.defer(move |cx| {
@@ -4971,8 +4981,7 @@ impl ChatInputRenderer {
         }
         let text = self
             .input_manager
-            .input_texts
-            .get(&split_id)
+            .draft(split_id)
             .cloned()
             .unwrap_or_default();
         let range = Self::utf16_range_to_utf8(&text, range_utf16);
@@ -4991,8 +5000,7 @@ impl ChatInputRenderer {
         }
         Some(
             self.input_manager
-                .input_texts
-                .get(&split_id)
+                .draft(split_id)
                 .map(|text| text.encode_utf16().count())
                 .unwrap_or(0),
         )

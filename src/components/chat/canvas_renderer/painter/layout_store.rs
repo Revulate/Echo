@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// Per-split layout cache capacity (LRU beyond it). The same for active and
+/// inactive splits, so a backgrounded split keeps its laid-out geometry and
+/// switching back is a cache hit, not a cold re-layout.
+const LAYOUT_CACHE_CAPACITY: usize = 640;
+
 pub(super) struct LayoutStore {
     pub(super) layouts: EvictionTrackingCache<LayoutCacheKey, Arc<CanvasMessageLayout>>,
     pub(super) runtime: LayoutRuntimeState,

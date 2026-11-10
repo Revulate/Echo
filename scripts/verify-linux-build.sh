@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Build the locked `dist` Echo and echo-version binaries on Linux and verify that
+# each is a 64-bit ELF with resolvable runtime linkage and a non-executable
+# stack, and that echo-version reports the workspace version and a Linux
+# target. It does not launch a window.
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,7 +18,6 @@ fi
 "$repo_root/scripts/setup-gpui-fork.sh"
 
 cd "$repo_root"
-cargo check --locked --bin echo
 cargo build --profile dist --locked --bin echo
 cargo build --profile dist --locked -p echo-version
 
@@ -23,13 +26,20 @@ for artifact in "$binary" "$version_binary"; do
         printf 'Expected executable was not produced: %s\n' "$artifact" >&2
         exit 1
     }
-    file "$artifact" | grep -q 'ELF 64-bit'
+    if ! file "$artifact" | grep -q 'ELF 64-bit'; then
+        printf 'Not a 64-bit ELF executable: %s\n%s\n' "$artifact" "$(file "$artifact")" >&2
+        exit 1
+    fi
     linkage="$(ldd -r "$artifact" 2>&1)"
     if grep -Eqi 'not found|undefined symbol' <<<"$linkage"; then
         printf '%s\n' "$linkage" >&2
         exit 1
     fi
-    readelf -W -l "$artifact" | grep -Eq 'GNU_STACK[[:space:]].*RW[[:space:]]'
+    if ! readelf -W -l "$artifact" | grep -Eq 'GNU_STACK[[:space:]].*RW[[:space:]]'; then
+        printf 'Expected a non-executable (RW) GNU_STACK segment in %s:\n' "$artifact" >&2
+        readelf -W -l "$artifact" | grep -E 'GNU_STACK' >&2 || printf '  (no GNU_STACK segment)\n' >&2
+        exit 1
+    fi
 done
 
 reported_identity="$($version_binary)"

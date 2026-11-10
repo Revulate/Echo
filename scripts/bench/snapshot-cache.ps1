@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+Record a structured cache directory snapshot.
+
+Records cache inventory only, not performance data. snapshot-cache.py is the
+Python twin.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -17,138 +24,15 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "value"
-    }
-
-    return $slug
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $args = @{
-        Scenario = $Scenario
-        CacheState = $Phase
-        Notes = "Cache snapshot for $App/$CacheName at phase '$Phase'."
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-        $args.OutputRoot = $OutputRoot
-    }
-
-    $output = & $initializer @args
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
-
-function ConvertTo-RelativePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$BasePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$TargetPath
-    )
-
-    $baseFullPath = [System.IO.Path]::GetFullPath($BasePath)
-    if (-not $baseFullPath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
-        $baseFullPath = $baseFullPath + [System.IO.Path]::DirectorySeparatorChar
-    }
-
-    $targetFullPath = [System.IO.Path]::GetFullPath($TargetPath)
-    $baseUri = [System.Uri]::new($baseFullPath)
-    $targetUri = [System.Uri]::new($targetFullPath)
-    $relativeUri = $baseUri.MakeRelativeUri($targetUri)
-
-    return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace("/", [System.IO.Path]::DirectorySeparatorChar)
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 $repoRoot = Resolve-RepoRoot
-$scenarioDir = Initialize-RunDirectory -RepoRoot $repoRoot
+$scenarioDir = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $Scenario
+    OutputRoot = $OutputRoot
+    CacheState = $Phase
+    Notes = "Cache snapshot for $App/$CacheName at phase '$Phase'."
+}
 $cacheExists = Test-Path $CachePath
 $resolvedCachePath = if ($cacheExists) { (Resolve-Path $CachePath).Path } else { $CachePath }
 $files = @()

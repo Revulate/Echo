@@ -18,15 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// echo-chat-render) plus exact-size lists of about 6 segments (184 B), 2-3
 /// text spans (792 B), 10 hitboxes (112 B) and 4 image commands (64 B). This is
 /// an estimate, not accounting: those lists vary with message length, so treat
-/// the layout line as approximate. It was 12,856 B while the lists were inline.
+/// the layout line as approximate.
 const LAYOUT_ENTRY_BYTES_ESTIMATE: usize = 5_300;
 
 static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
 fn interval_secs() -> u64 {
-    std::env::var("ECHO_MEM_REPORT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0)
+    echo_core::env::parsed("ECHO_MEM_REPORT_SECS").unwrap_or(0)
 }
 
 /// Log a breakdown if the configured interval has elapsed. Cheap no-op when the
@@ -47,8 +44,13 @@ pub fn maybe_log_memory_breakdown() {
 
 /// Log one memory breakdown immediately.
 pub fn log_memory_breakdown() {
-    let (static_b, frames_b, meta_b, anim_src_b, media_budget) =
-        crate::cache::loader::decoded_media_residency();
+    let crate::cache::loader::DecodedMediaResidency {
+        static_bytes: static_b,
+        frame_bytes: frames_b,
+        metadata_bytes: meta_b,
+        animation_source_bytes: anim_src_b,
+        total_budget_bytes: media_budget,
+    } = crate::cache::loader::decoded_media_residency();
     let crate::cache::loader::PickerMediaDiagnostics {
         picker_scopes,
         picker_touched_urls,
@@ -89,8 +91,11 @@ pub fn log_memory_breakdown() {
     let hot_frame_render_images_created =
         crate::cache::frame_layer::hot_frame_render_images_created();
     let full_cycle_demotions = crate::cache::frame_layer::full_cycle_demotions();
-    let (animation_frame_decompressions, animation_refill_windows, animation_refill_frames) =
-        crate::cache::loader::animation_refill_totals();
+    let crate::cache::loader::AnimationRefillTotals {
+        frame_decompressions: animation_frame_decompressions,
+        refill_windows: animation_refill_windows,
+        refill_frames: animation_refill_frames,
+    } = crate::cache::loader::animation_refill_totals();
     let uri_images = crate::cache::uri_layer::stats();
 
     let (channels, messages, message_bytes) = message_buffer_bytes();

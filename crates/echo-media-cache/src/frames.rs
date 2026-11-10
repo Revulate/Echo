@@ -1,12 +1,12 @@
-//! Animation frame layer for efficient animated emote rendering
+//! Animation frame layer for animated emote rendering.
 //!
-//! Combines the functionality of `frame_cache.rs` and `animated_image_cache.rs`:
-//! - Hot frame cache (20MB) for currently visible frames
-//! - Animation metadata storage
-//! - Frame prefetching for smooth playback
-//! - Integration with unified budget manager
+//! - a hot cache of decoded frames for the animations currently on screen,
+//!   charged to the frames share of the shared budget;
+//! - per-URL animation metadata (frame count, durations, dimensions);
+//! - frame prefetching so playback does not wait on decode.
 //!
 //! # Architecture
+//!
 
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
@@ -32,6 +32,7 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 use echo_cache_policy::budget::{BudgetManager, CacheLayer};
+use echo_cache_policy::loaded_urls::url_key;
 use echo_cache_policy::stats::CacheStats;
 pub use echo_render_core::animation_timing::AnimationMetadata;
 
@@ -89,8 +90,8 @@ static ANIMATION_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Key: hash of (width, height, pixel_data)
 /// Value: Weak<RenderImage> - allows automatic cleanup when all frames evicted
 ///
-/// PERF: Prevents duplicate GPU texture creation when identical emotes appear
-/// under different URLs (e.g., 7TV vs BTTV serving same "Kappa" pixels).
+/// Textures by pixel content, so identical frames served under different URLs
+/// (two providers hosting the same image) share one GPU texture.
 static TEXTURE_CACHE: LazyLock<DashMap<u64, Weak<RenderImage>>> =
     LazyLock::new(|| DashMap::with_capacity(2000));
 
@@ -332,10 +333,10 @@ pub struct FrameLayer {
     source_aliases: DashMap<u64, u64>,
     /// Resident frame count per canonical URL hash.
     ///
-    /// PERF: lets `has_renderable_frame` answer "does this URL have *any* resident
-    /// frame?" in O(1) instead of a full linear `frames` scan (which fired per
-    /// animated emote per frame on playback transitions). Maintained alongside
-    /// `frames` inserts/removals; entries are dropped when the count reaches zero.
+    /// Resident frames per animation, so `has_renderable_frame` answers "does
+    /// this URL have *any* resident frame?" without scanning `frames`; it runs
+    /// per animated emote per frame. Maintained alongside `frames` inserts and
+    /// removals; entries are dropped when the count reaches zero.
     frame_counts: DashMap<u64, usize>,
     /// Bounded resident frame indices per animation. Updated under
     /// `frame_mutation_lock` with `frames`, so picker two-frame replacement
@@ -510,7 +511,7 @@ impl FrameLayer {
         };
 
         if self.metadata.contains_key(&canonical_hash) {
-            let url_hash = Self::hash_url(url);
+            let url_hash = url_key(url);
             if url_hash != canonical_hash {
                 self.url_aliases.insert(url_hash, canonical_hash);
             }
@@ -647,39 +648,48 @@ impl FrameLayer {
         Some(entry.size_bytes)
     }
 
+    /// Register an animation with the default sliding hot-frame window.
     pub fn register_animation(&self, url: &str, metadata: AnimationMetadata) {
-        self.register_animation_with_source_key(url, None, metadata)
+        self.register_animation_with(
+            url,
+            None,
+            metadata,
+            AnimationResidency::Sliding {
+                frames: DEFAULT_MAX_RESIDENT_FRAMES_PER_ANIMATION,
+            },
+        );
     }
 
-    /// Register animation metadata with an optional provider/id/variant alias.
-    pub fn register_animation_with_source_key(
+    /// Register animation metadata, with an optional provider/id/variant
+    /// alias, keeping `residency` frames hot.
+    pub fn register_animation_with(
         &self,
         url: &str,
         source_key: Option<u64>,
         metadata: AnimationMetadata,
+        residency: AnimationResidency,
     ) {
-        self.register_animation_with_source_key_and_limit(
-            url,
-            source_key,
-            metadata,
-            DEFAULT_MAX_RESIDENT_FRAMES_PER_ANIMATION,
-        );
+        match residency {
+            AnimationResidency::Sliding { frames } => {
+                self.register_sliding_animation(url, source_key, metadata, frames);
+            }
+            AnimationResidency::FullCycle { fallback_frames } => {
+                let frame_count = metadata.frame_count as usize;
+                self.register_sliding_animation(url, source_key, metadata, frame_count);
+                self.full_cycle_fallback_limits
+                    .insert(url_key(url), fallback_frames.clamp(1, frame_count.max(1)));
+            }
+        }
     }
 
-    /// Register animation metadata with an explicit hot-frame ceiling.
-    ///
-    /// The loader resolves this from the workload-specific decode window: two
-    /// for dense picker playback, eight for ordinary emotes, or 32 for a large
-    /// name-paint sliding window. Full-cycle animations register through
-    /// [`Self::register_full_cycle_animation_with_source_key`].
-    pub fn register_animation_with_source_key_and_limit(
+    fn register_sliding_animation(
         &self,
         url: &str,
         source_key: Option<u64>,
         metadata: AnimationMetadata,
         max_resident_frames: usize,
     ) {
-        let hash = Self::hash_url(url);
+        let hash = url_key(url);
         let size = metadata.memory_size();
         let mut requested_frame_limit = max_resident_frames
             .max(1)
@@ -741,25 +751,6 @@ impl FrameLayer {
         self.budget.allocate(CacheLayer::Metadata, size);
     }
 
-    /// Register an animation that keeps its complete cycle resident.
-    ///
-    /// `sliding_frame_limit` is the window it returns to if byte or entry
-    /// pressure demotes it while visible.
-    pub fn register_full_cycle_animation_with_source_key(
-        &self,
-        url: &str,
-        source_key: Option<u64>,
-        metadata: AnimationMetadata,
-        sliding_frame_limit: usize,
-    ) {
-        let frame_count = metadata.frame_count as usize;
-        self.register_animation_with_source_key_and_limit(url, source_key, metadata, frame_count);
-        self.full_cycle_fallback_limits.insert(
-            Self::hash_url(url),
-            sliding_frame_limit.clamp(1, frame_count.max(1)),
-        );
-    }
-
     /// Whether a newly decoded animation of `frame_count` frames totalling
     /// `cycle_bytes` may keep its complete cycle resident.
     ///
@@ -808,7 +799,7 @@ impl FrameLayer {
                 return;
             }
         } else {
-            self.resolve_hash(Self::hash_url(url))
+            self.resolve_hash(url_key(url))
         };
         self.retained_consumer_hashes.insert(hash);
         let frame_count = self
@@ -839,20 +830,19 @@ impl FrameLayer {
     }
 
     /// Get animation metadata
-    /// PERF: Returns Arc to avoid cloning Vec<u16> frame durations per-emote per-frame
+    /// Shared, so per-frame callers do not copy the frame-duration list.
     pub fn get_metadata(&self, url: &str) -> Option<Arc<AnimationMetadata>> {
-        let hash = self.resolve_hash(Self::hash_url(url));
+        let hash = self.resolve_hash(url_key(url));
         self.metadata.get(&hash).map(|m| Arc::clone(m.value()))
     }
 
     /// Check if animation metadata exists
     pub fn has_metadata(&self, url: &str) -> bool {
-        self.has_metadata_by_hash(Self::hash_url(url))
+        self.has_metadata_by_hash(url_key(url))
     }
 
     /// Check if animation metadata exists for a pre-computed URL hash.
-    /// PERF: lets callers that already hashed the URL (or probe several maps)
-    /// avoid re-hashing per probe.
+    /// For callers that already hashed the URL (or probe several maps).
     #[inline]
     pub fn has_metadata_by_hash(&self, hash: u64) -> bool {
         self.metadata.contains_key(&self.resolve_hash(hash))
@@ -860,7 +850,7 @@ impl FrameLayer {
 
     /// Check whether a specific decoded animation frame is resident in the hot cache.
     pub fn has_frame(&self, url: &str, frame_idx: u16) -> bool {
-        let hash = self.resolve_hash(Self::hash_url(url));
+        let hash = self.resolve_hash(url_key(url));
         self.frames.contains_key(&FrameKey::new(hash, frame_idx))
     }
 
@@ -870,11 +860,11 @@ impl FrameLayer {
     /// frame prefetch. State/signature probes call this to avoid turning read-only
     /// readiness checks into cache-loader work.
     pub fn has_renderable_frame(&self, url: &str) -> bool {
-        self.has_renderable_frame_by_hash(Self::hash_url(url))
+        self.has_renderable_frame_by_hash(url_key(url))
     }
 
     /// `has_renderable_frame` for a pre-computed URL hash.
-    /// PERF: avoids re-hashing when the caller already has the hash.
+    /// For callers that already hashed the URL.
     pub fn has_renderable_frame_by_hash(&self, hash: u64) -> bool {
         let hash = self.resolve_hash(hash);
         let Some(metadata) = self.metadata.get(&hash) else {
@@ -889,8 +879,7 @@ impl FrameLayer {
             return true;
         }
 
-        // O(1) "does this URL have any resident frame?" via the per-URL count index,
-        // replacing the previous full linear scan of the frame cache.
+        // O(1) "does this URL have any resident frame?" via the per-URL count index.
         self.frame_counts
             .get(&hash)
             .map(|c| *c > 0)
@@ -903,7 +892,7 @@ impl FrameLayer {
     /// metadata, and pending prefetch markers so picker-owned animation memory
     /// can be dropped when the picker closes.
     pub fn purge_url(&self, url: &str) -> FramePurgeStats {
-        let hash = Self::hash_url(url);
+        let hash = url_key(url);
         let canonical_hash = self.resolve_hash(hash);
         if hash != canonical_hash {
             self.url_aliases.remove(&hash);
@@ -919,7 +908,7 @@ impl FrameLayer {
     /// removal would leave canonical metadata in place and permanently block
     /// normal network decode admission.
     pub fn purge_resolved_url(&self, url: &str) -> FramePurgeStats {
-        let canonical_hash = self.resolve_hash(Self::hash_url(url));
+        let canonical_hash = self.resolve_hash(url_key(url));
         self.purge_canonical_hash(canonical_hash)
     }
 
@@ -980,9 +969,8 @@ impl FrameLayer {
     /// Bounded fallback probe for a resident frame of the same animation when
     /// the exact `frame_idx` isn't cached yet.
     ///
-    /// PERF: replaces a full linear scan of *every* resident frame of *every*
-    /// animated emote that previously ran on the paint thread once per missed
-    /// emote per paint. Probe policy:
+    /// Runs on the paint thread once per missed emote per paint, so it probes
+    /// a bounded set of keys instead of scanning resident frames. Probe policy:
     ///   1. O(1) early-out — if the per-URL residency counter reports zero
     ///      resident frames, return immediately without probing.
     ///   2. Probe only `FrameKey`s for *this* `hash`: first a wrapping
@@ -993,8 +981,7 @@ impl FrameLayer {
     ///      decoded first and so are the likeliest residents when playback has
     ///      run far ahead of prefetch.
     ///   3. Hard-cap total probes at PROBE_LIMIT, then give up (return None). A
-    ///      one-frame visual hold until prefetch lands is acceptable and matches
-    ///      the previous miss behavior.
+    ///      one-frame visual hold until prefetch lands is acceptable.
     fn probe_fallback_frame_with_index(
         &self,
         hash: u64,
@@ -1076,7 +1063,7 @@ impl FrameLayer {
         // Reserve enough of the probe budget for the initial-window pass below:
         // a long animation whose playback position is far ahead of decode (only
         // the initial window resident yet — the common first-appearance case)
-        // must still find a frame there, as the previous full scan always did.
+        // must still find a frame there.
         let window = ANIMATION_INITIAL_DECODE_WINDOW_FRAMES.min(frame_count);
         let neighborhood_budget = PROBE_LIMIT.saturating_sub(window as usize);
 
@@ -1119,29 +1106,29 @@ impl FrameLayer {
     /// Returns the RenderImage for the current animation frame, or None if
     /// the frame isn't cached yet. Triggers prefetching of upcoming frames.
     ///
-    /// PERF: Uses read-only access (get, not get_mut) to avoid blocking render
-    /// threads while background decode threads insert frames. Recency is updated
+    /// Read-only map access (get, not get_mut), so render threads never block
+    /// on background decode threads inserting frames. Recency is updated
     /// through a lock-free atomic timestamp on the cached value.
     pub fn get_current_frame(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.get_current_frame_with_metadata_and_frame(url)
-            .map(|(image, _, _)| image)
+        self.animated_frame(url, FrameQuery::Current)
+            .map(|frame| frame.image)
     }
 
     /// Get a stable resident frame without advancing playback or scheduling a
     /// refill. Picker Hover/Never policies use this as a no-tick poster fallback.
     pub fn get_stable_frame(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.get_stable_frame_with_metadata_and_index(url)
-            .map(|(image, _, _)| image)
+        self.animated_frame(url, FrameQuery::Stable)
+            .map(|frame| frame.image)
     }
 
     /// [`Self::get_stable_frame`] plus the animation metadata and the index
     /// of the resident frame actually returned, which is frame 0 only when
     /// frame 0 is resident (the probe falls back to nearby frames).
-    pub fn get_stable_frame_with_metadata_and_index(
+    fn get_stable_frame_with_metadata_and_index(
         &self,
         url: &str,
     ) -> Option<(Arc<RenderImage>, Arc<AnimationMetadata>, u16)> {
-        let hash = self.resolve_hash(Self::hash_url(url));
+        let hash = self.resolve_hash(url_key(url));
         let metadata = self
             .metadata
             .get(&hash)
@@ -1156,43 +1143,36 @@ impl FrameLayer {
         Some((image, metadata, frame_idx))
     }
 
-    /// Get current frame and metadata together, hashing the URL only once.
-    ///
-    /// PERF: Replaces the two-call pattern (get_current_frame + get_metadata) used
-    /// in element_images.rs so the URL hash and metadata DashMap lookup are done
-    /// exactly once per call instead of twice.
-    pub fn get_current_frame_with_metadata(
-        &self,
-        url: &str,
-    ) -> Option<(Arc<RenderImage>, Arc<AnimationMetadata>)> {
-        self.get_current_frame_with_metadata_and_frame(url)
-            .map(|(image, metadata, _)| (image, metadata))
-    }
-
-    /// Get the displayed frame, animation metadata, and the actual resident
-    /// frame index selected for rendering.
-    ///
-    /// The returned index is the requested wall-clock frame on an exact hit and
-    /// the resident fallback index on a miss. Keeping that distinction in the
-    /// cache layer lets callers verify real displayed-frame motion without
-    /// mistaking a repeatedly-held fallback texture for animation progress.
-    pub fn get_current_frame_with_metadata_and_frame(
-        &self,
-        url: &str,
-    ) -> Option<(Arc<RenderImage>, Arc<AnimationMetadata>, u16)> {
-        self.get_current_frame_with_metadata_frame_and_exactness(url)
-            .map(|(image, metadata, frame_idx, _)| (image, metadata, frame_idx))
+    /// One frame of `url` as `query` selects it.
+    pub fn animated_frame(&self, url: &str, query: FrameQuery) -> Option<AnimatedFrame> {
+        let (image, metadata, index, exact) = match query {
+            FrameQuery::Current => self.get_current_frame_with_metadata_frame_and_exactness(url)?,
+            FrameQuery::Resident => {
+                self.get_resident_frame_with_metadata_frame_and_exactness(url)?
+            }
+            FrameQuery::Stable => {
+                let (image, metadata, index) =
+                    self.get_stable_frame_with_metadata_and_index(url)?;
+                (image, metadata, index, false)
+            }
+        };
+        Some(AnimatedFrame {
+            image,
+            metadata,
+            index,
+            exact,
+        })
     }
 
     /// Get the displayed frame plus whether it exactly matches the animation's
     /// current wall-clock target. Picker playback uses this to keep scheduling a
     /// high-quality primary refill without letting one held primary frame mask a
     /// healthy compact fallback animation.
-    pub fn get_current_frame_with_metadata_frame_and_exactness(
+    fn get_current_frame_with_metadata_frame_and_exactness(
         &self,
         url: &str,
     ) -> Option<(Arc<RenderImage>, Arc<AnimationMetadata>, u16, bool)> {
-        let hash = self.resolve_hash(Self::hash_url(url));
+        let hash = self.resolve_hash(url_key(url));
 
         // Get metadata (needed for frame index + visible registration)
         let metadata_arc = self
@@ -1240,11 +1220,11 @@ impl FrameLayer {
     /// Picker source handoff uses this to keep an already-playable alternate
     /// moving while the one authoritative decode URL hydrates. It must not make
     /// the alternate join the decode/refill working set.
-    pub fn get_resident_frame_with_metadata_frame_and_exactness(
+    fn get_resident_frame_with_metadata_frame_and_exactness(
         &self,
         url: &str,
     ) -> Option<(Arc<RenderImage>, Arc<AnimationMetadata>, u16, bool)> {
-        let hash = self.resolve_hash(Self::hash_url(url));
+        let hash = self.resolve_hash(url_key(url));
         let metadata = self
             .metadata
             .get(&hash)
@@ -1269,101 +1249,47 @@ impl FrameLayer {
 
     /// Insert a frame into the hot cache
     pub fn insert_frame(&self, url: &str, frame_idx: u16, data: Vec<u8>, width: u32, height: u32) {
-        let _ = self.insert_frame_internal(url, frame_idx, data, width, height, None, None);
-    }
-
-    /// Insert a frame whose CPU pixels are released once a window has uploaded
-    /// them to its sprite atlas; `pixel_source` rebuilds them for any later
-    /// upload (another window, or after the GPU device is lost).
-    pub fn insert_releasable_frame(
-        &self,
-        url: &str,
-        frame_idx: u16,
-        data: Vec<u8>,
-        width: u32,
-        height: u32,
-        pixel_source: RenderImagePixelSource,
-    ) {
-        let _ = self.insert_frame_internal(
+        let _ = self.insert_frame_with(
             url,
             frame_idx,
-            data,
-            width,
-            height,
-            None,
-            Some(pixel_source),
+            FramePixels {
+                data,
+                width,
+                height,
+            },
+            FrameInsertOptions::default(),
         );
     }
 
-    /// Insert one refill frame only while `prefetch_token` still owns the
-    /// canonical animation's active refill generation.
+    /// Insert a frame into the hot cache; returns whether it was admitted.
     ///
-    /// The ownership check runs under `frame_mutation_lock`, the same lock used
-    /// by purge. A purge therefore either removes this inserted frame afterward
-    /// or invalidates the token before insertion; stale tasks cannot resurrect
-    /// frames after scope cleanup.
-    pub fn insert_prefetched_frame(
+    /// With a `prefetch_token`, the frame is inserted only while that token
+    /// still owns the canonical animation's active refill generation. The
+    /// check runs under `frame_mutation_lock`, the same lock used by purge, so
+    /// a purge either removes the frame afterward or invalidates the token
+    /// first; stale refill tasks cannot resurrect frames after scope cleanup.
+    pub fn insert_frame_with(
         &self,
         url: &str,
         frame_idx: u16,
-        data: Vec<u8>,
-        width: u32,
-        height: u32,
-        prefetch_token: u64,
+        pixels: FramePixels,
+        options: FrameInsertOptions,
     ) -> bool {
-        self.insert_frame_internal(
-            url,
-            frame_idx,
+        let FramePixels {
             data,
             width,
             height,
-            Some(prefetch_token),
-            None,
-        )
-    }
-
-    /// [`Self::insert_prefetched_frame`] for a frame that releases its CPU
-    /// pixels after upload; see [`Self::insert_releasable_frame`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_prefetched_releasable_frame(
-        &self,
-        url: &str,
-        frame_idx: u16,
-        data: Vec<u8>,
-        width: u32,
-        height: u32,
-        prefetch_token: u64,
-        pixel_source: RenderImagePixelSource,
-    ) -> bool {
-        self.insert_frame_internal(
-            url,
-            frame_idx,
-            data,
-            width,
-            height,
-            Some(prefetch_token),
-            Some(pixel_source),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn insert_frame_internal(
-        &self,
-        url: &str,
-        frame_idx: u16,
-        data: Vec<u8>,
-        width: u32,
-        height: u32,
-        prefetch_token: Option<u64>,
-        pixel_source: Option<RenderImagePixelSource>,
-    ) -> bool {
-        let hash = self.resolve_hash(Self::hash_url(url));
+        } = pixels;
+        let FrameInsertOptions {
+            prefetch_token,
+            pixel_source,
+        } = options;
+        let hash = self.resolve_hash(url_key(url));
         let key = FrameKey::new(hash, frame_idx);
         let size_bytes = data.len();
 
-        // PERF: Content-based texture deduplication
-        // Check if we already have a texture with identical pixel content
-        // before entering the narrow frame-state mutation transaction.
+        // Reuse a texture with identical pixel content, checked before entering
+        // the narrow frame-state mutation transaction.
         let content_hash = hash_content(&data, width, height);
         let existing_texture = TEXTURE_CACHE
             .get(&content_hash)
@@ -2063,8 +1989,8 @@ impl FrameLayer {
     /// during each render pass. Returns true only if animated emotes are actually
     /// on screen, preventing animation ticks when emotes are loaded but not visible.
     ///
-    /// PERF: This is the key optimization - we only tick animations when they're
-    /// actually visible, not just because they were ever loaded.
+    /// Animation ticks run only while this is true, i.e. while an animation is
+    /// on screen, not merely loaded.
     pub fn has_visible_animations(&self) -> bool {
         visible_metadata_count() > 0
     }
@@ -2087,19 +2013,7 @@ impl FrameLayer {
     ///
     /// This scan is intentionally kept out of the normal cache-stat hot path.
     /// `ECHO_MEM_REPORT_SECS` calls it only at the requested reporting interval.
-    pub fn diagnostic_residency_counts(
-        &self,
-    ) -> (
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-    ) {
+    pub fn diagnostic_residency_counts(&self) -> FrameResidencyCounts {
         let picker_visible = self.picker_visible_canonical_hashes();
         let mut picker_protected_frames = 0usize;
         let mut picker_protected_bytes = 0usize;
@@ -2121,29 +2035,95 @@ impl FrameLayer {
             }
         }
         let frame_entries = self.frames.len();
-        (
-            frame_entries,
-            self.frame_counts.len(),
+        let entry_limit = Self::hot_frame_entry_limit(Self::picker_visible_animation_upper_bound());
+        FrameResidencyCounts {
+            frames: frame_entries,
+            urls: self.frame_counts.len(),
             picker_protected_frames,
             picker_protected_bytes,
-            maximum_frames_per_url,
+            max_frames_per_url: maximum_frames_per_url,
             urls_over_limit,
-            self.texture_frame_counts.len(),
-            Self::hot_frame_entry_limit(Self::picker_visible_animation_upper_bound()),
-            frame_entries.saturating_sub(Self::hot_frame_entry_limit(
-                Self::picker_visible_animation_upper_bound(),
-            )),
-        )
+            render_images: self.texture_frame_counts.len(),
+            entry_limit,
+            entries_over_limit: frame_entries.saturating_sub(entry_limit),
+        }
     }
+}
 
-    /// Hash a URL for fast lookup
-    #[inline]
-    pub fn hash_url(url: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = ahash::AHasher::default();
-        url.hash(&mut hasher);
-        hasher.finish()
-    }
+/// Hot-frame residency for the opt-in memory diagnostic.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameResidencyCounts {
+    /// Resident decoded frames.
+    pub frames: usize,
+    /// Animations with at least one resident frame.
+    pub urls: usize,
+    /// Frames of animations the open picker shows.
+    pub picker_protected_frames: usize,
+    pub picker_protected_bytes: usize,
+    pub max_frames_per_url: usize,
+    /// Animations holding more frames than their resident limit.
+    pub urls_over_limit: usize,
+    /// Animations with frames uploaded as GPU textures.
+    pub render_images: usize,
+    /// The global hot-frame entry limit at the current picker load.
+    pub entry_limit: usize,
+    pub entries_over_limit: usize,
+}
+
+/// How many decoded frames of an animation stay hot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationResidency {
+    /// A sliding window of `frames` around playback. The loader picks it from
+    /// the workload: two for dense picker playback, eight for ordinary emotes,
+    /// 32 for a large name-paint window.
+    Sliding { frames: usize },
+    /// The complete cycle; `fallback_frames` is the sliding window it returns
+    /// to if byte or entry pressure demotes it while visible.
+    FullCycle { fallback_frames: usize },
+}
+
+/// Which frame [`FrameLayer::animated_frame`] returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameQuery {
+    /// The frame for the current animation time, registering the animation
+    /// as visible and scheduling refills; a nearby resident frame is held
+    /// when that one is missing.
+    Current,
+    /// The current-time frame or a resident stand-in, without admitting the
+    /// animation or scheduling refill work.
+    Resident,
+    /// A resident frame near frame 0, for still display; never advances.
+    Stable,
+}
+
+/// One displayed frame of an animation.
+#[derive(Clone)]
+pub struct AnimatedFrame {
+    pub image: Arc<RenderImage>,
+    pub metadata: Arc<AnimationMetadata>,
+    /// The resident frame actually returned, which differs from the
+    /// wall-clock target when a fallback is held.
+    pub index: u16,
+    /// Whether `index` is the wall-clock target rather than a held fallback.
+    pub exact: bool,
+}
+
+/// Decoded BGRA pixels of one animation frame.
+pub struct FramePixels {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// How [`FrameLayer::insert_frame_with`] admits a frame.
+#[derive(Default)]
+pub struct FrameInsertOptions {
+    /// Insert only while this refill token still owns the animation.
+    pub prefetch_token: Option<u64>,
+    /// Release the CPU pixels once a window has uploaded them to its sprite
+    /// atlas; this source rebuilds them for any later upload (another window,
+    /// or after the GPU device is lost).
+    pub pixel_source: Option<RenderImagePixelSource>,
 }
 
 #[derive(Default)]
@@ -2152,6 +2132,30 @@ pub struct FramePurgeStats {
     pub frame_bytes: usize,
     pub metadata_removed: bool,
     pub metadata_bytes: usize,
+}
+
+/// Whether `prefetch_token` still owns this canonical animation's refill window.
+pub fn prefetch_token_is_current(url_hash: u64, prefetch_token: u64) -> bool {
+    PREFETCH_URL_IN_FLIGHT
+        .get(&url_hash)
+        .is_some_and(|owner| *owner == prefetch_token)
+}
+
+/// Remove a frame marker only when it still belongs to this refill task.
+pub fn clear_prefetch_in_flight(url_hash: u64, frame_idx: u16, prefetch_token: u64) {
+    PREFETCH_IN_FLIGHT.remove_if(&(url_hash, frame_idx), |_, owner| *owner == prefetch_token);
+}
+
+/// Remove multiple frames from the in-flight prefetch set.
+pub fn clear_prefetch_in_flight_batch(url_hash: u64, frame_indices: &[u16], prefetch_token: u64) {
+    for &frame_idx in frame_indices {
+        clear_prefetch_in_flight(url_hash, frame_idx, prefetch_token);
+    }
+}
+
+/// Release the per-animation guard only when this task still owns it.
+pub fn clear_prefetch_url_in_flight(url_hash: u64, prefetch_token: u64) {
+    PREFETCH_URL_IN_FLIGHT.remove_if(&url_hash, |_, owner| *owner == prefetch_token);
 }
 
 #[cfg(test)]
@@ -2212,9 +2216,9 @@ mod tests {
             Arc::new(BudgetManager::with_budget(1_000_000)),
             Arc::new(CacheStats::new()),
         );
-        let canonical = FrameLayer::hash_url("https://picker.example.test/canonical.webp");
-        let alias = FrameLayer::hash_url("https://picker.example.test/alias.webp");
-        let unknown = FrameLayer::hash_url("https://picker.example.test/unknown.webp");
+        let canonical = url_key("https://picker.example.test/canonical.webp");
+        let alias = url_key("https://picker.example.test/alias.webp");
+        let unknown = url_key("https://picker.example.test/unknown.webp");
         layer.url_aliases.insert(alias, canonical);
 
         let exact = HashSet::from([canonical]);
@@ -2237,7 +2241,7 @@ mod tests {
         layer.register_animation(url, AnimationMetadata::new(vec![100, 100, 100]));
 
         layer.insert_frame(url, 1, vec![0, 0, 0, 255], 1, 1);
-        let hash = FrameLayer::hash_url(url);
+        let hash = url_key(url);
         // Simulate frame 1 having been selected for display before the seam
         // lookahead arrives.
         layer.fallback_frame_indices.insert(hash, 1);
@@ -2273,10 +2277,7 @@ mod tests {
         let urls = (0..320)
             .map(|index| format!("https://picker.example.test/{index}.webp"))
             .collect::<Vec<_>>();
-        let hashes = urls
-            .iter()
-            .map(|url| FrameLayer::hash_url(url))
-            .collect::<HashSet<_>>();
+        let hashes = urls.iter().map(|url| url_key(url)).collect::<HashSet<_>>();
         replace_picker_visible_hashes(PickerViewport::Inline, HashSet::new(), hashes);
 
         for (index, url) in urls.iter().enumerate() {
@@ -2292,7 +2293,7 @@ mod tests {
             assert_eq!(
                 layer
                     .resident_frame_indices
-                    .get(&FrameLayer::hash_url(url))
+                    .get(&url_key(url))
                     .map(|indices| indices.len()),
                 Some(2),
                 "every dense picker URL keeps a bounded two-entry replacement index"
@@ -2302,10 +2303,7 @@ mod tests {
         replace_picker_visible_hashes(PickerViewport::Inline, HashSet::new(), HashSet::new());
         {
             let _mutation_guard = layer.frame_mutation_lock.lock();
-            layer.evict_frame_entries_to_limit_locked(FrameKey::new(
-                FrameLayer::hash_url(&urls[0]),
-                0,
-            ));
+            layer.evict_frame_entries_to_limit_locked(FrameKey::new(url_key(&urls[0]), 0));
         }
         assert_eq!(layer.frames.len(), 640);
         println!("dense_picker urls=320 ready_frames=640 below_baseline_limit=4096");
@@ -2324,7 +2322,7 @@ mod tests {
             layer.insert_frame(&url, 0, vec![index as u8, 0, 0, 255], 1, 1);
             layer
                 .frames
-                .get(&FrameKey::new(FrameLayer::hash_url(&url), 0))
+                .get(&FrameKey::new(url_key(&url), 0))
                 .unwrap()
                 .last_accessed_ms
                 .store(0, Ordering::Relaxed);
@@ -2351,11 +2349,13 @@ mod tests {
             Arc::new(CacheStats::new()),
         );
         let insert_cycle = |url: &str, frames: u16| {
-            layer.register_full_cycle_animation_with_source_key(
+            layer.register_animation_with(
                 url,
                 None,
                 AnimationMetadata::new(vec![100; frames as usize]),
-                DEFAULT_MAX_RESIDENT_FRAMES_PER_ANIMATION,
+                AnimationResidency::FullCycle {
+                    fallback_frames: DEFAULT_MAX_RESIDENT_FRAMES_PER_ANIMATION,
+                },
             );
             for frame in 0..frames {
                 layer.insert_frame(url, frame, vec![frame as u8, 0, 0, 255], 1, 1);
@@ -2371,23 +2371,20 @@ mod tests {
         let resident = |url: &str| {
             layer
                 .frame_counts
-                .get(&FrameLayer::hash_url(url))
+                .get(&url_key(url))
                 .map_or(0, |count| *count)
         };
         assert!(resident(large) <= DEFAULT_MAX_RESIDENT_FRAMES_PER_ANIMATION);
         assert_eq!(resident(small), 30, "smaller cycles stay whole");
         assert_eq!(resident(arriving), 30);
         assert_eq!(
-            layer
-                .frame_limits
-                .get(&FrameLayer::hash_url(large))
-                .map(|limit| *limit),
+            layer.frame_limits.get(&url_key(large)).map(|limit| *limit),
             Some(DEFAULT_MAX_RESIDENT_FRAMES_PER_ANIMATION)
         );
         assert!(
             !layer
                 .full_cycle_fallback_limits
-                .contains_key(&FrameLayer::hash_url(large))
+                .contains_key(&url_key(large))
         );
     }
 
@@ -2399,7 +2396,7 @@ mod tests {
             Arc::new(CacheStats::new()),
         );
         let url = "https://picker.example.test/full-cycle.webp";
-        let hash = FrameLayer::hash_url(url);
+        let hash = url_key(url);
         replace_picker_visible_hashes(
             PickerViewport::Inline,
             HashSet::new(),
@@ -2407,11 +2404,13 @@ mod tests {
         );
         assert!(layer.admits_full_cycle(12, 12 * 4));
         assert!(!layer.admits_full_cycle(12, ANIMATION_FULL_CYCLE_MAX_BYTES + 1));
-        layer.register_full_cycle_animation_with_source_key(
+        layer.register_animation_with(
             url,
             None,
             AnimationMetadata::new(vec![100; 12]),
-            PICKER_MAX_RESIDENT_FRAMES_PER_ANIMATION,
+            AnimationResidency::FullCycle {
+                fallback_frames: PICKER_MAX_RESIDENT_FRAMES_PER_ANIMATION,
+            },
         );
         for frame in 0..12u16 {
             layer.insert_frame(url, frame, vec![frame as u8, 0, 0, 255], 1, 1);
@@ -2427,7 +2426,7 @@ mod tests {
         let stats = Arc::new(CacheStats::new());
         let layer = FrameLayer::new(budget, stats);
         let url = "https://picker.example.test/seam.webp";
-        let hash = FrameLayer::hash_url(url);
+        let hash = url_key(url);
         replace_picker_visible_hashes(
             PickerViewport::Popout,
             HashSet::new(),
@@ -2496,7 +2495,7 @@ mod tests {
             Arc::new(CacheStats::new()),
         );
         let url = "https://picker.example.test/idle.webp";
-        let hash = FrameLayer::hash_url(url);
+        let hash = url_key(url);
         replace_picker_visible_hashes(
             PickerViewport::Popout,
             HashSet::new(),
@@ -2542,21 +2541,18 @@ mod tests {
         let urls = (0..320)
             .map(|index| format!("https://picker-bench.example.test/{index}.webp"))
             .collect::<Vec<_>>();
-        let hashes = urls
-            .iter()
-            .map(|url| FrameLayer::hash_url(url))
-            .collect::<HashSet<_>>();
+        let hashes = urls.iter().map(|url| url_key(url)).collect::<HashSet<_>>();
         replace_picker_visible_hashes(PickerViewport::Inline, HashSet::new(), hashes);
         for (index, url) in urls.iter().enumerate() {
             layer.register_animation(url, AnimationMetadata::new(vec![100; 128]));
             layer.insert_frame(url, 0, vec![index as u8, 0, 0, 255], 1, 1);
             layer.insert_frame(url, 1, vec![index as u8, 1, 0, 255], 1, 1);
-            layer.record_displayed_frame(FrameKey::new(FrameLayer::hash_url(url), 1));
+            layer.record_displayed_frame(FrameKey::new(url_key(url), 1));
         }
         let started = Instant::now();
         for step in 0..64u16 {
             for (index, url) in urls.iter().enumerate() {
-                let hash = FrameLayer::hash_url(url);
+                let hash = url_key(url);
                 let previous = (step + 1) % 128;
                 let next = (step + 2) % 128;
                 layer.record_displayed_frame(FrameKey::new(hash, previous));
@@ -2582,7 +2578,7 @@ mod tests {
             Arc::new(CacheStats::new()),
         );
         let url = "https://picker.example.test/index-lifecycle.webp";
-        let hash = FrameLayer::hash_url(url);
+        let hash = url_key(url);
         replace_picker_visible_hashes(
             PickerViewport::Inline,
             HashSet::new(),
@@ -2607,28 +2603,4 @@ mod tests {
         assert!(!layer.frame_counts.contains_key(&hash));
         assert!(!layer.fallback_frame_indices.contains_key(&hash));
     }
-}
-
-/// Whether `prefetch_token` still owns this canonical animation's refill window.
-pub fn prefetch_token_is_current(url_hash: u64, prefetch_token: u64) -> bool {
-    PREFETCH_URL_IN_FLIGHT
-        .get(&url_hash)
-        .is_some_and(|owner| *owner == prefetch_token)
-}
-
-/// Remove a frame marker only when it still belongs to this refill task.
-pub fn clear_prefetch_in_flight(url_hash: u64, frame_idx: u16, prefetch_token: u64) {
-    PREFETCH_IN_FLIGHT.remove_if(&(url_hash, frame_idx), |_, owner| *owner == prefetch_token);
-}
-
-/// Remove multiple frames from the in-flight prefetch set.
-pub fn clear_prefetch_in_flight_batch(url_hash: u64, frame_indices: &[u16], prefetch_token: u64) {
-    for &frame_idx in frame_indices {
-        clear_prefetch_in_flight(url_hash, frame_idx, prefetch_token);
-    }
-}
-
-/// Release the per-animation guard only when this task still owns it.
-pub fn clear_prefetch_url_in_flight(url_hash: u64, prefetch_token: u64) {
-    PREFETCH_URL_IN_FLIGHT.remove_if(&url_hash, |_, owner| *owner == prefetch_token);
 }

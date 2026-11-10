@@ -21,7 +21,7 @@ const WAKE_NETWORK_FALLBACK_PROBE_URL: &str = "https://recent-messages.robotty.d
 static WAKE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn handle_system_sleep() {
-    if crate::benchmark_profile::network_lanes_suppressed() {
+    if crate::bench::network_lanes_suppressed() {
         return;
     }
     crate::log_irc!(info, "System sleep - recording chat gap start");
@@ -29,8 +29,7 @@ pub fn handle_system_sleep() {
 }
 
 pub fn handle_system_wake() {
-    if crate::benchmark_profile::network_lanes_suppressed() || crate::backend::is_shutdown_started()
-    {
+    if crate::bench::network_lanes_suppressed() || crate::backend::is_shutdown_started() {
         return;
     }
     crate::backend::irc::note_system_wake();

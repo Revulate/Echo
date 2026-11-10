@@ -3,14 +3,17 @@
 use super::layout_resolution::LayoutHeightMode;
 use super::*;
 
+/// Per-update synchronous layout budget before we defer to async layout.
+/// This prevents long UI-thread stalls during resize storms / burst message loads.
+const SYNC_LAYOUT_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+
 impl CanvasMessageList {
     pub(super) fn update_layouts(&mut self, window: &mut Window) {
         let _layout_context = self.enter_layout_context();
         let mut force_layout_refresh = false;
         let mut order_tree_cleared_for_rebuild = false;
         let mut rebuild_scroll_anchor = None;
-        let sync_layout_budget_deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(SYNC_LAYOUT_BUDGET_MS);
+        let sync_layout_budget_deadline = std::time::Instant::now() + SYNC_LAYOUT_BUDGET;
         let mut sync_layout_budget_exhausted = false;
         let mut allow_sync_layout = || {
             if sync_layout_budget_exhausted {
@@ -99,11 +102,7 @@ impl CanvasMessageList {
             if force_layout_refresh {
                 self.message_state.needs_layout_rebuild = true;
             } else {
-                self.layout_store.runtime.refresh_missing_layouts_for_width = true;
-                self.layout_store.runtime.stale_layout_refresh_cursor = 0;
-                self.layout_store
-                    .runtime
-                    .stale_layout_refresh_pass_found_stale = false;
+                self.layout_store.runtime.restart_width_refresh();
                 self.interaction_state.hitbox_manager.invalidate_cache();
             }
             self.layout_store.runtime.has_stale_layouts = true;
@@ -213,11 +212,7 @@ impl CanvasMessageList {
             self.layout_store.runtime.last_checked_emote_version = current_emote_version;
             self.layout_store.runtime.last_checked_channel_emote_version =
                 current_channel_emote_version;
-            self.layout_store.runtime.has_stale_layouts = true;
-            self.layout_store.runtime.stale_layout_refresh_cursor = 0;
-            self.layout_store
-                .runtime
-                .stale_layout_refresh_pass_found_stale = false;
+            self.layout_store.runtime.mark_stale();
             true
         } else {
             self.layout_store.runtime.has_stale_layouts
@@ -288,12 +283,7 @@ impl CanvasMessageList {
         }
 
         if order_mismatch || height_mismatch || force_layout_refresh {
-            self.layout_store.runtime.has_stale_layouts = false;
-            self.layout_store.runtime.refresh_missing_layouts_for_width = false;
-            self.layout_store.runtime.stale_layout_refresh_cursor = 0;
-            self.layout_store
-                .runtime
-                .stale_layout_refresh_pass_found_stale = false;
+            self.layout_store.runtime.clear_stale_refresh();
             crate::log_ui!(debug,
                 channel_id = %self.channel_id,
                 msg_count = msg_count,

@@ -207,7 +207,7 @@ pub fn refresh_hotkey_cache() {
     cache.clear();
 
     for (action_name, binding) in settings_map {
-        if let Some(action) = HotkeyAction::from_str(&action_name) {
+        if let Ok(action) = action_name.parse::<HotkeyAction>() {
             cache.push(CachedHotkeyEntry {
                 binding,
                 scope: action.scope(),
@@ -463,7 +463,7 @@ fn configured_action_bindings_from(
     let mut custom_actions = Vec::new();
 
     for (storage_key, binding) in bindings {
-        if let Some(action) = HotkeyAction::from_str(storage_key) {
+        if let Ok(action) = storage_key.parse::<HotkeyAction>() {
             actions.push(ConfiguredActionBinding {
                 storage_key: storage_key.clone(),
                 scope: action.scope(),
@@ -517,7 +517,9 @@ fn conflicting_labels_for_new_binding(storage_key: &str, binding: &HotkeyBinding
 }
 
 fn storage_key_scope(storage_key: &str) -> Option<HotkeyScope> {
-    HotkeyAction::from_str(storage_key)
+    storage_key
+        .parse::<HotkeyAction>()
+        .ok()
         .map(|action| action.scope())
         .or_else(|| parse_custom_hotkey_action(storage_key).map(|action| action.scope()))
 }

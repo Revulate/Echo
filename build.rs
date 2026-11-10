@@ -132,7 +132,7 @@ fn windows_version(version: &str) -> u64 {
 }
 
 fn main() {
-    // PERF: Only re-run build script when these specific files change
+    // Only re-run build script when these specific files change
     // Without this, Cargo re-runs on ANY file change → full rebuild
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/echo.ico");

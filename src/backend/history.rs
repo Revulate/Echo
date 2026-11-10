@@ -1,6 +1,8 @@
-//! Chat history fetching from Twitch API.
-//! Called from irc.rs when connecting to a channel to backfill recent messages.
+//! Recent-message history for a channel: fetched from the recent-messages
+//! service when a channel opens or reconnects, with the local history cache as
+//! the fallback.
 
+use super::irc::format::{CTCP_ACTION_PREFIX_CHARS, strip_ctcp_action};
 use super::models::{ChatMessage, HighlightType, MessageFlags, SystemMessageType};
 use super::slots::compute_structure_hash;
 use super::slots::parser::{parse_emotes_tag_with_offset, parse_to_slots};
@@ -30,7 +32,10 @@ fn build_history_http_client() -> reqwest::Client {
         .connect_timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_else(|error| {
-            tracing::error!("Failed to create recent-messages HTTP client: {error}");
+            crate::log_net!(
+                error,
+                "Failed to create recent-messages HTTP client: {error}"
+            );
             crate::backend::http::timed_client(Duration::from_secs(15))
         })
 }
@@ -44,7 +49,7 @@ pub struct HistoryFetchResult {
 }
 
 /// Extract and preload emote URLs from message history
-/// PERF: Background preloading ensures emotes are ready before messages enter viewport
+/// Background preloading ensures emotes are ready before messages enter viewport
 fn preload_emotes_from_history(messages: &[ChatMessage], channel: &str) {
     use super::slots::MessageSlot;
     use rustc_hash::FxHashSet;
@@ -106,7 +111,7 @@ fn preload_emotes_from_history(messages: &[ChatMessage], channel: &str) {
             messages.len(),
             channel
         );
-        crate::cache::loader::trigger_lazy_preload_media_with_source(
+        crate::cache::loader::trigger_lazy_preload_media(
             media_requests,
             crate::cache::loader::PreloadSource::History,
         );
@@ -139,7 +144,7 @@ pub(crate) fn apply_blocked_visibility(
 ) -> Vec<ChatMessage> {
     let visibility = crate::backend::irc::blocked_channel_visibility_snapshot(channel);
     messages.retain_mut(|message| {
-        if is_user_attributed_message(message)
+        if super::irc::is_user_attributed_message(message)
             && visibility.should_hide_sender(message.user_id.as_deref(), message.sender.as_ref())
         {
             return false;
@@ -154,19 +159,14 @@ pub(crate) fn apply_blocked_visibility(
     messages
 }
 
-fn is_user_attributed_message(message: &ChatMessage) -> bool {
-    !message.flags.is_system
-        || message.user_id.is_some()
-        || !message.sender.eq_ignore_ascii_case("system")
-}
+/// Most messages requested from the recent-messages service per channel.
+const HISTORY_FETCH_LIMIT: u32 = 800;
 
-/// Fetch channel history with a single API call (800 messages max)
-/// Returns (messages, actual_count)
-///
-/// Uses local cache as fallback when API is unavailable.
-/// Saves API results to local cache for future sessions.
+/// Fetch a channel's recent messages in one request of up to
+/// [`HISTORY_FETCH_LIMIT`], falling back to the local history cache when the
+/// service is unavailable. Fetched messages are saved to that cache.
 pub async fn fetch_recent_messages_streaming(channel: &str) -> Result<HistoryFetchResult, String> {
-    match fetch_recent_messages_with_limit(channel, 800).await {
+    match fetch_recent_messages_with_limit(channel, HISTORY_FETCH_LIMIT).await {
         Ok(messages) if !messages.is_empty() => {
             let count = messages.len();
 
@@ -437,12 +437,10 @@ async fn convert_irc_message(
 
             let content = msg.params.last().cloned().unwrap_or_default();
 
-            let (mut clean_content, is_action) =
-                if content.starts_with("\x01ACTION ") && content.ends_with('\x01') {
-                    (content[8..content.len() - 1].to_string(), true)
-                } else {
-                    (content, false)
-                };
+            let (mut clean_content, is_action) = match strip_ctcp_action(&content) {
+                Some(text) => (text.to_string(), true),
+                None => (content, false),
+            };
 
             let reply_parent_msg_id = msg.tags.0.get("reply-parent-msg-id").cloned();
             let reply_parent_user_login = msg.tags.0.get("reply-parent-user-login").cloned();
@@ -636,25 +634,14 @@ async fn convert_irc_message(
                 flags: super::models::MessageFlags {
                     is_action,
                     highlight_type,
-                    is_system: false,
-                    is_usernotice: false,
                     is_first_message: tag_value(&msg, "first-msg").as_deref() == Some("1"),
-                    system_type: None,
                     is_shared_chat: source_broadcaster_login.is_some()
                         || source_room_id
                             .as_deref()
                             .is_some_and(|source_id| source_id != host_room_id),
-                    is_deleted: false,
-                    deleted_presentation: Default::default(),
                     is_elevated_message,
                     is_hype_chat,
-                    is_automod: false,
-                    is_automod_pending: false,
-                    is_suspicious_user: false,
-                    is_restricted: false,
-                    is_monitored: false,
-                    is_similar: false,
-                    is_alternate_row: false,
+                    ..Default::default()
                 },
                 twitch_gifs_tag,
                 twitch_emotes_tag: match replaced_emote_tag {
@@ -696,11 +683,9 @@ fn convert_history_usernotice(
         .get(1)
         .filter(|content| !content.trim().is_empty())
     {
-        let (content, is_action, action_offset) = if raw_content.starts_with("\x01ACTION ")
-            && raw_content.ends_with('\x01')
-            && raw_content.len() >= 9
+        let (content, is_action, action_offset) = if let Some(text) = strip_ctcp_action(raw_content)
         {
-            (raw_content[8..raw_content.len() - 1].to_string(), true, 8)
+            (text.to_string(), true, CTCP_ACTION_PREFIX_CHARS)
         } else {
             (raw_content.clone(), false, 0)
         };
@@ -737,22 +722,8 @@ fn convert_history_usernotice(
             flags: MessageFlags {
                 is_action,
                 highlight_type,
-                is_system: false,
                 is_usernotice: true,
-                is_first_message: false,
-                system_type: None,
-                is_shared_chat: false,
-                is_deleted: false,
-                deleted_presentation: Default::default(),
-                is_elevated_message: false,
-                is_hype_chat: false,
-                is_automod: false,
-                is_automod_pending: false,
-                is_suspicious_user: false,
-                is_restricted: false,
-                is_monitored: false,
-                is_similar: false,
-                is_alternate_row: false,
+                ..Default::default()
             },
             twitch_gifs_tag: None,
             twitch_emotes_tag: tag_value(msg, "emotes").map(Into::into),
@@ -865,24 +836,11 @@ fn system_chat_message(
         structure_hash,
         reply: None,
         flags: MessageFlags {
-            is_action: false,
             highlight_type,
             is_system: true,
             is_usernotice: raw.command == "USERNOTICE",
-            is_first_message: false,
             system_type: Some(SystemMessageType::Info),
-            is_shared_chat: false,
-            is_deleted: false,
-            deleted_presentation: Default::default(),
-            is_elevated_message: false,
-            is_hype_chat: false,
-            is_automod: false,
-            is_automod_pending: false,
-            is_suspicious_user: false,
-            is_restricted: false,
-            is_monitored: false,
-            is_similar: false,
-            is_alternate_row: false,
+            ..Default::default()
         },
         twitch_gifs_tag: None,
         twitch_emotes_tag: None,

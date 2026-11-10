@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Sample process RAM/CPU into benchmark raw artifacts for one process (launched
+or existing). sample-process.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet("echo", "other")]
@@ -38,70 +43,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function Resolve-ExecutablePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (Test-Path $Path) {
-        return (Resolve-Path $Path).Path
-    }
-
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-        return $command.Source
-    }
-
-    throw "LaunchPath '$Path' was not found as a file or executable command."
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Scenario)) {
-        throw "Scenario is required when RunDir is not provided."
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $args = @("-Scenario", $Scenario)
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) { $args += @("-OutputRoot", $OutputRoot) }
-    if (-not [string]::IsNullOrWhiteSpace($EchoPath)) { $args += @("-EchoPath", $EchoPath) }
-    if (-not [string]::IsNullOrWhiteSpace($EchoBuildType)) { $args += @("-EchoBuildType", $EchoBuildType) }
-    if (-not [string]::IsNullOrWhiteSpace($CacheState)) { $args += @("-CacheState", $CacheState) }
-    if (-not [string]::IsNullOrWhiteSpace($NetworkState)) { $args += @("-NetworkState", $NetworkState) }
-    if (-not [string]::IsNullOrWhiteSpace($FixtureName)) { $args += @("-FixtureName", $FixtureName) }
-    if (-not [string]::IsNullOrWhiteSpace($Notes)) { $args += @("-Notes", $Notes) }
-
-    $output = & powershell -NoProfile -ExecutionPolicy Bypass -File $initializer @args
-    if ($LASTEXITCODE -ne 0) {
-        throw "Benchmark run initializer failed."
-    }
-
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Get-TargetProcess {
     $selectorCount = 0
@@ -128,13 +70,13 @@ function Get-TargetProcess {
 
     if (-not [string]::IsNullOrWhiteSpace($ProcessName)) {
         $normalizedName = [System.IO.Path]::GetFileNameWithoutExtension($ProcessName)
-        $matches = @(Get-Process -Name $normalizedName -ErrorAction Stop)
-        if ($matches.Count -ne 1) {
-            throw "ProcessName '$ProcessName' matched $($matches.Count) processes. Use TargetProcessId for an exact target."
+        $namedProcesses = @(Get-Process -Name $normalizedName -ErrorAction Stop)
+        if ($namedProcesses.Count -ne 1) {
+            throw "ProcessName '$ProcessName' matched $($namedProcesses.Count) processes. Use TargetProcessId for an exact target."
         }
 
         return [ordered]@{
-            process = $matches[0]
+            process = $namedProcesses[0]
             launched = $false
             launch_path = ""
             launch_argument = @()
@@ -142,7 +84,7 @@ function Get-TargetProcess {
         }
     }
 
-    $resolvedLaunchPath = Resolve-ExecutablePath -Path $LaunchPath
+    $resolvedLaunchPath = Resolve-ExecutablePath -Path $LaunchPath -Label "LaunchPath"
     $environment = @{}
     foreach ($entry in $LaunchEnvironment) {
         $parts = $entry -split "=", 2
@@ -163,14 +105,11 @@ function Get-TargetProcess {
     $previousEnvironment = @{}
     try {
         foreach ($entry in $environment.GetEnumerator()) {
-            $previousEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
-            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+            Set-TemporaryEnv -Previous $previousEnvironment -Name ([string]$entry.Key) -Value ([string]$entry.Value)
         }
         $process = Start-Process @startArgs
     } finally {
-        foreach ($entry in $previousEnvironment.GetEnumerator()) {
-            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
-        }
+        Restore-Env -Previous $previousEnvironment
     }
     return [ordered]@{
         process = $process
@@ -234,27 +173,17 @@ function Ensure-Summary {
     }
 }
 
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
 $repoRoot = Resolve-RepoRoot
-$scenarioDir = Initialize-RunDirectory -RepoRoot $repoRoot
+$scenarioDir = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $Scenario
+    OutputRoot = $OutputRoot
+    EchoPath = $EchoPath
+    EchoBuildType = $EchoBuildType
+    CacheState = $CacheState
+    NetworkState = $NetworkState
+    FixtureName = $FixtureName
+    Notes = $Notes
+}
 $scenarioName = if (-not [string]::IsNullOrWhiteSpace($Scenario)) { $Scenario } else { Split-Path -Leaf $scenarioDir }
 $resolvedMetricName = if ([string]::IsNullOrWhiteSpace($MetricName)) { $App } else { $MetricName }
 if ($resolvedMetricName -notmatch "^[A-Za-z0-9._-]+$") {

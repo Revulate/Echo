@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Download a pinned PresentMon release, verify its SHA-256 and print the path of
+the verified executable.
+#>
 [CmdletBinding()]
 param(
     [ValidateNotNullOrEmpty()]

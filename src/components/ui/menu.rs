@@ -1,3 +1,11 @@
+//! Chrome menus: the shared panel and row look, and their keyboard contract.
+//!
+//! [`MenuNav`] holds the highlighted row, shared between the rows (pointer
+//! hover) and the key handler (arrows, Home/End, Tab). [`MenuKeyboard`] gives
+//! a focused panel that key handling, [`MenuHost`] bundles what a menu owner
+//! passes to the component that renders its panel, and [`menu_panel`],
+//! [`menu_item`], [`menu_divider`] and [`menu_header`] build the visuals.
+
 use crate::components::ui::{FocusNext, FocusPrev, PressToClick};
 use crate::icons::MenuMetrics;
 use crate::theme::colors;

@@ -24,7 +24,7 @@ fn provider_http_client(timeout: Duration, label: &str) -> reqwest::Client {
         .pool_max_idle_per_host(2)
         .build()
         .unwrap_or_else(|error| {
-            tracing::warn!("Failed to create {label} embed HTTP client: {error}");
+            crate::log_net!(warn, "Failed to create {label} embed HTTP client: {error}");
             http::timed_client(timeout)
         })
 }
@@ -38,7 +38,7 @@ async fn read_bounded_json<T: serde::de::DeserializeOwned>(
         .content_length()
         .is_some_and(|length| length > max_bytes as u64)
     {
-        tracing::debug!("{label} response exceeded {} KiB", max_bytes / 1024);
+        crate::log_net!(debug, "{label} response exceeded {} KiB", max_bytes / 1024);
         return Err(());
     }
 
@@ -51,20 +51,20 @@ async fn read_bounded_json<T: serde::de::DeserializeOwned>(
     );
     loop {
         let chunk = response.chunk().await.map_err(|error| {
-            tracing::debug!("Failed reading {label} response: {error}");
+            crate::log_net!(debug, "Failed reading {label} response: {error}");
         })?;
         let Some(chunk) = chunk else {
             break;
         };
         if chunk.len() > max_bytes.saturating_sub(body.len()) {
-            tracing::debug!("{label} response exceeded {} KiB", max_bytes / 1024);
+            crate::log_net!(debug, "{label} response exceeded {} KiB", max_bytes / 1024);
             return Err(());
         }
         body.extend_from_slice(&chunk);
     }
 
     serde_json::from_slice(&body).map_err(|error| {
-        tracing::debug!("Invalid {label} response: {error}");
+        crate::log_net!(debug, "Invalid {label} response: {error}");
     })
 }
 

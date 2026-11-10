@@ -74,7 +74,7 @@ pub enum HighlightType {
 
 /// Reply information for messages that are replies to other messages
 ///
-/// PERF: Uses Arc<str> for zero-cost cloning, matching ChatMessage's string strategy
+/// Uses Arc<str> for zero-cost cloning, matching ChatMessage's string strategy
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct ReplyInfo {
     pub parent_msg_id: Arc<str>,
@@ -161,23 +161,38 @@ pub enum DeletedPresentation {
 /// Flags for message rendering behavior
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct MessageFlags {
-    pub is_action: bool,                       // /me action message
-    pub highlight_type: Option<HighlightType>, // Highlight type for colored bars
-    pub is_system: bool,                       // System message (sub notification, etc.)
-    pub is_usernotice: bool, // Twitch USERNOTICE row (stable ID, but not a reply/delete target)
+    /// `/me` action message.
+    pub is_action: bool,
+    /// Highlight that colors the row's bar and background.
+    pub highlight_type: Option<HighlightType>,
+    /// System message (sub notification, etc.).
+    pub is_system: bool,
+    /// Twitch USERNOTICE row: a stable id, but not a reply or delete target.
+    pub is_usernotice: bool,
+    /// The sender's first message in this channel.
     pub is_first_message: bool,
-    pub system_type: Option<SystemMessageType>, // Type of system message with associated data
-    pub is_shared_chat: bool,                   // Message from shared chat (different source room)
-    pub is_deleted: bool, // Message was removed by Twitch CLEARMSG, a timeout, a ban or a chat clear
+    /// Kind of system message, with its associated data.
+    pub system_type: Option<SystemMessageType>,
+    /// Message from shared chat (a different source room).
+    pub is_shared_chat: bool,
+    /// Removed by Twitch CLEARMSG, a timeout, a ban or a chat clear.
+    pub is_deleted: bool,
     /// Presentation of a deleted row; only read while `is_deleted` is set.
     pub deleted_presentation: DeletedPresentation,
-    pub is_elevated_message: bool, // Twitch paid/elevated chat message
-    pub is_hype_chat: bool,        // Twitch Hype Chat / paid pinned chat message
-    pub is_automod: bool,          // AutoMod held/updated system row
-    pub is_automod_pending: bool, // AutoMod hold awaiting a moderator decision (renders inline Allow/Deny)
-    pub is_suspicious_user: bool, // Suspicious-user system row
-    pub is_restricted: bool,      // Restricted suspicious-user state
-    pub is_monitored: bool,       // Monitored suspicious-user state
+    /// Twitch paid/elevated chat message.
+    pub is_elevated_message: bool,
+    /// Twitch Hype Chat / paid pinned chat message.
+    pub is_hype_chat: bool,
+    /// AutoMod held/updated system row.
+    pub is_automod: bool,
+    /// AutoMod hold awaiting a moderator decision (renders inline Allow/Deny).
+    pub is_automod_pending: bool,
+    /// Suspicious-user system row.
+    pub is_suspicious_user: bool,
+    /// Restricted suspicious-user state.
+    pub is_restricted: bool,
+    /// Monitored suspicious-user state.
+    pub is_monitored: bool,
     /// Similarity detector flagged this message as repeating recent chat.
     /// Such rows are dimmed (shaded toward the background) instead of
     /// highlighted; set only when no stronger highlight applies and the
@@ -192,9 +207,8 @@ pub struct MessageFlags {
 
 /// Complete chat message with all parsed data
 ///
-/// PERF: Uses Arc<str> for string fields to reduce memory allocations
-/// and enable efficient sharing across message clones. SmallVec for badges
-/// avoids heap allocation for the common case of 1-4 badges.
+/// String fields are `Arc<str>` so message clones share them, and badges are
+/// a `SmallVec` so the common case of 1-4 badges needs no heap allocation.
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub id: Arc<str>,
@@ -211,7 +225,8 @@ pub struct ChatMessage {
     pub color: Option<Arc<str>>,
     pub badges: SmallVec<[Arc<str>; 4]>, // "name:version"
     pub timestamp: i64,
-    /// Message slots - immutable structure, emotes resolved at render time
+    /// Immutable message slots. Emotes are resolved when the message is
+    /// parsed; a word whose emote is not loaded stays text until a reparse.
     pub slots: Arc<[MessageSlot]>,
     /// Pre-computed structure hash for cache invalidation
     pub structure_hash: u64,
@@ -225,9 +240,8 @@ pub struct ChatMessage {
     /// Twitch user ID (from user-id IRC tag)
     pub user_id: Option<Arc<str>>,
     /// Offset applied to twitch_emotes_tag positions due to reply mention stripping.
-    /// When retokenizing, subtract this from parsed positions to get correct offsets.
-    /// This fixes a bug where reply messages with Twitch emotes would break after
-    /// retokenization because the raw emote tag has unadjusted positions.
+    /// The raw tag keeps its unadjusted positions, so retokenizing subtracts
+    /// this from parsed positions to land the emotes on the stripped text.
     pub reply_emote_offset: usize,
 }
 

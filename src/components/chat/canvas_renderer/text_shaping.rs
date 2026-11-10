@@ -1,9 +1,23 @@
-//! Text shaping and layout building
+//! Text shaping and layout building.
 //!
 //! Converts message tokens into pre-shaped text lines and layout segments.
 //! Text around emotes is split into separate runs with appropriate styling.
-//! Emoji characters are rendered as images using the selected style (Twitter, Apple, etc).
+//! Emoji characters are rendered as images in the selected emoji style.
 
+mod badges;
+mod builder;
+mod day_divider;
+mod embeds;
+mod emotes;
+mod trace;
+
+pub use self::badges::clear_badge_render_caches;
+use self::badges::{get_cached_badge_info, get_cached_badge_url};
+use self::builder::{LastTokenType, LayoutBuilder};
+use self::day_divider::build_day_divider_layout;
+use self::embeds::{embed_platform_for, preview_source_dimensions, shape_embed_preview_geometry};
+use self::emotes::{EmoteSlotSource, add_emote_render_unit, add_emote_render_unit_with_rules};
+use self::trace::LayoutTraceGuard;
 use gpui::*;
 use smallvec::SmallVec;
 use unicode_linebreak::{BreakOpportunity, linebreaks};
@@ -20,19 +34,29 @@ use crate::theme::colors;
 use echo_chat_render::native_emote_dimensions::logical_native_dimensions;
 use echo_emote_core::EmoteProvider;
 
-use super::bidi::BidiAnalysis;
-use super::font_metrics::{FONT_METRICS, scaled_font_size};
+use super::bounded_map::ClearOnFullMap;
 use super::layout::{
     BadgeTooltipMeta, CanvasMessageLayout, EMBED_ACCENT_WIDTH, EMBED_MIN_HEIGHT, EMBED_PADDING,
     EMBED_TEXT_THUMBNAIL_GAP, EMBED_TITLE_DESC_GAP, EmbedPreviewGeometry, EmoteTooltipMeta,
     HighlightType, HitboxKind, HitboxRegion, ImageType, LayeredEmote, LayeredTooltipEmote,
-    LayoutSegment, MESSAGE_PADDING, MESSAGE_PADDING_LEFT, MESSAGE_PADDING_RIGHT,
+    LayoutSegment, MESSAGE_PADDING_LEFT, MESSAGE_PADDING_RIGHT, MESSAGE_PADDING_VERTICAL,
     REPLY_CONNECTOR_ARM, REPLY_CONNECTOR_GAP, REPLY_CONNECTOR_LEFT, REPLY_PREVIEW_MAX_CHARS,
     ShapedLineData, TIMESTAMP_GAP, TextRunData, badge_gap, badge_margin_right, badge_size,
     calculate_emote_dimensions, emoji_size, emote_size, get_cached_color, get_cached_timestamp,
     hash_gpui_text_runs, is_animated_url, is_svg_image_url, line_height, reply_indicator_height,
     timestamp_width,
 };
+use super::seventv_paint::SevenTvLinePaint;
+use super::trace_span::{TRACE_SLOW_MS, TraceSpan, trace_switches};
+use crate::backend;
+use echo_chat_render::font_metrics::{font_metrics, scaled_font_size};
+use echo_chat_render::line_buffer::LineBuffer;
+use echo_chat_render::text_run_intern;
+use echo_render_core::bidi::BidiAnalysis;
+use std::{cell::Cell, sync::LazyLock};
+
+#[cfg(test)]
+use crate::backend::slots::MessageSlot;
 
 /// Content width a wrapped line must keep to the right of its indent.
 ///
@@ -42,305 +66,23 @@ use super::layout::{
 /// onto its own line. Roughly two average glyphs.
 const MIN_WRAPPED_CONTENT_WIDTH: f32 = 24.0;
 
-/// A row layout must leave enough room for a short, useful run of card text.
-/// Otherwise the thumbnail moves above the text instead of squeezing it into a
-/// column of one-word lines.
-const EMBED_MIN_HORIZONTAL_TEXT_WIDTH: f32 = 120.0;
-const EMBED_TEXT_ONLY_MIN_HEIGHT: f32 = 76.0;
-const EMBED_PLATFORM_LINE_HEIGHT: f32 = 14.0;
-const EMBED_TITLE_LINE_HEIGHT: f32 = 18.0;
-const EMBED_BODY_LINE_HEIGHT: f32 = 16.0;
-const EMBED_TITLE_MAX_LINES: u8 = 2;
-const EMBED_BODY_MAX_LINES: u8 = 3;
-use super::line_buffer::LineBuffer;
-use super::seventv_paint::SevenTvLinePaint;
-use super::text_run_intern;
-
-#[cfg(test)]
-use crate::backend::slots::MessageSlot;
-
-use crate::backend;
-use dashmap::DashMap;
-use std::{cell::Cell, sync::LazyLock, time::Instant};
-
-/// Badge URL cache keyed by (badge_key, channel_id) hash
-/// PERF: Uses u64 hash key to avoid string allocation on every lookup
-/// Memory optimization: Limited to 1000 entries to prevent unbounded growth
-static BADGE_URL_CACHE: LazyLock<DashMap<u64, Option<String>>> =
-    LazyLock::new(|| DashMap::with_capacity(500));
-static BADGE_INFO_CACHE: LazyLock<DashMap<u64, std::sync::Arc<BadgeRenderInfo>>> =
-    LazyLock::new(|| DashMap::with_capacity(500));
-
-struct BadgeRenderInfo {
-    name: SharedString,
-    description: Option<SharedString>,
-    tooltip_meta: std::sync::Arc<BadgeTooltipMeta>,
-    background: Option<Hsla>,
-}
-
-/// Backing color for FFZ custom moderator badges, whose artwork is drawn on
-/// a transparent background.
-const FFZ_MOD_BADGE_BACKGROUND: u32 = 0x34AE0A;
-
-const LAYOUT_TRACE_SLOW_MS: f64 = 8.0;
-
+/// Width an embed card takes when the split has room; a wider thumbnail
+/// widens it further.
+const EMBED_PREFERRED_WIDTH: f32 = 420.0;
+/// Vertical gap after each trailing embed or upload block, and above embeds.
+const TRAILING_BLOCK_GAP: f32 = 8.0;
+/// Vertical gap above an upload preview.
+const UPLOAD_PREVIEW_GAP_ABOVE: f32 = 6.0;
+/// Height of an upload preview; thumbnails with no known size are square.
+const UPLOAD_PREVIEW_HEIGHT: f32 = 56.0;
+/// Upload label width cap, in pixels and as a share of the available width.
+const UPLOAD_LABEL_MAX_WIDTH: f32 = 144.0;
+const UPLOAD_LABEL_MAX_SHARE: f32 = 0.4;
+/// Gap between an upload thumbnail and its label.
+const UPLOAD_LABEL_GAP: f32 = 8.0;
 /// Content opacity applied to messages flagged as similar/repeated: such rows
 /// dim toward the background instead of being highlighted.
 const SIMILAR_MESSAGE_DIM_OPACITY: f32 = 0.55;
-
-/// Fixed height of a derived day-divider row. Independent of chat density and
-/// font scale: the row is a separator, not a message.
-const DAY_DIVIDER_ROW_HEIGHT: f32 = 28.0;
-/// Size of the centered ISO date label.
-const DAY_DIVIDER_LABEL_FONT_SIZE: f32 = 11.0;
-/// Height of the label box; the label is centered inside it.
-const DAY_DIVIDER_LABEL_HEIGHT: f32 = 16.0;
-/// Thickness of the flexible rules flanking the label.
-const DAY_DIVIDER_RULE_HEIGHT: f32 = 1.0;
-/// Gap between the label box and each rule.
-const DAY_DIVIDER_LABEL_GAP: f32 = 8.0;
-/// Horizontal breathing room inside the label box.
-const DAY_DIVIDER_LABEL_PADDING_X: f32 = 4.0;
-/// Shortest rule still worth painting in a very narrow split.
-const DAY_DIVIDER_MIN_RULE_WIDTH: f32 = 2.0;
-/// Fallback advance ratio for the fixed-width ISO digits when a background
-/// layout worker shapes without a window.
-const DAY_DIVIDER_FALLBACK_ADVANCE_RATIO: f32 = 0.62;
-
-static LAYOUT_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("ECHO_LAYOUT_TRACE").is_some()
-        || std::env::var_os("ECHO_LAYOUT_TRACE_VERBOSE").is_some()
-});
-static LAYOUT_TRACE_VERBOSE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("ECHO_LAYOUT_TRACE_VERBOSE").is_some());
-
-thread_local! {
-    static LAYOUT_BUILD_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-struct LayoutTraceGuard {
-    enabled: bool,
-    verbose: bool,
-    depth: usize,
-    started_at: Instant,
-    message_id: String,
-    channel_id: String,
-    finished: bool,
-}
-
-impl LayoutTraceGuard {
-    fn enter(
-        msg: &ChatMessage,
-        channel_id: &str,
-        container_width: f32,
-        show_timestamp: bool,
-        uses_window_text_metrics: bool,
-    ) -> Self {
-        let enabled = *LAYOUT_TRACE_ENABLED;
-        if !enabled {
-            return Self {
-                enabled,
-                verbose: false,
-                depth: 0,
-                started_at: Instant::now(),
-                message_id: String::new(),
-                channel_id: String::new(),
-                finished: true,
-            };
-        }
-
-        let depth = LAYOUT_BUILD_DEPTH.with(|depth| {
-            let next = depth.get() + 1;
-            depth.set(next);
-            next
-        });
-        let verbose = *LAYOUT_TRACE_VERBOSE_ENABLED;
-        let guard = Self {
-            enabled,
-            verbose,
-            depth,
-            started_at: Instant::now(),
-            message_id: msg.id.to_string(),
-            channel_id: channel_id.to_string(),
-            finished: false,
-        };
-
-        if verbose {
-            let content_chars = msg.content.chars().count();
-            crate::log_perf_render!(
-                debug,
-                "layout.build.start depth={} msg={} channel={} slots={} chars={} reply={} width={:.1} timestamp={} window_metrics={}",
-                depth,
-                msg.id,
-                channel_id,
-                msg.slots.len(),
-                content_chars,
-                msg.reply.is_some(),
-                container_width,
-                show_timestamp,
-                uses_window_text_metrics
-            );
-        }
-        if depth > 1 {
-            crate::log_perf_render!(
-                warn,
-                "layout.build.reentrant depth={} msg={} channel={}",
-                depth,
-                msg.id,
-                channel_id
-            );
-        }
-
-        guard
-    }
-
-    fn finish(&mut self, layout: &CanvasMessageLayout) {
-        if !self.enabled || self.finished {
-            return;
-        }
-
-        self.finished = true;
-        let elapsed_ms = self.started_at.elapsed().as_secs_f64() * 1000.0;
-        if self.verbose {
-            crate::log_perf_render!(
-                debug,
-                "layout.build.finish depth={} msg={} channel={} elapsed_ms={:.2} height={:.1} lines={} segments={} shaped_lines={} hitboxes={} animated={}",
-                self.depth,
-                self.message_id,
-                self.channel_id,
-                elapsed_ms,
-                layout.height,
-                layout.line_count,
-                layout.segments.len(),
-                layout.shaped_lines.len(),
-                layout.hitbox_regions.len(),
-                layout.animated_emote_count
-            );
-        } else if elapsed_ms >= LAYOUT_TRACE_SLOW_MS {
-            crate::log_perf_render!(
-                warn,
-                "layout.build.slow depth={} msg={} channel={} elapsed_ms={:.2} height={:.1} lines={} segments={} shaped_lines={} hitboxes={} animated={}",
-                self.depth,
-                self.message_id,
-                self.channel_id,
-                elapsed_ms,
-                layout.height,
-                layout.line_count,
-                layout.segments.len(),
-                layout.shaped_lines.len(),
-                layout.hitbox_regions.len(),
-                layout.animated_emote_count
-            );
-        }
-    }
-}
-
-impl Drop for LayoutTraceGuard {
-    fn drop(&mut self) {
-        if !self.enabled {
-            return;
-        }
-
-        if !self.finished {
-            crate::log_perf_render!(
-                error,
-                "layout.build.unfinished depth={} msg={} channel={} elapsed_ms={:.2}",
-                self.depth,
-                self.message_id,
-                self.channel_id,
-                self.started_at.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        LAYOUT_BUILD_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_sub(1));
-        });
-    }
-}
-
-/// Maximum number of badge URLs to cache (prevents memory leak)
-const BADGE_CACHE_MAX_SIZE: usize = 1000;
-
-/// Compute hash key for badge lookup (avoids string allocation)
-#[inline]
-fn badge_cache_key(badge_key: &str, channel_id: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    badge_key.hash(&mut hasher);
-    channel_id.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Drop resolved badge URLs and names so a changed badge set is picked up.
-pub fn clear_badge_render_caches() {
-    BADGE_URL_CACHE.clear();
-    BADGE_INFO_CACHE.clear();
-}
-
-/// Get cached badge URL (avoids FFI call every frame)
-fn get_cached_badge_url(badge_key: &str, channel_id: &str) -> Option<String> {
-    if backend::has_ffz_authority_badge(badge_key, channel_id) {
-        return backend::get_badge_url(badge_key, channel_id);
-    }
-    let cache_key = badge_cache_key(badge_key, channel_id);
-
-    if let Some(cached) = BADGE_URL_CACHE.get(&cache_key) {
-        return cached.clone();
-    }
-
-    let url = backend::get_badge_url(badge_key, channel_id);
-
-    if BADGE_URL_CACHE.len() >= BADGE_CACHE_MAX_SIZE {
-        let to_evict = BADGE_CACHE_MAX_SIZE / 10;
-        let keys: Vec<u64> = BADGE_URL_CACHE
-            .iter()
-            .take(to_evict)
-            .map(|r| *r.key())
-            .collect();
-        for key in keys {
-            BADGE_URL_CACHE.remove(&key);
-        }
-    }
-
-    if let Some(ref resolved) = url {
-        BADGE_URL_CACHE.insert(cache_key, Some(resolved.clone()));
-    }
-    url
-}
-
-#[inline]
-fn badge_info_cache_key(badge_key: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    badge_key.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn get_cached_badge_info(badge_key: &str, channel_id: &str) -> std::sync::Arc<BadgeRenderInfo> {
-    if backend::has_ffz_authority_badge(badge_key, channel_id) {
-        return std::sync::Arc::new(parse_badge_info(badge_key, channel_id));
-    }
-
-    let cache_key = badge_info_cache_key(badge_key);
-    if let Some(cached) = BADGE_INFO_CACHE.get(&cache_key) {
-        return cached.clone();
-    }
-
-    let info = std::sync::Arc::new(parse_badge_info(badge_key, channel_id));
-    if BADGE_INFO_CACHE.len() >= BADGE_CACHE_MAX_SIZE {
-        let to_evict = BADGE_CACHE_MAX_SIZE / 10;
-        let keys: Vec<u64> = BADGE_INFO_CACHE
-            .iter()
-            .take(to_evict)
-            .map(|entry| *entry.key())
-            .collect();
-        for key in keys {
-            BADGE_INFO_CACHE.remove(&key);
-        }
-    }
-    BADGE_INFO_CACHE.insert(cache_key, info.clone());
-    info
-}
 
 /// Find break opportunities in text using UAX #14 Unicode Line Breaking Algorithm
 /// Returns a vector of byte positions where the text can be broken
@@ -474,18 +216,6 @@ fn contains_url(text: &str) -> bool {
     text.contains("http://") || text.contains("https://")
 }
 
-#[inline]
-fn emote_is_animated(emote: &crate::backend::emotes::Emote, render_url: &str) -> bool {
-    if emote.is_animated || is_animated_url(render_url) {
-        return true;
-    }
-
-    emote.url_4x.as_deref().is_some_and(is_animated_url)
-        || emote.url_2x.as_deref().is_some_and(is_animated_url)
-        || emote.url_1x.as_deref().is_some_and(is_animated_url)
-        || is_animated_url(&emote.url)
-}
-
 /// Use per-character prefix measurement for short runs to keep hit-testing and selection
 /// tightly aligned with painted glyph positions (kerning/ligatures/subpixel).
 const PRECISE_CHAR_POSITION_MAX: usize = 64;
@@ -514,32 +244,20 @@ fn push_wrapped_non_whitespace_run(builder: &mut LayoutBuilder<'_>, run: &str, c
                     continue;
                 }
                 let segment_width = builder.measure_text_width(segment, false);
-                if builder.current_x + segment_width > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
+                builder.wrap_unless_fits(segment_width);
                 builder.add_text_run(segment, color, false, false);
                 start = break_pos;
             }
             if start < run.len() {
                 let remaining = run.get(start..).unwrap_or("");
                 let remaining_width = builder.measure_text_width(remaining, false);
-                if builder.current_x + remaining_width > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
+                builder.wrap_unless_fits(remaining_width);
                 builder.add_text_run(remaining, color, false, false);
             }
         } else {
             for grapheme in run.graphemes(true) {
                 let grapheme_width = builder.measure_text_width(grapheme, false);
-                if builder.current_x + grapheme_width > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
+                builder.wrap_unless_fits(grapheme_width);
                 builder.add_text_run(grapheme, color, false, false);
             }
         }
@@ -660,147 +378,58 @@ fn push_text_segment(builder: &mut LayoutBuilder<'_>, text: &str, color: Hsla) {
     push_wrapped_text_preserving_breaks(builder, display_text, color);
 }
 
-/// Count the clamped lines an embed text field needs at its shaped width. The
-/// painter uses the same count and fixed line height, keeping the element tree
-/// within the exact height reserved by the message layout.
-fn embed_text_line_count(
-    builder: &mut LayoutBuilder<'_>,
-    text: Option<&str>,
-    text_width: f32,
-    is_bold: bool,
-    max_lines: u8,
-) -> u8 {
-    let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
-        return 0;
-    };
-    let measured_width = builder.measure_text_width(text, is_bold);
-    (measured_width / text_width.max(1.0))
-        .ceil()
-        .clamp(1.0, f32::from(max_lines)) as u8
-}
-
-fn preview_source_dimensions(
-    builder: &mut LayoutBuilder<'_>,
-    url: &str,
-    fallback: (f32, f32),
-) -> (f32, f32) {
-    if let Some((width, height)) = super::native_dimensions::decoded_image_size(url) {
-        (width as f32, height as f32)
-    } else {
-        builder.track_pending_native_dimension_url(url);
-        fallback
-    }
-}
-
-/// The thumbnail mode caps height; native aspect ratio determines width.
-fn shape_embed_preview_geometry(
-    builder: &mut LayoutBuilder<'_>,
-    preview_width: f32,
-    metadata: &crate::backend::link_types::EmbedMetadata,
-) -> (EmbedPreviewGeometry, f32) {
-    let inner_width = (preview_width - EMBED_ACCENT_WIDTH - EMBED_PADDING * 2.0).max(0.0);
-    let thumbnail_mode = settings::get_embed_thumbnail_mode();
-    let thumbnail_visible = !crate::backend::streamer_mode::should_hide_link_thumbnails()
-        && crate::backend::embed_thumbnails::should_render_thumbnail(
-            thumbnail_mode,
-            metadata.thumbnail_url.as_deref(),
-        )
-        && inner_width > 0.0;
-    let (thumbnail_width, thumbnail_height) = thumbnail_visible
-        .then(|| crate::backend::embed_thumbnails::thumbnail_dimensions(thumbnail_mode))
-        .flatten()
-        .map(|(configured_width, configured_height)| {
-            let (source_width, source_height) = preview_source_dimensions(
-                builder,
-                metadata.thumbnail_url.as_deref().unwrap_or_default(),
-                (configured_width, configured_height),
-            );
-            crate::backend::embed_thumbnails::fit_thumbnail_to_height(
-                source_width,
-                source_height,
-                inner_width,
-                configured_height,
-            )
-        })
-        .unwrap_or((0.0, 0.0));
-    let thumbnail_stacked = thumbnail_width > 0.0
-        && inner_width - thumbnail_width - EMBED_TEXT_THUMBNAIL_GAP
-            < EMBED_MIN_HORIZONTAL_TEXT_WIDTH;
-    let text_width = if thumbnail_width > 0.0 && !thumbnail_stacked {
-        inner_width - thumbnail_width - EMBED_TEXT_THUMBNAIL_GAP
-    } else {
-        inner_width
-    };
-    let title_lines = embed_text_line_count(
-        builder,
-        metadata.title.as_deref(),
-        text_width,
-        true,
-        EMBED_TITLE_MAX_LINES,
-    );
-    let description_lines = embed_text_line_count(
-        builder,
-        metadata.description.as_deref(),
-        text_width,
-        false,
-        EMBED_BODY_MAX_LINES,
-    );
-    let subtitle_lines = embed_text_line_count(
-        builder,
-        metadata.subtitle.as_deref(),
-        text_width,
-        false,
-        EMBED_BODY_MAX_LINES,
-    );
-
-    let mut text_height = EMBED_PLATFORM_LINE_HEIGHT;
-    let mut text_field_count = 1;
-    for (lines, line_height) in [
-        (title_lines, EMBED_TITLE_LINE_HEIGHT),
-        (description_lines, EMBED_BODY_LINE_HEIGHT),
-        (subtitle_lines, EMBED_BODY_LINE_HEIGHT),
-    ] {
-        if lines > 0 {
-            text_height += f32::from(lines) * line_height;
-            text_field_count += 1;
-        }
-    }
-    text_height += (text_field_count - 1) as f32 * EMBED_TITLE_DESC_GAP;
-
-    let content_height = if thumbnail_width > 0.0 {
-        if thumbnail_stacked {
-            thumbnail_height + EMBED_TEXT_THUMBNAIL_GAP + text_height
-        } else {
-            thumbnail_height.max(text_height)
-        }
-    } else {
-        text_height
-    };
-    let minimum_height = if thumbnail_width > 0.0 {
-        EMBED_MIN_HEIGHT
-    } else {
-        EMBED_TEXT_ONLY_MIN_HEIGHT
-    };
-    let height = (content_height + EMBED_PADDING * 2.0).max(minimum_height);
-
-    (
-        EmbedPreviewGeometry {
-            thumbnail_width,
-            thumbnail_height,
-            thumbnail_stacked,
-            thumbnail_gap: EMBED_TEXT_THUMBNAIL_GAP,
-            title_lines,
-            description_lines,
-            subtitle_lines,
-        },
-        height,
-    )
-}
-
 /// Build a complete layout for a message
 ///
 /// When `window` is provided, uses accurate GPUI text measurement (pixel-perfect).
 /// When `window` is None, uses cached character widths with 4px buffer for variance.
+/// Text shown instead of a collapsed ASCII-art message.
+const ASCII_ART_PLACEHOLDER: &str = "[ASCII Art]";
+/// Width of the placeholder's text segment.
+const ASCII_ART_PLACEHOLDER_WIDTH: f32 = 80.0;
+
+/// A one-line muted "[ASCII Art]" row in place of a collapsed ASCII-art message.
+fn build_ascii_art_placeholder_layout(layout: &mut CanvasMessageLayout) {
+    let lh = line_height();
+    layout.height = lh + MESSAGE_PADDING_VERTICAL * 2.0;
+    let placeholder = ASCII_ART_PLACEHOLDER;
+    let run = TextRunData::new(placeholder.len(), colors::text_muted());
+    let gpui_run = TextRun {
+        len: placeholder.len(),
+        font: Font {
+            family: text_run_intern::system_font_family(),
+            features: FontFeatures::default(),
+            fallbacks: None,
+            weight: run.font_weight,
+            style: FontStyle::Normal,
+        },
+        color: run.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    layout.shaped_lines.push(ShapedLineData {
+        text: placeholder.into(),
+        gpui_runs: SmallVec::from_elem(gpui_run.clone(), 1),
+        gpui_runs_hash: hash_gpui_text_runs(std::slice::from_ref(&gpui_run)),
+        char_positions: SmallVec::new(),
+        visual_char_positions: Vec::new(),
+        visual_to_logical: Vec::new(),
+        source_start_char: 0,
+        source_len_chars: placeholder.chars().count(),
+        seventv_paint: None,
+    });
+    layout.segments.push(LayoutSegment::Text {
+        line_idx: 0,
+        x: MESSAGE_PADDING_LEFT,
+        y: MESSAGE_PADDING_VERTICAL,
+        width: ASCII_ART_PLACEHOLDER_WIDTH,
+        height: lh,
+    });
+    layout.source_text = placeholder.to_string();
+    layout.line_count = 1;
+    layout.rebuild_paint_commands();
+}
+
 pub fn build_message_layout(
     msg: &ChatMessage,
     channel_id: &str,
@@ -832,45 +461,7 @@ pub fn build_message_layout(
     let collapse_ascii = ascii_art.is_collapsible() && settings::get_collapse_ascii_art();
 
     if collapse_ascii {
-        let lh = line_height();
-        layout.height = lh + MESSAGE_PADDING * 2.0;
-        let placeholder = "[ASCII Art]";
-        let run = TextRunData::new(placeholder.len(), colors::text_muted());
-        let gpui_run = TextRun {
-            len: placeholder.len(),
-            font: Font {
-                family: text_run_intern::system_font_family(),
-                features: FontFeatures::default(),
-                fallbacks: None,
-                weight: run.font_weight,
-                style: FontStyle::Normal,
-            },
-            color: run.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        layout.shaped_lines.push(ShapedLineData {
-            text: placeholder.into(),
-            gpui_runs: SmallVec::from_elem(gpui_run.clone(), 1),
-            gpui_runs_hash: hash_gpui_text_runs(std::slice::from_ref(&gpui_run)),
-            char_positions: SmallVec::new(),
-            visual_char_positions: Vec::new(),
-            visual_to_logical: Vec::new(),
-            source_start_char: 0,
-            source_len_chars: placeholder.chars().count(),
-            seventv_paint: None,
-        });
-        layout.segments.push(LayoutSegment::Text {
-            line_idx: 0,
-            x: MESSAGE_PADDING_LEFT,
-            y: MESSAGE_PADDING,
-            width: 80.0,
-            height: lh,
-        });
-        layout.source_text = placeholder.to_string();
-        layout.line_count = 1;
-        layout.rebuild_paint_commands();
+        build_ascii_art_placeholder_layout(&mut layout);
         trace_guard.finish(&layout);
         return layout;
     }
@@ -983,37 +574,13 @@ pub fn build_message_layout(
 
             if let Some(url) = get_cached_badge_url(badge_key, &msg.channel) {
                 let info = get_cached_badge_info(badge_key, &msg.channel);
-                let bs = badge_size();
-                let bg = badge_gap();
                 has_visible_badges = true;
-                if builder.current_x + bs > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
-                builder.add_image(
-                    &url,
-                    bs,
-                    bs,
-                    false,
-                    ImageType::Badge {
-                        name: info.name.clone(),
-                        description: info.description.clone(),
-                        tooltip_meta: Some(info.tooltip_meta.clone()),
-                        background: info.background,
-                    },
-                    None,
-                );
-                builder.advance(bs + bg);
+                builder.place_badge(&url, false, info.image_type());
             } else if echo_chat_render::ports::badge_set_pending(&msg.channel) {
                 let bs = badge_size();
                 has_visible_badges = true;
                 builder.reserved_badge_channel = Some(std::sync::Arc::clone(&msg.channel));
-                if builder.current_x + bs > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
+                builder.wrap_unless_fits(bs);
                 builder.advance(bs + badge_gap());
             }
         }
@@ -1034,28 +601,8 @@ pub fn build_message_layout(
 
             if let Some(url) = get_cached_badge_url(&badge_key, &msg.channel) {
                 let info = get_cached_badge_info(&badge_key, &msg.channel);
-                let bs = badge_size();
-                let bg = badge_gap();
                 has_visible_badges = true;
-                if builder.current_x + bs > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
-                builder.add_image(
-                    &url,
-                    bs,
-                    bs,
-                    false,
-                    ImageType::Badge {
-                        name: info.name.clone(),
-                        description: info.description.clone(),
-                        tooltip_meta: Some(info.tooltip_meta.clone()),
-                        background: info.background,
-                    },
-                    None,
-                );
-                builder.advance(bs + bg);
+                builder.place_badge(&url, false, info.image_type());
             }
         }
 
@@ -1064,18 +611,9 @@ pub fn build_message_layout(
                 .as_ref()
                 .and_then(|cosmetics| cosmetics.badge.as_ref())
                 .map(|badge| {
-                    let bs = badge_size();
-                    let bg = badge_gap();
                     let description = badge.tooltip.trim();
-                    if builder.current_x + bs > builder.right_boundary
-                        && builder.current_x > MESSAGE_PADDING_LEFT
-                    {
-                        builder.wrap_line();
-                    }
-                    builder.add_image(
+                    builder.place_badge(
                         &badge.url,
-                        bs,
-                        bs,
                         badge.is_animated,
                         ImageType::Badge {
                             name: badge.name.clone().into(),
@@ -1089,9 +627,7 @@ pub fn build_message_layout(
                             })),
                             background: None,
                         },
-                        None,
                     );
-                    builder.advance(bs + bg);
                     true
                 })
                 .unwrap_or(false)
@@ -1123,11 +659,7 @@ pub fn build_message_layout(
             .unwrap_or_else(|| base_display_name.to_string());
 
         let username_width = builder.measure_text_width(&display_name, true);
-        if builder.current_x + username_width > builder.right_boundary
-            && builder.current_x > MESSAGE_PADDING_LEFT
-        {
-            builder.wrap_line();
-        }
+        builder.wrap_unless_fits(username_width);
 
         let username_start_x = builder.current_x;
 
@@ -1277,11 +809,7 @@ pub fn build_message_layout(
                             let size = emoji_size();
                             advance_before_emote_like(&mut builder, remove_emote_spacing, size);
 
-                            if builder.current_x + size > builder.right_boundary
-                                && builder.current_x > MESSAGE_PADDING_LEFT
-                            {
-                                builder.wrap_line();
-                            }
+                            builder.wrap_unless_fits(size);
 
                             let source_range = builder.append_source_text_at_current_x(&emoji_char);
 
@@ -1409,11 +937,7 @@ pub fn build_message_layout(
                     let display = "[link hidden]";
                     let url_width = builder.measure_text_width(display, false);
 
-                    if builder.current_x + url_width > builder.right_boundary
-                        && builder.current_x > MESSAGE_PADDING_LEFT
-                    {
-                        builder.wrap_line();
-                    }
+                    builder.wrap_unless_fits(url_width);
 
                     builder.add_text_run(display, colors::text_muted(), false, false);
                     builder.flush_text_segment();
@@ -1426,11 +950,7 @@ pub fn build_message_layout(
                     let display = SharedString::from(url.clone());
                     let url_width = builder.measure_text_width(&display, false);
 
-                    if builder.current_x + url_width > builder.right_boundary
-                        && builder.current_x > MESSAGE_PADDING_LEFT
-                    {
-                        builder.wrap_line();
-                    }
+                    builder.wrap_unless_fits(url_width);
 
                     let link_color = if crate::utils::is_url_opened(url) {
                         colors::opened_link()
@@ -1465,11 +985,7 @@ pub fn build_message_layout(
                 };
                 let mention_width = builder.measure_text_width(&mention_text, true);
 
-                if builder.current_x + mention_width > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
+                builder.wrap_unless_fits(mention_width);
 
                 let mention_start_x = builder.current_x;
                 let mention_y = builder.current_y;
@@ -1523,11 +1039,7 @@ pub fn build_message_layout(
                 let emoji_width = emoji_size;
                 advance_before_emote_like(&mut builder, remove_emote_spacing, emoji_size);
 
-                if builder.current_x + emoji_width > builder.right_boundary
-                    && builder.current_x > MESSAGE_PADDING_LEFT
-                {
-                    builder.wrap_line();
-                }
+                builder.wrap_unless_fits(emoji_width);
 
                 let source_range = builder.append_source_text_at_current_x(emoji);
 
@@ -1555,11 +1067,7 @@ pub fn build_message_layout(
     if msg.flags.is_automod && msg.flags.is_automod_pending {
         builder.flush_text_segment();
         let actions_width = builder.measure_text_width("  Allow    Deny", true);
-        if builder.current_x + actions_width > builder.right_boundary
-            && builder.current_x > MESSAGE_PADDING_LEFT
-        {
-            builder.wrap_line();
-        }
+        builder.wrap_unless_fits(actions_width);
         builder.add_text_run("  ", colors::text_muted(), false, false);
         builder.flush_text_segment();
         builder.add_text_run("Allow", colors::success(), true, true);
@@ -1575,39 +1083,16 @@ pub fn build_message_layout(
     if !deferred_embeds.is_empty() {
         use super::layout::{EmbedPlatform, LayoutSegment};
         use crate::backend::bridge::is_embed_expanded_state;
-        use crate::backend::link_types::{LinkType, MediaKind};
+        use crate::backend::link_types::MediaKind;
 
-        builder.flush_text_segment();
-        builder.flush_layered_emote();
-        if !builder.line_buffer.is_empty() {
-            builder.commit_line();
-            builder.current_line += 1;
-            builder.line_y_positions.push(builder.current_y);
-            builder.current_x = builder.content_start_x;
-            builder.text_segment_start_x = builder.content_start_x;
-            builder.last_emote_buffer_idx = None;
-            builder.line_offsets.push(builder.source_offset);
-        }
+        builder.break_to_block();
 
         for (url, embed_id, metadata) in deferred_embeds {
-            builder.current_y += 8.0;
+            builder.current_y += TRAILING_BLOCK_GAP;
 
             let platform = match metadata.media.as_ref().map(|media| media.kind) {
                 Some(MediaKind::Video) => EmbedPlatform::Video,
-                Some(MediaKind::Image) | None => match metadata.link_info.link_type {
-                    LinkType::SevenTvEmote | LinkType::SevenTvUser => EmbedPlatform::SevenTv,
-                    LinkType::Spotify => EmbedPlatform::Spotify,
-                    LinkType::Steam => EmbedPlatform::Steam,
-                    LinkType::YouTube => EmbedPlatform::YouTube,
-                    LinkType::TwitchClip => EmbedPlatform::TwitchClip,
-                    LinkType::TwitchVod => EmbedPlatform::TwitchVod,
-                    LinkType::TwitchChannel => EmbedPlatform::TwitchChannel,
-                    LinkType::Twitter => EmbedPlatform::Twitter,
-                    LinkType::Reddit => EmbedPlatform::Reddit,
-                    LinkType::Image => EmbedPlatform::Image,
-                    LinkType::Video => EmbedPlatform::Video,
-                    LinkType::Generic => EmbedPlatform::Generic,
-                },
+                Some(MediaKind::Image) | None => embed_platform_for(&metadata.link_info.link_type),
             };
 
             let available_width = (builder.right_boundary - MESSAGE_PADDING_LEFT).max(0.0);
@@ -1628,8 +1113,9 @@ pub fn build_message_layout(
             } else {
                 0.0
             };
-            let preview_width = available_width
-                .min(420.0_f32.max(image_width + EMBED_ACCENT_WIDTH + EMBED_PADDING * 2.0));
+            let preview_width = available_width.min(
+                EMBED_PREFERRED_WIDTH.max(image_width + EMBED_ACCENT_WIDTH + EMBED_PADDING * 2.0),
+            );
             let (geometry, preview_height) =
                 shape_embed_preview_geometry(&mut builder, preview_width, &metadata);
 
@@ -1686,41 +1172,31 @@ pub fn build_message_layout(
                 });
             }
 
-            builder.current_y += preview_height + 8.0;
+            builder.current_y += preview_height + TRAILING_BLOCK_GAP;
             builder.current_x = builder.content_start_x;
             builder.last_token_type = LastTokenType::None;
         }
     }
 
     if let Some((url, thumbnail_url)) = upload_preview {
-        builder.flush_text_segment();
-        builder.flush_layered_emote();
-        if !builder.line_buffer.is_empty() {
-            builder.commit_line();
-            builder.current_line += 1;
-            builder.line_y_positions.push(builder.current_y);
-            builder.current_x = builder.content_start_x;
-            builder.text_segment_start_x = builder.content_start_x;
-            builder.last_emote_buffer_idx = None;
-            builder.line_offsets.push(builder.source_offset);
-        }
+        builder.break_to_block();
 
-        const UPLOAD_PREVIEW_HEIGHT: f32 = 56.0;
-        builder.current_y += 6.0;
+        const SQUARE: (f32, f32) = (UPLOAD_PREVIEW_HEIGHT, UPLOAD_PREVIEW_HEIGHT);
+        builder.current_y += UPLOAD_PREVIEW_GAP_ABOVE;
         let available_width = (builder.right_boundary - MESSAGE_PADDING_LEFT).max(0.0);
-        let label_width = 144.0_f32.min(available_width * 0.4);
-        let max_thumbnail_width = (available_width - label_width - 8.0).max(0.0);
+        let label_width = UPLOAD_LABEL_MAX_WIDTH.min(available_width * UPLOAD_LABEL_MAX_SHARE);
+        let max_thumbnail_width = (available_width - label_width - UPLOAD_LABEL_GAP).max(0.0);
         let (source_width, source_height) = thumbnail_url
             .as_ref()
-            .map(|url| preview_source_dimensions(&mut builder, url.as_ref(), (56.0, 56.0)))
-            .unwrap_or((56.0, 56.0));
+            .map(|url| preview_source_dimensions(&mut builder, url.as_ref(), SQUARE))
+            .unwrap_or(SQUARE);
         let (thumbnail_width, _) = crate::backend::embed_thumbnails::fit_thumbnail_to_height(
             source_width,
             source_height,
             max_thumbnail_width,
             UPLOAD_PREVIEW_HEIGHT,
         );
-        let preview_width = (thumbnail_width + 8.0 + label_width).min(available_width);
+        let preview_width = (thumbnail_width + UPLOAD_LABEL_GAP + label_width).min(available_width);
         builder.segments.push(LayoutSegment::UploadPreview {
             url,
             thumbnail_url,
@@ -1730,7 +1206,7 @@ pub fn build_message_layout(
             width: preview_width,
             height: UPLOAD_PREVIEW_HEIGHT,
         });
-        builder.current_y += UPLOAD_PREVIEW_HEIGHT + 8.0;
+        builder.current_y += UPLOAD_PREVIEW_HEIGHT + TRAILING_BLOCK_GAP;
         builder.current_x = builder.content_start_x;
         builder.last_token_type = LastTokenType::None;
     }
@@ -1774,124 +1250,6 @@ pub fn build_message_layout(
 
     trace_guard.finish(&layout);
     layout
-}
-
-/// Build the layout of a derived day-divider row: a centered ISO `YYYY-MM-DD`
-/// label flanked by flexible 1px rules, in a fixed 28px row.
-///
-/// The row deliberately has no timestamp column, badges, username, reply
-/// affordance, highlight, moderation hitbox, or message-background hitbox, so it
-/// cannot be selected, replied to, moderated, or copied.
-fn build_day_divider_layout(
-    layout: &mut CanvasMessageLayout,
-    date_iso: &str,
-    container_width: f32,
-    window: Option<&mut Window>,
-) {
-    layout.height = DAY_DIVIDER_ROW_HEIGHT;
-    layout.line_count = 1;
-    layout.line_y_positions.push(0.0);
-
-    let label_text = SharedString::from(date_iso);
-    let text_width = measure_day_divider_label(&label_text, window);
-
-    let left_edge = MESSAGE_PADDING_LEFT;
-    let right_edge = (container_width - MESSAGE_PADDING_RIGHT).max(left_edge);
-    let available = right_edge - left_edge;
-    let label_width = (text_width + DAY_DIVIDER_LABEL_PADDING_X * 2.0).min(available);
-    let label_x = left_edge + ((available - label_width) * 0.5).max(0.0);
-    let label_y = ((DAY_DIVIDER_ROW_HEIGHT - DAY_DIVIDER_LABEL_HEIGHT) * 0.5).floor();
-    let rule_y = ((DAY_DIVIDER_ROW_HEIGHT - DAY_DIVIDER_RULE_HEIGHT) * 0.5).floor();
-    let rule_color = colors::border_subtle();
-
-    let left_rule_width = label_x - DAY_DIVIDER_LABEL_GAP - left_edge;
-    if left_rule_width >= DAY_DIVIDER_MIN_RULE_WIDTH {
-        layout.segments.push(day_divider_rule(
-            left_edge,
-            rule_y,
-            left_rule_width,
-            rule_color,
-        ));
-    }
-
-    let right_rule_x = label_x + label_width + DAY_DIVIDER_LABEL_GAP;
-    let right_rule_width = right_edge - right_rule_x;
-    if right_rule_width >= DAY_DIVIDER_MIN_RULE_WIDTH {
-        layout.segments.push(day_divider_rule(
-            right_rule_x,
-            rule_y,
-            right_rule_width,
-            rule_color,
-        ));
-    }
-
-    layout.segments.push(LayoutSegment::InlineBox {
-        text: label_text,
-        x: label_x,
-        y: label_y,
-        width: label_width,
-        height: DAY_DIVIDER_LABEL_HEIGHT,
-        bg_color: transparent_black(),
-        text_color: colors::text_muted(),
-        font_size: DAY_DIVIDER_LABEL_FONT_SIZE,
-    });
-
-    layout.has_element_segments = true;
-    layout.rebuild_paint_commands();
-}
-
-/// One flexible rule of a day-divider row.
-///
-/// `InlineBox` is the only layout primitive that paints a solid colored rect at
-/// an explicit size, so it doubles as the rule; the empty label keeps it a plain
-/// fill.
-fn day_divider_rule(x: f32, y: f32, width: f32, color: Hsla) -> LayoutSegment {
-    LayoutSegment::InlineBox {
-        text: SharedString::from(""),
-        x,
-        y,
-        width,
-        height: DAY_DIVIDER_RULE_HEIGHT,
-        bg_color: color,
-        text_color: color,
-        font_size: DAY_DIVIDER_LABEL_FONT_SIZE,
-    }
-}
-
-/// Measure the divider label at its own 11px size (the message font size and
-/// timestamp pattern do not apply to derived rows).
-fn measure_day_divider_label(text: &SharedString, window: Option<&mut Window>) -> f32 {
-    let Some(window) = window else {
-        return text.chars().count() as f32
-            * DAY_DIVIDER_LABEL_FONT_SIZE
-            * DAY_DIVIDER_FALLBACK_ADVANCE_RATIO;
-    };
-
-    let run = TextRun {
-        len: text.len(),
-        font: Font {
-            family: text_run_intern::system_font_family(),
-            features: FontFeatures::default(),
-            fallbacks: None,
-            weight: FontWeight::SEMIBOLD,
-            style: FontStyle::Normal,
-        },
-        color: colors::text_muted(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-
-    window
-        .text_system()
-        .shape_line(
-            text.clone(),
-            px(DAY_DIVIDER_LABEL_FONT_SIZE),
-            std::slice::from_ref(&run),
-            None,
-        )
-        .width()
-        .as_f32()
 }
 
 /// Build reply indicator segments (L-shaped connector + @user + preview)
@@ -1938,7 +1296,7 @@ fn build_reply_indicator(
 
     layout.segments.push(LayoutSegment::ReplyIndicator {
         connector_x,
-        connector_y: MESSAGE_PADDING,
+        connector_y: MESSAGE_PADDING_VERTICAL,
         connector_height: reply_indicator_height() - 4.0,
         parent_display_name: parent_display_name.clone(),
         parent_color,
@@ -1949,7 +1307,7 @@ fn build_reply_indicator(
 
     layout.hitbox_regions.push(HitboxRegion {
         bounds: Bounds::new(
-            point(px(MESSAGE_PADDING_LEFT), px(MESSAGE_PADDING)),
+            point(px(MESSAGE_PADDING_LEFT), px(MESSAGE_PADDING_VERTICAL)),
             size(
                 px(container_width - MESSAGE_PADDING_LEFT - MESSAGE_PADDING_RIGHT),
                 px(reply_indicator_height()),
@@ -2067,510 +1425,6 @@ fn uses_bold_metrics(font_weight: Option<FontWeight>) -> bool {
     matches!(font_weight, Some(FontWeight::SEMIBOLD | FontWeight::BOLD))
 }
 
-/// Parse badge key to extract name and description
-fn parse_badge_info(badge_key: &str, channel_login: &str) -> BadgeRenderInfo {
-    let (badge_type_key, version_raw) = badge_key
-        .split_once('/')
-        .or_else(|| badge_key.split_once(':'))
-        .map(|(name, version)| (name, Some(version.to_string())))
-        .unwrap_or((badge_key, None));
-    let external_provider = settings::external_badge_provider_for_key(badge_key);
-    let external_name_is_in_version = matches!(
-        external_provider,
-        Some(
-            settings::ExternalBadgeProvider::Ffz
-                | settings::ExternalBadgeProvider::FfzBot
-                | settings::ExternalBadgeProvider::Bttv
-                | settings::ExternalBadgeProvider::BttvPro
-        )
-    );
-    let display_type_key = if external_name_is_in_version {
-        version_raw.as_deref().unwrap_or(badge_type_key)
-    } else {
-        badge_type_key
-    };
-    let name = humanize_badge_name(display_type_key);
-
-    let (description, tier_label) = match (badge_type_key, version_raw.as_deref()) {
-        ("subscriber", Some(version)) => {
-            let parsed = version.parse::<u32>().ok();
-            let tier = parsed.and_then(twitch_subscriber_tier_from_badge_version);
-            let desc = match parsed {
-                Some(v @ 1000) | Some(v @ 2000) | Some(v @ 3000) => {
-                    Some(format!("Subscriber badge ({})", v))
-                }
-                Some(months) => Some(format!("{} month subscriber", months)),
-                None => None,
-            };
-            (desc, tier)
-        }
-        ("founder", Some(version)) => {
-            let parsed = version.parse::<u32>().ok();
-            let tier = parsed.and_then(twitch_subscriber_tier_from_badge_version);
-            let desc = parsed.map(|v| format!("Founder badge ({})", v));
-            (desc, tier)
-        }
-        ("bits", Some(bits)) => (
-            bits.parse::<u32>().ok().map(|b| format!("{} bits", b)),
-            None,
-        ),
-        ("sub-gifter", Some(gifts)) => (
-            gifts.parse::<u32>().ok().map(|g| format!("{} gifts", g)),
-            None,
-        ),
-        ("follower", Some(version)) => (Some(format!("Follower badge ({})", version)), None),
-        ("bttv-pro", Some("subscriber")) | ("betterttv-pro", Some("subscriber")) => {
-            (Some("BetterTTV Pro Subscriber".to_string()), None)
-        }
-        _ => (None, None),
-    };
-
-    let is_ffz_authority_badge = backend::is_using_ffz_authority_badge(badge_key, channel_login);
-    let source_label = if is_ffz_authority_badge {
-        "FFZ Channel Badge"
-    } else {
-        external_provider
-            .map(|provider| provider.source_label())
-            .unwrap_or("Twitch Badge")
-    };
-
-    let tooltip_meta = BadgeTooltipMeta {
-        source_label: source_label.into(),
-        type_label: humanize_badge_name(display_type_key).into(),
-        tier_label,
-        is_animated: false,
-    };
-
-    BadgeRenderInfo {
-        name: name.into(),
-        description: description.map(Into::into),
-        tooltip_meta: std::sync::Arc::new(tooltip_meta),
-        background: (is_ffz_authority_badge
-            && crate::backend::badges::is_moderator_badge_key(badge_key))
-        .then(|| rgb(FFZ_MOD_BADGE_BACKGROUND).into()),
-    }
-}
-
-fn twitch_subscriber_tier_from_badge_version(version: u32) -> Option<SharedString> {
-    match version {
-        1000 => Some("Tier 1".into()),
-        2000 => Some("Tier 2".into()),
-        3000 => Some("Tier 3".into()),
-        _ => None,
-    }
-}
-
-fn build_emote_tooltip_meta(
-    emote: &crate::backend::emotes::Emote,
-    still_image: bool,
-) -> EmoteTooltipMeta {
-    use crate::backend::emotes::{EmoteProvider, get_twitch_emote_by_id_any_cached};
-
-    let canonical_twitch = if emote.provider == EmoteProvider::Twitch
-        && (emote.twitch_owner_login.is_none() || emote.twitch_emote_type.is_none())
-    {
-        get_twitch_emote_by_id_any_cached(emote.id.as_ref())
-    } else {
-        None
-    };
-    let emote = canonical_twitch.as_deref().unwrap_or(emote);
-
-    let provider_label: SharedString = match emote.provider {
-        EmoteProvider::SevenTV => "7TV",
-        EmoteProvider::BTTV => "BTTV",
-        EmoteProvider::FFZ => "FFZ",
-        EmoteProvider::Twitch => "Twitch",
-        EmoteProvider::Emoji => "Emoji",
-    }
-    .into();
-
-    let (source_label, owner_channel): (SharedString, Option<SharedString>) = match emote.provider {
-        EmoteProvider::SevenTV => match emote.channel.as_deref() {
-            Some("personal:7tv") => ("7TV Personal".into(), None),
-            Some(channel) if !channel.is_empty() => (
-                "7TV Channel".into(),
-                emote.channel.clone().map(SharedString::from),
-            ),
-            _ => ("7TV Global".into(), None),
-        },
-        EmoteProvider::BTTV => match emote.channel.as_deref() {
-            Some(channel) if !channel.is_empty() => (
-                "BTTV Channel/Shared".into(),
-                emote.channel.clone().map(SharedString::from),
-            ),
-            _ => ("BTTV Global".into(), None),
-        },
-        EmoteProvider::FFZ => match emote.channel.as_deref() {
-            Some(channel) if !channel.is_empty() => (
-                "FFZ Channel".into(),
-                emote.channel.clone().map(SharedString::from),
-            ),
-            _ => ("FFZ Global".into(), None),
-        },
-        EmoteProvider::Twitch => {
-            if let Some(emote_type) = emote.twitch_emote_type.as_deref() {
-                let owner_from_fields = emote
-                    .twitch_owner_login
-                    .as_ref()
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-                    .map(SharedString::from);
-                match emote_type {
-                    "subscriptions" => ("Twitch Subscriber Emote".into(), owner_from_fields),
-                    "follower" => ("Twitch Follower Emote".into(), owner_from_fields),
-                    "bitstier" | "bits" => ("Twitch Bits Emote".into(), owner_from_fields),
-                    "prime" => ("Twitch Prime Emote".into(), None),
-                    "limitedtime" | "limited" => ("Twitch Limited Emote".into(), None),
-                    "hypetrain" => ("Twitch Hype Train Emote".into(), None),
-                    "rewards" => ("Twitch Rewards Emote".into(), None),
-                    "turbo" => ("Twitch Turbo Emote".into(), None),
-                    "globals" | "smilies" | "twofactor" => ("Twitch Global Emote".into(), None),
-                    other => {
-                        let pretty = humanize_compound_label(other);
-                        (
-                            SharedString::from(format!("Twitch {} Emote", pretty)),
-                            owner_from_fields,
-                        )
-                    }
-                }
-            } else {
-                match emote.channel.as_deref() {
-                    Some(channel) if channel.starts_with("twitch:") => {
-                        let category = channel.trim_start_matches("twitch:");
-                        let pretty = match category {
-                            "subscriptions" => "Subscriber".into(),
-                            "follower" => "Follower".into(),
-                            "bits" => "Bits".into(),
-                            "channel_points" => "Channel Points".into(),
-                            "prime" => "Prime".into(),
-                            "turbo" => "Turbo".into(),
-                            "rewards" => "Rewards".into(),
-                            other => humanize_compound_label(other),
-                        };
-                        (SharedString::from(format!("Twitch {} Emote", pretty)), None)
-                    }
-                    Some(channel) if channel.starts_with("sub:") => {
-                        let owner = channel.trim_start_matches("sub:");
-                        let owner = if owner.is_empty() {
-                            None
-                        } else {
-                            Some(owner.into())
-                        };
-                        ("Twitch Subscriber Emote".into(), owner)
-                    }
-                    Some(channel) if !channel.is_empty() => (
-                        SharedString::from(format!(
-                            "Twitch Emote • {}",
-                            humanize_channel_display(channel)
-                        )),
-                        emote.channel.clone().map(SharedString::from),
-                    ),
-                    _ => ("Twitch Emote".into(), None),
-                }
-            }
-        }
-        EmoteProvider::Emoji => ("Emoji".into(), None),
-    };
-
-    let creator_name = emote.creator_name.clone().map(SharedString::from);
-    let original_name = emote.original_name.clone().map(SharedString::from);
-    let tooltip_preview_url = emote
-        .url_4x
-        .clone()
-        .or_else(|| emote.url_2x.clone())
-        .or_else(|| emote.url_1x.clone())
-        .map(SharedString::from)
-        .or_else(|| Some(SharedString::from(emote.url.clone())));
-
-    EmoteTooltipMeta {
-        provider_label,
-        source_label,
-        owner_channel,
-        creator_name,
-        original_name,
-        tooltip_preview_url,
-        native_width: emote.width,
-        native_height: emote.height,
-        is_animated: emote_is_animated(emote, &emote.url),
-        is_zero_width: emote.zero_width,
-        emote_id: SharedString::from(emote.id.clone()),
-        provider_key: echo_core::emote_display_rules::provider_key(emote.provider),
-        still_image,
-    }
-}
-
-/// Lay out one base emote with its zero-width overlays.
-///
-/// `still[i]` forces the static first frame for the base (`i == 0`) or overlay
-/// `i - 1`; missing entries animate as usual.
-fn add_emote_render_unit(
-    builder: &mut LayoutBuilder<'_>,
-    base: &crate::backend::emotes::Emote,
-    overlays: &[std::sync::Arc<crate::backend::emotes::Emote>],
-    still: &[bool],
-    remove_emote_spacing: bool,
-) {
-    let render_url = chat_display_url_shared_for_scale(base, super::layout_scale::current());
-
-    let base_still = still.first().copied().unwrap_or(false);
-    let is_animated = !base_still && emote_is_animated(base, &render_url);
-    if crate::log::emote_trace_enabled() {
-        crate::log_emotes!(
-            debug,
-            "[LAYOUT] Emote '{}': is_animated={} (flag={}, url_heuristic={}), provider={:?}, url={}, overlays={}",
-            base.name,
-            is_animated,
-            base.is_animated,
-            is_animated_url(&render_url),
-            base.provider,
-            render_url,
-            overlays.len()
-        );
-    }
-
-    let had_text = builder.flush_text_segment();
-
-    builder.flush_layered_emote();
-
-    if had_text {
-        builder.last_token_type = LastTokenType::Text;
-    }
-
-    let ((base_width, base_height), base_dimensions_pending) =
-        emote_dimensions_from_decoded_media(base, &render_url);
-    if base_dimensions_pending {
-        builder.track_pending_native_dimension_url(&render_url);
-    }
-    advance_before_emote_like(builder, remove_emote_spacing, base_height);
-
-    let base_tooltip_meta = std::sync::Arc::new(build_emote_tooltip_meta(base, base_still));
-
-    let mut layered_emote = LayeredEmote::new(
-        SharedString::from(render_url),
-        SharedString::from(base.name.clone()),
-        base_width,
-        base_height,
-        is_animated,
-        Some(std::sync::Arc::clone(&base_tooltip_meta)),
-    );
-
-    for (overlay_index, overlay) in overlays.iter().enumerate() {
-        let overlay_url =
-            chat_display_url_shared_for_scale(overlay, super::layout_scale::current());
-        let overlay_still = still.get(overlay_index + 1).copied().unwrap_or(false);
-        let overlay_is_animated = !overlay_still && emote_is_animated(overlay, &overlay_url);
-        let ((overlay_width, overlay_height), overlay_dimensions_pending) =
-            emote_dimensions_from_decoded_media(overlay, &overlay_url);
-        if overlay_dimensions_pending {
-            builder.track_pending_native_dimension_url(&overlay_url);
-        }
-        layered_emote.add_overlay(
-            SharedString::from(overlay_url),
-            SharedString::from(overlay.name.clone()),
-            overlay_width,
-            overlay_height,
-            overlay_is_animated,
-            Some(std::sync::Arc::new(build_emote_tooltip_meta(
-                overlay,
-                overlay_still,
-            ))),
-        );
-    }
-
-    let (bbox_width, _) = layered_emote.bounds();
-    if builder.current_x + bbox_width > builder.right_boundary
-        && builder.current_x > MESSAGE_PADDING_LEFT
-    {
-        builder.wrap_line();
-    }
-
-    let image_type = ImageType::Emote {
-        name: SharedString::from(base.name.clone()),
-        tooltip_meta: Some(base_tooltip_meta),
-    };
-
-    builder.pending_layered_emote = Some(PendingLayeredImage {
-        emote: layered_emote,
-        x: builder.current_x,
-        image_type,
-    });
-
-    builder.advance(base_width);
-
-    builder.last_token_type = LastTokenType::Emote;
-}
-
-/// The message's slots and a cursor over its emote slots. Render units keep
-/// every emote slot in order (overlays included), so the n-th emote laid out is
-/// the n-th emote slot.
-struct EmoteSlotSource<'a> {
-    slots: &'a [crate::backend::slots::MessageSlot],
-    cursor: &'a mut usize,
-}
-
-impl EmoteSlotSource<'_> {
-    fn next_emote_slot(&mut self) -> Option<usize> {
-        while let Some(slot) = self.slots.get(*self.cursor) {
-            let index = *self.cursor;
-            *self.cursor += 1;
-            if slot.emote_source_text().is_some() {
-                return Some(index);
-            }
-        }
-        None
-    }
-}
-
-/// Lay out an emote unit under the active display rules.
-///
-/// An emote shown as text renders exactly as its code would as plain message
-/// text, so it also ends the zero-width stack: the next image emote starts a new
-/// unit as its base, the way a zero-width emote with no base renders.
-fn add_emote_render_unit_with_rules(
-    builder: &mut LayoutBuilder<'_>,
-    unit: &EmoteRenderUnit,
-    mut source: EmoteSlotSource<'_>,
-    rules: &settings::CompiledEmoteDisplayRules,
-    channel: &str,
-    text_color: Hsla,
-    remove_emote_spacing: bool,
-) {
-    let mut flags: SmallVec<[settings::EmoteDisplayFlags; 5]> =
-        SmallVec::with_capacity(unit.overlays.len() + 1);
-    let mut slot_indices: SmallVec<[Option<usize>; 5]> =
-        SmallVec::with_capacity(unit.overlays.len() + 1);
-    unit.for_each_emote(|emote| {
-        flags.push(rules.flags_for(emote.provider, &emote.id, channel));
-        slot_indices.push(source.next_emote_slot());
-    });
-    let emote_at = |index: usize| {
-        if index == 0 {
-            &unit.base
-        } else {
-            &unit.overlays[index - 1]
-        }
-    };
-
-    let mut index = 0;
-    while index < flags.len() {
-        if flags[index].show_as_text {
-            let emote = emote_at(index);
-            let slot = slot_indices[index];
-            let code = slot
-                .and_then(|slot| source.slots[slot].emote_source_text())
-                .unwrap_or(&emote.name);
-            let glued = slot.is_some_and(|slot| {
-                echo_core::slot_parser::emote_slot_is_glued(source.slots, slot)
-            });
-            add_emote_code_as_text(builder, emote, code, glued, text_color);
-            index += 1;
-            continue;
-        }
-        let end = (index + 1..flags.len())
-            .find(|&next| flags[next].show_as_text)
-            .unwrap_or(flags.len());
-        let still: SmallVec<[bool; 5]> = flags[index..end]
-            .iter()
-            .map(|flags| flags.still_image)
-            .collect();
-        add_emote_render_unit(
-            builder,
-            emote_at(index),
-            &unit.overlays[index..end - 1],
-            &still,
-            remove_emote_spacing,
-        );
-        index = end;
-    }
-}
-
-/// Render an emote's `code` (what was typed) as message text. The code joins
-/// the copy/selection source like any word, and an emote hitbox over it keeps
-/// the tooltip (a still preview) and the emote context menu with "Show image
-/// again" reachable.
-fn add_emote_code_as_text(
-    builder: &mut LayoutBuilder<'_>,
-    emote: &crate::backend::emotes::Emote,
-    code: &str,
-    glued: bool,
-    color: Hsla,
-) {
-    builder.flush_layered_emote();
-    // The parser drops the whitespace before an emote and keeps the one after
-    // it, so restore a separating space the way the text would have had one,
-    // except after punctuation the emote was typed glued to, as in "(KEKW)".
-    if matches!(builder.last_token_type, LastTokenType::Emote) {
-        builder.ensure_source_separator();
-    } else if !glued && !builder.last_text_ended_with_whitespace && !builder.source_text.is_empty()
-    {
-        push_text_segment(builder, " ", color);
-    }
-    builder.flush_text_segment();
-
-    push_text_segment(builder, code, color);
-    let render_url = chat_display_url_shared_for_scale(emote, super::layout_scale::current());
-    builder.add_hitbox(HitboxKind::Emote {
-        name: SharedString::from(emote.name.clone()),
-        url: SharedString::from(render_url),
-        meta: Some(std::sync::Arc::new(build_emote_tooltip_meta(emote, true))),
-    });
-    builder.flush_text_segment();
-    builder.last_token_type = LastTokenType::Text;
-}
-
-/// Return the selected source URL's pixel density for native-size conversion.
-///
-/// Echo stores Twitch's `3.0` and BTTV's `3x` maximum variants in `url_4x`.
-/// Twitch's normal `3.0` response is four times the 1x geometry (112px for a
-/// 28px emote), so URL labels are not used as a literal divisor here. Historical
-/// Twitch exceptions use their verified normalization factors, including the
-/// fractional heart-emote density.
-#[inline]
-fn selected_emote_source_density(emote: &crate::backend::emotes::Emote, url: &str) -> f32 {
-    echo_emote_core::model::emote_source_density(emote, url)
-}
-
-/// Provider geometry fixes the image box before pixels arrive. When it is
-/// absent, resident or remembered sizes from any tier avoid a square fallback.
-#[inline]
-fn emote_dimensions_from_decoded_media(
-    emote: &crate::backend::emotes::Emote,
-    url: &str,
-) -> ((f32, f32), bool) {
-    let logical = emote
-        .width
-        .zip(emote.height)
-        .filter(|(width, height)| *width > 0 && *height > 0)
-        .or_else(|| {
-            (emote.provider == EmoteProvider::Twitch)
-                .then(|| echo_emote_core::twitch_base_dimensions(&emote.id))
-        })
-        .or_else(|| {
-            [
-                Some(url),
-                emote.url_1x.as_deref(),
-                emote.url_2x.as_deref(),
-                emote.url_4x.as_deref(),
-                Some(emote.url.as_ref()),
-            ]
-            .into_iter()
-            .flatten()
-            .find_map(|candidate| {
-                logical_native_dimensions(
-                    echo_chat_render::ports::decoded_image_size(candidate),
-                    selected_emote_source_density(emote, candidate),
-                    None,
-                )
-            })
-        });
-    let (width, height) = calculate_emote_dimensions(
-        logical.map(|(width, _)| width),
-        logical.map(|(_, height)| height),
-        emote_size(),
-    );
-    ((width, height), logical.is_none())
-}
-
 /// Moderation buttons act on a chatter: skip system rows, the viewer's own
 /// messages and the broadcaster's.
 fn message_takes_mod_buttons(msg: &ChatMessage) -> bool {
@@ -2582,982 +1436,6 @@ fn message_takes_mod_buttons(msg: &ChatMessage) -> bool {
         && !msg
             .sender
             .eq_ignore_ascii_case(&settings::get_username_lowercase())
-}
-
-fn humanize_compound_label(raw: &str) -> String {
-    raw.split(['_', '-'])
-        .filter(|s| !s.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(c) => {
-                    let mut out = c.to_uppercase().collect::<String>();
-                    out.push_str(chars.as_str());
-                    out
-                }
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn humanize_channel_display(channel: &str) -> String {
-    let mut chars = channel.chars();
-    match chars.next() {
-        Some(first) => {
-            let mut out = first.to_uppercase().collect::<String>();
-            out.push_str(chars.as_str());
-            out
-        }
-        None => String::new(),
-    }
-}
-
-/// Convert badge key to human-readable name
-fn humanize_badge_name(key: &str) -> String {
-    match key {
-        "subscriber" => "Subscriber".to_string(),
-        "moderator" => "Moderator".to_string(),
-        "lead_moderator" | "lead-moderator" => "Lead Moderator".to_string(),
-        "broadcaster" => "Broadcaster".to_string(),
-        "vip" => "VIP".to_string(),
-        "bits" => "Bits".to_string(),
-        "sub-gifter" => "Sub Gifter".to_string(),
-        "premium" => "Turbo".to_string(),
-        "partner" => "Partner".to_string(),
-        "founder" => "Founder".to_string(),
-        "artist-badge" => "Artist".to_string(),
-        other => {
-            let mut out = String::with_capacity(other.len());
-            for (i, word) in other.split('-').enumerate() {
-                if i > 0 {
-                    out.push(' ');
-                }
-                let mut chars = word.chars();
-                if let Some(first) = chars.next() {
-                    let up = first.to_uppercase().next().unwrap_or(first);
-                    out.push(up);
-                }
-                out.extend(chars);
-            }
-            out
-        }
-    }
-}
-
-/// Type of the last token processed (for spacing decisions)
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum LastTokenType {
-    /// No token processed yet or at start of content
-    None,
-    /// Last token was text (including space)
-    Text,
-    /// Last token was an emote
-    Emote,
-    /// Last token was a URL, mention, or embed link
-    Link,
-}
-
-struct PendingLayeredImage {
-    emote: LayeredEmote,
-    x: f32,
-    image_type: ImageType,
-}
-
-/// Helper for building layout incrementally with dynamic line heights
-struct LayoutBuilder<'a> {
-    /// Right boundary for content (absolute X position)
-    right_boundary: f32,
-    /// Current X position
-    current_x: f32,
-    /// Current Y position (start of current line)
-    current_y: f32,
-    /// Current line index
-    current_line: u32,
-
-    /// Accumulated text for current segment
-    pending_text: String,
-    /// Number of chars in pending_text (Unicode scalar values)
-    /// PERF: Avoids rescanning pending_text on flush.
-    pending_char_count: usize,
-    /// Text runs for current segment
-    pending_runs: SmallVec<[TextRunData; 4]>,
-    /// Start X of current text segment
-    text_segment_start_x: f32,
-    /// Exact 7TV paint spec for the username inside the current text segment.
-    pending_seventv_paint: Option<std::sync::Arc<SevenTvLinePaint>>,
-    /// PERF: Character positions for current segment (built during add_text_run, reused in flush)
-    pending_char_positions: SmallVec<[f32; 24]>,
-
-    /// X position where message content starts (after timestamp/badges/username)
-    /// Used for indenting wrapped lines
-    content_start_x: f32,
-    /// Whether we've passed the username (content has started)
-    content_started: bool,
-    /// Whether timestamps are shown (affects wrap indent calculation)
-    show_timestamp: bool,
-
-    /// All completed segments (from committed lines)
-    segments: SmallVec<[LayoutSegment; 8]>,
-    /// All shaped line data
-    shaped_lines: SmallVec<[ShapedLineData; 4]>,
-    /// All hitbox regions
-    /// PERF: most messages have 8-16 hitboxes
-    /// (badges, username, mentions, emotes, URLs) so 16 avoids heap allocation
-    hitboxes: SmallVec<[HitboxRegion; 16]>,
-    /// Mention highlight regions (x, y, width, height)
-    mention_highlights: SmallVec<[(f32, f32, f32, f32); 4]>,
-
-    /// Selection map line offsets
-    line_offsets: Vec<usize>,
-    /// Total source text length in characters (Unicode scalar values)
-    source_offset: usize,
-    /// Absolute X positions for each character (for selection highlighting)
-    source_char_positions: SmallVec<[f32; 48]>,
-    /// Source text for clipboard (built alongside positions for consistency)
-    source_text: String,
-
-    /// Twitch/BTTV URLs that did not have decoded dimensions when this layout
-    /// was built. They are transferred to the layout for a targeted refresh
-    /// when cache residency later makes native geometry available.
-    pending_native_dimension_urls: SmallVec<[SharedString; 4]>,
-    reserved_badge_channel: Option<std::sync::Arc<str>>,
-
-    /// Index of the last emote in the current line buffer (for zero-width overlay attachment)
-    last_emote_buffer_idx: Option<usize>,
-    /// Height of the most recent media-like token, used to scale visual gaps around large emotes.
-    last_media_height: Option<f32>,
-
-    /// Pending layered emote being built (for centering zero-width overlays)
-    /// When a regular emote is encountered, a LayeredEmote is created here.
-    /// Zero-width emotes are added as overlays to this pending emote.
-    /// The pending emote is flushed when we encounter non-emote content or wrap/finalize.
-    pending_layered_emote: Option<PendingLayeredImage>,
-
-    /// Type of the last token processed (for spacing decisions between tokens)
-    last_token_type: LastTokenType,
-    /// Whether the most recently added text run ended with whitespace.
-    /// Used to preserve text-like spacing at token boundaries (e.g. text + URL).
-    last_text_ended_with_whitespace: bool,
-
-    /// Buffer for current line items (committed on wrap or finalize)
-    line_buffer: LineBuffer,
-
-    /// Y positions for each committed line (for selection hit testing)
-    line_y_positions: SmallVec<[f32; 8]>,
-
-    /// Index where hitboxes for current line start (for Y adjustment after commit)
-    line_hitbox_start_idx: usize,
-    /// Index where mention highlights for current line start (for Y adjustment after commit)
-    line_mention_highlight_start_idx: usize,
-
-    /// Optional window for accurate GPUI text measurement (pixel-perfect when available)
-    window: Option<&'a mut Window>,
-
-    /// Whether message content text should be struck through.
-    strike_content: bool,
-
-    /// Measure and paint subsequent text runs with the ASCII-art monospace
-    /// family. Enabled only after the timestamp/badges/username header so the
-    /// header retains its normal UI typography.
-    monospace_text: bool,
-
-    /// Count of animated emotes encountered during layout building
-    /// PERF: Tracked here, transferred to layout in finalize() for render optimization
-    animated_emote_count: u8,
-
-    /// PERF: line_height() cached for the lifetime of this build (2 Mutex locks per call).
-    /// Settings changes force a full relayout via cache invalidation, so this is invariant.
-    cached_line_height: f32,
-    /// Where content starts after the timestamp column (and any mod buttons
-    /// before it); wrapped lines indent here when timestamps are shown.
-    timestamp_column_end_x: f32,
-}
-
-impl<'a> LayoutBuilder<'a> {
-    fn new_with_y_offset(
-        right_boundary: f32,
-        show_timestamp: bool,
-        y_offset: f32,
-        mut window: Option<&'a mut Window>,
-        strike_content: bool,
-    ) -> Self {
-        let initial_y = MESSAGE_PADDING + y_offset;
-        let mut line_y_positions = SmallVec::new();
-        line_y_positions.push(initial_y);
-
-        let cached_line_height = line_height();
-        if let Some(win) = window.as_deref_mut() {
-            super::layout::refresh_timestamp_width_probe(win);
-        }
-        let cached_timestamp_width = timestamp_width();
-
-        Self {
-            right_boundary,
-            current_x: MESSAGE_PADDING_LEFT,
-            current_y: initial_y,
-            current_line: 0,
-            pending_text: String::new(),
-            pending_char_count: 0,
-            pending_runs: SmallVec::new(),
-            text_segment_start_x: MESSAGE_PADDING_LEFT,
-            pending_seventv_paint: None,
-            pending_char_positions: SmallVec::new(),
-            content_start_x: MESSAGE_PADDING_LEFT,
-            content_started: false,
-            show_timestamp,
-            segments: SmallVec::new(),
-            shaped_lines: SmallVec::new(),
-            hitboxes: SmallVec::new(),
-            mention_highlights: SmallVec::new(),
-            line_offsets: vec![0],
-            source_offset: 0,
-            source_char_positions: SmallVec::new(),
-            source_text: String::new(),
-            pending_native_dimension_urls: SmallVec::new(),
-            reserved_badge_channel: None,
-            last_emote_buffer_idx: None,
-            last_media_height: None,
-            pending_layered_emote: None,
-            last_token_type: LastTokenType::None,
-            last_text_ended_with_whitespace: false,
-            line_buffer: LineBuffer::new(cached_line_height),
-            line_y_positions,
-            line_hitbox_start_idx: 0,
-            line_mention_highlight_start_idx: 0,
-            window,
-            strike_content,
-            monospace_text: false,
-            animated_emote_count: 0,
-            cached_line_height,
-            timestamp_column_end_x: MESSAGE_PADDING_LEFT + cached_timestamp_width + TIMESTAMP_GAP,
-        }
-    }
-
-    /// Mark the start of message content (after username)
-    /// Wrapped lines will indent to this position
-    fn mark_content_start(&mut self) {
-        self.content_start_x = self.current_x;
-        self.content_started = true;
-    }
-
-    #[inline]
-    fn track_pending_native_dimension_url(&mut self, url: &str) {
-        if !self
-            .pending_native_dimension_urls
-            .iter()
-            .any(|pending| pending.as_ref() == url)
-        {
-            self.pending_native_dimension_urls
-                .push(SharedString::from(url));
-        }
-    }
-
-    /// Measure text width accurately using GPUI when window is available, else use cached metrics
-    fn measure_text_width(&mut self, text: &str, is_bold: bool) -> f32 {
-        if self.monospace_text {
-            if let Some(window) = self.window.as_mut() {
-                let run = TextRun {
-                    len: text.len(),
-                    font: Font {
-                        family: text_run_intern::mono_font_family(),
-                        weight: if is_bold {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        },
-                        ..Default::default()
-                    },
-                    color: colors::text_primary(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                return window
-                    .text_system()
-                    .shape_line(
-                        SharedString::from(text),
-                        px(scaled_font_size()),
-                        std::slice::from_ref(&run),
-                        None,
-                    )
-                    .width()
-                    .as_f32();
-            }
-
-            return text.chars().count() as f32 * scaled_font_size() * 0.6;
-        }
-        if let Some(window) = self.window.as_mut() {
-            FONT_METRICS.measure_string_gpui(text, is_bold, window)
-        } else {
-            FONT_METRICS.measure_string_bold(text, is_bold)
-        }
-    }
-
-    /// Flush pending layered emote to line buffer
-    ///
-    /// Call this before adding non-emote content, wrapping, or finalizing.
-    /// Converts the pending LayeredEmote with all its overlays into a LineItem.
-    fn flush_layered_emote(&mut self) {
-        if let Some(PendingLayeredImage {
-            mut emote,
-            x,
-            image_type,
-        }) = self.pending_layered_emote.take()
-        {
-            if emote.base.is_animated {
-                self.animated_emote_count = self.animated_emote_count.saturating_add(1);
-            }
-            for overlay in &emote.overlays {
-                if overlay.is_animated {
-                    self.animated_emote_count = self.animated_emote_count.saturating_add(1);
-                }
-            }
-
-            let (bbox_width, bbox_height) = emote.bounds();
-            let overflow_width = (bbox_width - emote.base.width).max(0.0);
-            if overflow_width > 0.0 {
-                self.current_x += overflow_width;
-                self.text_segment_start_x = self.current_x;
-            }
-
-            let (source_start_char, source_len_chars) =
-                self.append_source_emote_code(emote.base.name.as_ref());
-
-            self.line_buffer.add_layered_emote(
-                emote,
-                x,
-                image_type,
-                source_start_char,
-                source_len_chars,
-            );
-            self.last_emote_buffer_idx = Some(self.line_buffer.len() - 1);
-            self.last_media_height = Some(bbox_height);
-        }
-    }
-
-    /// Splice a single separating space into `source_text`/`source_char_positions`
-    /// if the content appended so far didn't already end in whitespace (and
-    /// there's something to separate from at all -- never insert a leading
-    /// space at the very start of the message).
-    ///
-    /// Two call sites need this, both working around the fact that
-    /// `add_text_run_weighted` appends its text verbatim with no gap logic of
-    /// its own, mirroring what the *visual* spacing functions
-    /// (`advance_before_emote_like` / `advance_before_text_like`) already do for
-    /// `current_x`:
-    /// - `append_source_emote_code`, before splicing in an emote's code (e.g.
-    ///   text "word" + emote -> "word Kappa", and back-to-back emotes ->
-    ///   "Kappa Kappa" rather than "KappaKappa").
-    /// - the `SlotRenderUnit::Text` handler, before appending text that
-    ///   immediately follows an emote: that handler deliberately strips the
-    ///   text's authored leading whitespace (relying on the synthesized visual
-    ///   gap instead), so without this call `source_text` would glue the
-    ///   emote's just-spliced code directly onto the next word.
-    ///
-    /// Position values pushed here are not meaningful for x-lookup (emotes are
-    /// hit-tested via their own segment geometry, not a char-position binary
-    /// search) -- they only need to exist so `source_char_positions.len()` keeps
-    /// tracking `source_text.chars().count()`, the invariant `source_char_len()`
-    /// and every range computation depend on.
-    fn ensure_source_separator(&mut self) {
-        if !self.last_text_ended_with_whitespace && !self.source_text.is_empty() {
-            self.source_char_positions.push(self.current_x);
-            self.source_text.push(' ');
-            self.source_offset += 1;
-            self.last_text_ended_with_whitespace = true;
-        }
-    }
-
-    /// Append exact source text whose rendered object begins at `current_x`.
-    ///
-    /// Unicode emoji can contain several scalar values while occupying one image
-    /// hitbox. Give each scalar the same boundary position so source ranges stay
-    /// exact without allowing pointer selection to split the rendered image.
-    fn append_source_text_at_current_x(&mut self, text: &str) -> (usize, usize) {
-        let start_char = self.source_offset;
-        let mut len_chars = 0usize;
-        for ch in text.chars() {
-            self.source_char_positions.push(self.current_x);
-            self.source_text.push(ch);
-            len_chars += 1;
-        }
-        self.source_offset += len_chars;
-        if let Some(last) = text.chars().last() {
-            self.last_text_ended_with_whitespace = last.is_whitespace();
-        }
-
-        (start_char, len_chars)
-    }
-
-    /// Append an emote's text code into the flat `source_text`/`source_char_positions`
-    /// buffers so drag-selection and Ctrl+C copy include emote codes, mirroring how
-    /// `add_text_run_weighted` builds these buffers for real text runs. See
-    /// `ensure_source_separator` for the separator semantics.
-    ///
-    /// Clears `last_text_ended_with_whitespace` afterward (codes never end in
-    /// whitespace) so a following emote or text run inserts its own separator
-    /// in turn.
-    ///
-    /// Returns `(source_start_char, source_len_chars)` covering just the code
-    /// itself; the synthesized separator (if any) is excluded from the range.
-    fn append_source_emote_code(&mut self, code: &str) -> (usize, usize) {
-        if code.is_empty() {
-            return (self.source_offset, 0);
-        }
-
-        self.ensure_source_separator();
-        self.append_source_text_at_current_x(code)
-    }
-
-    /// Add a text run to the current segment
-    fn add_text_run(&mut self, text: &str, color: Hsla, bold: bool, underline: bool) {
-        self.add_text_run_weighted(text, color, bold, underline, None);
-    }
-
-    fn add_text_run_weighted(
-        &mut self,
-        text: &str,
-        color: Hsla,
-        bold: bool,
-        underline: bool,
-        font_weight: Option<FontWeight>,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-
-        if self.pending_text.is_empty() {
-            self.text_segment_start_x = self.current_x;
-        }
-
-        let len = text.len();
-        let mut run = TextRunData::new(len, color);
-        if self.monospace_text {
-            run.font_family = text_run_intern::mono_font_family();
-        }
-        if bold {
-            run = run.bold();
-        }
-        if let Some(font_weight) = font_weight {
-            run = run.with_font_weight(font_weight);
-        }
-        if underline {
-            run = run.underlined();
-        }
-        if self.strike_content && self.content_started {
-            run = run.struck();
-        }
-
-        let measure_bold = font_weight.map_or(bold, |weight| uses_bold_metrics(Some(weight)));
-
-        let start_x = self.current_x;
-        let pending_before = self.pending_char_positions.len();
-        self.current_x = FONT_METRICS.batch_char_positions_into(
-            text,
-            start_x,
-            measure_bold,
-            &mut self.source_char_positions,
-            &mut self.pending_char_positions,
-            &mut self.source_text,
-        );
-        let char_count = self
-            .pending_char_positions
-            .len()
-            .saturating_sub(pending_before);
-
-        if self.window.is_some() && char_count > 0 {
-            let source_start = self.source_char_positions.len().saturating_sub(char_count);
-            let has_precise_budget = char_count <= PRECISE_CHAR_POSITION_MAX;
-
-            if has_precise_budget {
-                let font_size = scaled_font_size();
-                let run = TextRun {
-                    len: text.len(),
-                    font: Font {
-                        family: if self.monospace_text {
-                            text_run_intern::mono_font_family()
-                        } else {
-                            text_run_intern::system_font_family()
-                        },
-                        weight: if measure_bold {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        },
-                        ..Default::default()
-                    },
-                    color: colors::text_primary(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let Some(window) = self.window.as_mut() else {
-                    debug_assert!(
-                        false,
-                        "add_text_run_weighted: window was None inside is_some() guard"
-                    );
-                    return;
-                };
-                let shaped = window.text_system().shape_line(
-                    SharedString::from(text),
-                    px(font_size),
-                    std::slice::from_ref(&run),
-                    None,
-                );
-
-                for (i, (byte_idx, _)) in text.char_indices().enumerate() {
-                    let x = start_x + shaped.x_for_index(byte_idx).as_f32();
-                    self.pending_char_positions[pending_before + i] = x;
-                    self.source_char_positions[source_start + i] = x;
-                }
-                self.current_x = start_x + shaped.width().as_f32();
-            } else {
-                let accurate_width = self.measure_text_width(text, measure_bold);
-                let estimated_width = (self.current_x - start_x).max(0.0);
-                if estimated_width > f32::EPSILON {
-                    let scale = accurate_width / estimated_width;
-                    for i in 0..char_count {
-                        let adjusted = start_x
-                            + (self.pending_char_positions[pending_before + i] - start_x) * scale;
-                        self.pending_char_positions[pending_before + i] = adjusted;
-                        self.source_char_positions[source_start + i] = adjusted;
-                    }
-                } else {
-                    for i in 0..char_count {
-                        self.pending_char_positions[pending_before + i] = start_x;
-                        self.source_char_positions[source_start + i] = start_x;
-                    }
-                }
-                self.current_x = start_x + accurate_width;
-            }
-        }
-
-        self.pending_text.push_str(text);
-        self.pending_runs.push(run);
-        self.pending_char_count += char_count;
-        self.source_offset += char_count;
-        self.last_text_ended_with_whitespace = text.chars().last().is_some_and(char::is_whitespace);
-    }
-
-    /// Add an image segment to the line buffer
-    fn add_image(
-        &mut self,
-        url: &str,
-        width: f32,
-        height: f32,
-        is_animated: bool,
-        image_type: ImageType,
-        source_range: Option<(usize, usize)>,
-    ) {
-        self.flush_text_segment();
-
-        if is_animated {
-            self.animated_emote_count = self.animated_emote_count.saturating_add(1);
-        }
-
-        let url_owned = SharedString::from(url);
-        self.line_buffer.add_image(
-            url_owned,
-            self.current_x,
-            width,
-            height,
-            is_animated,
-            image_type,
-            source_range,
-        );
-
-        self.last_emote_buffer_idx = self.line_buffer.last_image_index();
-        self.last_media_height = Some(height);
-    }
-
-    /// Add an inline box (like NEW badge) to the line buffer
-    fn add_inline_box(&mut self, text: &str, text_color: Hsla, px_h: Pixels, _px_v: Pixels) {
-        self.flush_text_segment();
-
-        let text_width = self.measure_text_width(text, false);
-        let px_h_f32: f32 = px_h.into();
-        let box_width = text_width + px_h_f32 * 2.0;
-        let box_height = self.cached_line_height * 0.8;
-
-        let mut bg_color = text_color;
-        bg_color.a = 0.15;
-
-        let text_owned = SharedString::from(text);
-        self.line_buffer.add_inline_box(
-            text_owned,
-            self.current_x,
-            box_width,
-            box_height,
-            bg_color,
-            text_color,
-            11.0 * settings::get_font_scale(),
-        );
-
-        self.current_x += box_width + badge_gap();
-        self.text_segment_start_x = self.current_x;
-    }
-
-    /// Inline moderation button: a chip outside the selectable text with its
-    /// own hitbox, placed before the timestamp.
-    fn add_mod_button(&mut self, label: &str, command: &str, destructive: bool) {
-        self.flush_text_segment();
-        let chip_width = self.measure_text_width(label, false) + 3.0 * 2.0;
-        if self.current_x > MESSAGE_PADDING_LEFT
-            && self.current_x + chip_width > self.right_boundary
-        {
-            self.wrap_line();
-        }
-        let start_x = self.current_x;
-        let color = if destructive {
-            colors::error()
-        } else {
-            colors::text_muted()
-        };
-        self.add_inline_box(label, color, px(3.0), px(1.0));
-        let width = (self.current_x - badge_gap() - start_x).max(1.0);
-        self.hitboxes.push(HitboxRegion {
-            bounds: Bounds::new(
-                point(px(start_x), px(self.current_y)),
-                size(px(width), px(self.cached_line_height)),
-            ),
-            kind: HitboxKind::ModAction {
-                label: SharedString::from(label.to_string()),
-                command: SharedString::from(command.to_string()),
-            },
-        });
-    }
-
-    /// Add a hitbox at current position
-    fn add_hitbox(&mut self, kind: HitboxKind) {
-        let text_width = self.current_x - self.text_segment_start_x;
-        if text_width > 0.0 {
-            self.hitboxes.push(HitboxRegion {
-                bounds: Bounds::new(
-                    point(px(self.text_segment_start_x), px(self.current_y)),
-                    size(px(text_width), px(self.cached_line_height)),
-                ),
-                kind,
-            });
-        }
-    }
-
-    /// Add a hitbox GUARANTEED - even if text width is 0, creates a minimum clickable area
-    /// This is critical for usernames and mentions to always be clickable
-    fn add_hitbox_guaranteed(&mut self, kind: HitboxKind) {
-        let text_width = self.current_x - self.text_segment_start_x;
-        let effective_width = text_width.max(8.0);
-
-        self.hitboxes.push(HitboxRegion {
-            bounds: Bounds::new(
-                point(px(self.text_segment_start_x), px(self.current_y)),
-                size(px(effective_width), px(self.cached_line_height)),
-            ),
-            kind,
-        });
-    }
-
-    /// Advance X position (for fixed-width elements)
-    fn advance(&mut self, width: f32) {
-        self.current_x = self.current_x.max(self.text_segment_start_x + width);
-        self.text_segment_start_x = self.current_x;
-    }
-
-    /// Advance X position by a relative amount
-    fn advance_by(&mut self, amount: f32) {
-        self.current_x += amount;
-        self.text_segment_start_x = self.current_x;
-    }
-
-    /// Set absolute X position (for fixed-width columns like timestamp)
-    fn set_x(&mut self, x: f32) {
-        self.current_x = x;
-        self.text_segment_start_x = x;
-    }
-
-    /// Add mention highlight background
-    fn add_mention_highlight(&mut self, x: f32, y: f32, width: f32) {
-        self.mention_highlights
-            .push((x, y, width, self.cached_line_height));
-    }
-
-    /// Flush pending text into the line buffer
-    /// Returns true if text was actually flushed, false if buffer was empty
-    fn flush_text_segment(&mut self) -> bool {
-        if self.pending_text.is_empty() {
-            return false;
-        }
-
-        let line_idx = self.shaped_lines.len();
-        let seg_len_chars = self.pending_char_count;
-        let seg_start_char = self.source_offset.saturating_sub(seg_len_chars);
-        let width = self.current_x - self.text_segment_start_x;
-
-        let mut char_positions = std::mem::take(&mut self.pending_char_positions);
-        char_positions.push(self.current_x);
-
-        let text: SharedString = std::mem::take(&mut self.pending_text).into();
-        let runs = std::mem::take(&mut self.pending_runs);
-
-        let mut gpui_runs: SmallVec<[TextRun; 4]> = SmallVec::with_capacity(runs.len().max(1));
-        for run in &runs {
-            gpui_runs.push(text_run_intern::gpui_run_from_data(run));
-        }
-        if gpui_runs.is_empty() {
-            gpui_runs.push(text_run_intern::default_gpui_run(
-                text.len(),
-                colors::text_primary(),
-            ));
-        }
-
-        let bidi = BidiAnalysis::new(text.as_ref());
-        let (visual_char_positions, visual_to_logical) = if bidi.needs_reordering {
-            (
-                bidi.build_visual_char_positions(&char_positions, seg_len_chars)
-                    .into_vec(),
-                bidi.visual_to_logical.into_vec(),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        self.shaped_lines.push(ShapedLineData {
-            text,
-            gpui_runs_hash: hash_gpui_text_runs(&gpui_runs),
-            gpui_runs,
-            char_positions,
-            visual_char_positions,
-            visual_to_logical,
-            source_start_char: seg_start_char,
-            source_len_chars: seg_len_chars,
-            seventv_paint: self.pending_seventv_paint.take(),
-        });
-
-        self.line_buffer
-            .add_text(line_idx, self.text_segment_start_x, width);
-
-        self.text_segment_start_x = self.current_x;
-        self.pending_char_count = 0;
-        true
-    }
-
-    /// Commit the current line buffer to final segments.
-    ///
-    /// This finalizes the line, calculating the actual line height based on
-    /// the tallest element and positioning all items with proper baseline alignment.
-    fn commit_line(&mut self) {
-        if self.line_buffer.is_empty() {
-            return;
-        }
-
-        let line_buffer = std::mem::replace(
-            &mut self.line_buffer,
-            LineBuffer::new(self.cached_line_height),
-        );
-        let (new_segments, actual_height) = line_buffer.finalize(self.current_y);
-
-        let y_adjustment = actual_height - self.cached_line_height;
-        if y_adjustment > 0.0 {
-            for hitbox in self.hitboxes[self.line_hitbox_start_idx..].iter_mut() {
-                match &hitbox.kind {
-                    HitboxKind::Username { .. }
-                    | HitboxKind::Url { .. }
-                    | HitboxKind::Mention { .. }
-                    | HitboxKind::Emote { .. } => {
-                        let old_y: f32 = hitbox.bounds.origin.y.into();
-                        hitbox.bounds.origin.y = px(old_y + y_adjustment);
-                    }
-                    _ => {}
-                }
-            }
-
-            for (_, y, _, _) in
-                self.mention_highlights[self.line_mention_highlight_start_idx..].iter_mut()
-            {
-                *y += y_adjustment;
-            }
-        }
-
-        for segment in &new_segments {
-            match segment {
-                LayoutSegment::Image {
-                    url,
-                    x,
-                    y,
-                    width,
-                    height,
-                    image_type,
-                    overlays,
-                    ..
-                } => {
-                    let hitbox_kind = if overlays.is_empty() {
-                        match image_type {
-                            ImageType::TwitchGif { alt_text } => HitboxKind::Url {
-                                url: url.clone(),
-                                display_text: alt_text.clone(),
-                                embed_id: 0,
-                            },
-                            ImageType::Emote { name, tooltip_meta } => HitboxKind::Emote {
-                                name: name.clone(),
-                                url: url.clone(),
-                                meta: tooltip_meta.clone(),
-                            },
-                            ImageType::Badge {
-                                name,
-                                description,
-                                tooltip_meta,
-                                ..
-                            } => HitboxKind::Badge {
-                                name: name.clone(),
-                                url: url.clone(),
-                                description: description.clone(),
-                                meta: tooltip_meta.clone(),
-                            },
-                        }
-                    } else {
-                        let mut emotes = vec![];
-                        if let ImageType::Emote { name, tooltip_meta } = image_type {
-                            emotes.push(LayeredTooltipEmote {
-                                name: name.clone(),
-                                url: url.clone(),
-                                meta: tooltip_meta.clone(),
-                            });
-                        }
-                        for overlay in overlays {
-                            emotes.push(LayeredTooltipEmote {
-                                name: overlay.name.clone(),
-                                url: overlay.url.clone(),
-                                meta: overlay.tooltip_meta.clone(),
-                            });
-                        }
-                        HitboxKind::LayeredEmote { emotes }
-                    };
-
-                    self.hitboxes.push(HitboxRegion {
-                        bounds: Bounds::new(point(px(*x), px(*y)), size(px(*width), px(*height))),
-                        kind: hitbox_kind,
-                    });
-                }
-                LayoutSegment::LayeredImage {
-                    layers,
-                    x,
-                    y,
-                    width,
-                    height,
-                    ..
-                } => {
-                    let emotes = layers
-                        .iter()
-                        .map(|layer| LayeredTooltipEmote {
-                            name: layer.name.clone(),
-                            url: layer.url.clone(),
-                            meta: layer.tooltip_meta.clone(),
-                        })
-                        .collect();
-
-                    self.hitboxes.push(HitboxRegion {
-                        bounds: Bounds::new(point(px(*x), px(*y)), size(px(*width), px(*height))),
-                        kind: HitboxKind::LayeredEmote { emotes },
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        self.segments.extend(new_segments);
-
-        self.current_y += actual_height;
-
-        self.line_hitbox_start_idx = self.hitboxes.len();
-        self.line_mention_highlight_start_idx = self.mention_highlights.len();
-    }
-
-    /// Wrap to next line
-    fn wrap_line(&mut self) {
-        self.flush_text_segment();
-        self.flush_layered_emote();
-
-        self.commit_line();
-
-        self.current_line += 1;
-
-        self.line_y_positions.push(self.current_y);
-
-        self.last_emote_buffer_idx = None;
-        self.last_media_height = None;
-
-        let indent = if self.content_started {
-            if self.show_timestamp {
-                self.timestamp_column_end_x
-            } else {
-                self.content_start_x
-            }
-        } else {
-            MESSAGE_PADDING_LEFT
-        };
-
-        let indent =
-            indent.min((self.right_boundary - MIN_WRAPPED_CONTENT_WIDTH).max(MESSAGE_PADDING_LEFT));
-
-        self.current_x = indent;
-        self.text_segment_start_x = indent;
-
-        self.line_offsets.push(self.source_offset);
-    }
-
-    /// Commit an authored hard line break without shaping it as a whitespace
-    /// glyph. Source and selection indices still retain the original newline
-    /// bytes as Unicode scalar positions.
-    fn hard_break(&mut self, source_break: &str) {
-        self.flush_text_segment();
-        for ch in source_break.chars() {
-            self.source_char_positions.push(self.current_x);
-            self.source_text.push(ch);
-            self.source_offset += 1;
-        }
-        self.last_text_ended_with_whitespace = true;
-        self.last_token_type = LastTokenType::None;
-        self.wrap_line();
-    }
-
-    /// Finalize and write results to layout
-    fn finalize(mut self, layout: &mut CanvasMessageLayout) {
-        self.flush_text_segment();
-        self.flush_layered_emote();
-
-        self.commit_line();
-
-        layout.height = self.current_y + MESSAGE_PADDING;
-        layout.line_count = self.current_line + 1;
-
-        self.source_char_positions.push(self.current_x);
-        debug_assert_eq!(
-            self.source_char_positions.len(),
-            self.source_text.chars().count() + 1,
-            "canvas source positions must retain one boundary per Unicode scalar"
-        );
-
-        let mut final_segments = std::mem::take(&mut layout.segments);
-        final_segments.extend(self.segments);
-        layout.segments = final_segments;
-
-        layout.shaped_lines = self.shaped_lines.into_vec();
-
-        let mut final_hitboxes = std::mem::take(&mut layout.hitbox_regions);
-        final_hitboxes.extend(self.hitboxes);
-        layout.hitbox_regions = final_hitboxes;
-        layout.mention_highlights = self.mention_highlights;
-
-        layout.line_y_positions = self.line_y_positions;
-
-        layout.source_text = self.source_text;
-        layout.source_char_positions = self.source_char_positions;
-        layout.pending_native_dimension_urls = self.pending_native_dimension_urls;
-        layout.reserved_badge_channel = self.reserved_badge_channel;
-
-        layout.animated_emote_count = self.animated_emote_count;
-    }
 }
 
 #[cfg(test)]

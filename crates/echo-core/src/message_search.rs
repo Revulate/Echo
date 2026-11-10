@@ -1,3 +1,4 @@
+use crate::badge_key::{badge_key_matches, badge_key_name, is_moderator_badge_key};
 use crate::message::{ChatMessage, HighlightType, SystemMessageType};
 use crate::search::SearchMessage;
 use crate::slot::MessageSlot;
@@ -22,48 +23,6 @@ fn slot_search_text(message: &ChatMessage) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     (!text.trim().is_empty()).then_some(text)
-}
-
-fn badge_key_name(value: &str) -> &str {
-    value
-        .split_once('/')
-        .or_else(|| value.split_once(':'))
-        .map(|(name, _)| name)
-        .unwrap_or(value)
-}
-
-fn badge_name_matches(name: &str, expected: &str) -> bool {
-    name.eq_ignore_ascii_case(expected)
-        || (is_lead_moderator_badge_name(name) && is_lead_moderator_badge_name(expected))
-}
-
-fn badge_key_matches(stored: &str, expected: &str) -> bool {
-    badge_name_matches(stored, expected) || badge_name_matches(badge_key_name(stored), expected)
-}
-
-fn is_lead_moderator_badge_name(value: &str) -> bool {
-    value.eq_ignore_ascii_case("lead_moderator") || value.eq_ignore_ascii_case("lead-moderator")
-}
-
-fn is_moderator_badge_key(value: &str) -> bool {
-    let name = badge_key_name(value);
-    name.eq_ignore_ascii_case("moderator") || is_lead_moderator_badge_name(name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn moderator_badges_match_only_moderator_and_lead_aliases() {
-        assert!(is_moderator_badge_key("moderator/1"));
-        assert!(is_moderator_badge_key("LEAD-MODERATOR:1"));
-        assert!(badge_key_matches("subscriber:12", "subscriber:12"));
-        assert!(badge_key_matches("lead_moderator/1", "LEAD-MODERATOR"));
-        for badge in ["broadcaster/1", "staff/1", "admin/1", "global-mod/1"] {
-            assert!(!is_moderator_badge_key(badge), "{badge}");
-        }
-    }
 }
 
 impl SearchMessage for ChatMessage {

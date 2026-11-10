@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Time `cargo build --profile <dist|dist-max> --locked --bin echo` and record the
+elapsed time and artifact hashes.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet("dist", "dist-max")]

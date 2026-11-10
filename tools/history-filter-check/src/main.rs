@@ -1,3 +1,6 @@
+//! Contract: which IRC commands and protocol status rows recent-message history
+//! drops, in `src/backend/history_filter.rs`.
+
 #[path = "../../../src/backend/history_filter.rs"]
 mod history_filter;
 

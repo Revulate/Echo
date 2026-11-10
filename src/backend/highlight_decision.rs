@@ -312,7 +312,7 @@ pub fn test_highlight_sample(sample: &HighlightSample) -> HighlightTestOutcome {
     }
     let channel = sample.channel.trim().trim_start_matches('#').to_lowercase();
 
-    let (clean_text, is_action) = super::irc::normalize_message_text(&sample.message);
+    let (clean_text, is_action) = super::irc::format::normalize_message_text(&sample.message);
     let contains_account_name = super::irc::contains_account_mention(&clean_text, &username);
     let own_sender = !username.is_empty() && sender_login.eq_ignore_ascii_case(&username);
     let blacklisted_sender = super::settings::is_highlight_blacklisted_user(&sender_login);

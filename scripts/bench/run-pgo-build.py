@@ -318,7 +318,7 @@ def cargo_build(
         commands.append(
             (
                 f"build-{flavor}-search",
-                [cargo, "build", "--locked", "--profile", "dist", "--message-format=json-render-diagnostics", "-p", "echo-search-bench", "--bin", "echo-search-bench"],
+                [cargo, "build", "--locked", "--profile", "dist", "--message-format=json-render-diagnostics", "-p", "search-bench", "--bin", "search-bench"],
             )
         )
     stages: list[dict[str, Any]] = []
@@ -337,7 +337,7 @@ def cargo_build(
             logs[1].read_text(encoding="utf-8").splitlines(), "echo_gpui", "layout_bench", "bench"
         )
         artifacts["search"] = parse_cargo_executable(
-            logs[2].read_text(encoding="utf-8").splitlines(), "echo-search-bench", "echo-search-bench", "bin"
+            logs[2].read_text(encoding="utf-8").splitlines(), "search-bench", "search-bench", "bin"
         )
     for name, path in artifacts.items():
         if not path.is_file():

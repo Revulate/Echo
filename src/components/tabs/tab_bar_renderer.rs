@@ -1,38 +1,34 @@
-//! Tab Bar Renderer Entity - Extracted from app.rs monolith
+//! Tab bar entity: renders the tab strip in each overflow mode and owns its
+//! transient interaction state (hover, drag, rename, context and overflow menus).
 //!
-//! This entity handles all tab bar rendering logic with support for multiple overflow modes:
-//! - Scroll: Single row with scroll arrows
-//! - Dropdown: Single row with overflow menu
-//! - MultiLine: Tabs wrap to multiple rows
-//!
-//! Extracted from app.rs to reduce its size from 5,752 lines.
+//! - Scroll: single row with scroll arrows
+//! - Dropdown: single row with an overflow menu
+//! - MultiLine: tabs wrap to multiple rows
 
+use super::benchmark_hooks;
 use crate::backend;
 use crate::components::chat::chat_ui::format_viewer_count;
-use crate::components::overlays::{
-    clear_global_tooltip, clear_global_tooltip_if_source_in_window, show_text_tooltip,
-    text_tooltip_on_hover,
-};
 use crate::components::ui::ButtonExt;
-use crate::components::ui::input::{Input, InputEvent, InputState, SelectAll};
-use crate::components::ui::menu::{
-    MenuAction, MenuHost, MenuKeyboard, menu_divider, menu_header, menu_item, menu_panel,
-};
+use crate::components::ui::input::{InputEvent, InputState, SelectAll};
 use crate::config;
-use crate::icons::{CLOSE_GLYPH, MenuMetrics, modal_backdrop_style};
+use crate::icons::MenuMetrics;
 use crate::managers::tab_manager::{
-    ScrollDirection, TAB_CONTEXT_MENU_ITEMS, TabDropTarget, TabDropZone, TabManager,
+    ScrollDirection, TAB_CONTEXT_MENU_ITEMS, TabDropTarget, TabManager, TabMenuItem,
 };
 use crate::state::{AppState, SplitNode, TabState};
 use crate::theme::colors;
-use crate::theme::tokens::{FontSize, Radii, RadiiPixels, Spacing};
+use crate::theme::tokens::{FontSize, Radii, RadiiPixels};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
 use std::sync::Arc;
+
+mod menus;
+mod tab_item;
+
+use tab_item::TabItem;
 
 /// Minimal tabs are 28 px tall and clamp their content width to 150 px. These
 /// dimensions apply only to the minimal appearance; the browser-style themes
@@ -49,6 +45,11 @@ const TAB_CONTEXT_MENU_MAX_HEIGHT_PX: f32 = 400.0;
 /// never shrink; tabs that do not fit move to the overflow menu instead. This
 /// floor only sizes an empty title. Active state never changes width.
 const BROWSER_TAB_MIN_WIDTH_PX: f32 = 40.0;
+/// Width floor for browser-style tabs in Scroll mode.
+const SCROLL_TAB_MIN_WIDTH_PX: f32 = 50.0;
+/// Width floor for browser-style tabs measured outside a single-row solver:
+/// multiline row packing and holding a tab's width while it is renamed.
+const NATURAL_TAB_MIN_WIDTH_PX: f32 = 55.0;
 const BROWSER_ADD_TAB_CONTROL_WIDTH_PX: f32 = 36.0;
 /// Compact all-tabs affordance shared by visibility math and rendering. Keeping
 /// this narrower than one compact tab prevents the first overflow transition
@@ -92,8 +93,6 @@ struct DropdownTabLayout {
 /// Keeping these named avoids coupling callers to the helper's return order.
 #[derive(Clone, Copy)]
 struct TabLayoutMetrics {
-    character_width: f32,
-    chrome_width: f32,
     minimum_width: f32,
     add_button_width: f32,
     tab_spacer: f32,
@@ -211,12 +210,9 @@ impl InlineTabDemand {
 fn tab_context_menu_preferred_height(split_target_count: usize) -> f32 {
     let static_height: f32 = TAB_CONTEXT_MENU_ITEMS
         .iter()
-        .map(|item| {
-            if item.is_divider {
-                MenuMetrics::DIVIDER_HEIGHT
-            } else {
-                MenuMetrics::ITEM_HEIGHT
-            }
+        .map(|item| match item {
+            TabMenuItem::Divider => MenuMetrics::DIVIDER_HEIGHT,
+            TabMenuItem::Action { .. } => MenuMetrics::ITEM_HEIGHT,
         })
         .sum();
     let split_section_height = if split_target_count > 1 {
@@ -312,27 +308,39 @@ impl TabBarRenderer {
     }
 
     fn effective_tab_theme() -> backend::TabTheme {
-        crate::benchmark_ui_fixture::tab_theme_override().unwrap_or_else(|| {
+        benchmark_hooks::tab_theme_override().unwrap_or_else(|| {
             use crate::backend::lock_utils::MutexExt;
             crate::backend::settings::SETTINGS
                 .lock_or_recover()
                 .tab_theme
                 .clone()
-                .into()
         })
     }
 
     fn effective_overflow_mode() -> backend::TabOverflowMode {
-        crate::benchmark_ui_fixture::tab_overflow_override()
-            .unwrap_or_else(backend::get_tab_overflow_mode)
+        benchmark_hooks::overflow_mode_override().unwrap_or_else(backend::get_tab_overflow_mode)
     }
 
     fn save_tabs_if_allowed(state: &AppState, action: &str) {
-        if crate::benchmark_ui_fixture::should_suppress_persistence() {
+        if benchmark_hooks::suppress_tab_persistence() {
             return;
         }
         crate::log_ui!(trace, "Queueing tab save after {}", action);
         crate::config::queue_save_tabs(state.tabs_for_persistence());
+    }
+
+    /// Make tab `idx` the active tab, then persist and announce the change.
+    fn activate_tab(&self, idx: usize, reason: &str, cx: &mut Context<Self>) {
+        self.app_state
+            .update(cx, |state, cx| state.switch_tab(idx, cx));
+        self.publish_tab_activation(reason, cx);
+    }
+
+    /// Persist the tab set after the active tab or split changed and let the
+    /// app move keyboard focus to the newly active split.
+    fn publish_tab_activation(&self, reason: &str, cx: &mut Context<Self>) {
+        Self::save_tabs_if_allowed(self.app_state.read(cx), reason);
+        cx.emit(TabBarActiveSplitChanged);
     }
 
     /// Resolve the minimal appearance's inactive activity hierarchy. Kept as
@@ -391,16 +399,26 @@ impl TabBarRenderer {
 
     /// Width produced by `render_tab_item` for overflow layout.
     ///
-    /// Browser appearances use the same shaped title width as painting, then
-    /// add theme/mode chrome and a small safety minimum.
+    /// Browser appearances floor the natural width at `min_width`; minimal
+    /// tabs already clamp their own width and ignore it.
     fn measured_tab_width(
         &self,
         tab: &TabState,
         tab_theme: &backend::TabTheme,
-        _legacy_character_width: f32,
-        _legacy_chrome_width: f32,
-        legacy_min_width: f32,
+        min_width: f32,
     ) -> f32 {
+        let width = self.natural_tab_width(tab, tab_theme);
+        if Self::uses_browser_tab_sizing(tab_theme) {
+            width.max(min_width)
+        } else {
+            width
+        }
+    }
+
+    /// Unfloored rendered width: the same shaped title width as painting plus
+    /// the lock glyph and theme chrome. A browser tab without a model yet
+    /// measures zero.
+    fn natural_tab_width(&self, tab: &TabState, tab_theme: &backend::TabTheme) -> f32 {
         let minimal = *tab_theme == backend::TabTheme::Minimal;
         let lock_width = if tab.is_locked {
             TAB_LOCK_GLYPH_WIDTH_PX + if minimal { 8.0 } else { 6.0 }
@@ -419,10 +437,9 @@ impl TabBarRenderer {
                     model.live.live_channel_count > 0,
                     tab.has_unread || tab.highlight_state != crate::state::TabHighlightState::None,
                 ))
-            .ceil()
-            .max(legacy_min_width),
+            .ceil(),
             None if minimal => MINIMAL_TAB_MIN_WIDTH_PX,
-            None => legacy_min_width,
+            None => 0.0,
         }
     }
 
@@ -430,14 +447,14 @@ impl TabBarRenderer {
         tab_theme: &backend::TabTheme,
         overflow_mode: &backend::TabOverflowMode,
     ) -> TabLayoutMetrics {
-        let (character_width, chrome_width, minimum_width) =
-            if *overflow_mode == backend::TabOverflowMode::Scroll {
-                (6.5, 24.0, 50.0)
-            } else {
-                (7.6, 28.0, BROWSER_TAB_MIN_WIDTH_PX)
-            };
+        let minimum_width = if *overflow_mode == backend::TabOverflowMode::Scroll {
+            SCROLL_TAB_MIN_WIDTH_PX
+        } else {
+            BROWSER_TAB_MIN_WIDTH_PX
+        };
+        // The minimal add button is a square as tall as a minimal tab.
         let add_button_width = if *tab_theme == backend::TabTheme::Minimal {
-            28.0
+            MINIMAL_TAB_HEIGHT_PX
         } else {
             BROWSER_ADD_TAB_CONTROL_WIDTH_PX
         };
@@ -448,8 +465,6 @@ impl TabBarRenderer {
         };
 
         TabLayoutMetrics {
-            character_width,
-            chrome_width,
             minimum_width,
             add_button_width,
             tab_spacer,
@@ -463,7 +478,6 @@ impl TabBarRenderer {
     fn publish_inline_tab_demand(
         &mut self,
         tabs: &[(usize, &TabState)],
-        _active_idx: usize,
         tab_theme: &backend::TabTheme,
         overflow_mode: &backend::TabOverflowMode,
     ) {
@@ -473,15 +487,8 @@ impl TabBarRenderer {
         }
 
         let metrics = Self::tab_layout_metrics(tab_theme, overflow_mode);
-        let tab_width = |tab: &TabState| {
-            self.measured_tab_width(
-                tab,
-                tab_theme,
-                metrics.character_width,
-                metrics.chrome_width,
-                metrics.minimum_width,
-            )
-        };
+        let tab_width =
+            |tab: &TabState| self.measured_tab_width(tab, tab_theme, metrics.minimum_width);
         let full_tab_set_width: f32 = tabs.iter().map(|(_, tab)| tab_width(tab)).sum();
         let controls_and_spacers_width = metrics.add_button_width
             + metrics.tab_spacer
@@ -532,15 +539,8 @@ impl TabBarRenderer {
             return DropdownTabLayout::default();
         }
 
-        let tab_width = |tab: &TabState| {
-            self.measured_tab_width(
-                tab,
-                tab_theme,
-                metrics.character_width,
-                metrics.chrome_width,
-                metrics.minimum_width,
-            )
-        };
+        let tab_width =
+            |tab: &TabState| self.measured_tab_width(tab, tab_theme, metrics.minimum_width);
         let active_position = tabs.iter().position(|(idx, _)| *idx == active_idx);
 
         let natural_widths: Vec<f32> = tabs.iter().map(|(_, tab)| tab_width(tab)).collect();
@@ -728,23 +728,18 @@ impl TabBarRenderer {
             return vec![(0..tabs.len()).collect()];
         }
 
-        let add_button_width = if *tab_theme == backend::TabTheme::Minimal {
-            28.0
-        } else {
-            36.0
-        };
-        let tab_spacer = if *tab_theme == backend::TabTheme::Minimal {
-            MINIMAL_TAB_SPACER_PX
-        } else {
-            0.0
-        };
+        let TabLayoutMetrics {
+            add_button_width,
+            tab_spacer,
+            ..
+        } = Self::tab_layout_metrics(tab_theme, &backend::TabOverflowMode::MultiLine);
         let mut rows = vec![Vec::new()];
         let mut row_width = 0.0_f32;
 
         for (position, (_, tab)) in tabs.iter().enumerate() {
             let row_idx = rows.len() - 1;
             let width = self
-                .measured_tab_width(tab, tab_theme, 7.6, 28.0, 55.0)
+                .measured_tab_width(tab, tab_theme, NATURAL_TAB_MIN_WIDTH_PX)
                 .min(bar_width);
             let is_last = position + 1 == tabs.len();
             let reserved_add_width = if is_last { add_button_width } else { 0.0 };
@@ -856,10 +851,9 @@ impl TabBarRenderer {
         if overflow_mode == backend::TabOverflowMode::Scroll {
             self.prepare_scroll_tabs(&visible_tabs, active_idx, &tab_theme);
         }
-        self.publish_inline_tab_demand(&visible_tabs, active_idx, &tab_theme, &overflow_mode);
+        self.publish_inline_tab_demand(&visible_tabs, &tab_theme, &overflow_mode);
         self.multiline_row_count = if overflow_mode == backend::TabOverflowMode::MultiLine {
-            let bar_width =
-                crate::benchmark_ui_fixture::cap_tab_layout_width(self.tab_manager.bar_width);
+            let bar_width = benchmark_hooks::layout_width(self.tab_manager.bar_width);
             self.calculate_multiline_rows(&visible_tabs, &tab_theme, bar_width)
                 .len()
                 .max(1)
@@ -934,7 +928,7 @@ impl TabBarRenderer {
     /// `prepare` reported its inputs changed. The cached layout box mirrors the
     /// root the view renders, so both paths lay out identically.
     pub fn view_element(entity: &Entity<Self>, height: f32, stale: bool) -> AnyElement {
-        if stale || crate::benchmark_ui_fixture::is_enabled() {
+        if stale || benchmark_hooks::bypass_view_cache() {
             entity.clone().into_any_element()
         } else {
             entity
@@ -991,22 +985,6 @@ impl TabBarRenderer {
 
     pub fn close_overflow(&mut self) {
         self.tab_manager.overflow_dropdown_open = false;
-    }
-
-    /// Clear the transient tab-bar state created by the disposable UI
-    /// fixture. This deliberately avoids changing saved tabs or the normal
-    /// interaction paths; the benchmark driver calls it only while tearing
-    /// down its in-memory fixture.
-    #[doc(hidden)]
-    pub fn benchmark_close_transients(&mut self) -> bool {
-        self.close_overflow();
-        self.close_context_menu();
-        self.tab_manager.hovered_idx = None;
-        self.tab_manager.scroll_direction = None;
-        !self.is_overflow_open()
-            && !self.is_context_menu_open()
-            && self.hovered_tab_idx().is_none()
-            && self.tab_manager.scroll_direction.is_none()
     }
 
     pub fn bar_width(&self) -> f32 {
@@ -1239,22 +1217,21 @@ impl TabBarRenderer {
         &mut self,
         tabs: &[(usize, &TabState)],
         active_idx: usize,
-        app_state: Entity<AppState>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match Self::effective_overflow_mode() {
             backend::TabOverflowMode::Scroll => {
                 self.multiline_row_count = 1;
-                self.render_tab_bar_scroll(tabs, active_idx, app_state, cx)
+                self.render_tab_bar_scroll(tabs, active_idx, cx)
                     .into_any_element()
             }
             backend::TabOverflowMode::Dropdown => {
                 self.multiline_row_count = 1;
-                self.render_tab_bar_dropdown(tabs, active_idx, app_state, cx)
+                self.render_tab_bar_dropdown(tabs, active_idx, cx)
                     .into_any_element()
             }
             backend::TabOverflowMode::MultiLine => self
-                .render_tab_bar_multiline(tabs, active_idx, app_state, cx)
+                .render_tab_bar_multiline(tabs, active_idx, cx)
                 .into_any_element(),
         }
     }
@@ -1265,20 +1242,13 @@ impl TabBarRenderer {
         active_idx: usize,
         tab_theme: &backend::TabTheme,
     ) {
-        let bar_width =
-            crate::benchmark_ui_fixture::cap_tab_layout_width(self.tab_manager.bar_width);
+        let bar_width = benchmark_hooks::layout_width(self.tab_manager.bar_width);
         let metrics = Self::tab_layout_metrics(tab_theme, &backend::TabOverflowMode::Scroll);
         let mut content_width = 0.0;
         let mut active_bounds = None;
         let mut active_id = None;
         for &(idx, tab) in tabs {
-            let width = self.measured_tab_width(
-                tab,
-                tab_theme,
-                metrics.character_width,
-                metrics.chrome_width,
-                metrics.minimum_width,
-            );
+            let width = self.measured_tab_width(tab, tab_theme, metrics.minimum_width);
             if idx == active_idx {
                 active_bounds = Some((content_width, content_width + width));
                 active_id = Some(tab.id.as_str());
@@ -1333,7 +1303,6 @@ impl TabBarRenderer {
         &mut self,
         tabs: &[(usize, &TabState)],
         active_idx: usize,
-        app_state: Entity<AppState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let tab_theme = Self::effective_tab_theme();
@@ -1348,25 +1317,19 @@ impl TabBarRenderer {
             let Some(model) = self.tab_models.get(&tab.id) else {
                 continue;
             };
-            let is_active = idx == active_idx;
+            let item = TabItem {
+                idx,
+                tab,
+                model,
+                is_active: idx == active_idx,
+                assigned_width_px: None,
+            };
             tab_elements.push(
-                self.render_tab_item(
-                    tab,
-                    model,
-                    &tab_theme,
-                    None,
-                    is_active,
-                    idx,
-                    app_state.clone(),
-                    cx,
-                )
-                .into_any_element(),
+                self.render_tab_item(item, &tab_theme, cx)
+                    .into_any_element(),
             );
         }
-        tab_elements.push(
-            self.render_add_tab_button(app_state.clone(), cx)
-                .into_any_element(),
-        );
+        tab_elements.push(self.render_add_tab_button(cx).into_any_element());
 
         div()
             .id("tab-bar")
@@ -1612,7 +1575,6 @@ impl TabBarRenderer {
         &mut self,
         tabs: &[(usize, &TabState)],
         active_idx: usize,
-        app_state: Entity<AppState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let tab_theme = Self::effective_tab_theme();
@@ -1659,21 +1621,18 @@ impl TabBarRenderer {
             let Some(model) = self.tab_models.get(&tab.id) else {
                 continue;
             };
-            let is_active = idx == active_idx;
+            let item = TabItem {
+                idx,
+                tab,
+                model,
+                is_active: idx == active_idx,
+                assigned_width_px: assigned_widths
+                    .as_ref()
+                    .and_then(|widths| widths.get(position).copied()),
+            };
             tab_elements.push(
-                self.render_tab_item(
-                    tab,
-                    model,
-                    &tab_theme,
-                    assigned_widths
-                        .as_ref()
-                        .and_then(|widths| widths.get(position).copied()),
-                    is_active,
-                    idx,
-                    app_state.clone(),
-                    cx,
-                )
-                .into_any_element(),
+                self.render_tab_item(item, &tab_theme, cx)
+                    .into_any_element(),
             );
         }
 
@@ -1713,7 +1672,7 @@ impl TabBarRenderer {
                     cx,
                 ))
             })
-            .child(self.render_add_tab_button(app_state, cx))
+            .child(self.render_add_tab_button(cx))
     }
 
     /// Render tab bar with multiline wrapping
@@ -1721,21 +1680,16 @@ impl TabBarRenderer {
         &mut self,
         tabs: &[(usize, &TabState)],
         active_idx: usize,
-        app_state: Entity<AppState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let tab_theme = Self::effective_tab_theme();
         let row_height = config::TAB_BAR_HEIGHT_PX;
-        let bar_width =
-            crate::benchmark_ui_fixture::cap_tab_layout_width(self.tab_manager.bar_width);
+        let bar_width = benchmark_hooks::layout_width(self.tab_manager.bar_width);
         let rows = self.calculate_multiline_rows(tabs, &tab_theme, bar_width);
         self.multiline_row_count = rows.len().max(1);
         let bar_height = self.multiline_row_count as f32 * row_height;
-        let tab_spacer = if tab_theme == backend::TabTheme::Minimal {
-            MINIMAL_TAB_SPACER_PX
-        } else {
-            0.0
-        };
+        let tab_spacer =
+            Self::tab_layout_metrics(&tab_theme, &backend::TabOverflowMode::MultiLine).tab_spacer;
 
         let mut row_elements = Vec::with_capacity(rows.len());
         let final_row_idx = rows.len().saturating_sub(1);
@@ -1750,20 +1704,17 @@ impl TabBarRenderer {
                 let Some(model) = self.tab_models.get(&tab.id) else {
                     continue;
                 };
-                let is_active = idx == active_idx;
-                let width = self.measured_tab_width(tab, &tab_theme, 7.6, 28.0, 55.0);
+                let width = self.measured_tab_width(tab, &tab_theme, NATURAL_TAB_MIN_WIDTH_PX);
+                let item = TabItem {
+                    idx,
+                    tab,
+                    model,
+                    is_active: idx == active_idx,
+                    assigned_width_px: (bar_width > 1.0 && width > bar_width).then_some(bar_width),
+                };
                 tab_elements.push(
-                    self.render_tab_item(
-                        tab,
-                        model,
-                        &tab_theme,
-                        (bar_width > 1.0 && width > bar_width).then_some(bar_width),
-                        is_active,
-                        idx,
-                        app_state.clone(),
-                        cx,
-                    )
-                    .into_any_element(),
+                    self.render_tab_item(item, &tab_theme, cx)
+                        .into_any_element(),
                 );
             }
 
@@ -1778,7 +1729,7 @@ impl TabBarRenderer {
                     .overflow_hidden()
                     .children(tab_elements)
                     .when(is_final_row, |row| {
-                        row.child(self.render_add_tab_button(app_state.clone(), cx))
+                        row.child(self.render_add_tab_button(cx))
                     })
                     .into_any_element(),
             );
@@ -1790,8 +1741,8 @@ impl TabBarRenderer {
             .h(px(bar_height))
             .flex_shrink_0()
             .w_full()
-            .when(crate::benchmark_ui_fixture::is_enabled(), |bar| {
-                bar.w(px(crate::benchmark_ui_fixture::FIXTURE_TAB_LAYOUT_WIDTH_PX))
+            .when_some(benchmark_hooks::multiline_bar_width_px(), |bar, width| {
+                bar.w(px(width))
             })
             .flex()
             .flex_col()
@@ -1918,815 +1869,8 @@ impl TabBarRenderer {
             })
     }
 
-    /// Render a single tab item; each tab has its own layout.
-    #[allow(clippy::too_many_arguments)]
-    fn render_tab_item(
-        &self,
-        tab: &TabState,
-        model: &TabRenderModel,
-        tab_theme: &backend::TabTheme,
-        assigned_width_px: Option<f32>,
-        is_active: bool,
-        idx: usize,
-        app_state: Entity<AppState>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let (
-            active_bg,
-            inactive_bg,
-            hover_bg,
-            tab_padding_x,
-            radius,
-            top_only_radius,
-            add_border,
-            active_border_top,
-            active_border_bottom,
-            minimal_style,
-        ) = match tab_theme {
-            backend::TabTheme::Chrome => (
-                colors::bg_plate(),
-                colors::bg_plate(),
-                colors::bg_hover(),
-                10.0_f32,
-                0.0_f32,
-                false,
-                false,
-                false,
-                true,
-                false,
-            ),
-            backend::TabTheme::Firefox => {
-                let mut active = colors::bg_elevated();
-                active.a = 0.95;
-                (
-                    active,
-                    TabManager::tab_bg(false),
-                    colors::bg_hover(),
-                    12.0_f32,
-                    9.0_f32,
-                    true,
-                    true,
-                    false,
-                    false,
-                    false,
-                )
-            }
-            backend::TabTheme::Edge => {
-                let mut inactive = colors::bg_surface();
-                inactive.a = 0.9;
-                (
-                    TabManager::tab_bg(true),
-                    inactive,
-                    colors::bg_hover(),
-                    12.0_f32,
-                    5.0_f32,
-                    false,
-                    true,
-                    true,
-                    false,
-                    false,
-                )
-            }
-            backend::TabTheme::Square => (
-                TabManager::tab_bg(true),
-                TabManager::tab_bg(false),
-                colors::bg_elevated(),
-                12.0_f32,
-                0.0_f32,
-                false,
-                true,
-                false,
-                true,
-                false,
-            ),
-            backend::TabTheme::Arc => {
-                let active = colors::bg_elevated();
-                let mut hover = colors::bg_hover();
-                hover.a = 0.75;
-                (
-                    active,
-                    TabManager::tab_bg(false),
-                    hover,
-                    14.0_f32,
-                    999.0_f32,
-                    false,
-                    true,
-                    false,
-                    false,
-                    false,
-                )
-            }
-            backend::TabTheme::Minimal => (
-                colors::bg_elevated(),
-                colors::bg_plate(),
-                colors::bg_hover(),
-                4.0_f32,
-                0.0_f32,
-                false,
-                false,
-                false,
-                false,
-                true,
-            ),
-        };
-
-        let tab_highlight = if is_active {
-            crate::state::TabHighlightState::None
-        } else {
-            tab.highlight_state
-        };
-        let minimal_visual_state = Self::minimal_visual_state(tab, is_active);
-        let bg = if is_active { active_bg } else { inactive_bg };
-        let text_color =
-            if is_active || minimal_visual_state != crate::state::TabHighlightState::None {
-                colors::text_primary()
-            } else {
-                colors::text_tertiary()
-            };
-        let unread_dot_color = match tab_highlight {
-            crate::state::TabHighlightState::Highlighted => colors::mention_border(),
-            _ => colors::accent(),
-        };
-
-        let title = model.title.clone();
-        let tab_id = tab.id.clone();
-        let is_locked = tab.is_locked;
-        let has_unread = (tab.has_unread || tab_highlight != crate::state::TabHighlightState::None)
-            && !is_active;
-
-        let is_live = model.live.live_channel_count > 0;
-        let live_indicator_tooltip = model.live_tooltip.clone();
-        let live_indicator_tooltip_source = model.live_tooltip_source.clone();
-        let channel_tooltip = model.channel_tooltip.clone();
-        let channel_tooltip_source = model.channel_tooltip_source.clone();
-
-        let is_renaming = self.tab_manager.rename_state.is_active
-            && self.tab_manager.rename_state.tab_id == tab_id;
-        let rename_input = is_renaming.then(|| self.rename_input.clone()).flatten();
-        let rename_min_width = is_renaming.then(|| {
-            assigned_width_px
-                .unwrap_or_else(|| self.measured_tab_width(tab, tab_theme, 7.6, 28.0, 55.0))
-        });
-
-        let is_dragging = self.tab_manager.drag_state.is_dragging;
-        let is_source = is_dragging && self.tab_manager.drag_state.source_idx == idx;
-        let is_drop_target = self
-            .tab_manager
-            .drag_state
-            .drop_target
-            .as_ref()
-            .map(|t| t.target_idx == idx)
-            .unwrap_or(false);
-        let drop_zone = self
-            .tab_manager
-            .drag_state
-            .drop_target
-            .as_ref()
-            .filter(|t| t.target_idx == idx)
-            .map(|t| t.zone);
-
-        let is_hovered = self.tab_manager.hovered_idx == Some(idx);
-        let show_close_button =
-            (is_hovered || (minimal_style && is_active)) && !is_renaming && !is_dragging;
-        let minimal_line_color = if is_active {
-            colors::text_secondary()
-        } else {
-            match minimal_visual_state {
-                crate::state::TabHighlightState::Highlighted => colors::mention_border(),
-                crate::state::TabHighlightState::NewMessage => colors::text_muted(),
-                crate::state::TabHighlightState::None if is_hovered => colors::border(),
-                crate::state::TabHighlightState::None => colors::border_subtle(),
-            }
-        };
-        let tab_height = if minimal_style {
-            MINIMAL_TAB_HEIGHT_PX
-        } else {
-            config::TAB_BAR_HEIGHT_PX
-        };
-        let tab_gap = if minimal_style { 8.0 } else { 6.0 };
-        let constrain_title = assigned_width_px.is_some_and(|width| {
-            width + 0.5 < self.measured_tab_width(tab, tab_theme, 0.0, 0.0, 0.0)
-        });
-
-        let tab_id_for_close = tab_id.clone();
-        let tab_id_for_middle = tab_id.clone();
-        let tab_id_for_middle_up = tab_id.clone();
-        let tab_id_for_middle_out = tab_id.clone();
-        let tab_id_for_close_up = tab_id.clone();
-        let tab_id_for_close_out = tab_id.clone();
-        let tab_id_for_ctx = tab_id.clone();
-        let tab_id_for_dblclick = tab_id.clone();
-
-        let entity = cx.entity().clone();
-        let title_entity = entity.clone();
-        let title_width = model.shaped_title_width;
-        let tab_id_for_accessibility = tab_id.clone();
-        let tab_id_for_accessible_close = tab_id.clone();
-        // Screen readers announce the name first and often skip the description,
-        // so live and unread state ride on the name ("#xqc, live, unread").
-        let mut accessible_name = title.to_string();
-        match model.live.live_channel_count {
-            0 => {}
-            1 => accessible_name.push_str(", live"),
-            count => accessible_name.push_str(&format!(", {count} live channels")),
-        }
-        if has_unread {
-            accessible_name.push_str(
-                if tab_highlight == crate::state::TabHighlightState::Highlighted {
-                    ", unread mentions"
-                } else {
-                    ", unread"
-                },
-            );
-        }
-        let accessibility_state = [
-            is_live.then(|| live_indicator_tooltip.to_string()),
-            is_locked.then(|| "Layout locked".to_string()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(". ");
-
-        let mut tab_el = div()
-            .id(("tab", idx))
-            .role(Role::Tab)
-            .aria_label(accessible_name)
-            .aria_description(accessibility_state)
-            .aria_selected(is_active)
-            .aria_position_in_set(model.position_in_set)
-            .aria_size_of_set(model.size_of_set)
-            .on_a11y_action(accesskit::Action::Click, {
-                let click = cx.listener(move |this, _: &(), _window, cx| {
-                    this.commit_rename(cx);
-                    this.close_context_menu();
-                    this.close_overflow();
-                    let changed = this.app_state.update(cx, |state, cx| {
-                        let Some(idx) = state
-                            .tabs
-                            .iter()
-                            .position(|tab| tab.id == tab_id_for_accessibility)
-                        else {
-                            return false;
-                        };
-                        state.switch_tab(idx, cx);
-                        true
-                    });
-                    if changed {
-                        Self::save_tabs_if_allowed(
-                            this.app_state.read(cx),
-                            "accessible tab switch",
-                        );
-                        cx.emit(TabBarActiveSplitChanged);
-                        cx.notify();
-                    }
-                });
-                move |_, window, cx| click(&(), window, cx)
-            })
-            .group(SharedString::from(format!("tab-{}", idx)))
-            .h(px(tab_height))
-            .flex_shrink_0()
-            .px(px(tab_padding_x))
-            .pt(px(Spacing::HAIRLINE))
-            .flex()
-            .items_center()
-            .gap(px(tab_gap))
-            .bg(bg)
-            .relative()
-            .when_some(assigned_width_px, |tab, width| tab.w(px(width)))
-            .when(
-                !is_renaming && !is_dragging && (!minimal_style || !is_active),
-                |s| s.hover(|s| s.bg(hover_bg)),
-            )
-            .cursor_default()
-            .opacity(if is_source { 0.5 } else { 1.0 })
-            .when(
-                is_drop_target && drop_zone == Some(TabDropZone::SwapWith),
-                |s| s.border_2().border_color(colors::accent()),
-            )
-            .when(minimal_style, |tab| {
-                tab.min_w(px(MINIMAL_TAB_MIN_WIDTH_PX))
-                    .max_w(px(MINIMAL_TAB_MAX_WIDTH_PX))
-                    .overflow_hidden()
-            })
-            // The rename field has no intrinsic width, so an intrinsically sized
-            // tab collapses around it; hold the tab at its pre-rename width.
-            .when_some(rename_min_width, |tab, width| tab.min_w(px(width)));
-
-        tab_el = if top_only_radius {
-            tab_el.rounded_t(px(radius))
-        } else {
-            tab_el.rounded(px(radius))
-        };
-
-        if add_border {
-            tab_el = tab_el.border_1().border_color(colors::border());
-        }
-        if is_active && active_border_top {
-            tab_el = tab_el
-                .border_t(px(3.0))
-                .border_color(colors::text_secondary());
-        }
-        if is_active && active_border_bottom {
-            tab_el = tab_el
-                .border_b(px(3.0))
-                .border_color(colors::text_secondary());
-        }
-        if minimal_style {
-            tab_el = tab_el.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(if is_active { 3.0 } else { 2.0 }))
-                    .bg(minimal_line_color),
-            );
-        }
-
-        let show_live_indicator = is_live;
-
-        tab_el
-            .on_hover({
-                let tooltip = channel_tooltip.clone();
-                let tooltip_source = channel_tooltip_source.clone();
-                let title = title.clone();
-                let entity = entity.clone();
-                move |hovered, window, app| {
-                    if *hovered {
-                        if let Some(tooltip) =
-                            entity.read(app).tab_tooltip(idx, &title, tooltip.as_ref())
-                        {
-                            show_text_tooltip(
-                                window.window_handle(),
-                                tooltip_source.to_string(),
-                                tooltip,
-                                window.mouse_position(),
-                            );
-                        }
-                    } else {
-                        clear_global_tooltip_if_source_in_window(
-                            window.window_handle(),
-                            &tooltip_source,
-                        );
-                    }
-                }
-            })
-            .on_mouse_move(
-                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                    if this.tab_manager.hovered_idx != Some(idx) {
-                        this.tab_manager.hovered_idx = Some(idx);
-                        cx.notify();
-                    }
-
-                    if this.tab_manager.update_drag_position(
-                        event.position,
-                        event.pressed_button == Some(MouseButton::Left),
-                    ) {
-                        cx.notify();
-                    }
-                    if !this.tab_manager.drag_state.is_dragging {
-                        return;
-                    }
-                    let source_idx = this.tab_manager.drag_state.source_idx;
-
-                    let bounds = this.tab_manager.hit_areas.get(&idx).cloned();
-                    if let Some(bounds) = bounds {
-                        let zone = TabManager::calculate_tab_drop_zone(event.position, bounds);
-
-                        let skip = match zone {
-                            TabDropZone::InsertBefore => idx == source_idx || idx == source_idx + 1,
-                            TabDropZone::InsertAfter => idx == source_idx || idx + 1 == source_idx,
-                            TabDropZone::SwapWith => idx == source_idx,
-                        };
-
-                        if skip {
-                            if this.tab_manager.drag_state.drop_target.is_some() {
-                                this.tab_manager.drag_state.drop_target = None;
-                                cx.notify();
-                            }
-                            return;
-                        }
-
-                        let new_target = TabDropTarget {
-                            target_idx: idx,
-                            zone,
-                        };
-                        let should_update = match &this.tab_manager.drag_state.drop_target {
-                            Some(t) => t.target_idx != idx || t.zone != zone,
-                            None => true,
-                        };
-
-                        if should_update {
-                            this.tab_manager.drag_state.drop_target = Some(new_target);
-                            cx.notify();
-                        }
-                    }
-                }),
-            )
-            .when(has_unread && !minimal_style, |s| {
-                s.child(
-                    div()
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded(Radii::full())
-                        .bg(unread_dot_color),
-                )
-            })
-            .when(show_live_indicator, |s| {
-                let indicator_color = if minimal_style {
-                    colors::signal_red()
-                } else {
-                    colors::signal_green()
-                };
-                let tooltip_source = live_indicator_tooltip_source.clone();
-                let tooltip_text = live_indicator_tooltip.clone();
-                let channel_tooltip_source = channel_tooltip_source.clone();
-                let channel_tooltip = channel_tooltip.clone();
-                let tooltip_title = title.clone();
-                let tooltip_entity = entity.clone();
-                s.child(
-                    div()
-                        .id(("live-indicator", idx))
-                        .w(px(if minimal_style { 4.0 } else { 6.0 }))
-                        .h(px(if minimal_style { 4.0 } else { 6.0 }))
-                        .rounded(Radii::full())
-                        .bg(indicator_color)
-                        .when(minimal_style, |indicator| {
-                            indicator
-                                .absolute()
-                                .top(px(if is_active { 4.0 } else { 5.0 }))
-                                .right(px(3.0))
-                        })
-                        .on_hover(move |hovered, window, app| {
-                            if *hovered {
-                                clear_global_tooltip_if_source_in_window(
-                                    window.window_handle(),
-                                    &channel_tooltip_source,
-                                );
-                                show_text_tooltip(
-                                    window.window_handle(),
-                                    tooltip_source.to_string(),
-                                    tooltip_text.to_string(),
-                                    window.mouse_position(),
-                                );
-                            } else {
-                                clear_global_tooltip_if_source_in_window(
-                                    window.window_handle(),
-                                    &tooltip_source,
-                                );
-                                let renderer = tooltip_entity.read(app);
-                                let position = window.mouse_position();
-                                let over_tab = renderer
-                                    .tab_bounds(idx)
-                                    .is_some_and(|bounds| bounds.contains(&position))
-                                    && renderer
-                                        .tab_manager
-                                        .scroll_viewport_bounds
-                                        .as_ref()
-                                        .is_none_or(|bounds| bounds.contains(&position));
-                                if let Some(channel_tooltip) = over_tab
-                                    .then(|| {
-                                        renderer.tab_tooltip(
-                                            idx,
-                                            &tooltip_title,
-                                            channel_tooltip.as_ref(),
-                                        )
-                                    })
-                                    .flatten()
-                                {
-                                    show_text_tooltip(
-                                        window.window_handle(),
-                                        channel_tooltip_source.to_string(),
-                                        channel_tooltip.to_string(),
-                                        window.mouse_position(),
-                                    );
-                                }
-                            }
-                        }),
-                )
-            })
-            .when(!is_renaming, |el| {
-                el.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        if this.is_renaming() {
-                            this.commit_rename(cx);
-                        }
-                        let close_button_press = this
-                            .tab_manager
-                            .is_close_button_press(&tab_id_for_dblclick, event.position);
-                        if !close_button_press {
-                            this.tab_manager.close_press = None;
-                        }
-                        if !close_button_press && this.tab_manager.check_tab_double_click(idx) {
-                            this.start_rename(tab_id_for_dblclick.clone());
-                            this.ensure_rename_input(window, cx);
-                            this.tab_manager.drag_state =
-                                crate::managers::tab_manager::TabDragState::default();
-                            cx.notify();
-                            return;
-                        }
-
-                        if !close_button_press {
-                            app_state.update(cx, |state, cx| {
-                                state.switch_tab(idx, cx);
-                            });
-                            let state = app_state.read(cx);
-                            Self::save_tabs_if_allowed(state, "tab switch");
-                            cx.emit(TabBarActiveSplitChanged);
-                        }
-
-                        let tab_order = app_state
-                            .read(cx)
-                            .tabs
-                            .iter()
-                            .map(|tab| tab.id.clone())
-                            .collect();
-                        this.tab_manager.begin_drag(
-                            idx,
-                            tab_id_for_dblclick.clone(),
-                            tab_order,
-                            event.position,
-                        );
-                        cx.notify();
-                    }),
-                )
-            })
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.tab_manager.arm_close_press(
-                        tab_id_for_middle.clone(),
-                        MouseButton::Middle,
-                        event.position,
-                    );
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Middle,
-                cx.listener(move |this, _event, _window, _cx| {
-                    this.tab_manager
-                        .disarm_close_press(&tab_id_for_middle_out, MouseButton::Middle);
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
-                    cx.stop_propagation();
-                    if !this.tab_manager.take_completed_close(
-                        &tab_id_for_middle_up,
-                        MouseButton::Middle,
-                        event.position,
-                    ) {
-                        return;
-                    }
-                    this.cancel_tab_drag();
-                    cx.emit(crate::app::TabCloseRequest {
-                        tab_id: tab_id_for_middle_up.clone(),
-                    });
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.tab_manager.context_menu = crate::managers::tab_manager::TabContextMenu {
-                        is_open: true,
-                        tab_idx: idx,
-                        tab_id: tab_id_for_ctx.clone(),
-                        x: event.position.x.into(),
-                        y: event.position.y.into(),
-                    };
-                    cx.notify();
-                }),
-            )
-            .when(is_locked && !is_renaming, |el| {
-                el.child(render_tab_lock_glyph(text_color))
-            })
-            .child(if is_renaming {
-                let rename_input = rename_input.expect("active rename has an input state");
-                let rename_input = div()
-                    .id(("tab-rename-input", idx))
-                    .flex()
-                    .items_center()
-                    .flex_1()
-                    .min_w_0()
-                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                        if event.keystroke.key == "escape" {
-                            this.cancel_rename();
-                            cx.stop_propagation();
-                            cx.emit(TabBarActiveSplitChanged);
-                            cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        Input::new(&rename_input)
-                            .appearance(true)
-                            .bordered(true)
-                            .focus_bordered(true)
-                            .accessibility_label("Rename tab"),
-                    );
-                rename_input.into_any_element()
-            } else {
-                div()
-                    .relative()
-                    .text_size(px(TAB_TITLE_FONT_SIZE_PX))
-                    .text_color(text_color)
-                    .when(minimal_style, |title| {
-                        title
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_center()
-                    })
-                    .when(!minimal_style && assigned_width_px.is_some(), |title| {
-                        title.flex_1().whitespace_nowrap().text_center()
-                    })
-                    .when(constrain_title, |title| {
-                        title.min_w_0().overflow_hidden().text_ellipsis()
-                    })
-                    .child(title)
-                    .child(
-                        canvas(
-                            move |bounds, window, cx| {
-                                let visible = bounds.intersect(&window.content_mask().bounds);
-                                title_entity.update(cx, |renderer, _| {
-                                    if title_width > f32::from(visible.size.width) + 0.5 {
-                                        renderer.tab_manager.clipped_titles.insert(idx);
-                                    } else {
-                                        renderer.tab_manager.clipped_titles.remove(&idx);
-                                    }
-                                });
-                            },
-                            |_, _: (), _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
-                    .into_any_element()
-            })
-            .when(
-                show_close_button
-                    || minimal_style
-                    || assigned_width_px.is_none()
-                    || constrain_title,
-                |el| {
-                    // Layout only ever sees this 16 px slot, hovered or not.
-                    // Taffy undersizes an intrinsically sized flex row when a
-                    // non-shrinking item has a negative margin, which made a
-                    // hovered tab collapse out from under the pointer, so the
-                    // larger close hit area is positioned absolutely instead.
-                    let slot = div().w(px(16.0)).h(px(16.0)).flex_shrink_0().relative();
-                    if !show_close_button {
-                        return el.child(slot);
-                    }
-                    let hover_bg = if minimal_style {
-                        colors::text_primary().opacity(0.16)
-                    } else {
-                        colors::error().opacity(0.15)
-                    };
-                    let hover_text = if minimal_style {
-                        colors::text_primary()
-                    } else {
-                        colors::signal_red()
-                    };
-                    el.child(
-                        slot.child(
-                            div()
-                                .id(("tab-close", idx))
-                                .role(Role::Button)
-                                .aria_label("Close tab")
-                                .on_a11y_action(accesskit::Action::Click, {
-                                    let click = cx.listener(move |this, _: &(), _window, cx| {
-                                        this.cancel_tab_drag();
-                                        cx.emit(crate::app::TabCloseRequest {
-                                            tab_id: tab_id_for_accessible_close.clone(),
-                                        });
-                                        cx.notify();
-                                    });
-                                    move |_, window, cx| click(&(), window, cx)
-                                })
-                                .on_hover(text_tooltip_on_hover(
-                                    format!("tab-close-{idx}"),
-                                    "Close tab".to_string(),
-                                ))
-                                // Extends into the existing gap and padding without changing layout.
-                                .absolute()
-                                .left(px(-4.0))
-                                .top(px(-4.0))
-                                .w(px(24.0))
-                                .h(px(24.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(if minimal_style { px(0.0) } else { Radii::sm() })
-                                .text_size(px(FontSize::XS))
-                                .text_color(colors::text_muted())
-                                .hover(move |s| s.bg(hover_bg).text_color(hover_text))
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(
-                                        move |this, event: &MouseDownEvent, _window, _cx| {
-                                            if this.tab_manager.drag_state.is_dragging {
-                                                return;
-                                            }
-                                            this.tab_manager.arm_close_press(
-                                                tab_id_for_close.clone(),
-                                                MouseButton::Left,
-                                                event.position,
-                                            );
-                                        },
-                                    ),
-                                )
-                                .on_mouse_up_out(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _event, _window, _cx| {
-                                        this.tab_manager.disarm_close_press(
-                                            &tab_id_for_close_out,
-                                            MouseButton::Left,
-                                        );
-                                    }),
-                                )
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
-                                        if !this.tab_manager.take_completed_close(
-                                            &tab_id_for_close_up,
-                                            MouseButton::Left,
-                                            event.position,
-                                        ) {
-                                            return;
-                                        }
-                                        this.cancel_tab_drag();
-                                        cx.emit(crate::app::TabCloseRequest {
-                                            tab_id: tab_id_for_close_up.clone(),
-                                        });
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(CLOSE_GLYPH),
-                        ),
-                    )
-                },
-            )
-            .when(
-                is_drop_target && drop_zone == Some(TabDropZone::InsertBefore),
-                |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .left(px(-2.0))
-                            .top(px(6.0))
-                            .bottom(px(6.0))
-                            .w(px(3.0))
-                            .rounded(Radii::xs())
-                            .bg(colors::accent()),
-                    )
-                },
-            )
-            .when(
-                is_drop_target && drop_zone == Some(TabDropZone::InsertAfter),
-                |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .right(px(-2.0))
-                            .top(px(6.0))
-                            .bottom(px(6.0))
-                            .w(px(3.0))
-                            .rounded(Radii::xs())
-                            .bg(colors::accent()),
-                    )
-                },
-            )
-            .child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        entity.update(cx, |renderer, _| {
-                            renderer.tab_manager.hit_areas.insert(idx, bounds);
-                        });
-                    },
-                    |_bounds, _: (), _window, _cx| {},
-                )
-                .absolute()
-                .inset_0(),
-            )
-    }
-
     /// Add new tab button
-    fn render_add_tab_button(
-        &self,
-        _app_state: Entity<AppState>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn render_add_tab_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let minimal_style = Self::effective_tab_theme() == backend::TabTheme::Minimal;
 
         div()
@@ -2761,521 +1905,6 @@ impl TabBarRenderer {
                     .child("+"),
             )
     }
-
-    /// Render the tab's right-click context menu overlay.
-    ///
-    /// Extracted from app.rs to reduce monolith size.
-    pub fn render_context_menu_overlay(
-        &mut self,
-        app_state: Entity<AppState>,
-        menu: &MenuHost,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if !self.is_context_menu_open() {
-            return div().into_any_element();
-        }
-
-        clear_global_tooltip();
-
-        let (_, tab_id_ref, x, y) = self.context_menu_info();
-        let tab_id = tab_id_ref.to_string();
-
-        let target = {
-            let state = app_state.read(cx);
-            state.tabs.iter().enumerate().find_map(|(idx, tab)| {
-                (tab.id == tab_id).then(|| {
-                    (
-                        idx,
-                        tab.is_locked,
-                        tab.mark_unread_on_new,
-                        tab.valid_active_split_path(),
-                        tab.channel_targets(),
-                    )
-                })
-            })
-        };
-        let Some((idx, is_locked, mark_unread, active_split_path, channel_targets)) = target else {
-            self.close_context_menu();
-            cx.notify();
-            return div().into_any_element();
-        };
-        self.tab_manager.context_menu.tab_idx = idx;
-
-        let viewport = window.viewport_size();
-        let menu_fit = crate::utils::fit_overlay_to_viewport(
-            viewport,
-            220.0,
-            tab_context_menu_preferred_height(channel_targets.len())
-                .min(TAB_CONTEXT_MENU_MAX_HEIGHT_PX),
-            8.0,
-        );
-        let x = crate::utils::clamp_overlay_axis(
-            x,
-            menu_fit.width,
-            f32::from(viewport.width),
-            menu_fit.margin_x,
-        );
-        let y = crate::utils::clamp_overlay_axis(
-            y,
-            menu_fit.height,
-            f32::from(viewport.height),
-            menu_fit.margin_y,
-        );
-
-        let tab_bar = cx.entity();
-        let nav = &menu.nav;
-        let mut actions: Vec<MenuAction> = Vec::new();
-        let mut menu_items: Vec<AnyElement> = Vec::new();
-        for item in TAB_CONTEXT_MENU_ITEMS {
-            if item.is_divider {
-                menu_items.push(menu_divider().into_any_element());
-                continue;
-            }
-            let action = item.action;
-            let tab_id = tab_id.clone();
-            let app_state = app_state.clone();
-            let tab_bar = tab_bar.clone();
-            let toggle_state = TabManager::get_toggle_state(action, is_locked, mark_unread);
-            let run: MenuAction = Rc::new(move |window: &mut Window, cx: &mut App| {
-                tab_bar.update(cx, |this, cx| {
-                    this.handle_tab_action(action, &tab_id, app_state.clone(), window, cx);
-                    this.close_context_menu();
-                    cx.notify();
-                });
-            });
-            let index = actions.len();
-            actions.push(run.clone());
-            menu_items.push(
-                menu_item(item.action, index, nav, run)
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(MenuMetrics::ITEM_TEXT))
-                            .text_color(if item.is_destructive {
-                                colors::signal_red()
-                            } else {
-                                colors::text_primary()
-                            })
-                            .child(item.label),
-                    )
-                    .when(item.is_toggle && toggle_state, |row| {
-                        row.child(
-                            div()
-                                .text_size(px(MenuMetrics::ITEM_TEXT))
-                                .text_color(colors::signal_green())
-                                .child("✓"),
-                        )
-                    })
-                    .into_any_element(),
-            );
-        }
-
-        if channel_targets.len() > 1 {
-            menu_items.push(menu_divider().into_any_element());
-            menu_items.push(
-                menu_header()
-                    .id(("tab-channel-heading", idx))
-                    .child("Switch to split")
-                    .into_any_element(),
-            );
-
-            for (target_idx, (path, label)) in channel_targets.into_iter().enumerate() {
-                let is_active_target = path == active_split_path;
-                let app_state = app_state.clone();
-                let tab_bar = tab_bar.clone();
-                let tab_id = tab_id.clone();
-                let run: MenuAction = Rc::new(move |_window: &mut Window, cx: &mut App| {
-                    tab_bar.update(cx, |this, cx| {
-                        let mut changed = false;
-                        app_state.update(cx, |state, cx| {
-                            let Some(idx) = state.tabs.iter().position(|tab| tab.id == tab_id)
-                            else {
-                                return;
-                            };
-                            changed = state.active_tab_idx != idx;
-                            state.switch_tab(idx, cx);
-                            changed |= state.tabs_mut()[idx].set_active_split_path(path.clone());
-                        });
-                        if changed {
-                            let state = app_state.read(cx);
-                            Self::save_tabs_if_allowed(state, "switch split from tab menu");
-                            cx.emit(TabBarActiveSplitChanged);
-                        }
-                        this.close_context_menu();
-                        cx.notify();
-                    });
-                });
-                let index = actions.len();
-                actions.push(run.clone());
-                menu_items.push(
-                    menu_item(
-                        SharedString::from(format!("tab-channel-target-{idx}-{target_idx}")),
-                        index,
-                        nav,
-                        run,
-                    )
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(MenuMetrics::ITEM_TEXT))
-                            .text_color(colors::text_primary())
-                            .child(label),
-                    )
-                    .when(is_active_target, |item| {
-                        item.child(
-                            div()
-                                .text_size(px(MenuMetrics::ITEM_TEXT))
-                                .text_color(colors::signal_green())
-                                .child("✓"),
-                        )
-                    })
-                    .into_any_element(),
-                );
-            }
-        }
-
-        modal_backdrop_style()
-            .id("tab-context-menu-overlay")
-            .on_mouse_move(|_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-            .on_scroll(|_, _, cx| cx.stop_propagation())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                    this.close_context_menu();
-                    cx.notify();
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-            .child(
-                menu_panel()
-                    .id("tab-context-menu")
-                    .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .w(px(menu_fit.width))
-                    .max_h(px(menu_fit.height))
-                    .overflow_y_scroll()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .menu_keyboard(&menu.focus, &menu.nav, actions, menu.close_handler())
-                    .children(menu_items),
-            )
-            .into_any_element()
-    }
-
-    /// Render tab overflow dropdown overlay for dropdown mode
-    ///
-    /// Extracted from app.rs to reduce monolith size.
-    pub fn render_overflow_dropdown_overlay(
-        &mut self,
-        app_state: Entity<AppState>,
-        menu: &MenuHost,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if !self.is_overflow_open() {
-            return div().into_any_element();
-        }
-
-        clear_global_tooltip();
-
-        if Self::effective_overflow_mode() != backend::TabOverflowMode::Dropdown {
-            self.close_overflow();
-            return div().into_any_element();
-        }
-
-        if app_state.read(cx).should_hide_tab_bar() {
-            self.close_overflow();
-            return div().into_any_element();
-        }
-
-        let tab_bar_width = self.bar_width();
-
-        let tab_theme = Self::effective_tab_theme();
-        let metrics = Self::tab_layout_metrics(&tab_theme, &backend::TabOverflowMode::Dropdown);
-        let overflow_button_width = DROPDOWN_OVERFLOW_CONTROL_WIDTH_PX;
-
-        let overflow_rows: Vec<(
-            usize,
-            SharedString,
-            bool,
-            Hsla,
-            crate::state::TabHighlightState,
-        )> = {
-            let state = app_state.read(cx);
-            let active_idx = state.active_tab_idx;
-            let tabs = state
-                .visible_tab_indices()
-                .into_iter()
-                .filter_map(|idx| state.tabs.get(idx).map(|tab| (idx, tab)))
-                .collect::<Vec<_>>();
-            self.sync_tab_models(&tabs, &state.stream_info, window);
-            let visible_positions = self
-                .calculate_dropdown_layout(
-                    &tabs,
-                    active_idx,
-                    &tab_theme,
-                    tab_bar_width,
-                    metrics,
-                    overflow_button_width,
-                )
-                .visible_positions;
-
-            let overflow_tabs: Vec<(usize, &TabState)> = tabs
-                .iter()
-                .enumerate()
-                .filter(|(position, _)| !visible_positions.contains(position))
-                .map(|(_, tab)| *tab)
-                .collect();
-
-            overflow_tabs
-                .into_iter()
-                .map(|(idx, tab)| {
-                    let title = self
-                        .tab_models
-                        .get(&tab.id)
-                        .map(|model| model.title.clone())
-                        .unwrap_or_else(|| SharedString::from(tab.display_title()));
-                    let is_active = idx == active_idx;
-                    let tab_highlight = if is_active {
-                        crate::state::TabHighlightState::None
-                    } else {
-                        tab.highlight_state
-                    };
-                    let visual_state = match tab_highlight {
-                        crate::state::TabHighlightState::None if !is_active && tab.has_unread => {
-                            crate::state::TabHighlightState::NewMessage
-                        }
-                        state => state,
-                    };
-                    let text_color =
-                        if is_active || visual_state != crate::state::TabHighlightState::None {
-                            colors::text_primary()
-                        } else {
-                            colors::text_tertiary()
-                        };
-                    (idx, title, is_active, text_color, visual_state)
-                })
-                .collect()
-        };
-
-        if overflow_rows.is_empty() {
-            self.close_overflow();
-            return div().into_any_element();
-        }
-
-        let viewport = window.viewport_size();
-        let dropdown_fit = crate::utils::fit_overlay_to_viewport(viewport, 180.0, 400.0, 8.0);
-        let dropdown_width = dropdown_fit.width;
-        let (x, y) = if let Some(bounds) = self.overflow_button_bounds() {
-            let bx: f32 = bounds.origin.x.into();
-            let by: f32 = bounds.origin.y.into();
-            let height: f32 = bounds.size.height.into();
-            let constrained_x = crate::utils::clamp_overlay_axis(
-                bx,
-                dropdown_width,
-                f32::from(viewport.width),
-                dropdown_fit.margin_x,
-            );
-            (constrained_x, by + height)
-        } else {
-            (
-                0.0,
-                backend::settings::titlebar_height_px() + config::TAB_BAR_HEIGHT_PX,
-            )
-        };
-
-        let tab_bar = cx.entity();
-        let mut actions: Vec<MenuAction> = Vec::with_capacity(overflow_rows.len());
-        let overflow_items: Vec<_> = overflow_rows
-            .into_iter()
-            .enumerate()
-            .map(
-                |(position, (idx, title, is_active, text_color, visual_state))| {
-                    let app_state = app_state.clone();
-                    let tab_bar = tab_bar.clone();
-                    let run: MenuAction = Rc::new(move |_window: &mut Window, cx: &mut App| {
-                        tab_bar.update(cx, |this, cx| {
-                            app_state.update(cx, |state, cx| {
-                                state.switch_tab(idx, cx);
-                            });
-                            this.close_overflow();
-                            let state = app_state.read(cx);
-                            Self::save_tabs_if_allowed(state, "overflow switch");
-                            cx.emit(TabBarActiveSplitChanged);
-                            cx.notify();
-                        });
-                    });
-                    actions.push(run.clone());
-                    let state_color = if is_active {
-                        colors::text_secondary()
-                    } else {
-                        match visual_state {
-                            crate::state::TabHighlightState::Highlighted => {
-                                colors::mention_border()
-                            }
-                            crate::state::TabHighlightState::NewMessage => colors::signal_yellow(),
-                            crate::state::TabHighlightState::None => colors::border_subtle(),
-                        }
-                    };
-
-                    menu_item(("overflow-tab", idx), position, &menu.nav, run)
-                        .border_l(px(if is_active { 3.0 } else { 2.0 }))
-                        .border_color(state_color)
-                        .when(is_active && !menu.nav.is_highlighted(position), |s| {
-                            s.bg(colors::bg_plate())
-                        })
-                        .child(
-                            div()
-                                .text_size(px(MenuMetrics::ITEM_TEXT))
-                                .text_color(text_color)
-                                .child(title),
-                        )
-                        .into_any_element()
-                },
-            )
-            .collect();
-
-        let y = crate::utils::clamp_overlay_axis(
-            y,
-            dropdown_fit.height,
-            f32::from(viewport.height),
-            dropdown_fit.margin_y,
-        );
-
-        modal_backdrop_style()
-            .id("tab-overflow-dropdown-overlay")
-            .on_mouse_move(|_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-            .on_scroll(|_, _, cx| cx.stop_propagation())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                    this.close_overflow();
-                    cx.notify();
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
-            .child(
-                menu_panel()
-                    .id("tab-overflow-dropdown")
-                    .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .w(px(dropdown_width))
-                    .max_h(px(dropdown_fit.height))
-                    .overflow_y_scroll()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .menu_keyboard(&menu.focus, &menu.nav, actions, menu.close_handler())
-                    .children(overflow_items),
-            )
-            .into_any_element()
-    }
-
-    /// Handle a tab context menu action.
-    ///
-    /// Extracted from app.rs to reduce monolith size.
-    pub fn handle_tab_action(
-        &mut self,
-        action: &str,
-        tab_id: &str,
-        app_state: Entity<AppState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(idx) = app_state
-            .read(cx)
-            .tabs
-            .iter()
-            .position(|tab| tab.id == tab_id)
-        else {
-            self.cancel_tab_drag();
-            return;
-        };
-        self.cancel_tab_drag();
-
-        match action {
-            "rename" => {
-                self.start_rename(tab_id.to_string());
-                self.ensure_rename_input(window, cx);
-                cx.notify();
-            }
-            "duplicate" => {
-                app_state.update(cx, |state, _cx| {
-                    state.duplicate_tab(idx);
-                });
-            }
-            "close" => {
-                cx.emit(crate::app::TabCloseRequest {
-                    tab_id: tab_id.to_string(),
-                });
-                return;
-            }
-            "close_others" | "close_right" => {
-                let to_right = action == "close_right";
-                let tab_count = app_state.read(cx).tabs.len();
-                let count = if to_right {
-                    tab_count.saturating_sub(idx + 1)
-                } else {
-                    tab_count.saturating_sub(1)
-                };
-                if count > 0 {
-                    crate::backend::push_ui_action(crate::backend::UiAction::ConfirmCloseTabs {
-                        tab_id: tab_id.to_string(),
-                        to_right,
-                        count,
-                    });
-                }
-            }
-            "reopen_closed" => {
-                let reopened = app_state.update(cx, |state, cx| state.reopen_closed_tabs(cx));
-                if reopened == 0 {
-                    crate::backend::push_ui_action(crate::backend::UiAction::ShowWarningToast {
-                        message: "No closed tab".to_string(),
-                        detail: Some("Close a tab before using Reopen Closed Tab.".to_string()),
-                    });
-                }
-            }
-            "toggle_unread" => {
-                app_state.update(cx, |state, _cx| {
-                    if idx < state.tabs.len() {
-                        let current = state.tabs[idx].mark_unread_on_new;
-                        state.tabs_mut()[idx].mark_unread_on_new = !current;
-                    }
-                });
-            }
-            "toggle_lock" => {
-                app_state.update(cx, |state, _cx| {
-                    if idx < state.tabs.len() {
-                        let current = state.tabs[idx].is_locked;
-                        state.tabs_mut()[idx].is_locked = !current;
-                    }
-                });
-            }
-            "sort_alpha" => {
-                app_state.update(cx, |state, _cx| {
-                    state.sort_tabs_alphabetically();
-                });
-            }
-            _ => {
-                crate::log_ui!(warn, "Unknown tab action: {}", action);
-            }
-        }
-        if action == "reopen_closed" {
-            cx.emit(TabBarActiveSplitChanged);
-        }
-        let state = app_state.read(cx);
-        Self::save_tabs_if_allowed(state, "context action");
-    }
 }
 
 impl Render for TabBarRenderer {
@@ -3300,7 +1929,7 @@ impl Render for TabBarRenderer {
             .collect::<Vec<_>>();
         self.tab_manager.hit_areas.clear();
         self.tab_manager.clipped_titles.clear();
-        self.render_tab_bar_fast(&visible_tabs, active_idx, app_state, cx)
+        self.render_tab_bar_fast(&visible_tabs, active_idx, cx)
     }
 }
 
@@ -3375,25 +2004,4 @@ mod browser_dropdown_layout_tests {
         assert_eq!(solve(&[120.0, 80.0], None, 70.0), vec![0]);
         assert!(solve(&[], Some(0), 300.0).is_empty());
     }
-}
-
-/// A small padlock drawn from boxes, marking a tab whose split layout is locked.
-fn render_tab_lock_glyph(color: Hsla) -> impl IntoElement {
-    div()
-        .flex_shrink_0()
-        .w(px(8.0))
-        .h(px(10.0))
-        .flex()
-        .flex_col()
-        .items_center()
-        .child(
-            div()
-                .w(px(6.0))
-                .h(px(5.0))
-                .border_1()
-                .border_b_0()
-                .border_color(color)
-                .rounded_t(Radii::sm()),
-        )
-        .child(div().w(px(8.0)).h(px(5.0)).rounded(Radii::xs()).bg(color))
 }

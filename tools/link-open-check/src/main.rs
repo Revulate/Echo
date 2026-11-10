@@ -1,9 +1,8 @@
-#![allow(dead_code, unused_variables)]
+//! Contract: external-URL validation (accepted schemes, trimming, rejected inputs)
+//! and per-browser incognito arguments in `src/utils/open_url.rs`.
 
-#[macro_export]
-macro_rules! log_ui {
-    ($($arg:tt)*) => {{}};
-}
+pub(crate) use check_support::category_log as log_ui;
+use check_support::{FIXTURE_HEADER, assert_fixture};
 
 mod log {
     pub fn redact_url(raw: &str) -> String {
@@ -12,6 +11,7 @@ mod log {
 }
 
 mod backend {
+    #[allow(dead_code)] // the toast payload is only built, never shown
     pub enum UiAction {
         ShowWarningToast {
             message: String,
@@ -74,75 +74,67 @@ mod managers {
 }
 
 #[path = "../../../src/utils/open_url.rs"]
+#[allow(dead_code)] // the launch and opened-URL history paths spawn real processes
 mod open_url;
 
 use open_url::{incognito_args, validate_external_url};
 
 fn main() {
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
 
-    print_fixture(
+    assert_fixture(
         "link_accept_http",
         validate_external_url(" http://example.com/path ").expect("http URL"),
         "http://example.com/path",
     );
-    print_fixture(
+    assert_fixture(
         "link_accept_https",
         validate_external_url("https://example.com/path?q=1").expect("https URL"),
         "https://example.com/path?q=1",
     );
-    print_fixture(
+    assert_fixture(
         "link_reject_empty",
-        &validate_external_url("   ").expect_err("empty URL"),
+        validate_external_url("   ").expect_err("empty URL"),
         "URL is empty",
     );
-    print_fixture(
+    assert_fixture(
         "link_reject_javascript",
-        &validate_external_url("javascript:alert(1)").expect_err("javascript URL"),
+        validate_external_url("javascript:alert(1)").expect_err("javascript URL"),
         "scheme 'javascript' is not allowed for external links",
     );
-    print_fixture(
+    assert_fixture(
         "link_reject_file",
-        &validate_external_url("file:///tmp/secret").expect_err("file URL"),
+        validate_external_url("file:///tmp/secret").expect_err("file URL"),
         "scheme 'file' is not allowed for external links",
     );
-    print_fixture(
+    assert_fixture(
         "link_reject_relative",
-        &validate_external_url("example.com/path").expect_err("relative URL"),
+        validate_external_url("example.com/path").expect_err("relative URL"),
         "invalid URL 'example.com/path': relative URL without a base",
     );
 
-    print_fixture(
+    assert_fixture(
         "incognito_args_firefox",
-        &incognito_arg_summary("firefox"),
+        incognito_arg_summary("firefox"),
         "--private-window",
     );
-    print_fixture(
+    assert_fixture(
         "incognito_args_edge",
-        &incognito_arg_summary("msedge"),
+        incognito_arg_summary("msedge"),
         "--inprivate",
     );
-    print_fixture(
+    assert_fixture(
         "incognito_args_chrome",
-        &incognito_arg_summary("google-chrome"),
+        incognito_arg_summary("google-chrome"),
         "--incognito",
     );
-    print_fixture(
+    assert_fixture(
         "incognito_args_brave",
-        &incognito_arg_summary("brave-browser"),
+        incognito_arg_summary("brave-browser"),
         "--incognito",
     );
 }
 
 fn incognito_arg_summary(browser: &str) -> String {
     incognito_args(browser).join(" ")
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
-}
-
-fn checksum(value: &str) -> usize {
-    value.bytes().map(usize::from).sum()
 }

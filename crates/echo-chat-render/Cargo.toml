@@ -9,14 +9,16 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-dashmap = "6"
-echo-core = { path = "../echo-core" }
-echo-cosmetics-core = { path = "../echo-cosmetics-core" }
-echo-render-core = { path = "../echo-render-core" }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
-rustc-hash = "2"
-smallvec = "1.13"
-tracing = "0.1"
+dashmap.workspace = true
+echo-core.workspace = true
+echo-cosmetics-core.workspace = true
+echo-render-core.workspace = true
+gpui.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
 
+# The `echo_core::log_*!` macros expand to `tracing::...` at the call site, so
+# this crate needs `tracing` as a direct dependency without naming it itself.
 [package.metadata.cargo-machete]
 ignored = ["tracing"]

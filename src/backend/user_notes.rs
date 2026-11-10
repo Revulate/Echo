@@ -39,9 +39,10 @@ enum UserNotesRead {
 
 impl UserNotesManager {
     fn new() -> Self {
-        let config_dir = crate::benchmark_profile::config_root_or_dot();
+        let config_dir = crate::storage_roots::config_root_or_dot();
         if let Err(e) = fs::create_dir_all(&config_dir) {
-            tracing::warn!(
+            crate::log_persist!(
+                warn,
                 "Failed to create config directory '{}': {}",
                 config_dir.display(),
                 e
@@ -50,7 +51,7 @@ impl UserNotesManager {
 
         Self {
             file_path: config_dir.join("user_notes.json"),
-            legacy_path: crate::benchmark_profile::legacy_cwd_file("user_notes.json")
+            legacy_path: crate::storage_roots::legacy_cwd_file("user_notes.json")
                 .unwrap_or_else(|| config_dir.join("user_notes.json")),
         }
     }
@@ -118,13 +119,15 @@ impl UserNotesManager {
     fn load_legacy_or_default(&self) -> Result<UserNotesData, String> {
         match Self::read(&self.legacy_path) {
             UserNotesRead::Ready(data) => {
-                tracing::info!(
+                crate::log_persist!(
+                    info,
                     "Migrating legacy user notes from '{}' to '{}'",
                     self.legacy_path.display(),
                     self.file_path.display()
                 );
                 if let Err(error) = self.save_primary(&data) {
-                    tracing::warn!(
+                    crate::log_persist!(
+                        warn,
                         "Loaded legacy user notes but could not migrate them to '{}': {}",
                         self.file_path.display(),
                         error
@@ -142,14 +145,16 @@ impl UserNotesManager {
         data: UserNotesData,
         primary_failure: &str,
     ) -> Result<UserNotesData, String> {
-        tracing::warn!(
+        crate::log_persist!(
+            warn,
             "Recovering user notes from '{}': {}",
             self.backup_path().display(),
             primary_failure
         );
 
         if let Err(error) = self.save_primary(&data) {
-            tracing::warn!(
+            crate::log_persist!(
+                warn,
                 "Loaded the user-notes backup but could not restore '{}': {}",
                 self.file_path.display(),
                 error
@@ -183,7 +188,8 @@ static USER_NOTES: LazyLock<Mutex<UserNotesState>> = LazyLock::new(|| {
     let state = match manager.load() {
         Ok(data) => UserNotesState::Ready(data),
         Err(error) => {
-            tracing::error!(
+            crate::log_persist!(
+                error,
                 "User notes are unavailable; refusing to overwrite them: {}",
                 error
             );
@@ -203,7 +209,7 @@ fn user_notes_backup_tx() -> &'static crossbeam_channel::Sender<()> {
             .name("user-notes-backup".into())
             .spawn(move || user_notes_backup_worker(rx))
         {
-            tracing::warn!("Failed to spawn user-notes backup worker: {error}");
+            crate::log_persist!(warn, "Failed to spawn user-notes backup worker: {error}");
         }
         tx
     })
@@ -221,7 +227,8 @@ fn user_notes_backup_worker(rx: crossbeam_channel::Receiver<()>) {
 
         let manager = UserNotesManager::new();
         if let Err(error) = manager.save_backup(&snapshot) {
-            tracing::warn!(
+            crate::log_persist!(
+                warn,
                 "Failed to refresh user-notes backup '{}': {}",
                 manager.backup_path().display(),
                 error
@@ -235,7 +242,7 @@ fn schedule_user_notes_backup() {
         Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => {}
         Err(crossbeam_channel::TrySendError::Disconnected(())) => {
             if !USER_NOTES_BACKUP_WARN_EMITTED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("User-notes backup worker unavailable");
+                crate::log_persist!(warn, "User-notes backup worker unavailable");
             }
         }
     }

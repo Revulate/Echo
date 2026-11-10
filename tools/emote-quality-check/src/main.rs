@@ -1,10 +1,11 @@
+//! Contract: emote image URL selection per quality setting, its fallbacks, and the
+//! auto tier chosen for device and rendered scale in
+//! `crates/echo-emote-core/src/quality.rs`.
+
+use check_support::{FIXTURE_HEADER, assert_fixture};
 use echo_emote_core::quality::{
     EmoteImageScale, NOMINAL_ONE_X_EMOTE_PX, resolve_auto_tier, select_emote_display_url,
 };
-use std::hint::black_box;
-use std::time::Instant;
-
-const ITERS: usize = 5_000_000;
 
 fn main() {
     let default_url = "https://cdn.example/emote/default.webp";
@@ -111,33 +112,8 @@ fn main() {
         EmoteImageScale::FourX
     );
 
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(default_url, one_x, two_x, four_x);
-    bench_scale(
-        "select_auto",
-        EmoteImageScale::Auto,
-        default_url,
-        Some(one_x),
-        Some(two_x),
-        Some(four_x),
-    );
-    bench_scale(
-        "select_4x",
-        EmoteImageScale::FourX,
-        default_url,
-        Some(one_x),
-        Some(two_x),
-        Some(four_x),
-    );
-    bench_scale(
-        "select_4x_fallback",
-        EmoteImageScale::FourX,
-        default_url,
-        Some(one_x),
-        Some(two_x),
-        None,
-    );
-    bench_mixed(default_url, one_x, two_x, four_x);
 }
 
 fn print_smoke_rows(default_url: &str, one_x: &str, two_x: &str, four_x: &str) {
@@ -147,34 +123,34 @@ fn print_smoke_rows(default_url: &str, one_x: &str, two_x: &str, four_x: &str) {
         ("emote_quality_select_2x", EmoteImageScale::TwoX, two_x),
         ("emote_quality_select_4x", EmoteImageScale::FourX, four_x),
     ] {
-        print_fixture(
+        assert_fixture(
             name,
             select_emote_display_url(default_url, Some(one_x), Some(two_x), Some(four_x), scale),
             expected,
         );
     }
 
-    print_fixture(
+    assert_fixture(
         "emote_quality_4x_fallback_2x",
         select_emote_display_url(default_url, None, Some(two_x), None, EmoteImageScale::FourX),
         two_x,
     );
-    print_fixture(
+    assert_fixture(
         "emote_quality_4x_fallback_1x",
         select_emote_display_url(default_url, Some(one_x), None, None, EmoteImageScale::FourX),
         one_x,
     );
-    print_fixture(
+    assert_fixture(
         "emote_quality_4x_fallback_default",
         select_emote_display_url(default_url, None, None, None, EmoteImageScale::FourX),
         default_url,
     );
-    print_fixture(
+    assert_fixture(
         "emote_quality_1x_fallback_4x",
         select_emote_display_url(default_url, None, None, Some(four_x), EmoteImageScale::OneX),
         four_x,
     );
-    print_fixture(
+    assert_fixture(
         "emote_quality_2x_fallback_4x",
         select_emote_display_url(
             default_url,
@@ -192,19 +168,19 @@ fn print_smoke_rows(default_url: &str, one_x: &str, two_x: &str, four_x: &str) {
         ("emote_quality_setting_balanced", "balanced", "2x"),
         ("emote_quality_setting_unknown", "unknown", "auto"),
     ] {
-        print_fixture(
+        assert_fixture(
             name,
             EmoteImageScale::from_settings_value(value).settings_value(),
             expected,
         );
     }
 
-    print_fixture(
+    assert_fixture(
         "emote_quality_from_u8_4",
         EmoteImageScale::from_u8(4).settings_value(),
         "4x",
     );
-    print_fixture(
+    assert_fixture(
         "emote_quality_from_u8_unknown",
         EmoteImageScale::from_u8(9).settings_value(),
         "auto",
@@ -248,72 +224,10 @@ fn print_smoke_rows(default_url: &str, one_x: &str, two_x: &str, four_x: &str) {
             EmoteImageScale::FourX,
         ),
     ] {
-        print_fixture(
+        assert_fixture(
             name,
             resolve_auto_tier(device_scale, rendered_scale).settings_value(),
             expected.settings_value(),
         );
     }
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bench_scale(
-    name: &str,
-    scale: EmoteImageScale,
-    default_url: &str,
-    one_x: Option<&str>,
-    two_x: Option<&str>,
-    four_x: Option<&str>,
-) {
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let url = select_emote_display_url(
-            black_box(default_url),
-            black_box(one_x),
-            black_box(two_x),
-            black_box(four_x),
-            black_box(scale),
-        );
-        checksum = checksum.wrapping_add(url.len());
-    }
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / ITERS as f64;
-    let units_per_second = ITERS as f64 / elapsed.as_secs_f64();
-    println!(
-        "resolve,{},{},{:.2},{:.0},{}",
-        name, ITERS, ns_per_unit, units_per_second, checksum
-    );
-}
-
-fn bench_mixed(default_url: &str, one_x: &str, two_x: &str, four_x: &str) {
-    let scales = [
-        EmoteImageScale::Auto,
-        EmoteImageScale::OneX,
-        EmoteImageScale::TwoX,
-        EmoteImageScale::FourX,
-    ];
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..ITERS {
-        let url = select_emote_display_url(
-            black_box(default_url),
-            black_box(Some(one_x)),
-            black_box(Some(two_x)),
-            black_box(Some(four_x)),
-            black_box(scales[i & 3]),
-        );
-        checksum = checksum.wrapping_add(url.as_bytes()[0] as usize + url.len());
-    }
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / ITERS as f64;
-    let units_per_second = ITERS as f64 / elapsed.as_secs_f64();
-    println!(
-        "resolve,select_mixed,{},{:.2},{:.0},{}",
-        ITERS, ns_per_unit, units_per_second, checksum
-    );
 }

@@ -1,3 +1,6 @@
+//! Helper: prints Echo's version and target, or with `apply-update <args>` runs
+//! the self-update installer from `echo-update-core`.
+
 fn main() {
     let arguments: Vec<String> = std::env::args().collect();
     if arguments.get(1).map(String::as_str) != Some("apply-update") {

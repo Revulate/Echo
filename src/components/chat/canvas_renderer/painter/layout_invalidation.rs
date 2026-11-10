@@ -52,7 +52,7 @@ impl CanvasMessageList {
 
     /// Invalidate all cached layouts (e.g., when emote scale changes)
     /// Call this when settings that affect layout change
-    /// PERF: Layouts are cleared atomically in update_layouts() to avoid visible blank state
+    /// Layouts are cleared atomically in update_layouts() to avoid visible blank state
     #[track_caller]
     pub fn invalidate_local_layouts(&mut self) {
         let was_at_bottom = self.is_at_bottom();

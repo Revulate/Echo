@@ -27,7 +27,7 @@
       "args": [],
       "cwd": "${workspaceFolder}",
       "env": {
-        "RUST_LOG": "warn,echo_gpui=info,echo_gpui::backend::irc=debug",
+        "ECHO_LOG": "irc",
         "RUST_BACKTRACE": "1",
         "ECHO_LOG_FILE": "1"
       }

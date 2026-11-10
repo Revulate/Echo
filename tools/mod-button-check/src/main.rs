@@ -1,9 +1,12 @@
+//! Contract: moderation-button placeholder expansion and the default button set
+//! (order, message-context requirements, destructive flags) in
+//! `src/backend/mod_buttons.rs`.
+
 #[path = "../../../src/backend/mod_buttons.rs"]
 mod mod_buttons;
 
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 use mod_buttons::{ModButtonConfig, default_mod_buttons};
-use std::hint::black_box;
-use std::time::Instant;
 
 fn main() {
     let configured = ModButtonConfig {
@@ -51,24 +54,7 @@ fn main() {
         .expect("ban default button");
     assert!(ban_button.is_destructive);
 
-    let iterations = 1_000_000usize;
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for index in 0..iterations {
-        let button = black_box(&defaults[index % defaults.len()]);
-        let command = button.resolve_for_context(
-            black_box("SomeUser"),
-            black_box("msg-123"),
-            black_box("bad text"),
-            black_box("somechannel"),
-        );
-        checksum = checksum.wrapping_add(command.len());
-    }
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / iterations as f64;
-    let units_per_second = iterations as f64 / elapsed.as_secs_f64();
-
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(
         &resolved_context,
         &resolved_legacy,
@@ -77,10 +63,6 @@ fn main() {
         one_second_timeout,
         one_day_timeout,
         ban_button,
-    );
-    println!(
-        "resolve,mod_button_placeholders,{},{:.2},{:.0},{}",
-        iterations, ns_per_unit, units_per_second, checksum
     );
 }
 
@@ -93,22 +75,18 @@ fn print_smoke_rows(
     one_day_timeout: &ModButtonConfig,
     ban_button: &ModButtonConfig,
 ) {
-    print_fixture(
+    assert_fixture(
         "mod_button_context_resolution",
         resolved_context,
         "/timeout SomeUser 60 msg-123 somechannel bad text SomeUser msg-123",
     );
-    print_fixture(
+    assert_fixture(
         "mod_button_legacy_resolution",
         resolved_legacy,
         "/timeout SomeUser 60 msg-123   SomeUser msg-123",
     );
-    print_fixture(
-        "mod_button_default_count",
-        &defaults.len().to_string(),
-        "10",
-    );
-    print_fixture(
+    assert_fixture("mod_button_default_count", defaults.len().to_string(), "10");
+    assert_fixture(
         "mod_button_default_first",
         defaults
             .first()
@@ -116,33 +94,24 @@ fn print_smoke_rows(
             .unwrap_or("none"),
         "Delete",
     );
-    print_fixture(
+    assert_fixture(
         "mod_button_delete_requires_message",
         bool_text(delete_button.requires_message_context()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "mod_button_timeout_without_message",
         bool_text(!one_second_timeout.requires_message_context()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "mod_button_timeout_1d_command",
         &one_day_timeout.command,
         "/timeout {user.name} 86400",
     );
-    print_fixture(
+    assert_fixture(
         "mod_button_ban_destructive",
         bool_text(ban_button.is_destructive),
         "true",
     );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }

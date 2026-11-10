@@ -14,30 +14,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The maintained `cu-bincode` fork remains wire-compatible with Echo's old
 /// v9 cache. New snapshots use Postcard; this configuration must never be
 /// used by a current writer.
-/// Uses standard config which includes:
-/// - Variable integer encoding (enums as u8 instead of u32 for smaller files)
-/// - Little endian (optimal for most desktop platforms)
-/// - 50MB size limit for security against memory exhaustion attacks
+/// Standard configuration (varint, little endian) with the decompressed-size
+/// limit as a bound on allocation from untrusted input.
 const LEGACY_BINCODE_CONFIG: bincode::config::Configuration<
     bincode::config::LittleEndian,
     bincode::config::Varint,
-    bincode::config::Limit<52_428_800>,
-> = bincode::config::standard().with_limit::<52_428_800>();
+    bincode::config::Limit<MAX_EMOTE_CACHE_DECOMPRESSED_BYTES>,
+> = bincode::config::standard().with_limit::<MAX_EMOTE_CACHE_DECOMPRESSED_BYTES>();
 
-/// Current Postcard cache schema version - increment when changing the
-/// structure or persisted semantics.
-/// v2: Changed enum serialization format, added user_emotes caching
-/// v3: Fixed bincode incompatibility with skip_serializing_if
-/// v4: Upgraded to bincode 2.0 with native Encode/Decode traits for better performance
-/// v5: Previous version
-/// v6: Added zstd compression for 60-70% smaller disk cache
-/// v7: Added is_animated, width, height fields for proper emote rendering
-/// v8: Persisted the authenticated Twitch user-emote cache owner
-/// v9: Legacy Bincode cache format
-/// v10: Postcard payload with an explicit cache magic and codec generation
-/// v11: Emote dimensions are logical 1x geometry (not selected source pixels)
-/// v12: 7TV emotes keep every alias of a shared emote id
-/// v13: Missing provider geometry stays unknown rather than defaulting to 28x28
+/// Current Postcard cache schema version. Bump it whenever the structure or
+/// the meaning of a persisted field changes. A snapshot of another version is
+/// rejected, and its emotes refetched, unless decoding migrates it.
 pub(super) const EMOTE_CACHE_VERSION: u32 = 13;
 const LEGACY_BINCODE_EMOTE_CACHE_VERSION: u32 = 9;
 

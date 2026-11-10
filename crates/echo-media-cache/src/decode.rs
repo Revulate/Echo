@@ -1,12 +1,10 @@
 //! Pure image decoding functions for GPUI RenderImage
 //!
 //! Separates CPU-bound decode work from I/O and caching.
-//! Handles BGRA conversion for GPUI/Blade/Vulkan GPU compatibility.
 //!
-//! # Platform Notes
-//! GPUI uses Blade graphics with Vulkan on all platforms (Windows, Linux, macOS).
-//! Vulkan expects BGRA pixel format. The `image` crate decodes to RGBA, so we
-//! always convert to BGRA for GPU compatibility.
+//! GPUI's `RenderImage` stores BGRA pixels on every platform renderer, while
+//! the `image` crate decodes to RGBA, so every decoded frame is converted to
+//! BGRA here.
 
 use gpui::RenderImage;
 use image::{AnimationDecoder, Delay, Frame, ImageFormat, ImageReader, RgbaImage};
@@ -112,9 +110,9 @@ const MAX_DECODED_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 /// Maximum cumulative full-canvas pixel work for one animation decode.
 ///
 /// Frames are compressed as they stream, so this is a CPU/work bound rather
-/// than resident source-cache size. It permits complete wide/high-frame emotes
-/// that exceeded the old 20 MiB raw-stack proxy without retaining that raw
-/// stack in memory.
+/// than resident source-cache size. It admits complete wide or long emotes
+/// whose raw frame stack would exceed [`MAX_DECODED_IMAGE_BYTES`], since that
+/// stack is never held in memory at once.
 const MAX_ANIMATION_DECODE_WORK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum transient full-canvas frame accepted from an animation decoder.

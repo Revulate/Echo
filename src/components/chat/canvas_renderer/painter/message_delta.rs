@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::backend::ChatMessage;
 
-use super::INITIAL_SNAPSHOT_FAST_PATH_MIN_MESSAGES;
+/// Minimum first snapshot size where estimated-height seeding is cheaper than a full rebuild.
+const INITIAL_SNAPSHOT_FAST_PATH_MIN_MESSAGES: usize = 32;
 
 pub(super) struct MessageDeltaPlan {
     pub(super) content_changed: bool,
@@ -38,16 +39,10 @@ impl MessageDeltaPlan {
         let mut old_order_middle_start = None;
 
         if count_increased && has_stable_existing_order {
-            old_order_matches_prefix = message_order
-                .iter()
-                .zip(next_messages.iter())
-                .all(|(old_id, new_msg)| old_id.as_ref() == new_msg.id.as_ref());
+            old_order_matches_prefix = ids_align(message_order, next_messages);
 
             if !old_order_matches_prefix {
-                old_order_matches_suffix = message_order
-                    .iter()
-                    .zip(next_messages.iter().skip(added_count))
-                    .all(|(old_id, new_msg)| old_id.as_ref() == new_msg.id.as_ref());
+                old_order_matches_suffix = ids_align(message_order, &next_messages[added_count..]);
 
                 if !old_order_matches_suffix {
                     old_order_middle_start = message_order.first().and_then(|first_old_id| {
@@ -57,12 +52,7 @@ impl MessageDeltaPlan {
                             .filter(|&start| {
                                 start > 0
                                     && start + old_count <= new_count
-                                    && message_order
-                                        .iter()
-                                        .zip(next_messages.iter().skip(start))
-                                        .all(|(old_id, new_msg)| {
-                                            old_id.as_ref() == new_msg.id.as_ref()
-                                        })
+                                    && ids_align(message_order, &next_messages[start..])
                             })
                     });
                 }
@@ -85,4 +75,23 @@ impl MessageDeltaPlan {
             is_initial_snapshot_fast_path,
         }
     }
+}
+
+/// Whether `order` and the ids of `messages` agree over their common length.
+pub(super) fn ids_align(order: &[SharedString], messages: &[Arc<ChatMessage>]) -> bool {
+    order
+        .iter()
+        .zip(messages)
+        .all(|(old_id, new_msg)| old_id.as_ref() == new_msg.id.as_ref())
+}
+
+/// How many rows a same-length snapshot dropped from the front of `order`:
+/// `Some(n)` when `next` starts with `order[n..]` and `0 < n < next.len()`.
+pub(super) fn same_count_rotation(
+    order: &[SharedString],
+    next: &[Arc<ChatMessage>],
+) -> Option<usize> {
+    let first_new_id = next.first()?.id.as_ref();
+    let rotated = order.iter().position(|id| id.as_ref() == first_new_id)?;
+    (rotated > 0 && rotated < next.len() && ids_align(&order[rotated..], next)).then_some(rotated)
 }

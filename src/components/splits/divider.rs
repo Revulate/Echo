@@ -17,7 +17,7 @@ pub fn accessible_split_divider(
     cx: &mut Context<EchoApp>,
 ) -> Stateful<Div> {
     let tab = app.app_state.read(cx).active_tab();
-    let Some(node @ SplitNode::Split { children, .. }) = tab.layout.get_node_at_path(path) else {
+    let Some(node @ SplitNode::Split { children, .. }) = tab.layout.node_at_path(path) else {
         return divider;
     };
     let grid_bands = if band.is_none() && child_idx == 0 {
@@ -111,7 +111,7 @@ pub fn accessible_split_divider(
                 let tab = app.app_state.read(cx).active_tab();
                 tab.id == tab_id
                     && !tab.is_locked
-                    && tab.layout.get_node_at_path(&path).is_some_and(|node| {
+                    && tab.layout.node_at_path(&path).is_some_and(|node| {
                         node.split_id() == node_id
                             && matches!(node, SplitNode::Split { orientation, .. } if *orientation == source_orientation)
                     })

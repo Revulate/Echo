@@ -215,15 +215,7 @@ impl Toast {
         }
         self.effective_elapsed().as_secs() >= self.duration_secs as u64
     }
-
-    pub fn remaining_fraction(&self) -> f32 {
-        let elapsed = self.effective_elapsed().as_secs_f32();
-        let duration = self.duration_secs as f32;
-        (1.0 - elapsed / duration).max(0.0)
-    }
 }
-
-pub const MAX_TOASTS: usize = 5;
 
 #[derive(Clone, Debug, Default)]
 pub struct ToastManagerState {
@@ -232,13 +224,11 @@ pub struct ToastManagerState {
 }
 
 impl ToastManagerState {
-    pub const MAX_TOASTS: usize = MAX_TOASTS;
-    pub const TOAST_WIDTH: f32 = 340.0;
-    pub const TOAST_SPACING: f32 = 8.0;
-    pub const MARGIN: f32 = 16.0;
+    /// Toasts shown at once; pushing past this drops the oldest.
+    pub const MAX_TOASTS: usize = 5;
 
     pub fn push(&mut self, toast: Toast) {
-        while self.toasts.len() >= MAX_TOASTS {
+        while self.toasts.len() >= Self::MAX_TOASTS {
             self.toasts.remove(0);
         }
         self.toasts.push(toast);
@@ -297,8 +287,7 @@ mod tests {
 
     #[test]
     fn test_state_close() {
-        let mut state = HotkeyCheatSheetState::default();
-        state.is_open = true;
+        let mut state = HotkeyCheatSheetState { is_open: true };
         state.close();
         assert!(!state.is_open);
     }
@@ -383,8 +372,5 @@ mod tests {
             state.push(Toast::info(format!("Toast {index}")));
         }
         assert_eq!(state.toasts.len(), ToastManagerState::MAX_TOASTS);
-        assert_eq!(ToastManagerState::TOAST_WIDTH, 340.0);
-        assert_eq!(ToastManagerState::TOAST_SPACING, 8.0);
-        assert_eq!(ToastManagerState::MARGIN, 16.0);
     }
 }

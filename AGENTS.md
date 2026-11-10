@@ -24,6 +24,7 @@ you are about to change. Prefer updating existing docs over creating new plans:
 - `docs/ENVIRONMENT.md`: every `ECHO_*` variable
 - `docs/BENCHMARKING.md`: the benchmark harness
 - `docs/LINUX_DEVELOPMENT.md`: the Linux test platform
+- `docs/LINUX_DESKTOP.md`: how Echo installs and behaves on the Linux desktop
 - `docs/MEMORY_PROFILING.md`: memory attribution
 - `docs/DEPENDENCY_POLICY.md`: dependency and supply-chain rules
 
@@ -41,11 +42,11 @@ adding or changing a native-window root, and update that checker's explicit
 caller list in the same slice.
 
 Every Echo-owned config, local-data, or cache path must route through
-`benchmark_profile`. `ECHO_BENCH_PROFILE_ROOT` isolates experiments from normal
+`storage_roots`. `ECHO_BENCH_PROFILE_ROOT` isolates experiments from normal
 user state, including the Windows keyring; do not add direct
 `dirs::config_dir`, `dirs::data_local_dir`, `dirs::cache_dir`, manual
 `HOME/.config`, or legacy cwd storage roots outside that module. Run
-`pwsh -NoProfile -File scripts/check-benchmark-profile-roots.ps1 -SelfTest`
+`pwsh -NoProfile -File scripts/check-storage-roots.ps1 -SelfTest`
 after changing Echo-owned storage roots. OS-external discovery (for example
 OBS and Discord logs) must remain outside that profile and skip while it is
 active.

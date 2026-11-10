@@ -1,7 +1,7 @@
-//! Tab Manager - Extracted from app.rs monolith
+//! Tab Manager
 //!
-//! Handles:
-//! - Tab bar rendering (scroll, dropdown, multiline modes)
+//! State behind the tab bar, which `TabBarRenderer` draws:
+//! - Tab bar layout state (scroll, dropdown, multiline modes)
 //! - Tab drag-and-drop reordering
 //! - Tab context menu (rename, duplicate, close)
 //! - Overflow management
@@ -11,108 +11,78 @@ use crate::theme::colors;
 use gpui::*;
 use std::collections::{HashMap, HashSet};
 
-/// Context menu item definition
-pub struct TabMenuItem {
-    pub label: &'static str,
-    pub action: &'static str,
-    pub is_divider: bool,
-    pub is_toggle: bool,
-    pub is_destructive: bool,
+/// What a tab context-menu row does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabMenuAction {
+    Rename,
+    Duplicate,
+    Close,
+    CloseOthers,
+    CloseRight,
+    ReopenClosed,
+    ToggleUnread,
+    ToggleLock,
+    SortAlpha,
+}
+
+impl TabMenuAction {
+    /// Stable element id of the row.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Rename => "rename",
+            Self::Duplicate => "duplicate",
+            Self::Close => "close",
+            Self::CloseOthers => "close_others",
+            Self::CloseRight => "close_right",
+            Self::ReopenClosed => "reopen_closed",
+            Self::ToggleUnread => "toggle_unread",
+            Self::ToggleLock => "toggle_lock",
+            Self::SortAlpha => "sort_alpha",
+        }
+    }
+}
+
+/// One row of the tab context menu.
+pub enum TabMenuItem {
+    Divider,
+    Action {
+        label: &'static str,
+        action: TabMenuAction,
+        is_destructive: bool,
+    },
+}
+
+const fn tab_menu_action(label: &'static str, action: TabMenuAction) -> TabMenuItem {
+    TabMenuItem::Action {
+        label,
+        action,
+        is_destructive: false,
+    }
+}
+
+const fn destructive_tab_menu_action(label: &'static str, action: TabMenuAction) -> TabMenuItem {
+    TabMenuItem::Action {
+        label,
+        action,
+        is_destructive: true,
+    }
 }
 
 /// Static context menu items (toggles get their state dynamically)
 pub const TAB_CONTEXT_MENU_ITEMS: &[TabMenuItem] = &[
-    TabMenuItem {
-        label: "Rename tab",
-        action: "rename",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "",
-        action: "divider1",
-        is_divider: true,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "Duplicate tab",
-        action: "duplicate",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "",
-        action: "divider2",
-        is_divider: true,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "Close tab",
-        action: "close",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: true,
-    },
-    TabMenuItem {
-        label: "Close other tabs",
-        action: "close_others",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: true,
-    },
-    TabMenuItem {
-        label: "Close tabs to the right",
-        action: "close_right",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: true,
-    },
-    TabMenuItem {
-        label: "Reopen closed tab",
-        action: "reopen_closed",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "",
-        action: "divider3",
-        is_divider: true,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "Mark unread on new messages",
-        action: "toggle_unread",
-        is_divider: false,
-        is_toggle: true,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "Lock tab layout",
-        action: "toggle_lock",
-        is_divider: false,
-        is_toggle: true,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "",
-        action: "divider4",
-        is_divider: true,
-        is_toggle: false,
-        is_destructive: false,
-    },
-    TabMenuItem {
-        label: "Sort tabs alphabetically",
-        action: "sort_alpha",
-        is_divider: false,
-        is_toggle: false,
-        is_destructive: false,
-    },
+    tab_menu_action("Rename tab", TabMenuAction::Rename),
+    TabMenuItem::Divider,
+    tab_menu_action("Duplicate tab", TabMenuAction::Duplicate),
+    TabMenuItem::Divider,
+    destructive_tab_menu_action("Close tab", TabMenuAction::Close),
+    destructive_tab_menu_action("Close other tabs", TabMenuAction::CloseOthers),
+    destructive_tab_menu_action("Close tabs to the right", TabMenuAction::CloseRight),
+    tab_menu_action("Reopen closed tab", TabMenuAction::ReopenClosed),
+    TabMenuItem::Divider,
+    tab_menu_action("Mark unread on new messages", TabMenuAction::ToggleUnread),
+    tab_menu_action("Lock tab layout", TabMenuAction::ToggleLock),
+    TabMenuItem::Divider,
+    tab_menu_action("Sort tabs alphabetically", TabMenuAction::SortAlpha),
 ];
 
 /// Tab context menu state
@@ -665,11 +635,16 @@ mod tests {
 
 impl TabManager {
     /// Get toggle state for a menu item action
-    pub fn get_toggle_state(action: &str, is_locked: bool, mark_unread: bool) -> bool {
+    /// The checkmark state of a toggle row, or `None` for an action row.
+    pub fn get_toggle_state(
+        action: TabMenuAction,
+        is_locked: bool,
+        mark_unread: bool,
+    ) -> Option<bool> {
         match action {
-            "toggle_lock" => is_locked,
-            "toggle_unread" => mark_unread,
-            _ => false,
+            TabMenuAction::ToggleLock => Some(is_locked),
+            TabMenuAction::ToggleUnread => Some(mark_unread),
+            _ => None,
         }
     }
     /// Get tab background color based on state

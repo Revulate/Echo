@@ -1,8 +1,8 @@
-//! Chat UI helper functions
+//! Building blocks of the chat split header: title, status, and metadata
+//! pieces plus the width estimates that decide which of them fit.
 //!
-//! Pure rendering functions extracted from app.rs to reduce code duplication
-//! and improve maintainability. These functions take data and return elements
-//! without needing access to EchoApp state or event handlers.
+//! These are pure functions of their inputs; they need no `EchoApp` state or
+//! event handlers.
 
 use crate::backend::StreamInfo;
 use crate::theme::colors;

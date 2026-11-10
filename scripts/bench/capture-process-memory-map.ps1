@@ -1,3 +1,9 @@
+<#
+.SYNOPSIS
+Snapshot a running process's virtual memory regions and working-set residency
+(VirtualQueryEx plus QueryWorkingSetEx) and its largest allocations into a run
+directory.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]

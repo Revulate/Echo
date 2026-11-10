@@ -40,7 +40,7 @@ struct TrayState {
 }
 
 pub fn install(window: &gpui::Window) {
-    if echo_gpui::benchmark_profile::is_enabled() {
+    if echo_gpui::storage_roots::is_isolated() {
         return;
     }
     let Ok(handle) = HasWindowHandle::window_handle(window) else {

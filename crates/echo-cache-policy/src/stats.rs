@@ -1,7 +1,7 @@
 //! Unified cache statistics
 //!
-//! Consolidates statistics from all cache layers into a single UI-independent struct.
-//! for monitoring, debugging, and UI display.
+//! Counters from every cache layer in one UI-independent struct, read by the
+//! metrics overlay, diagnostics and logs.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

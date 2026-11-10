@@ -293,7 +293,7 @@ pub const COMMAND_AUTOCOMPLETE_SPECS: &[CommandAutocompleteSpec] = &[
     command_spec!("subscribersoff", "Disable subscribers-only"),
     command_spec!("themefile", "Load a theme file", usage: "/themefile <path>"),
     command_spec!("themefile-export", "Export the current theme", usage: "/themefile-export <path>"),
-    command_spec!("test-chatters", "Open a large chatter-list view"),
+    command_spec!("test-chatters", "Alias for /chatters"),
     command_spec!("timeout", "Timeout a user", usage: "/timeout <user|id:userID> [seconds] [reason]", argument_completion: CommandArgumentCompletion::User),
     command_spec!("to", "Alias for /timeout", usage: "/to <user|id:userID> [seconds] [reason]", argument_completion: CommandArgumentCompletion::User),
     command_spec!("unban", "Unban a user", usage: "/unban <user|id:userID>", argument_completion: CommandArgumentCompletion::User),
@@ -334,8 +334,7 @@ pub async fn execute_command(channel: &str, input: &str) -> CommandResult {
         return CommandResult::NotACommand;
     }
 
-    if let Err(error) = crate::benchmark_profile::reject_live_outbound_user_action("slash command")
-    {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("slash command") {
         return CommandResult::Error(error);
     }
 
@@ -404,8 +403,7 @@ pub async fn execute_command(channel: &str, input: &str) -> CommandResult {
         "setgame" => helix::cmd_setgame(channel, args).await,
         "settitle" => helix::cmd_settitle(channel, args).await,
         "unraid" => helix::cmd_unraid(channel).await,
-        "chatters" => helix::cmd_chatters(channel).await,
-        "test-chatters" => helix::cmd_test_chatters(channel).await,
+        "chatters" | "test-chatters" => helix::cmd_chatters(channel).await,
 
         "clearmessages" => local::cmd_clearmessages(channel).await,
         "copy" => local::cmd_copy(args).await,
@@ -441,6 +439,14 @@ pub async fn execute_command(channel: &str, input: &str) -> CommandResult {
     }
 }
 
+fn command_parts(without_slash: &str) -> (&str, &str) {
+    let mut parts = without_slash.splitn(2, char::is_whitespace);
+    (
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or("").trim(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use core::prelude::v1::test;
@@ -457,12 +463,4 @@ mod tests {
             );
         }
     }
-}
-
-fn command_parts(without_slash: &str) -> (&str, &str) {
-    let mut parts = without_slash.splitn(2, char::is_whitespace);
-    (
-        parts.next().unwrap_or(""),
-        parts.next().unwrap_or("").trim(),
-    )
 }

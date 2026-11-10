@@ -7,7 +7,6 @@
 //! - URLs: full URL
 
 use gpui::*;
-use std::time::{Duration, Instant};
 
 use super::layout::{
     BadgeTooltipMeta, EmoteTooltipMeta, HitboxKind, LayeredTooltipEmote, get_cached_color,
@@ -15,10 +14,6 @@ use super::layout::{
 use crate::backend::irc::get_user_color;
 use crate::theme::colors;
 
-/// Delay before showing tooltip (milliseconds)
-///
-/// Set to zero for instantaneous hover tooltips.
-const TOOLTIP_DELAY_MS: u64 = 0;
 /// Panel padding, the emote-name row, and the two gaps around it. Keep this
 /// conservative because GPUI resolves `text_xs` line height above its font size.
 const EMOTE_TOOLTIP_FIXED_HEIGHT_PX: f32 = 50.0;
@@ -69,10 +64,6 @@ pub struct TooltipState {
     pub hovered: Option<HitboxKind>,
     /// Screen position for tooltip popup
     pub position: Point<Pixels>,
-    /// Time when hover started (for delay)
-    pub hover_start: Option<Instant>,
-    /// Whether tooltip is currently visible
-    pub is_visible: bool,
 }
 
 impl TooltipState {
@@ -94,19 +85,14 @@ impl TooltipState {
                 self.owner_window = Some(owner_window);
                 self.hovered = kind;
                 self.position = position;
-                self.hover_start = Some(Instant::now());
-                self.is_visible = TOOLTIP_DELAY_MS == 0;
                 true
             }
             (Some(prev), Some(new))
                 if self.owner_window != Some(owner_window) || !hitbox_kinds_equal(prev, new) =>
             {
-                let was_visible = self.is_visible;
                 self.owner_window = Some(owner_window);
                 self.hovered = kind;
                 self.position = position;
-                self.hover_start = Some(Instant::now());
-                self.is_visible = was_visible || TOOLTIP_DELAY_MS == 0;
                 true
             }
             (Some(_), Some(_)) => {
@@ -114,19 +100,10 @@ impl TooltipState {
                 self.hovered = kind;
                 self.owner_window = Some(owner_window);
                 self.position = position;
-                if let Some(start) = self.hover_start
-                    && start.elapsed() >= Duration::from_millis(TOOLTIP_DELAY_MS)
-                {
-                    let was_visible = self.is_visible;
-                    self.is_visible = true;
-                    return payload_changed || !was_visible;
-                }
                 payload_changed
             }
             (Some(_), None) => {
                 self.hovered = None;
-                self.hover_start = None;
-                self.is_visible = false;
                 true
             }
             (None, None) => false,
@@ -148,41 +125,13 @@ impl TooltipState {
         let was_showing_tooltip = self.should_show()
             && !matches!(self.hovered, Some(HitboxKind::MessageBackground { .. }));
         self.hovered = None;
-        self.hover_start = None;
-        self.is_visible = false;
         was_showing_tooltip
     }
 
-    /// Check if tooltip should be shown (delay has passed)
+    /// Whether a tooltip is showing: tooltips appear as soon as a target is
+    /// hovered.
     pub fn should_show(&self) -> bool {
-        self.is_visible && self.owner_window.is_some() && self.hovered.is_some()
-    }
-
-    /// Remaining delay until the tooltip should become visible.
-    ///
-    /// Returns `None` when no tooltip is pending (not hovering or already visible).
-    pub fn remaining_delay(&self) -> Option<Duration> {
-        if self.is_visible || self.hovered.is_none() {
-            return None;
-        }
-        let start = self.hover_start?;
-        Some(Duration::from_millis(TOOLTIP_DELAY_MS).saturating_sub(start.elapsed()))
-    }
-
-    /// Re-check hover delay without requiring another mouse move event.
-    ///
-    /// Returns true when visibility changed (hidden -> visible).
-    pub fn poll_delay_visibility(&mut self) -> bool {
-        if self.is_visible || self.hovered.is_none() {
-            return false;
-        }
-        if let Some(start) = self.hover_start
-            && start.elapsed() >= Duration::from_millis(TOOLTIP_DELAY_MS)
-        {
-            self.is_visible = true;
-            return true;
-        }
-        false
+        self.owner_window.is_some() && self.hovered.is_some()
     }
 }
 
@@ -602,7 +551,7 @@ fn tooltip_image_with_cached_placeholder(
     }
 
     if motion == TooltipMotion::Animated {
-        image_cache::trigger_animated_decode_with_source(
+        image_cache::trigger_animated_decode(
             target_url.as_ref(),
             image_cache::PreloadSource::TooltipVisible,
         );

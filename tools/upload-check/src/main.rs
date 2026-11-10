@@ -1,4 +1,8 @@
-#![allow(dead_code)]
+//! Contract: image-uploader presets in `src/backend/image_uploader.rs` and
+//! `crates/echo-link-core`: config validation and secret redaction, header and
+//! response-template parsing, ShareX import, export round trip, PNG encoding and
+//! size thresholds. `--preset <file>` also verifies a real preset and
+//! `--live-upload` uploads with it.
 
 mod backend {
     pub mod http {
@@ -26,8 +30,10 @@ mod settings {
 }
 
 #[path = "../../../src/backend/image_uploader.rs"]
+#[allow(dead_code)] // paste/drop gating reads live settings and is not checked here
 mod image_uploader;
 
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 use image_uploader::{
     ImageUploaderConfig, UPLOADER_API_KEY_PLACEHOLDER, encode_rgba_png,
     export_uploader_config_json, format_upload_size, has_placeholder_uploader_key,
@@ -37,12 +43,7 @@ use image_uploader::{
 };
 use std::env;
 use std::fs;
-use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-
-const ITERS: usize = 250_000;
-const ENCODE_ITERS: usize = 1_000;
 
 #[derive(Debug, Default)]
 struct Cli {
@@ -146,7 +147,7 @@ async fn main() {
     let header_error = validate_config(&disabled_bad_headers).unwrap_err();
     assert!(!header_error.contains(header_canary));
     let rgba = make_rgba_image(128, 128);
-    let encoded = encode_rgba_png(128, 128, rgba.clone()).expect("RGBA should encode as PNG");
+    let encoded = encode_rgba_png(128, 128, rgba).expect("RGBA should encode as PNG");
     assert!(encoded.starts_with(b"\x89PNG"));
 
     let exported = export_uploader_config_json(&config).expect("config should export");
@@ -187,37 +188,8 @@ async fn main() {
     );
     assert!(import_uploader_config_json("{}", &sharex_base).is_err());
 
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(headers, response, &config, &encoded);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        checksum += parse_extra_headers(black_box(headers)).unwrap().len();
-    }
-    print_measurement("parse", "headers", ITERS, start, checksum);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let parsed = parse_upload_response(
-            black_box(response),
-            black_box("{url}"),
-            black_box("https://delete.example.test/{file.id}"),
-        )
-        .unwrap();
-        checksum += parsed.image_link.len() + parsed.deletion_link.unwrap_or_default().len();
-    }
-    print_measurement("parse", "response_template", ITERS, start, checksum);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ENCODE_ITERS {
-        let png = encode_rgba_png(black_box(128), black_box(128), black_box(rgba.clone()))
-            .expect("RGBA should encode as PNG");
-        checksum += png.len();
-    }
-    print_measurement("encode", "rgba_png_128x128", ENCODE_ITERS, start, checksum);
 
     if let Some(path) = cli.preset.as_deref() {
         verify_preset(path, cli.live_upload)
@@ -239,7 +211,7 @@ fn parse_cli() -> Result<Cli, String> {
             }
             "--live-upload" => cli.live_upload = true,
             "--help" | "-h" => {
-                println!("Usage: echo-upload-check [--preset <uploader.json>] [--live-upload]");
+                println!("Usage: upload-check [--preset <uploader.json>] [--live-upload]");
                 std::process::exit(0);
             }
             other => return Err(format!("Unknown argument: {other}")),
@@ -349,33 +321,29 @@ fn print_smoke_rows(
     encoded_png: &[u8],
 ) {
     let parsed_headers = parse_extra_headers(headers).expect("headers should parse");
-    print_fixture(
-        "upload_header_count",
-        &parsed_headers.len().to_string(),
-        "2",
-    );
-    print_fixture(
+    assert_fixture("upload_header_count", parsed_headers.len().to_string(), "2");
+    assert_fixture(
         "upload_header_authorization",
-        &format!("{}={}", parsed_headers[0].0, parsed_headers[0].1),
+        format!("{}={}", parsed_headers[0].0, parsed_headers[0].1),
         "Authorization=Basic abc123",
     );
-    print_fixture(
+    assert_fixture(
         "upload_header_token_colon_value",
-        &format!("{}={}", parsed_headers[1].0, parsed_headers[1].1),
+        format!("{}={}", parsed_headers[1].0, parsed_headers[1].1),
         "X-Upload-Token=token:value",
     );
-    print_fixture(
+    assert_fixture(
         "upload_header_missing_colon_rejected",
         bool_text(parse_extra_headers("BrokenHeader").is_err()),
         "true",
     );
 
-    print_fixture(
+    assert_fixture(
         "upload_mime_png_uppercase",
         mime_type_for_image_path(Path::new("drop.PNG")).unwrap_or("none"),
         "image/png",
     );
-    print_fixture(
+    assert_fixture(
         "upload_mime_txt_rejected",
         bool_text(mime_type_for_image_path(Path::new("drop.txt")).is_none()),
         "true",
@@ -383,18 +351,18 @@ fn print_smoke_rows(
 
     let parsed = parse_upload_response(response, "{url}", "https://delete.example.test/{file.id}")
         .expect("response template should resolve");
-    print_fixture(
+    assert_fixture(
         "upload_response_image_link",
         &parsed.image_link,
         "https://i.example.test/a.png",
     );
-    print_fixture(
+    assert_fixture(
         "upload_response_delete_link",
         parsed.deletion_link.as_deref().unwrap_or("none"),
         "https://delete.example.test/abc",
     );
 
-    print_fixture(
+    assert_fixture(
         "upload_config_valid",
         bool_text(validate_config(config).is_ok()),
         "true",
@@ -403,7 +371,7 @@ fn print_smoke_rows(
         "Authorization: Basic abc123 was rejected at https://user:password@i.example.test/upload?token=fixture",
         config,
     );
-    print_fixture(
+    assert_fixture(
         "upload_configured_error_credentials_redacted",
         bool_text(
             !error_detail.contains("Basic abc123")
@@ -421,7 +389,7 @@ fn print_smoke_rows(
         "Rejected Token session-part-12345, bot-canary-12345, client-canary-12345, oauth-canary-12345, key-canary-12345, user-name, pass+word, query-token+value, user%2Dname, pass%2Bword, query%2Dtoken%2Bvalue, 1234567890123456, webhook-token-12345678, and webhook-header-12345678",
         &redaction_config,
     );
-    print_fixture(
+    assert_fixture(
         "upload_configured_redaction_canaries",
         bool_text(
             [
@@ -449,7 +417,7 @@ fn print_smoke_rows(
         "ident=<https://unknown-user:unknown-password@example.test/upload?key=unknown-query>",
         &redaction_config,
     );
-    print_fixture(
+    assert_fixture(
         "upload_identified_url_credentials_redacted",
         bool_text(
             identified_detail.starts_with("ident=<https://")
@@ -459,7 +427,7 @@ fn print_smoke_rows(
         ),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "upload_placeholder_key_detected",
         bool_text(has_placeholder_uploader_key(&ImageUploaderConfig {
             extra_headers: format!("X-API-Key: {UPLOADER_API_KEY_PLACEHOLDER}"),
@@ -472,7 +440,7 @@ fn print_smoke_rows(
         request_url: String::new(),
         ..ImageUploaderConfig::default()
     };
-    print_fixture(
+    assert_fixture(
         "upload_config_missing_url_rejected",
         bool_text(validate_config(&invalid_config).is_err()),
         "true",
@@ -484,7 +452,7 @@ fn print_smoke_rows(
         extra_headers: String::new(),
         ..ImageUploaderConfig::default()
     };
-    print_fixture(
+    assert_fixture(
         "upload_disabled_blank_config_valid",
         bool_text(validate_config(&disabled_blank_config).is_ok()),
         "true",
@@ -494,7 +462,7 @@ fn print_smoke_rows(
         request_url: "ftp://upload.example.test/file".to_string(),
         ..ImageUploaderConfig::default()
     };
-    print_fixture(
+    assert_fixture(
         "upload_disabled_ftp_rejected",
         bool_text(validate_config(&disabled_ftp_config).is_err()),
         "true",
@@ -506,28 +474,28 @@ fn print_smoke_rows(
         ..ImageUploaderConfig::default()
     };
     let header_error = validate_config(&disabled_bad_headers).unwrap_err();
-    print_fixture(
+    assert_fixture(
         "upload_invalid_header_redacted",
         bool_text(!header_error.contains(header_canary)),
         "true",
     );
-    print_fixture("upload_size_1536", &format_upload_size(1536), "1.5 KB");
-    print_fixture(
+    assert_fixture("upload_size_1536", format_upload_size(1536), "1.5 KB");
+    assert_fixture(
         "upload_large_threshold",
-        &large_upload_confirmation_threshold(config).to_string(),
+        large_upload_confirmation_threshold(config).to_string(),
         "52428800",
     );
-    print_fixture(
+    assert_fixture(
         "upload_confirm_below_threshold",
         bool_text(should_confirm_upload_size(config, 50 * 1024 * 1024 - 1)),
         "false",
     );
-    print_fixture(
+    assert_fixture(
         "upload_confirm_at_threshold",
         bool_text(should_confirm_upload_size(config, 50 * 1024 * 1024)),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "upload_png_signature",
         bool_text(encoded_png.starts_with(b"\x89PNG")),
         "true",
@@ -536,7 +504,7 @@ fn print_smoke_rows(
     let exported = export_uploader_config_json(config).expect("config should export");
     let round_trip = import_uploader_config_json(&exported, &ImageUploaderConfig::default())
         .expect("exported config should import");
-    print_fixture(
+    assert_fixture(
         "upload_portable_native_round_trip",
         bool_text(round_trip == *config),
         "true",
@@ -556,17 +524,17 @@ fn print_smoke_rows(
     };
     let imported =
         import_uploader_config_json(sharex, &sharex_base).expect("ShareX preset should import");
-    print_fixture(
+    assert_fixture(
         "upload_portable_sharex_template",
         &imported.image_link_template,
         "https://cdn.example.test/{files.0.url}",
     );
-    print_fixture(
+    assert_fixture(
         "upload_portable_sharex_deletion_template",
         &imported.deletion_link_template,
         "{delete.url}",
     );
-    print_fixture(
+    assert_fixture(
         "upload_portable_sharex_entrypoints_and_limit",
         bool_text(
             imported.enabled
@@ -576,20 +544,11 @@ fn print_smoke_rows(
         ),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "upload_portable_missing_version_rejected",
         bool_text(import_uploader_config_json("{}", &sharex_base).is_err()),
         "true",
     );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 fn make_rgba_image(width: usize, height: usize) -> Vec<u8> {
@@ -603,11 +562,4 @@ fn make_rgba_image(width: usize, height: usize) -> Vec<u8> {
         }
     }
     rgba
-}
-
-fn print_measurement(kind: &str, name: &str, units: usize, start: Instant, checksum: usize) {
-    let elapsed = start.elapsed();
-    let nanos_per_unit = elapsed.as_nanos() as f64 / units as f64;
-    let units_per_second = units as f64 / elapsed.as_secs_f64();
-    println!("{kind},{name},{units},{nanos_per_unit:.2},{units_per_second:.0},{checksum}");
 }

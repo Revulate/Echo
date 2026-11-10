@@ -1,30 +1,27 @@
 //! Render trace flags and render-depth guard.
 
 use super::*;
+use crate::components::chat::canvas_renderer::trace_span::{
+    TRACE_SLOW_MS, TraceSpan, trace_switches,
+};
 use std::cell::Cell;
 
-const RENDER_TRACE_SLOW_MS: f64 = 8.0;
-
-pub(super) static RENDER_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("ECHO_RENDER_TRACE").is_some()
-        || std::env::var_os("ECHO_RENDER_TRACE_VERBOSE").is_some()
-});
-static RENDER_TRACE_VERBOSE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("ECHO_RENDER_TRACE_VERBOSE").is_some());
+/// `(ECHO_RENDER_TRACE, ECHO_RENDER_TRACE_VERBOSE)` as `(enabled, verbose)`.
+static RENDER_TRACE_SWITCHES: LazyLock<(bool, bool)> =
+    LazyLock::new(|| trace_switches("ECHO_RENDER_TRACE", "ECHO_RENDER_TRACE_VERBOSE"));
+pub(super) static RENDER_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| RENDER_TRACE_SWITCHES.0);
 pub(super) static SCROLL_SMOKE_TRACE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("ECHO_BENCH_SCROLL_SMOKE").is_some());
+    LazyLock::new(|| echo_core::env::flag("ECHO_BENCH_SCROLL_SMOKE"));
 
 thread_local! {
     static CANVAS_RENDER_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(super) struct CanvasRenderTraceGuard {
-    enabled: bool,
+    /// `None` when render tracing is off.
+    span: Option<TraceSpan>,
     verbose: bool,
-    depth: usize,
-    started_at: Option<std::time::Instant>,
     channel_id: String,
-    finished: bool,
 }
 
 impl CanvasRenderTraceGuard {
@@ -34,24 +31,17 @@ impl CanvasRenderTraceGuard {
         container_width: f32,
         viewport_height: f32,
     ) -> Self {
-        let enabled = *RENDER_TRACE_ENABLED;
+        let (enabled, verbose) = *RENDER_TRACE_SWITCHES;
         if !enabled {
             return Self {
-                enabled,
+                span: None,
                 verbose: false,
-                depth: 0,
-                started_at: None,
                 channel_id: String::new(),
-                finished: true,
             };
         }
 
-        let depth = CANVAS_RENDER_DEPTH.with(|depth| {
-            let next = depth.get() + 1;
-            depth.set(next);
-            next
-        });
-        let verbose = *RENDER_TRACE_VERBOSE_ENABLED;
+        let span = TraceSpan::enter(&CANVAS_RENDER_DEPTH);
+        let depth = span.depth();
         if verbose {
             crate::log_perf_render!(
                 debug,
@@ -73,41 +63,32 @@ impl CanvasRenderTraceGuard {
         }
 
         Self {
-            enabled,
+            span: Some(span),
             verbose,
-            depth,
-            started_at: Some(std::time::Instant::now()),
             channel_id: channel_id.to_string(),
-            finished: false,
         }
     }
 
     pub(super) fn finish(&mut self) {
-        if !self.enabled || self.finished {
+        let Some(span) = self.span.as_mut() else {
             return;
-        }
-
-        self.finished = true;
-        let elapsed_ms = self
-            .started_at
-            .as_ref()
-            .map(std::time::Instant::elapsed)
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1000.0;
+        };
+        let Some(elapsed_ms) = span.finish() else {
+            return;
+        };
         if self.verbose {
             crate::log_perf_render!(
                 debug,
                 "canvas.render.finish depth={} channel={} elapsed_ms={:.2}",
-                self.depth,
+                span.depth(),
                 self.channel_id,
                 elapsed_ms
             );
-        } else if elapsed_ms >= RENDER_TRACE_SLOW_MS {
+        } else if elapsed_ms >= TRACE_SLOW_MS {
             crate::log_perf_render!(
                 warn,
                 "canvas.render.slow depth={} channel={} elapsed_ms={:.2}",
-                self.depth,
+                span.depth(),
                 self.channel_id,
                 elapsed_ms
             );
@@ -117,27 +98,16 @@ impl CanvasRenderTraceGuard {
 
 impl Drop for CanvasRenderTraceGuard {
     fn drop(&mut self) {
-        if !self.enabled {
-            return;
-        }
-
-        if !self.finished {
+        if let Some(span) = self.span.as_ref()
+            && !span.is_finished()
+        {
             crate::log_perf_render!(
                 error,
                 "canvas.render.unfinished depth={} channel={} elapsed_ms={:.2}",
-                self.depth,
+                span.depth(),
                 self.channel_id,
-                self.started_at
-                    .as_ref()
-                    .map(std::time::Instant::elapsed)
-                    .unwrap_or_default()
-                    .as_secs_f64()
-                    * 1000.0
+                span.elapsed_ms()
             );
         }
-
-        CANVAS_RENDER_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_sub(1));
-        });
     }
 }

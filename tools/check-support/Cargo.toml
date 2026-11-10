@@ -1,0 +1,15 @@
+[package]
+name = "check-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared fixture output for Echo's contract tools"
+publish = false
+
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+tracing.workspace = true

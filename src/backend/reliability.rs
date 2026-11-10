@@ -20,7 +20,7 @@ const MAX_CRASH_REPORTS: usize = 10;
 static SAFE_MODE: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static GUI_RUN_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Set once `benchmark_profile` has chosen the storage roots; a panic before
+/// Set once `storage_roots` has chosen the storage roots; a panic before
 /// that writes no files, so an isolated profile never leaks into normal state.
 static STORAGE_ROOTS_READY: AtomicBool = AtomicBool::new(false);
 static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
@@ -518,5 +518,5 @@ fn last_panic_path() -> Option<PathBuf> {
 }
 
 fn reliability_dir() -> Option<PathBuf> {
-    crate::benchmark_profile::config_root()
+    crate::storage_roots::config_root()
 }

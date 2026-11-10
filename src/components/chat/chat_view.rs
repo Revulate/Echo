@@ -1,6 +1,5 @@
-//! ChatView entity for rendering a single chat pane
-//!
-//! This extracts chat pane rendering from the app.rs monolith into a dedicated entity.
+//! `ChatView`, the entity that renders one chat split: it owns the split's
+//! `CanvasMessageList` and keeps it in sync with the channel's `ChatState`.
 
 use crate::backend::ChatMessage;
 use crate::components::chat::canvas_renderer::CanvasMessageList;
@@ -35,65 +34,70 @@ pub enum ChatViewDirtyReason {
     InactiveHistoryDeferred,
 }
 
+impl ChatViewDirtyReason {
+    const ALL: [Self; 9] = [
+        Self::Initial,
+        Self::ChatStateEvent,
+        Self::DecorationEvent,
+        Self::RenderParams,
+        Self::CanvasStateSync,
+        Self::ManualScroll,
+        Self::SearchJump,
+        Self::ScrollMapJump,
+        Self::InactiveHistoryDeferred,
+    ];
+
+    fn bit(self) -> u16 {
+        1 << self as u16
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ChatStateEvent => "chat_state_event",
+            Self::DecorationEvent => "decoration_event",
+            Self::RenderParams => "render_params",
+            Self::CanvasStateSync => "canvas_state_sync",
+            Self::ManualScroll => "manual_scroll",
+            Self::SearchJump => "search_jump",
+            Self::ScrollMapJump => "scroll_map_jump",
+            Self::InactiveHistoryDeferred => "inactive_history_deferred",
+        }
+    }
+}
+
+/// The set of reasons a chat view was marked dirty since the last render.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChatViewDirtyReasons(u16);
 
 impl ChatViewDirtyReasons {
-    const INITIAL: u16 = 1 << 0;
-    const CHAT_STATE_EVENT: u16 = 1 << 2;
-    const RENDER_PARAMS: u16 = 1 << 3;
-    const CANVAS_STATE_SYNC: u16 = 1 << 4;
-    const MANUAL_SCROLL: u16 = 1 << 5;
-    const SEARCH_JUMP: u16 = 1 << 6;
-    const SCROLL_MAP_JUMP: u16 = 1 << 7;
-    const DECORATION_EVENT: u16 = 1 << 8;
-    const INACTIVE_HISTORY_DEFERRED: u16 = 1 << 9;
-
     fn insert(&mut self, reason: ChatViewDirtyReason) {
-        self.0 |= Self::bit_for(reason);
-    }
-
-    fn bit_for(reason: ChatViewDirtyReason) -> u16 {
-        match reason {
-            ChatViewDirtyReason::Initial => Self::INITIAL,
-            ChatViewDirtyReason::ChatStateEvent => Self::CHAT_STATE_EVENT,
-            ChatViewDirtyReason::RenderParams => Self::RENDER_PARAMS,
-            ChatViewDirtyReason::CanvasStateSync => Self::CANVAS_STATE_SYNC,
-            ChatViewDirtyReason::ManualScroll => Self::MANUAL_SCROLL,
-            ChatViewDirtyReason::SearchJump => Self::SEARCH_JUMP,
-            ChatViewDirtyReason::ScrollMapJump => Self::SCROLL_MAP_JUMP,
-            ChatViewDirtyReason::DecorationEvent => Self::DECORATION_EVENT,
-            ChatViewDirtyReason::InactiveHistoryDeferred => Self::INACTIVE_HISTORY_DEFERRED,
-        }
+        self.0 |= reason.bit();
     }
 
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// The single reason's label, `"none"`, or `"multiple"`.
     pub fn labels(self) -> &'static str {
-        match self.0 {
-            0 => "none",
-            Self::INITIAL => "initial",
-            Self::CHAT_STATE_EVENT => "chat_state_event",
-            Self::RENDER_PARAMS => "render_params",
-            Self::CANVAS_STATE_SYNC => "canvas_state_sync",
-            Self::MANUAL_SCROLL => "manual_scroll",
-            Self::SEARCH_JUMP => "search_jump",
-            Self::SCROLL_MAP_JUMP => "scroll_map_jump",
-            Self::DECORATION_EVENT => "decoration_event",
-            Self::INACTIVE_HISTORY_DEFERRED => "inactive_history_deferred",
-            _ => "multiple",
+        if self.0 == 0 {
+            return "none";
         }
+        ChatViewDirtyReason::ALL
+            .iter()
+            .find(|reason| reason.bit() == self.0)
+            .map_or("multiple", |reason| reason.label())
     }
 }
 
-/// A paced prefix of a message list: (source list, visible count, prefix).
-type RevealedPrefix = (
-    Arc<Vec<Arc<ChatMessage>>>,
-    usize,
-    Arc<Vec<Arc<ChatMessage>>>,
-);
+/// The first `visible` messages of `source`, kept so repeated paced syncs of
+/// the same snapshot reuse one prefix list.
+struct RevealedPrefix {
+    source: Arc<Vec<Arc<ChatMessage>>>,
+    visible: usize,
+    prefix: Arc<Vec<Arc<ChatMessage>>>,
+}
 
 /// Entity for rendering a single chat pane with messages, input, and header
 pub struct ChatView {
@@ -534,14 +538,18 @@ impl ChatView {
             self.reveal_prefix = None;
             return messages;
         }
-        if let Some((source, count, prefix)) = &self.reveal_prefix
-            && Arc::ptr_eq(source, &messages)
-            && *count == visible
+        if let Some(revealed) = &self.reveal_prefix
+            && Arc::ptr_eq(&revealed.source, &messages)
+            && revealed.visible == visible
         {
-            return prefix.clone();
+            return revealed.prefix.clone();
         }
         let prefix = Arc::new(messages[..visible].to_vec());
-        self.reveal_prefix = Some((messages, visible, prefix.clone()));
+        self.reveal_prefix = Some(RevealedPrefix {
+            source: messages,
+            visible,
+            prefix: prefix.clone(),
+        });
         prefix
     }
 

@@ -3,10 +3,11 @@
 //! Renders the text input with cursor, selection, and spell check underlines.
 
 use gpui::{
-    App, Bounds, CaretAffinity, ContentMask, ElementInputHandler, Entity, FocusHandle, Hsla,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, RenderOnce, Role, ShapedLine, StatefulInteractiveElement, Styled,
-    TextAlign, TextRun, Window, accesskit, canvas, div, fill, point, px, size,
+    Action, App, Bounds, CaretAffinity, ContentMask, Context, ElementInputHandler, Entity,
+    FocusHandle, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, RenderOnce, Role, ShapedLine,
+    StatefulInteractiveElement, Styled, TextAlign, TextRun, Window, accesskit, canvas, div, fill,
+    point, px, size,
 };
 use std::ops::Range;
 
@@ -14,12 +15,8 @@ use crate::theme::colors;
 use crate::theme::tokens::{Radii, RadiiPixels, Spacing};
 
 use super::CONTEXT;
+use super::bidi_probe;
 use super::state::InputState;
-use super::{
-    Backspace, Copy, Cut, Delete, DeleteWord, DeleteWordForward, Enter, Escape, MoveLeft,
-    MoveRight, MoveToEnd, MoveToStart, MoveWordLeft, MoveWordRight, Paste, Redo, SelectAll,
-    SelectLeft, SelectRight, SelectToEnd, SelectToStart, SelectWordLeft, SelectWordRight, Undo,
-};
 
 const CARET_WIDTH: Pixels = px(2.0);
 
@@ -105,6 +102,15 @@ impl Input {
     }
 }
 
+/// Action listener that runs `handler` on the input's state entity.
+fn forward<A: Action>(
+    state: &Entity<InputState>,
+    handler: fn(&mut InputState, &A, &mut Window, &mut Context<InputState>),
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+    move |action, window, cx| state.update(cx, |state, cx| handler(state, action, window, cx))
+}
+
 fn accessibility_value(text: &str, secure: bool) -> String {
     if secure {
         "•".repeat(text.chars().count())
@@ -115,14 +121,8 @@ fn accessibility_value(text: &str, secure: bool) -> String {
 
 impl RenderOnce for Input {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        if crate::benchmark_ui_fixture::take_feedback_bidi_input_request() {
-            self.state.update(cx, |state, cx| {
-                state.set_value(
-                    crate::benchmark_ui_fixture::FEEDBACK_BIDI_INPUT_TEXT,
-                    window,
-                    cx,
-                );
-            });
+        if crate::bench::ui_fixture::take_feedback_bidi_input_request() {
+            bidi_probe::load_bidi_input_text(&self.state, window, cx);
         }
         let state = self.state.read(cx);
         let text = state.value().to_string();
@@ -282,150 +282,33 @@ impl RenderOnce for Input {
         }
 
         container = container
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Backspace, window, cx| {
-                    state.update(cx, |s, cx| s.handle_backspace(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Delete, window, cx| {
-                    state.update(cx, |s, cx| s.handle_delete(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &DeleteWord, window, cx| {
-                    state.update(cx, |s, cx| s.handle_delete_word(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &DeleteWordForward, window, cx| {
-                    state.update(cx, |s, cx| s.handle_delete_word_forward(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Enter, window, cx| {
-                    state.update(cx, |s, cx| s.handle_enter(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Escape, window, cx| {
-                    state.update(cx, |s, cx| s.handle_escape(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &MoveLeft, window, cx| {
-                    state.update(cx, |s, cx| s.handle_move_left(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &MoveRight, window, cx| {
-                    state.update(cx, |s, cx| s.handle_move_right(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &MoveToStart, window, cx| {
-                    state.update(cx, |s, cx| s.handle_move_to_start(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &MoveToEnd, window, cx| {
-                    state.update(cx, |s, cx| s.handle_move_to_end(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &MoveWordLeft, window, cx| {
-                    state.update(cx, |s, cx| s.handle_move_word_left(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &MoveWordRight, window, cx| {
-                    state.update(cx, |s, cx| s.handle_move_word_right(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectLeft, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_left(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectRight, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_right(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectToStart, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_to_start(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectToEnd, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_to_end(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectWordLeft, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_word_left(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectWordRight, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_word_right(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &SelectAll, window, cx| {
-                    state.update(cx, |s, cx| s.handle_select_all(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Copy, window, cx| {
-                    state.update(cx, |s, cx| s.handle_copy(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Cut, window, cx| {
-                    state.update(cx, |s, cx| s.handle_cut(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Paste, window, cx| {
-                    state.update(cx, |s, cx| s.handle_paste(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Undo, window, cx| {
-                    state.update(cx, |s, cx| s.handle_undo(action, window, cx));
-                }
-            })
-            .on_action({
-                let state = state_entity.clone();
-                move |action: &Redo, window, cx| {
-                    state.update(cx, |s, cx| s.handle_redo(action, window, cx));
-                }
-            });
+            .on_action(forward(&state_entity, InputState::handle_backspace))
+            .on_action(forward(&state_entity, InputState::handle_delete))
+            .on_action(forward(&state_entity, InputState::handle_delete_word))
+            .on_action(forward(
+                &state_entity,
+                InputState::handle_delete_word_forward,
+            ))
+            .on_action(forward(&state_entity, InputState::handle_enter))
+            .on_action(forward(&state_entity, InputState::handle_escape))
+            .on_action(forward(&state_entity, InputState::handle_move_left))
+            .on_action(forward(&state_entity, InputState::handle_move_right))
+            .on_action(forward(&state_entity, InputState::handle_move_to_start))
+            .on_action(forward(&state_entity, InputState::handle_move_to_end))
+            .on_action(forward(&state_entity, InputState::handle_move_word_left))
+            .on_action(forward(&state_entity, InputState::handle_move_word_right))
+            .on_action(forward(&state_entity, InputState::handle_select_left))
+            .on_action(forward(&state_entity, InputState::handle_select_right))
+            .on_action(forward(&state_entity, InputState::handle_select_to_start))
+            .on_action(forward(&state_entity, InputState::handle_select_to_end))
+            .on_action(forward(&state_entity, InputState::handle_select_word_left))
+            .on_action(forward(&state_entity, InputState::handle_select_word_right))
+            .on_action(forward(&state_entity, InputState::handle_select_all))
+            .on_action(forward(&state_entity, InputState::handle_copy))
+            .on_action(forward(&state_entity, InputState::handle_cut))
+            .on_action(forward(&state_entity, InputState::handle_paste))
+            .on_action(forward(&state_entity, InputState::handle_undo))
+            .on_action(forward(&state_entity, InputState::handle_redo));
 
         if !is_disabled {
             container = container
@@ -508,12 +391,14 @@ impl RenderOnce for Input {
 
                     let exact_interaction_geometry =
                         !line.has_bidi_runs || line.bidi_geometry_complete;
-                    let cursor_x = exact_interaction_geometry.then(|| {
-                        line.x_for_index_with_affinity_checked(
-                            cursor.min(line.len()),
-                            cursor_affinity,
-                        )
-                    }).flatten();
+                    let cursor_x = exact_interaction_geometry
+                        .then(|| {
+                            line.x_for_index_with_affinity_checked(
+                                cursor.min(line.len()),
+                                cursor_affinity,
+                            )
+                        })
+                        .flatten();
 
                     let scroll_x = state_entity.update(cx, |state, _| {
                         let scroll_x = state.follow_caret(
@@ -591,85 +476,15 @@ impl RenderOnce for Input {
                         })
                         .unwrap_or_default();
 
-                    if crate::benchmark_ui_fixture::is_feedback_bidi_input_text(&display_text) {
-                        let find_hit_test_x = |target: usize| {
-                            let line_width: f32 = line.width().into();
-                            let whole_pixels = line_width.floor() as i32;
-                            (1..whole_pixels).find_map(|step| {
-                                let x = px(step as f32);
-                                line.caret_for_x(x).and_then(|caret| {
-                                    (caret.index == target).then_some((x.into(), caret.affinity))
-                                })
-                            })
-                        };
-                        let target_selection = display_text
-                            .char_indices()
-                            .map(|(offset, _)| offset)
-                            .chain(std::iter::once(display_text.len()))
-                            .collect::<Vec<_>>();
-                        let target_selection = target_selection.iter().enumerate().find_map(
-                            |(start_index, &start)| {
-                                target_selection[start_index + 1..].iter().find_map(|&end| {
-                                    let spans = line.visual_spans_for_range(start..end);
-                                    (spans.len() >= 2
-                                        && spans.iter().all(|span| span.end > span.start))
-                                    .then(|| {
-                                        find_hit_test_x(start)
-                                            .zip(find_hit_test_x(end))
-                                            .map(|((start_x, start_affinity), (end_x, end_affinity))| {
-                                                (
-                                                    start,
-                                                    end,
-                                                    start_x,
-                                                    end_x,
-                                                    start_affinity,
-                                                    end_affinity,
-                                                )
-                                            })
-                                    })
-                                    .flatten()
-                                })
-                            },
-                        );
-                        let to_feedback_rect =
-                            |bounds: &Bounds<Pixels>| crate::benchmark_ui_fixture::FeedbackRect {
-                                x: bounds.origin.x.into(),
-                                y: bounds.origin.y.into(),
-                                width: bounds.size.width.into(),
-                                height: bounds.size.height.into(),
-                            };
-                        crate::benchmark_ui_fixture::publish_feedback_shared_input(
-                            crate::benchmark_ui_fixture::FeedbackSharedInputSnapshot {
-                                bounds: to_feedback_rect(&bounds),
-                                text_len: display_text.len(),
-                                cursor,
-                                cursor_affinity: match cursor_affinity {
-                                    CaretAffinity::Leading => crate::benchmark_ui_fixture::FeedbackCaretAffinity::Leading,
-                                    CaretAffinity::Trailing => crate::benchmark_ui_fixture::FeedbackCaretAffinity::Trailing,
-                                },
-                                target_selection_start: target_selection.map(|target| target.0),
-                                target_selection_end: target_selection.map(|target| target.1),
-                                target_selection_start_affinity: target_selection.map(|target| {
-                                    match target.4 {
-                                        CaretAffinity::Leading => crate::benchmark_ui_fixture::FeedbackCaretAffinity::Leading,
-                                        CaretAffinity::Trailing => crate::benchmark_ui_fixture::FeedbackCaretAffinity::Trailing,
-                                    }
-                                }),
-                                target_selection_end_affinity: target_selection.map(|target| {
-                                    match target.5 {
-                                        CaretAffinity::Leading => crate::benchmark_ui_fixture::FeedbackCaretAffinity::Leading,
-                                        CaretAffinity::Trailing => crate::benchmark_ui_fixture::FeedbackCaretAffinity::Trailing,
-                                    }
-                                }),
-                                selection_start_x: target_selection.map(|target| target.2),
-                                selection_end_x: target_selection.map(|target| target.3),
-                                selection_start: selection.as_ref().map(|range| range.start),
-                                selection_end: selection.as_ref().map(|range| range.end),
-                                selection_spans: selection_bounds
-                                    .iter()
-                                    .map(to_feedback_rect)
-                                    .collect(),
-                            },
+                    if crate::bench::ui_fixture::is_feedback_bidi_input_text(&display_text) {
+                        bidi_probe::publish_bidi_input_probe(
+                            &line,
+                            &display_text,
+                            bounds,
+                            cursor,
+                            cursor_affinity,
+                            selection.as_ref(),
+                            &selection_bounds,
                         );
                     }
 

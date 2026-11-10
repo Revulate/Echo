@@ -58,11 +58,7 @@ pub fn still_frame_source(url: SharedString, source: PreloadSource) -> ImageSour
                 "still frame unavailable".into(),
             )));
         }
-        image_cache::trigger_animated_poster_preload_media_single_with_source(
-            url.as_ref(),
-            None,
-            source,
-        );
+        image_cache::trigger_animated_poster_preload_media_single(url.as_ref(), None, source);
 
         let key = (window.current_view(), url.clone());
         let now = Instant::now();

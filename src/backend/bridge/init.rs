@@ -15,9 +15,9 @@ const STARTUP_RECENT_EMOTE_PRELOAD_DEFAULT_GAP_MS: u64 = 2_000;
 static BACKEND_SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 const EMOTE_CACHE_AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Persist the emote-set cache shortly after sets change. It used to be written
-/// only on a clean exit, so after a crash, forced close or power loss the next
-/// launch painted every emote as text until the provider fetches returned.
+/// Persist the emote-set cache shortly after sets change, so a crash, forced
+/// close or power loss does not leave the next launch painting every emote as
+/// text until the provider fetches return.
 fn spawn_emote_cache_autosave() {
     RUNTIME.spawn(async {
         let mut saved = crate::backend::emotes::emote_cache_persist_generation();
@@ -40,11 +40,7 @@ fn spawn_emote_cache_autosave() {
 }
 
 fn env_duration_ms(name: &str, default_ms: u64) -> Duration {
-    let ms = std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(default_ms);
-    Duration::from_millis(ms)
+    Duration::from_millis(echo_core::env::parsed(name).unwrap_or(default_ms))
 }
 
 fn normalize_recent_channels(recent_channels: Vec<String>) -> Vec<String> {
@@ -52,7 +48,7 @@ fn normalize_recent_channels(recent_channels: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
 
     for channel in recent_channels {
-        let channel = channel.trim().trim_start_matches('#').to_ascii_lowercase();
+        let channel = echo_core::channel_identity::normalize_channel_key(channel.trim());
         if channel.is_empty() || channel == "whisper" {
             continue;
         }
@@ -263,7 +259,7 @@ async fn resolve_recent_preload_channel_id(channel_login: &str) -> Option<String
 }
 
 async fn set_emote_cache_path() {
-    let Some(echo_dir) = crate::benchmark_profile::config_root() else {
+    let Some(echo_dir) = crate::storage_roots::config_root() else {
         crate::log_ui!(
             warn,
             "Could not determine config directory, emote cache will not be persisted"
@@ -275,9 +271,7 @@ async fn set_emote_cache_path() {
     }
     let emote_cache_path = echo_dir.join("emote_cache.postcard");
     crate::log_ui!(info, "Set emote cache path: {:?}", emote_cache_path);
-    crate::backend::emotes::EMOTE_CACHE
-        .set_cache_path(emote_cache_path)
-        .await;
+    crate::backend::emotes::EMOTE_CACHE.set_cache_path(emote_cache_path);
 }
 
 /// Retokenize every resident chat row on a blocking thread. Only rows whose
@@ -291,13 +285,15 @@ fn spawn_resident_row_retokenize() {
 /// Initialize the backend (call once at startup)
 pub fn initialize() {
     crate::log_ui!(info, "Initializing Echo backend...");
-    let offline_scenario = crate::benchmark_profile::network_lanes_suppressed();
+    let offline_scenario = crate::bench::network_lanes_suppressed();
 
     crate::backend::slots::resolver::install_resolver_ports();
 
     crate::backend::irc::load_user_color_cache();
     crate::backend::irc::load_user_color_overrides();
-    crate::startup_metrics::record("user_colors_loaded");
+    crate::diagnostics::startup_metrics::record(
+        crate::diagnostics::startup_metrics::StartupMarker::UserColorsLoaded,
+    );
 
     crate::backend::settings::init_settings_channel();
     crate::backend::activity_persistence::start();
@@ -323,7 +319,9 @@ pub fn initialize() {
         drop(state);
         crate::backend::eventsub::notify_auth_readiness_changed();
     }
-    crate::startup_metrics::record("settings_loaded");
+    crate::diagnostics::startup_metrics::record(
+        crate::diagnostics::startup_metrics::StartupMarker::SettingsLoaded,
+    );
 
     RUNTIME.spawn(async move {
         let startup_emote_channels = startup_emote_cache_channels();
@@ -343,7 +341,11 @@ pub fn initialize() {
             let channels = startup_emote_channels.clone();
             async move {
                 set_emote_cache_path().await;
-                let (global, _, channel_count) = crate::backend::emotes::EMOTE_CACHE
+                let crate::backend::emotes::DiskCacheLoad {
+                    global,
+                    channels: channel_count,
+                    ..
+                } = crate::backend::emotes::EMOTE_CACHE
                     .load_from_disk_scoped(
                         Some(channels),
                         crate::backend::emotes::DiskCacheParts::Shared,
@@ -357,7 +359,9 @@ pub fn initialize() {
                 );
                 if global {
                     crate::backend::emotes::mark_initial_catalogs_ready();
-                    crate::startup_metrics::record("initial_catalogs_ready");
+                    crate::diagnostics::startup_metrics::record(
+                        crate::diagnostics::startup_metrics::StartupMarker::InitialCatalogsReady,
+                    );
                     Some(crate::backend::emotes::get_global_emote_version())
                 } else {
                     None
@@ -413,12 +417,13 @@ pub fn initialize() {
             // validated owner id they are fenced on. Autosave starts only after
             // this, so it never writes a cache missing the disk user set.
             let startup_scope_count = startup_emote_channels.len();
-            let (_, user, _) = crate::backend::emotes::EMOTE_CACHE
-                .load_from_disk_scoped(
-                    Some(startup_emote_channels),
-                    crate::backend::emotes::DiskCacheParts::User,
-                )
-                .await;
+            let crate::backend::emotes::DiskCacheLoad { user, .. } =
+                crate::backend::emotes::EMOTE_CACHE
+                    .load_from_disk_scoped(
+                        Some(startup_emote_channels),
+                        crate::backend::emotes::DiskCacheParts::User,
+                    )
+                    .await;
             crate::log_emotes!(
                 info,
                 "Loaded user emote cache: user={}, startup_scope={}",
@@ -430,11 +435,7 @@ pub fn initialize() {
 
             crate::backend::chat_replay::start_chat_replay_from_env();
 
-            if !offline_scenario
-                && crate::backend::emotes::EMOTE_CACHE
-                    .global_needs_refresh()
-                    .await
-            {
+            if !offline_scenario && crate::backend::emotes::EMOTE_CACHE.global_needs_refresh() {
                 crate::log_emotes!(info, "Loading global emotes...");
                 if let Err(e) = crate::backend::emotes::EMOTE_CACHE
                     .load_global_emotes()
@@ -457,7 +458,9 @@ pub fn initialize() {
             }
             if global_version_at_ready.is_none() {
                 crate::backend::emotes::mark_initial_catalogs_ready();
-                crate::startup_metrics::record("initial_catalogs_ready");
+                crate::diagnostics::startup_metrics::record(
+                    crate::diagnostics::startup_metrics::StartupMarker::InitialCatalogsReady,
+                );
             }
 
             if !offline_scenario

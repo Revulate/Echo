@@ -1,17 +1,12 @@
+//! Contract: 7TV user-profile, cosmetics-catalog and v4 paint parsing, paint/badge
+//! resolution and gradient-layer decoding in `crates/echo-cosmetics-core`.
+
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 use echo_cosmetics_core::{
     ResolvedUserCosmetics, RgbaColor, SevenTvGradientKind, SevenTvGradientStop, SevenTvNamePaint,
-    SevenTvRadialShape, SevenTvUserProfile, css_gradient_direction, parse_cosmetics_catalog_json,
-    parse_paints_v4_json, parse_user_profile_json, project_rect_bounds, repeating_gradient_ratio,
-    resolve_user_cosmetics, sample_gradient_stops,
+    SevenTvRadialShape, SevenTvUserProfile, parse_cosmetics_catalog_json, parse_paints_v4_json,
+    parse_user_profile_json, repeating_gradient_ratio, resolve_user_cosmetics,
 };
-use std::hint::black_box;
-use std::time::Instant;
-
-const ITERS: usize = 100_000;
-const V4_PARSE_ITERS: usize = 100_000;
-const GRADIENT_SAMPLE_ITERS: usize = 2_000_000;
-const GRADIENT_GEOMETRY_ITERS: usize = 2_000_000;
-const TEXT_STYLE_ITERS: usize = 500_000;
 
 fn main() {
     let user_json = sample_user_json();
@@ -191,7 +186,7 @@ fn main() {
             > 0
     );
 
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(
         &profile,
         &resolved,
@@ -199,100 +194,6 @@ fn main() {
         gradient_paint,
         image_paint,
         repeating_period_sample,
-    );
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let profile = parse_user_profile_json(black_box(user_json)).unwrap();
-        let catalog = parse_cosmetics_catalog_json(black_box(catalog_json)).unwrap();
-        let resolved = resolve_user_cosmetics(&profile, &catalog);
-        checksum += resolved
-            .paint
-            .as_ref()
-            .map(|paint| paint.colors.len() + paint.shadows.len())
-            .unwrap_or_default();
-        checksum += resolved
-            .badge
-            .as_ref()
-            .map(|badge| badge.url.len())
-            .unwrap_or_default();
-    }
-    print_measurement("parse", "user_and_catalog", ITERS, start, checksum);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..V4_PARSE_ITERS {
-        let paints = parse_paints_v4_json(black_box(paints_v4_json)).unwrap();
-        checksum += paints
-            .values()
-            .map(|paint| paint.gradients.len() + paint.shadows.len() + paint.image_urls.len())
-            .sum::<usize>();
-    }
-    print_measurement(
-        "parse",
-        "paints_v4_catalog",
-        V4_PARSE_ITERS,
-        start,
-        checksum,
-    );
-
-    let stops = &gradient.stops;
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..GRADIENT_SAMPLE_ITERS {
-        let ratio = (i % 256) as f32 / 255.0;
-        let color = sample_gradient_stops(black_box(stops), black_box(ratio)).unwrap();
-        checksum = checksum.wrapping_add(color.r as usize + color.g as usize + color.b as usize);
-    }
-    print_measurement(
-        "resolve",
-        "gradient_stop_sampling",
-        GRADIENT_SAMPLE_ITERS,
-        start,
-        checksum,
-    );
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..GRADIENT_GEOMETRY_ITERS {
-        let angle = (i % 360) as f32;
-        let direction = css_gradient_direction(black_box(angle));
-        let (min_projection, max_projection) =
-            project_rect_bounds(direction, black_box(220.0), black_box(24.0));
-        checksum = checksum
-            .wrapping_add(((max_projection - min_projection) * 16.0) as usize)
-            .wrapping_add((direction.0.abs() * 128.0) as usize);
-    }
-    print_measurement(
-        "resolve",
-        "gradient_geometry",
-        GRADIENT_GEOMETRY_ITERS,
-        start,
-        checksum,
-    );
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..TEXT_STYLE_ITERS {
-        let transformed = v3_paint.transformed_display_name(black_box("alice"));
-        checksum = checksum.wrapping_add(transformed.len());
-        checksum = checksum.wrapping_add(v3_paint.text.weight.unwrap_or_default() as usize);
-        checksum = checksum.wrapping_add(
-            v3_paint
-                .text
-                .stroke
-                .as_ref()
-                .map(|stroke| (stroke.width * 100.0) as usize + stroke.color.r as usize)
-                .unwrap_or_default(),
-        );
-    }
-    print_measurement(
-        "resolve",
-        "name_paint_text_style",
-        TEXT_STYLE_ITERS,
-        start,
-        checksum,
     );
 }
 
@@ -304,33 +205,33 @@ fn print_smoke_rows(
     image_paint: &SevenTvNamePaint,
     repeating_period_sample: f32,
 ) {
-    print_fixture(
+    assert_fixture(
         "cosmetics_profile_id",
         &profile.id,
         "01H00000000000000000000001",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_profile_color",
-        &profile
+        profile
             .style
             .color
             .map(|color| color.to_hex_rgb())
             .unwrap_or_else(|| "none".to_string()),
         "#17ebb6",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_profile_badge_id",
         profile.style.badge_id.as_deref().unwrap_or("none"),
         "01GAF95ZTG000E8VNG1S1RMTBB",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_avatar_url",
         resolved.avatar_url.as_deref().unwrap_or("none"),
         "https://static-cdn.jtvnw.net/jtv_user_pictures/example-profile_image-300x300.png",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_v4_gradient_stop_count",
-        &gradient_paint
+        gradient_paint
             .gradients
             .first()
             .map(|gradient| gradient.stops.len())
@@ -338,9 +239,9 @@ fn print_smoke_rows(
             .to_string(),
         "3",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_v4_gradient_angle",
-        &format!(
+        format!(
             "{:.1}",
             gradient_paint
                 .gradients
@@ -350,14 +251,14 @@ fn print_smoke_rows(
         ),
         "45.0",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_repeating_period",
-        &format!("{repeating_period_sample:.2}"),
+        format!("{repeating_period_sample:.2}"),
         "0.30",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_v4_shadow_blur",
-        &format!(
+        format!(
             "{:.1}",
             gradient_paint
                 .shadows
@@ -367,12 +268,12 @@ fn print_smoke_rows(
         ),
         "3.0",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_shadow_render_budget",
-        &echo_cosmetics_core::MAX_7TV_SHADOW_RENDER_LAYERS.to_string(),
+        echo_cosmetics_core::MAX_7TV_SHADOW_RENDER_LAYERS.to_string(),
         "8",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_v4_image_paint_url",
         image_paint
             .image_urls
@@ -381,70 +282,51 @@ fn print_smoke_rows(
             .unwrap_or("none"),
         "https://cdn.7tv.app/paint/image-2x-animated.webp",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_v4_image_paint_animated",
-        &image_paint
+        image_paint
             .gradients
             .first()
             .is_some_and(|layer| layer.image_is_animated)
             .to_string(),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_text_weight",
-        &v3_paint.text.weight.unwrap_or_default().to_string(),
+        v3_paint.text.weight.unwrap_or_default().to_string(),
         "700",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_text_transform",
-        &v3_paint.transformed_display_name("alice"),
+        v3_paint.transformed_display_name("alice"),
         "ALICE",
     );
     let stroke = v3_paint.text.stroke.as_ref().expect("paint stroke");
-    print_fixture(
+    assert_fixture(
         "cosmetics_stroke_color",
-        &stroke.color.to_hex_rgb(),
+        stroke.color.to_hex_rgb(),
         "#fefeff",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_stroke_width",
-        &format!("{:.1}", stroke.width),
+        format!("{:.1}", stroke.width),
         "1.5",
     );
     let badge = resolved.badge.as_ref().expect("badge");
-    print_fixture(
+    assert_fixture(
         "cosmetics_badge_url",
         &badge.url,
         "https://cdn.7tv.app/badge/01GAF95ZTG000E8VNG1S1RMTBB/2x.webp",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_badge_tooltip",
         &badge.tooltip,
         "7TV Subscriber (2 Months)",
     );
-    print_fixture(
+    assert_fixture(
         "cosmetics_badge_animated",
         bool_text(badge.is_animated),
         "false",
-    );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
-fn print_measurement(kind: &str, name: &str, units: usize, start: Instant, checksum: usize) {
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / units as f64;
-    let units_per_second = units as f64 / elapsed.as_secs_f64();
-    println!(
-        "{},{},{},{:.2},{:.0},{}",
-        kind, name, units, ns_per_unit, units_per_second, checksum
     );
 }
 

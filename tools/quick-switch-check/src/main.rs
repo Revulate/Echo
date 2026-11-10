@@ -1,6 +1,11 @@
-use std::cmp::Ordering;
+//! Contract: quick-switcher ranking (`echo_core::quick_switch`) with
+//! echo-core's `fuzzy_score`: exact beats prefix beats camel-case matches,
+//! case-insensitively; ties break on recent channels, then live channels, then
+//! name.
 
-use echo_core::fuzzy_score;
+use check_support::{FIXTURE_HEADER, assert_fixture};
+use echo_core::fuzzy::fuzzy_score;
+use echo_core::quick_switch::{QuickSwitchCandidate, rank_channels};
 
 #[derive(Clone, Debug)]
 struct QuickItem {
@@ -9,7 +14,7 @@ struct QuickItem {
 }
 
 fn main() {
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
 
     let exact = fuzzy_score("pog", "pog").expect("exact match");
     let prefix = fuzzy_score("pog", "PogChamp").expect("prefix match");
@@ -25,22 +30,22 @@ fn main() {
     assert_eq!(case_a, case_b, "fuzzy matching should be case-insensitive");
     assert!(fuzzy_score("xyz", "PogChamp").is_none());
 
-    print_fixture(
+    assert_fixture(
         "fuzzy_exact_gt_prefix",
-        &ordering_text(exact > prefix),
+        ordering_text(exact > prefix),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "fuzzy_prefix_gt_camel",
-        &ordering_text(prefix > camel),
+        ordering_text(prefix > camel),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "fuzzy_case_insensitive",
-        &ordering_text(case_a == case_b),
+        ordering_text(case_a == case_b),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "fuzzy_no_match",
         option_text(fuzzy_score("xyz", "PogChamp")),
         "none",
@@ -66,19 +71,19 @@ fn main() {
     ];
     let recent = ["zeta", "alpha"];
 
-    print_fixture(
+    assert_fixture(
         "quick_switch_empty_recent_live_alpha",
-        &ordered_channels("", &items, &recent),
+        ordered_channels("", &items, &recent),
         "zeta|alpha|beta|gamma",
     );
-    print_fixture(
+    assert_fixture(
         "quick_switch_query_exact_first",
-        &ordered_channels("beta", &items, &recent),
+        ordered_channels("beta", &items, &recent),
         "beta",
     );
-    print_fixture(
+    assert_fixture(
         "quick_switch_query_prefix_before_sparse",
-        &ordered_channels(
+        ordered_channels(
             "ga",
             &[
                 QuickItem {
@@ -97,53 +102,19 @@ fn main() {
 }
 
 fn ordered_channels(query: &str, items: &[QuickItem], recent: &[&str]) -> String {
-    let mut indices: Vec<usize> = (0..items.len()).collect();
-
-    if query.is_empty() {
-        indices.sort_by(|a_idx, b_idx| {
-            let a = &items[*a_idx];
-            let b = &items[*b_idx];
-            recent_rank(recent, a.channel)
-                .cmp(&recent_rank(recent, b.channel))
-                .then_with(|| b.is_live.cmp(&a.is_live))
-                .then_with(|| a.channel.cmp(b.channel))
-        });
-    } else {
-        let mut matches: Vec<(usize, f64)> = indices
-            .into_iter()
-            .filter_map(|idx| fuzzy_score(query, items[idx].channel).map(|score| (idx, score)))
-            .collect();
-
-        matches.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-            let a = &items[*a_idx];
-            let b = &items[*b_idx];
-            b_score
-                .partial_cmp(a_score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| recent_rank(recent, a.channel).cmp(&recent_rank(recent, b.channel)))
-                .then_with(|| b.is_live.cmp(&a.is_live))
-                .then_with(|| a.channel.cmp(b.channel))
-        });
-        indices = matches.into_iter().map(|(idx, _)| idx).collect();
-    }
-
-    indices
+    let candidates: Vec<QuickSwitchCandidate<'_>> = items
         .iter()
-        .map(|idx| items[*idx].channel)
+        .map(|item| QuickSwitchCandidate {
+            channel: item.channel,
+            mention_count: 0,
+            is_live: item.is_live,
+        })
+        .collect();
+    rank_channels(query, &candidates, recent)
+        .into_iter()
+        .map(|idx| items[idx].channel)
         .collect::<Vec<_>>()
         .join("|")
-}
-
-fn recent_rank(recent: &[&str], channel: &str) -> usize {
-    recent
-        .iter()
-        .position(|recent| recent.eq_ignore_ascii_case(channel))
-        .unwrap_or(usize::MAX)
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
 }
 
 fn ordering_text(value: bool) -> String {
@@ -152,8 +123,4 @@ fn ordering_text(value: bool) -> String {
 
 fn option_text(value: Option<f64>) -> &'static str {
     if value.is_some() { "some" } else { "none" }
-}
-
-fn checksum(value: &str) -> usize {
-    value.bytes().map(usize::from).sum()
 }

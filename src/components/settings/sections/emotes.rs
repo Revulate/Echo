@@ -342,7 +342,7 @@ pub fn render_chat_emotes_more<T: 'static>(
                         stacked,
                     ),
                 ))
-                .child(bool_row(
+                .child(crate::components::settings::widgets::setting_toggle_row(
                     EMOTE_SPACING,
                     current.remove_spacing,
                     defaults.remove_emote_spacing,
@@ -351,7 +351,7 @@ pub fn render_chat_emotes_more<T: 'static>(
                     cx,
                     settings::set_remove_emote_spacing,
                 ))
-                .child(bool_row(
+                .child(crate::components::settings::widgets::setting_toggle_row(
                     ZERO_WIDTH_EMOTES,
                     current.zero_width_enabled,
                     defaults.zero_width_enabled,
@@ -361,15 +361,15 @@ pub fn render_chat_emotes_more<T: 'static>(
                     settings::set_zero_width_enabled,
                 ))
                 .child(settings_subheading("Providers"))
-                .child(bool_row(SEVENTV_EMOTES, current.enable_seventv_emotes, defaults.enable_seventv_emotes, "Show global, channel, and personal 7TV emotes in chat and picker", stacked, cx, settings::set_enable_seventv_emotes))
-                .child(bool_row(BTTV_EMOTES, current.enable_bttv_emotes, defaults.enable_bttv_emotes, "Show global, channel, and shared BetterTTV emotes in chat and picker", stacked, cx, settings::set_enable_bttv_emotes))
-                .child(bool_row(FFZ_EMOTES, current.enable_ffz_emotes, defaults.enable_ffz_emotes, "Show global and channel FrankerFaceZ emotes in chat and picker", stacked, cx, settings::set_enable_ffz_emotes))
+                .child(crate::components::settings::widgets::setting_toggle_row(SEVENTV_EMOTES, current.enable_seventv_emotes, defaults.enable_seventv_emotes, "Show global, channel, and personal 7TV emotes in chat and picker", stacked, cx, settings::set_enable_seventv_emotes))
+                .child(crate::components::settings::widgets::setting_toggle_row(BTTV_EMOTES, current.enable_bttv_emotes, defaults.enable_bttv_emotes, "Show global, channel, and shared BetterTTV emotes in chat and picker", stacked, cx, settings::set_enable_bttv_emotes))
+                .child(crate::components::settings::widgets::setting_toggle_row(FFZ_EMOTES, current.enable_ffz_emotes, defaults.enable_ffz_emotes, "Show global and channel FrankerFaceZ emotes in chat and picker", stacked, cx, settings::set_enable_ffz_emotes))
                 .child(setting_target(ACCOUNT_EMOTES, action_row(ACCOUNT_EMOTES, "Refetch account-specific emotes for the active login.", stacked, cx)))
                 .child(settings_subheading("Badges"))
-                .child(bool_row(FFZ_BADGES, current.show_ffz_badges, defaults.show_ffz_badges, "Show FrankerFaceZ user and channel badges when available", stacked, cx, settings::set_show_ffz_badges))
-                .child(bool_row(BTTV_BADGES, current.show_bttv_badges, defaults.show_bttv_badges, "Show BetterTTV user and channel badges when available", stacked, cx, settings::set_show_bttv_badges))
-                .child(bool_row(BTTV_PRO_BADGES, current.show_bttv_pro_badges, defaults.show_bttv_pro_badges, "Show BetterTTV Pro badges separately from regular BetterTTV badges", stacked, cx, settings::set_show_bttv_pro_badges))
-                .child(bool_row(FFZ_BOT_BADGES, current.show_ffz_bot_badges, defaults.show_ffz_bot_badges, "Show FrankerFaceZ bot badges where provider metadata marks them", stacked, cx, settings::set_show_ffz_bot_badges))
+                .child(crate::components::settings::widgets::setting_toggle_row(FFZ_BADGES, current.show_ffz_badges, defaults.show_ffz_badges, "Show FrankerFaceZ user and channel badges when available", stacked, cx, settings::set_show_ffz_badges))
+                .child(crate::components::settings::widgets::setting_toggle_row(BTTV_BADGES, current.show_bttv_badges, defaults.show_bttv_badges, "Show BetterTTV user and channel badges when available", stacked, cx, settings::set_show_bttv_badges))
+                .child(crate::components::settings::widgets::setting_toggle_row(BTTV_PRO_BADGES, current.show_bttv_pro_badges, defaults.show_bttv_pro_badges, "Show BetterTTV Pro badges separately from regular BetterTTV badges", stacked, cx, settings::set_show_bttv_pro_badges))
+                .child(crate::components::settings::widgets::setting_toggle_row(FFZ_BOT_BADGES, current.show_ffz_bot_badges, defaults.show_ffz_bot_badges, "Show FrankerFaceZ bot badges where provider metadata marks them", stacked, cx, settings::set_show_ffz_bot_badges))
                 .child(settings_subheading("Cosmetics"))
                 .child(setting_target(SEVENTV_NAME_PAINTS, crate::components::settings::widgets::setting_compact_row(
                     SEVENTV_NAME_PAINTS.id,
@@ -399,8 +399,8 @@ pub fn render_chat_emotes_more<T: 'static>(
                     )),
                     stacked,
                 )))
-                .child(bool_row(SEVENTV_COSMETIC_BADGES, current.show_seventv_cosmetic_badges, defaults.show_seventv_cosmetic_badges, "Render 7TV cosmetic badges in chat and user cards", stacked, cx, settings::set_show_seventv_cosmetic_badges))
-                .child(bool_row(SEVENTV_PROFILE_AVATARS, current.show_seventv_profile_avatars, defaults.show_seventv_profile_avatars, "Use 7TV profile avatar images in user cards", stacked, cx, settings::set_show_seventv_profile_avatars))
+                .child(crate::components::settings::widgets::setting_toggle_row(SEVENTV_COSMETIC_BADGES, current.show_seventv_cosmetic_badges, defaults.show_seventv_cosmetic_badges, "Render 7TV cosmetic badges in chat and user cards", stacked, cx, settings::set_show_seventv_cosmetic_badges))
+                .child(crate::components::settings::widgets::setting_toggle_row(SEVENTV_PROFILE_AVATARS, current.show_seventv_profile_avatars, defaults.show_seventv_profile_avatars, "Use 7TV profile avatar images in user cards", stacked, cx, settings::set_show_seventv_profile_avatars))
         },
     )
 }
@@ -587,53 +587,6 @@ fn render_emote_rule_flag<T: 'static>(
                 .text_color(colors::text_secondary())
                 .child(caption),
         )
-}
-
-fn bool_row<T: 'static, F>(
-    descriptor: SettingDescriptor,
-    value: bool,
-    default: bool,
-    help: &'static str,
-    stacked: bool,
-    cx: &mut Context<T>,
-    set: F,
-) -> impl IntoElement + use<T, F>
-where
-    F: Fn(bool) + Clone + 'static,
-{
-    let reset = set.clone();
-    let modified = value != default;
-    setting_target(
-        descriptor,
-        crate::components::settings::widgets::setting_compact_row(
-            descriptor.id,
-            descriptor.label,
-            Some(help),
-            labelled_toggle(
-                SharedString::from(format!("toggle-{}", descriptor.control_id)),
-                descriptor.label,
-                value,
-                cx,
-                move |enabled, cx| {
-                    set(enabled);
-                    cx.notify();
-                },
-            ),
-            modified,
-            modified.then(|| {
-                setting_reset(
-                    format!("reset-{}", descriptor.control_id),
-                    descriptor.label,
-                    cx,
-                    move |cx| {
-                        reset(default);
-                        cx.notify();
-                    },
-                )
-            }),
-            stacked,
-        ),
-    )
 }
 
 fn action_row<T: 'static>(

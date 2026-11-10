@@ -1,7 +1,6 @@
 //! GPUI-compatible chat observer for reactive state updates.
 //!
 //! Bridges between the backend observer system and GPUI's entity/context system.
-#![allow(clippy::type_complexity)]
 
 use crate::backend::lock_utils::MutexExt;
 use crate::backend::observers::{ChannelEvent, ChannelObserver};
@@ -9,6 +8,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Wakes the GPUI side after an event is queued; called from background threads.
+type NotifyCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Hard cap to prevent unbounded memory growth when UI thread stalls.
 const MAX_EVENT_QUEUE_LEN: usize = 4096;
@@ -22,7 +24,7 @@ pub struct ChatStateObserver {
     /// `event_queue`.
     oldest_queued_at: Mutex<Option<Instant>>,
     /// Callback to trigger GPUI notification (called from background threads)
-    notify_callback: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    notify_callback: Mutex<Option<NotifyCallback>>,
     /// Number of dropped events due to queue backpressure.
     dropped_events: AtomicU64,
     /// Whether any dropped event was a badge or user decoration change.

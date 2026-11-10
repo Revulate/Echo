@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Summarize a saved frame-time CSV trace.
+summarize-frame-trace.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -19,105 +24,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "value"
-    }
-
-    return $slug
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
-
-function Get-Percentile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [double[]]$SortedValues,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateRange(0, 100)]
-        [double]$Percentile
-    )
-
-    if ($SortedValues.Count -eq 0) {
-        return $null
-    }
-
-    if ($SortedValues.Count -eq 1) {
-        return [Math]::Round($SortedValues[0], 6)
-    }
-
-    $rank = ($Percentile / 100.0) * ($SortedValues.Count - 1)
-    $lower = [Math]::Floor($rank)
-    $upper = [Math]::Ceiling($rank)
-    if ($lower -eq $upper) {
-        return [Math]::Round($SortedValues[$lower], 6)
-    }
-
-    $weight = $rank - $lower
-    $value = ($SortedValues[$lower] * (1.0 - $weight)) + ($SortedValues[$upper] * $weight)
-    return [Math]::Round($value, 6)
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Find-FrameTimeColumn {
     param(
@@ -208,12 +115,12 @@ $summary = [ordered]@{
     frame_count = $frameTimes.Count
     target_frame_time_ms = $TargetFrameTimeMs
     dropped_frame_threshold_ms = $DroppedFrameThresholdMs
-    min_ms = Get-Percentile -SortedValues $sortedFrameTimes -Percentile 0
-    p50_ms = Get-Percentile -SortedValues $sortedFrameTimes -Percentile 50
-    p90_ms = Get-Percentile -SortedValues $sortedFrameTimes -Percentile 90
-    p95_ms = Get-Percentile -SortedValues $sortedFrameTimes -Percentile 95
-    p99_ms = Get-Percentile -SortedValues $sortedFrameTimes -Percentile 99
-    max_ms = Get-Percentile -SortedValues $sortedFrameTimes -Percentile 100
+    min_ms = Get-Percentile -Values $sortedFrameTimes -Percentile 0
+    p50_ms = Get-Percentile -Values $sortedFrameTimes -Percentile 50
+    p90_ms = Get-Percentile -Values $sortedFrameTimes -Percentile 90
+    p95_ms = Get-Percentile -Values $sortedFrameTimes -Percentile 95
+    p99_ms = Get-Percentile -Values $sortedFrameTimes -Percentile 99
+    max_ms = Get-Percentile -Values $sortedFrameTimes -Percentile 100
     average_ms = [Math]::Round($total / $frameTimes.Count, 6)
     frames_over_target = $overTarget
     dropped_frame_count = $dropped

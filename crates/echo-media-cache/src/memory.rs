@@ -19,6 +19,7 @@ use gpui::RenderImage;
 
 use echo_cache_policy::budget::{BudgetManager, CacheLayer};
 use echo_cache_policy::eviction::{AccessBuffer, EvictableEntry, EvictionPolicy};
+use echo_cache_policy::loaded_urls::url_key;
 use echo_cache_policy::stats::CacheStats;
 
 use crate::registry::{
@@ -209,7 +210,7 @@ impl MemoryLayer {
     /// Get an image by URL string
     #[inline]
     pub fn get_by_url(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.get(Self::hash_url(url))
+        self.get(url_key(url))
     }
 
     /// Check if an image is cached
@@ -222,7 +223,7 @@ impl MemoryLayer {
     /// Check if an image is cached by URL
     #[inline]
     pub fn contains_url(&self, url: &str) -> bool {
-        self.contains(Self::hash_url(url))
+        self.contains(url_key(url))
     }
 
     /// Insert an image into the cache
@@ -317,7 +318,7 @@ impl MemoryLayer {
 
     /// Insert an image by URL string
     pub fn insert_by_url(&self, url: &str, image: Arc<RenderImage>) -> bool {
-        self.insert(Self::hash_url(url), image)
+        self.insert(url_key(url), image)
     }
 
     /// Insert an image by URL string and provider/id/variant source key.
@@ -327,7 +328,7 @@ impl MemoryLayer {
         source_key: Option<u64>,
         image: Arc<RenderImage>,
     ) -> bool {
-        self.insert_with_source_key(Self::hash_url(url), source_key, image)
+        self.insert_with_source_key(url_key(url), source_key, image)
     }
 
     /// Remove one decoded image from memory.
@@ -345,7 +346,7 @@ impl MemoryLayer {
 
     /// Remove one decoded image by URL string.
     pub fn remove_by_url(&self, url: &str) -> Option<usize> {
-        self.remove(Self::hash_url(url))
+        self.remove(url_key(url))
     }
 
     fn remove_evicted_entry(&self, url_hash: u64) -> Option<usize> {
@@ -572,15 +573,6 @@ impl MemoryLayer {
             "Memory layer eviction complete"
         );
     }
-
-    /// Hash a URL for fast lookup
-    #[inline]
-    pub fn hash_url(url: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = ahash::AHasher::default();
-        url.hash(&mut hasher);
-        hasher.finish()
-    }
 }
 
 #[cfg(test)]
@@ -602,7 +594,7 @@ mod tests {
         let layer = MemoryLayer::new(budget, stats);
 
         let url = "https://example.com/image.png";
-        let hash = MemoryLayer::hash_url(url);
+        let hash = url_key(url);
         let image = create_test_image(100, 100);
 
         assert!(!layer.contains(hash));
@@ -664,12 +656,44 @@ mod tests {
     #[test]
     fn test_hash_consistency() {
         let url = "https://cdn.7tv.app/emote/123/1x.webp";
-        let hash1 = MemoryLayer::hash_url(url);
-        let hash2 = MemoryLayer::hash_url(url);
+        let hash1 = url_key(url);
+        let hash2 = url_key(url);
         assert_eq!(hash1, hash2);
 
-        let different = MemoryLayer::hash_url("https://cdn.7tv.app/emote/456/1x.webp");
+        let different = url_key("https://cdn.7tv.app/emote/456/1x.webp");
         assert_ne!(hash1, different);
+    }
+
+    /// The memory and frame layers key their maps with `url_key` and the
+    /// loader looks those maps up with keys it computed itself, so the key
+    /// must stay the plain ahash of the URL string that both layers, and the
+    /// hex disk-name form, have always used.
+    #[test]
+    fn url_key_matches_the_layer_hash() {
+        fn ahash_of_url(url: &str) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = ahash::AHasher::default();
+            url.hash(&mut hasher);
+            hasher.finish()
+        }
+        let urls = [
+            "",
+            "https://cdn.7tv.app/emote/123/1x.webp",
+            "https://cdn.7tv.app/emote/01F6MZGCNG000255K4X1K96WWK/4x.avif",
+            "https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/2.0",
+            "https://cdn.betterttv.net/emote/5590b223b344e2c42a9e28e3/3x",
+            "https://cdn.frankerfacez.com/emote/128054/4",
+            "https://picker.example.test/caf\u{e9}.webp",
+        ];
+        for url in urls {
+            let expected = ahash_of_url(url);
+            assert_eq!(url_key(url), expected, "{url}");
+            assert_eq!(
+                format!("{:016x}", url_key(url)),
+                format!("{expected:016x}"),
+                "{url}"
+            );
+        }
     }
 
     #[test]

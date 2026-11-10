@@ -81,6 +81,13 @@ static GLOBAL_TOOLTIP_STATE: LazyLock<Mutex<GlobalTooltipState>> =
     LazyLock::new(|| Mutex::new(GlobalTooltipState::default()));
 static GLOBAL_TOOLTIP_CONTENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Lock a transient tooltip mutex, discarding its contents if a panic poisoned
+/// it.
+///
+/// Unlike `MutexExt::lock_or_recover`, which keeps the half-updated value and
+/// leaves the mutex poisoned (warning on every later lock), tooltip state is
+/// pure UI scratch: resetting it to `Default` only hides the current tooltip,
+/// and clearing the poison keeps later frames from re-warning.
 fn lock_or_reset<'a, T: Default>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -595,8 +602,8 @@ fn render_stream_header_tooltip(
         .items_center()
         .gap(px(Spacing::XS_PLUS));
 
-    if live && !crate::benchmark_ui_fixture::is_fixture_channel(channel) {
-        let normalized_channel = channel.trim_start_matches('#').to_ascii_lowercase();
+    if live && !crate::bench::ui_fixture::is_fixture_channel(channel) {
+        let normalized_channel = echo_core::channel_identity::normalize_channel_key(channel);
         let cache_bucket = crate::utils::unix_now_secs() / 180;
         let thumbnail_url = format!(
             "https://static-cdn.jtvnw.net/previews-ttv/live_user_{normalized_channel}-320x180.jpg?echo={cache_bucket}"

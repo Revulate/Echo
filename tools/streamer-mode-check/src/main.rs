@@ -1,9 +1,9 @@
-#![allow(dead_code)]
+//! Contract: streamer-mode privacy gates in `src/backend/streamer_mode.rs` for each
+//! mode (always on, disabled, auto with nothing detected) and the per-gate
+//! content toggles.
 
-#[macro_export]
-macro_rules! log_ui {
-    ($($a:tt)*) => {{}};
-}
+pub(crate) use check_support::category_log as log_ui;
+use check_support::{FIXTURE_HEADER, assert_fixture};
 
 mod lock_utils {
     pub use echo_core::sync::{MutexExt, RwLockExt};
@@ -58,7 +58,7 @@ mod settings {
 // The production detector consults the profile-aware external config root for
 // OBS/Discord activity logs. This deterministic harness does not create or
 // inspect those logs, but retains the same module surface for compilation.
-mod benchmark_profile {
+mod storage_roots {
     use std::path::PathBuf;
 
     pub fn external_config_dir() -> Option<PathBuf> {
@@ -66,7 +66,10 @@ mod benchmark_profile {
     }
 }
 
+// Only the settings-driven gates are checked; process detection, cached status
+// and settings updates run against live system state.
 #[path = "../../../src/backend/streamer_mode.rs"]
+#[allow(dead_code)]
 mod streamer_mode;
 
 use streamer_mode::{
@@ -78,15 +81,15 @@ use streamer_mode::{
 };
 
 fn main() {
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
 
     set_streamer_mode(StreamerModeSettings {
         enabled: StreamerModeStatus::AlwaysOn,
         ..Default::default()
     });
-    print_fixture(
+    assert_fixture(
         "streamer_always_on_all_default_gates",
-        &gate_summary(),
+        gate_summary(),
         "111111111111",
     );
 
@@ -94,9 +97,9 @@ fn main() {
         enabled: StreamerModeStatus::Disabled,
         ..Default::default()
     });
-    print_fixture(
+    assert_fixture(
         "streamer_disabled_all_gates_off",
-        &gate_summary(),
+        gate_summary(),
         "000000000000",
     );
 
@@ -104,9 +107,9 @@ fn main() {
         enabled: StreamerModeStatus::Auto,
         ..Default::default()
     });
-    print_fixture(
+    assert_fixture(
         "streamer_auto_no_detection_gates_off",
-        &gate_summary(),
+        gate_summary(),
         "000000000000",
     );
 
@@ -118,9 +121,9 @@ fn main() {
         suppress_notifications: false,
         ..Default::default()
     });
-    print_fixture(
+    assert_fixture(
         "streamer_disabled_individual_toggles",
-        &selected_gate_summary(),
+        selected_gate_summary(),
         "0000",
     );
 
@@ -130,9 +133,9 @@ fn main() {
         hide_whisper_content: false,
         ..Default::default()
     });
-    print_fixture(
+    assert_fixture(
         "streamer_content_toggle_overrides",
-        &content_gate_summary(),
+        content_gate_summary(),
         "001",
     );
 }
@@ -189,13 +192,4 @@ fn content_gate_summary() -> String {
 
 fn bool_digit(value: bool) -> char {
     if value { '1' } else { '0' }
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
-}
-
-fn checksum(value: &str) -> usize {
-    value.bytes().map(usize::from).sum()
 }

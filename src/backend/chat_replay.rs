@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use smallvec::SmallVec;
 
-use crate::backend::irc::tmi_adapter::format_badge;
+use crate::backend::irc::format::{format_badge, normalize_message_text};
 use crate::backend::models::{ChatMessage, MessageFlags, ReplyInfo, SystemMessageType};
 use crate::backend::slots::compute_structure_hash;
 use crate::backend::slots::parser::{parse_emotes_tag, parse_to_slots};
@@ -37,7 +37,7 @@ const REPLAY_INSERT_CONTROL_ENV: &str = "ECHO_CHAT_REPLAY_INSERT_CONTROL_MESSAGE
 /// configuration instead of replay-generated message IDs also protects live
 /// rows received while a benchmark fixture is active.
 pub fn suppresses_history_persistence() -> bool {
-    std::env::var_os(REPLAY_PATH_ENV).is_some()
+    echo_core::env::os_value(REPLAY_PATH_ENV).is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -138,7 +138,7 @@ pub fn start_chat_replay_from_env() -> bool {
             true
         }
         Err(error) => {
-            tracing::error!("Failed to spawn Echo chat replay worker: {error}");
+            crate::log_app!(error, "Failed to spawn Echo chat replay worker: {error}");
             false
         }
     }
@@ -146,17 +146,19 @@ pub fn start_chat_replay_from_env() -> bool {
 
 impl ReplayConfig {
     fn from_env() -> Option<Self> {
-        let path = std::env::var_os(REPLAY_PATH_ENV).map(PathBuf::from)?;
+        let path = echo_core::env::os_value(REPLAY_PATH_ENV).map(PathBuf::from)?;
         Some(Self {
             path,
-            report_path: std::env::var_os(REPLAY_REPORT_ENV).map(PathBuf::from),
-            channel_override: non_empty_env(REPLAY_CHANNEL_ENV).map(normalize_channel),
-            delay_ms: env_u64(REPLAY_DELAY_MS_ENV).unwrap_or(0),
-            speedup: env_f64(REPLAY_SPEEDUP_ENV).filter(|value| value.is_finite() && *value > 0.0),
-            max_events: env_usize(REPLAY_MAX_EVENTS_ENV),
-            clear_channel: env_flag(REPLAY_CLEAR_CHANNEL_ENV),
-            preserve_timestamps: env_flag(REPLAY_PRESERVE_TIMESTAMPS_ENV),
-            insert_control_messages: env_flag(REPLAY_INSERT_CONTROL_ENV),
+            report_path: echo_core::env::os_value(REPLAY_REPORT_ENV).map(PathBuf::from),
+            channel_override: echo_core::env::value(REPLAY_CHANNEL_ENV)
+                .map(|channel| echo_core::channel_identity::normalize_channel_key(channel.trim())),
+            delay_ms: echo_core::env::parsed::<u64>(REPLAY_DELAY_MS_ENV).unwrap_or(0),
+            speedup: echo_core::env::parsed::<f64>(REPLAY_SPEEDUP_ENV)
+                .filter(|value| value.is_finite() && *value > 0.0),
+            max_events: echo_core::env::parsed::<usize>(REPLAY_MAX_EVENTS_ENV),
+            clear_channel: echo_core::env::flag(REPLAY_CLEAR_CHANNEL_ENV),
+            preserve_timestamps: echo_core::env::flag(REPLAY_PRESERVE_TIMESTAMPS_ENV),
+            insert_control_messages: echo_core::env::flag(REPLAY_INSERT_CONTROL_ENV),
         })
     }
 }
@@ -188,7 +190,7 @@ fn run_chat_replay(config: ReplayConfig) {
                     Ok(line) => line,
                     Err(error) => {
                         stats.parse_errors += 1;
-                        tracing::warn!(
+                        crate::log_app!(warn,
                             path = ?config.path,
                             line = line_idx + 1,
                             "Failed to read Echo chat replay line: {error}"
@@ -204,7 +206,7 @@ fn run_chat_replay(config: ReplayConfig) {
                     Ok(event) => event,
                     Err(error) => {
                         stats.parse_errors += 1;
-                        tracing::warn!(
+                        crate::log_app!(warn,
                             path = ?config.path,
                             line = line_idx + 1,
                             "Failed to parse Echo chat replay line: {error}"
@@ -275,7 +277,7 @@ fn run_chat_replay(config: ReplayConfig) {
             "Echo chat replay injected into backend message buffer; not compared"
         }
         Err(error) => {
-            tracing::error!(path = ?config.path, "Failed to open Echo chat replay: {error}");
+            crate::log_app!(error, path = ?config.path, "Failed to open Echo chat replay: {error}");
             "Echo chat replay failed before injection"
         }
     };
@@ -326,7 +328,7 @@ fn build_replay_message(
         .or_else(|| tags.and_then(|tags| tags.display_name.as_deref()))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(login.as_str());
-    let (clean_text, is_action) = normalize_replay_message_text(&message.text);
+    let (clean_text, is_action) = normalize_message_text(&message.text);
     let emotes_tag = tags.and_then(|tags| tags.emotes.as_deref()).unwrap_or("");
     let twitch_emotes = parse_emotes_tag(emotes_tag);
     let gifs_tag = tags
@@ -432,10 +434,11 @@ fn build_control_message(
 }
 
 fn event_channel(event: &ReplayEvent, config: &ReplayConfig) -> String {
-    config
-        .channel_override
-        .clone()
-        .unwrap_or_else(|| normalize_channel(event.channel.as_deref().unwrap_or("echo-bench")))
+    config.channel_override.clone().unwrap_or_else(|| {
+        echo_core::channel_identity::normalize_channel_key(
+            event.channel.as_deref().unwrap_or("echo-bench").trim(),
+        )
+    })
 }
 
 fn parse_badges(raw: &str) -> SmallVec<[Arc<str>; 4]> {
@@ -454,61 +457,6 @@ fn parse_badges(raw: &str) -> SmallVec<[Arc<str>; 4]> {
         .collect()
 }
 
-fn normalize_replay_message_text(raw: &str) -> (String, bool) {
-    if raw.starts_with("\x01ACTION ") && raw.ends_with('\x01') && raw.len() >= 9 {
-        (raw[8..raw.len() - 1].to_string(), true)
-    } else if let Some(stripped) = raw.strip_prefix("/me ") {
-        (stripped.to_string(), true)
-    } else {
-        (raw.to_string(), false)
-    }
-}
-
-fn normalize_channel(channel: impl AsRef<str>) -> String {
-    channel
-        .as_ref()
-        .trim()
-        .trim_start_matches('#')
-        .to_ascii_lowercase()
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-}
-
-fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<f64>().ok())
-}
-
 fn write_replay_report(
     config: &ReplayConfig,
     stats: &ReplayStats,
@@ -524,7 +472,7 @@ fn write_replay_report(
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
-        tracing::warn!(path = ?parent, "Failed to create Echo chat replay report directory: {error}");
+        crate::log_app!(warn, path = ?parent, "Failed to create Echo chat replay report directory: {error}");
         return;
     }
 
@@ -558,11 +506,11 @@ fn write_replay_report(
     match serde_json::to_vec_pretty(&report) {
         Ok(bytes) => {
             if let Err(error) = std::fs::write(path, bytes) {
-                tracing::warn!(path = ?path, "Failed to write Echo chat replay report: {error}");
+                crate::log_app!(warn, path = ?path, "Failed to write Echo chat replay report: {error}");
             }
         }
         Err(error) => {
-            tracing::warn!("Failed to serialize Echo chat replay report: {error}");
+            crate::log_app!(warn, "Failed to serialize Echo chat replay report: {error}");
         }
     }
 }

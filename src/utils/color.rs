@@ -30,7 +30,7 @@ pub fn parse_hex_color_opt(hex: &str) -> Option<Hsla> {
 
 /// Parse optional hex color with fallback to specified default
 /// Common pattern: parse_optional_hex_or(&user.color, colors::text_primary())
-/// PERF: Accepts Option<Arc<str>> to avoid allocation when used with ChatMessage.color
+/// Accepts Option<Arc<str>> to avoid allocation when used with ChatMessage.color
 #[inline]
 pub fn parse_optional_hex_or(color: &Option<std::sync::Arc<str>>, default: Hsla) -> Hsla {
     color

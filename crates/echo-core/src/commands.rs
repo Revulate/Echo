@@ -2,17 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-fn default_true() -> bool {
-    true
-}
-
 /// Custom chat command
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomCommand {
     pub id: String,
     pub name: String,
     pub response: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub enabled: bool,
 }
 

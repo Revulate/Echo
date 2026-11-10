@@ -2,7 +2,8 @@
 //!
 //! Provides shared eviction candidate selection for cache owners without UI dependencies.
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// Trait for cache entries that can be evicted
 pub trait Evictable {
@@ -18,49 +19,20 @@ pub trait Evictable {
     }
 }
 
-/// LRU-LFU hybrid eviction policy
-///
-/// Score formula: ln(access_count + 1) / (age_hours + 1)
-/// Higher score = keep longer, lower score = evict first
-#[derive(Debug, Clone)]
-pub struct EvictionPolicy {
-    /// Weight for frequency component (default: 1.0)
-    frequency_weight: f64,
-    /// Weight for recency component (default: 1.0)
-    recency_weight: f64,
-    /// Size penalty factor (larger entries scored lower)
-    size_penalty: bool,
-    /// Protection threshold (entries with more accesses are protected)
-    protection_threshold: u64,
-}
+/// Entries read at least this often are never evicted by the policy.
+const PROTECTED_ACCESS_COUNT: u64 = 100;
 
-impl Default for EvictionPolicy {
-    fn default() -> Self {
-        Self {
-            frequency_weight: 1.0,
-            recency_weight: 1.0,
-            size_penalty: true,
-            protection_threshold: 100,
-        }
-    }
-}
+/// LRU-LFU hybrid eviction policy for in-memory media.
+///
+/// Score: `ln(access_count + 1) / (age_hours + 1)`, scaled down for larger
+/// entries so that, at equal use, big images go first. Higher score = keep
+/// longer, lower score = evict first.
+#[derive(Debug, Clone, Default)]
+pub struct EvictionPolicy;
 
 impl EvictionPolicy {
-    /// Create a new eviction policy with default settings
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Enable or disable the size penalty.
-    pub fn with_size_penalty(mut self, enabled: bool) -> Self {
-        self.size_penalty = enabled;
-        self
-    }
-
-    /// Set the access-count protection threshold.
-    pub fn with_protection_threshold(mut self, threshold: u64) -> Self {
-        self.protection_threshold = threshold;
-        self
+        Self
     }
 
     /// Calculate eviction score for an entry
@@ -68,37 +40,30 @@ impl EvictionPolicy {
     /// Higher score = keep longer, lower score = evict first
     #[inline]
     pub fn score<E: Evictable>(&self, entry: &E) -> f64 {
-        if entry.is_protected() || entry.access_count() >= self.protection_threshold {
+        if Self::is_exempt(entry) {
             return f64::MAX;
         }
 
         let access_count = entry.access_count() as f64;
         let age_hours = entry.age().as_secs_f64() / 3600.0;
+        let frequency = (access_count + 1.0).ln();
+        let recency = 1.0 / (age_hours + 1.0);
 
-        // Frequency component: ln(access_count + 1)
-        let frequency = (access_count + 1.0).ln() * self.frequency_weight;
+        let size_kb = entry.size_bytes() as f64 / 1024.0;
+        let size_factor = if size_kb < 4.0 {
+            1.0
+        } else if size_kb < 16.0 {
+            0.9
+        } else if size_kb < 64.0 {
+            0.7
+        } else {
+            0.5
+        };
+        frequency * recency * size_factor
+    }
 
-        // Recency component: 1 / (age_hours + 1)
-        let recency = self.recency_weight / (age_hours + 1.0);
-
-        let mut score = frequency * recency;
-
-        // Size penalty: larger entries get lower scores
-        if self.size_penalty {
-            let size_kb = entry.size_bytes() as f64 / 1024.0;
-            let size_factor = if size_kb < 4.0 {
-                1.0
-            } else if size_kb < 16.0 {
-                0.9
-            } else if size_kb < 64.0 {
-                0.7
-            } else {
-                0.5
-            };
-            score *= size_factor;
-        }
-
-        score
+    fn is_exempt<E: Evictable>(entry: &E) -> bool {
+        entry.is_protected() || entry.access_count() >= PROTECTED_ACCESS_COUNT
     }
 
     /// Get eviction candidates sorted by score (lowest first)
@@ -111,7 +76,7 @@ impl EvictionPolicy {
         bytes_needed: usize,
     ) -> Vec<E> {
         let mut scored: Vec<(E, f64)> = entries
-            .filter(|e| !e.is_protected() && e.access_count() < self.protection_threshold)
+            .filter(|e| !Self::is_exempt(e))
             .map(|e| {
                 let score = self.score(&e);
                 (e, score)
@@ -136,26 +101,21 @@ impl EvictionPolicy {
         candidates
     }
 
-    /// Probabilistic eviction for large caches
+    /// Sampled eviction for large caches.
     ///
-    /// Samples a random subset of entries instead of sorting all.
-    /// More efficient for caches with 10,000+ entries.
+    /// Scores a `sample_percent` stripe of the entries instead of sorting all
+    /// of them. Each call starts the stripe at a different offset, so repeated
+    /// evictions look at different entries.
     pub fn sample_candidates<E: Evictable + Clone>(
         &self,
         entries: Vec<E>,
         sample_percent: f64,
         bytes_needed: usize,
     ) -> Vec<E> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        static SAMPLE_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
         let sample_size = ((entries.len() as f64 * sample_percent / 100.0) as usize).max(10);
-
-        // Deterministic sampling based on current time
-        let now = Instant::now();
-        let mut hasher = DefaultHasher::new();
-        now.elapsed().as_nanos().hash(&mut hasher);
-        let seed = hasher.finish() as usize;
+        let seed = SAMPLE_OFFSET.fetch_add(sample_percent.max(1.0) as usize, Ordering::Relaxed);
 
         // Sample entries
         let sampled: Vec<E> = entries
@@ -287,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_size_penalty() {
-        let policy = EvictionPolicy::new().with_size_penalty(true);
+        let policy = EvictionPolicy::new();
 
         // Same access pattern, different sizes
         let small = EvictableEntry::new(1, 1000, 10, Duration::ZERO);
@@ -302,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_get_candidates() {
-        let policy = EvictionPolicy::new().with_size_penalty(false);
+        let policy = EvictionPolicy::new();
 
         let entries = vec![
             EvictableEntry::new(1, 100, 50, Duration::ZERO), // High frequency
@@ -334,13 +294,25 @@ mod tests {
     }
 
     #[test]
+    fn sampling_moves_across_calls() {
+        let policy = EvictionPolicy::new();
+        let entries = (0..1_000)
+            .map(|key| EvictableEntry::new(key, 1, 1, Duration::ZERO))
+            .collect::<Vec<_>>();
+        let first = policy.sample_candidates(entries.clone(), 10.0, usize::MAX);
+        let second = policy.sample_candidates(entries, 10.0, usize::MAX);
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|a| second.iter().all(|b| a.key != b.key)));
+    }
+
+    #[test]
     fn test_protected_entries() {
-        let policy = EvictionPolicy::new().with_protection_threshold(50);
+        let policy = EvictionPolicy::new();
 
         let protected = EvictableEntry {
             key: 1,
             size_bytes: 100,
-            access_count: 100, // Above threshold
+            access_count: PROTECTED_ACCESS_COUNT,
             age: Duration::from_secs(7200),
             protected: false,
         };

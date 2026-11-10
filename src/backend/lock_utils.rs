@@ -1,20 +1,15 @@
-//! Lock Safety Utilities
+//! Lock helpers shared by the backend.
 //!
-//! Provides safe wrappers around std::sync locks that recover from poisoning
-//! instead of panicking. This prevents cascading failures when a thread panics
-//! while holding a lock.
+//! `MutexExt`/`RwLockExt` recover a poisoned std lock instead of panicking, so
+//! one panicking thread does not take every later lock user down with it.
 //!
-//! ## Lock Acquisition Order
+//! ## Lock ordering
 //!
-//! To prevent deadlocks, locks must be acquired in this order:
-//! 1. CHAT_MESSAGES (DashMap - per-channel sharding, minimal contention)
-//! 2. MESSAGE_DEDUP (Mutex)
-//! 3. USER_COLOR_CACHE (Mutex)
-//! 4. RECENT_CHATTERS (RwLock)
-//! 5. PENDING_OPTIMISTIC (Mutex)
-//! 6. Other channel-specific locks
-//!
-//! Never acquire a lower-numbered lock while holding a higher-numbered one.
+//! `blocked_users::visibility_commit_guard()` is taken before the blocked-user
+//! cache and before the per-channel chat buffers it publishes into, and is never
+//! held across network or parsing work. `CHAT_MESSAGES`, `MESSAGE_DEDUP` and
+//! `RECENT_CHATTERS` are sharded `DashMap`s: never hold a reference into one
+//! entry while writing another key of the same map.
 
 pub use echo_core::sync::{MutexExt, RwLockExt};
 
@@ -58,7 +53,8 @@ impl Drop for DashSetKeyGuard<'_> {
     fn drop(&mut self) {
         if !self.removed {
             self.set.remove(&self.key);
-            tracing::debug!(
+            crate::log_app!(
+                debug,
                 "DashSetKeyGuard dropped, removed key '{}' from set",
                 self.key
             );

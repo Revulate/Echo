@@ -4,9 +4,9 @@
 //! anywhere (including outside the main Echo window), resized from its window
 //! edges, and interacted with without fighting the chat underneath.
 //!
-//! Follows the same cross-window pattern as `emote_picker_popout`: a single
-//! reusable window tracked by statics, with pending state applied on render
-//! when a new user card is requested while the window is already open. All
+//! A single reusable window tracked by a [`SingletonWindow`], with pending
+//! state applied on render when a new user card is requested while the window
+//! is already open. All
 //! card actions (mention, whisper, mod commands, toasts) already flow through
 //! the global `backend::push_ui_action` queue, so no extra plumbing back to
 //! the main window is needed.
@@ -14,20 +14,15 @@
 use super::user_card::{UserCard, UserCardState};
 use super::{ensure_global_tooltip_animation_waker, render_global_tooltip_overlay};
 use crate::backend::hotkeys::{HotkeyAction, HotkeyMatchContext, MatchedHotkey};
-use crate::backend::lock_utils::MutexExt;
+use crate::components::ui::{Retarget, SingletonWindow};
 use crate::theme::colors;
 use crate::utils::persist_window_bounds;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
 
-/// Flag indicating if the user card popout window is currently open
-static USER_CARD_POPOUT_OPEN: AtomicBool = AtomicBool::new(false);
-static USER_CARD_POPOUT_HANDLE: LazyLock<Mutex<Option<AnyWindowHandle>>> =
-    LazyLock::new(|| Mutex::new(None));
-/// Card state requested while the window was already open; applied on render.
-static PENDING_USER_CARD_STATE: Mutex<Option<UserCardState>> = Mutex::new(None);
+/// Pending payload: the card state requested while the window was already
+/// open, applied on render.
+static USER_CARD_POPOUT: SingletonWindow<UserCardState> = SingletonWindow::new();
 
 fn user_card_window_title(state: &UserCardState) -> String {
     let name = state
@@ -41,34 +36,18 @@ fn user_card_window_title(state: &UserCardState) -> String {
     }
 }
 
-/// Mark the popout as closed (called from Drop or when the handle is stale).
-pub fn mark_user_card_popout_closed() {
-    USER_CARD_POPOUT_OPEN.store(false, Ordering::SeqCst);
-    *USER_CARD_POPOUT_HANDLE.lock_or_recover() = None;
-    *PENDING_USER_CARD_STATE.lock_or_recover() = None;
-}
-
 /// Open the user card popout window, or retarget + refocus it if already open.
 pub fn open_user_card_popout(state: UserCardState, cx: &mut App) {
-    if USER_CARD_POPOUT_OPEN.load(Ordering::SeqCst) {
-        *PENDING_USER_CARD_STATE.lock_or_recover() = Some(state.clone());
-        let handle = *USER_CARD_POPOUT_HANDLE.lock_or_recover();
-        if let Some(handle) = handle
-            && handle
-                .update(cx, |_, window, cx| {
-                    cx.activate(true);
-                    window.activate_window();
-                    window.refresh();
-                })
-                .is_ok()
-        {
-            return;
+    let state = match USER_CARD_POPOUT.retarget(state, cx) {
+        Retarget::Retargeted => return,
+        Retarget::NotOpen(state) => state,
+        Retarget::Stale(state) => {
+            USER_CARD_POPOUT.mark_closed();
+            state
         }
+    };
 
-        mark_user_card_popout_closed();
-    }
-
-    USER_CARD_POPOUT_OPEN.store(true, Ordering::SeqCst);
+    USER_CARD_POPOUT.mark_open();
 
     let (width, height) = crate::backend::settings::get_user_card_popout_window_size();
     let window_size = size(px(width), px(height));
@@ -103,7 +82,7 @@ pub fn open_user_card_popout(state: UserCardState, cx: &mut App) {
             ..Default::default()
         },
         move |window, cx| {
-            *USER_CARD_POPOUT_HANDLE.lock_or_recover() = Some(window.window_handle());
+            USER_CARD_POPOUT.set_handle(window.window_handle());
             let popout = cx.new(|cx| UserCardPopout::new(state.clone(), cx));
             let focus_handle = popout.read(cx).focus_handle.clone();
             window.focus(&focus_handle, cx);
@@ -111,7 +90,7 @@ pub fn open_user_card_popout(state: UserCardState, cx: &mut App) {
         },
     );
     if open_result.is_err() {
-        mark_user_card_popout_closed();
+        USER_CARD_POPOUT.mark_closed();
     }
 }
 
@@ -178,7 +157,7 @@ pub struct UserCardPopout {
 
 impl Drop for UserCardPopout {
     fn drop(&mut self) {
-        mark_user_card_popout_closed();
+        USER_CARD_POPOUT.mark_closed();
     }
 }
 
@@ -262,7 +241,7 @@ impl UserCardPopout {
 
     /// Apply a card state requested while the window was already open.
     fn apply_pending_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let next = PENDING_USER_CARD_STATE.lock_or_recover().take();
+        let next = USER_CARD_POPOUT.take_pending();
         let Some(state) = next else {
             return;
         };

@@ -49,17 +49,10 @@ use crate::components::settings::settings_navigation::{
     SettingDescriptor, SettingsSectionId, SettingsSubsectionId, canonical_section,
 };
 use crate::components::settings::settings_page::SettingsPage;
-use crate::components::settings::widgets::{
-    button, settings_group, settings_group_contents, toggle_small_static,
-};
-use crate::components::ui::PressToClick;
+use crate::components::settings::widgets::{button, settings_group, settings_group_contents};
 use crate::theme::colors;
-use crate::theme::tokens::{Radii, RadiiPixels};
 use gpui::prelude::FluentBuilder;
-use gpui::{
-    AnyElement, Context, Div, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, Styled, Window, div,
-};
+use gpui::{AnyElement, Context, Div, Entity, EntityId, ParentElement, Styled, Window, div};
 
 const fn combine_settings<const N: usize>(
     groups: &[&[SettingDescriptor]],
@@ -140,23 +133,12 @@ pub const SHORTCUTS_ALL_SETTINGS: &[SettingDescriptor] = &combine_settings::<
     HOTKEYS_CUSTOM_SETTINGS,
 ]);
 
-pub const APPEARANCE_OPTIONS_SETTINGS:
-    &[crate::components::settings::settings_navigation::SettingDescriptor] = &{
-    let mut combined = [APPEARANCE_THEME_OPTIONS_SETTINGS[0];
-        APPEARANCE_THEME_OPTIONS_SETTINGS.len() + APPEARANCE_WINDOWS_OVERLAY_SETTINGS.len()];
-    let mut index = 0;
-    while index < APPEARANCE_THEME_OPTIONS_SETTINGS.len() {
-        combined[index] = APPEARANCE_THEME_OPTIONS_SETTINGS[index];
-        index += 1;
-    }
-    let mut window_index = 0;
-    while window_index < APPEARANCE_WINDOWS_OVERLAY_SETTINGS.len() {
-        combined[index] = APPEARANCE_WINDOWS_OVERLAY_SETTINGS[window_index];
-        index += 1;
-        window_index += 1;
-    }
-    combined
-};
+pub const APPEARANCE_OPTIONS_SETTINGS: &[SettingDescriptor] = &combine_settings::<
+    { APPEARANCE_THEME_OPTIONS_SETTINGS.len() + APPEARANCE_WINDOWS_OVERLAY_SETTINGS.len() },
+>(&[
+    APPEARANCE_THEME_OPTIONS_SETTINGS,
+    APPEARANCE_WINDOWS_OVERLAY_SETTINGS,
+]);
 
 /// Developer Tools › Diagnostics.
 ///
@@ -188,11 +170,45 @@ fn brief_regex_error(error: &regex::Error) -> String {
         .to_string()
 }
 
+// Every per-host editor input and viewer state a section keeps outside the
+// surface is released from the two functions below, so a new editor registers
+// its cleanup here rather than in the surface.
+
+/// Release all per-host section state when a settings surface closes or drops.
+pub(crate) fn release_host_editor_state(host: EntityId) {
+    general::release_player_path_inputs_for_host(host);
+    proxy::release_proxy_inputs_for_host(host);
+    logging::forget_logging_viewer_state_for_host(host);
+    commands::release_command_editor_inputs_for_host(host);
+    hotkeys::forget_hotkey_editor_host(host);
+    uploader::clear_uploader_status(host.as_u64());
+}
+
+/// Release the inputs of pages that are not on screen, so a hidden page does
+/// not keep its editor entities alive. `previous` is the page rendered last.
+pub(crate) fn release_hidden_page_inputs(
+    host: EntityId,
+    previous: Option<SettingsSectionId>,
+    section: SettingsSectionId,
+) {
+    if previous == Some(SettingsSectionId::Advanced) && section != SettingsSectionId::Advanced {
+        proxy::release_proxy_inputs_for_host(host);
+        logging::release_logging_inputs_for_host(host);
+    }
+    if section != SettingsSectionId::Hotkeys {
+        commands::release_command_editor_inputs_for_host(host);
+        hotkeys::release_hotkey_editor_inputs_for_host(host);
+    }
+    if section != SettingsSectionId::Connections {
+        general::release_player_path_inputs_for_host(host);
+    }
+}
+
 /// Invalidate transient drafts whose persisted authority was replaced by a
 /// successful full-settings import or reset.
 pub(crate) fn reset_migrated_editor_drafts_after_settings_replace() {
     general::reset_settings_import_editor_after_settings_replace();
-    general::reset_general_settings_editor_after_settings_replace();
+    general::reset_player_paths_editor_after_settings_replace();
     general::reset_timestamp_builder_after_settings_replace();
     proxy::reset_proxy_editor_after_settings_replace();
     commands::reset_command_editor_after_settings_replace();
@@ -444,41 +460,6 @@ pub(super) fn single_line_text(text: &str) -> String {
     text.chars()
         .filter(|ch| *ch != '\r' && *ch != '\n')
         .collect()
-}
-
-pub(super) fn render_toggle_button<T: 'static, F: Fn(&mut Context<T>) + 'static>(
-    label: &'static str,
-    is_on: bool,
-    on_click: F,
-    cx: &mut Context<T>,
-) -> impl IntoElement + use<T, F> {
-    div()
-        .id(SharedString::from(format!(
-            "toggle-button-{}",
-            crate::components::settings::widgets::control_slug(label)
-        )))
-        .hover(|s| s.bg(colors::bg_hover()))
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .py_1()
-        .rounded(Radii::md())
-        .border_1()
-        .border_color(colors::border())
-        .bg(colors::bg_surface())
-        .cursor_pointer()
-        .child(toggle_small_static(is_on))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors::text_secondary())
-                .child(label),
-        )
-        .on_completed_click(cx.listener(move |_this, _event, _window, cx| {
-            on_click(cx);
-        }))
 }
 
 /// Append the Save/Add, Cancel-while-editing, and status line controls of a

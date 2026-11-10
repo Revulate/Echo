@@ -926,7 +926,7 @@ pub fn render_logging_section<T: 'static>(
                 ))
                 .child(setting_target(
                     HISTORY_FOLDER,
-                    render_path_row(
+                    settings_path_row(
                         "history-folder-row",
                         "Message history folder",
                         &history_dir_label,
@@ -968,7 +968,7 @@ pub fn render_logging_section<T: 'static>(
                         stacked,
                     ),
                 ))
-                .child(render_path_row(
+                .child(settings_path_row(
                     "readable-log-folder-row",
                     "Readable log folder",
                     &readable_log_dir_label,
@@ -1026,7 +1026,7 @@ pub fn render_logging_section<T: 'static>(
                         }),
                     stacked,
                 ))
-                .child(render_path_row(
+                .child(settings_path_row(
                     "latest-readable-log-row",
                     "Latest readable log",
                     &latest_readable_log_file_label,
@@ -1071,7 +1071,7 @@ pub fn render_logging_section<T: 'static>(
                 ))
                 .child(setting_target(
                     LATEST_HISTORY_FILE,
-                    render_path_row(
+                    settings_path_row(
                         "latest-history-file-row",
                         "Latest history file",
                         &latest_history_file_label,
@@ -1133,7 +1133,7 @@ pub fn render_logging_section<T: 'static>(
                         stacked,
                     ),
                 ))
-                .child(render_path_row(
+                .child(settings_path_row(
                     "history-exports-folder-row",
                     "History text exports folder",
                     &history_exports_dir_label,
@@ -1669,7 +1669,7 @@ fn render_latest_log_preview_for_host<T: 'static>(
                                 .flex_wrap()
                                 .items_center()
                                 .gap_2()
-                                .child(render_inline_button("Open Log", cx, {
+                                .child(render_inline_button("Open log", cx, {
                                     let preview_path = preview.path.clone();
                                     move |cx| {
                                         let preview_path = preview_path.clone();
@@ -1701,7 +1701,7 @@ fn render_latest_log_preview_for_host<T: 'static>(
                                         cx.notify();
                                     }
                                 }))
-                                .child(render_inline_button("Copy Preview", cx, move |cx| {
+                                .child(render_inline_button("Copy preview", cx, move |cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         copy_text.clone(),
                                     ));
@@ -2041,7 +2041,7 @@ fn render_log_search_results<T: 'static>(
                             }
                             cx.notify();
                         }))
-                        .child(render_inline_button("Copy Match", cx, {
+                        .child(render_inline_button("Copy match", cx, {
                             let selected_line = selected_line.clone();
                             move |cx| {
                                 if let Some(line) = selected_line.clone() {
@@ -2270,7 +2270,7 @@ fn render_global_log_search_results<T: 'static>(
                             }
                             cx.notify();
                         }))
-                        .child(render_inline_button("Open File", cx, {
+                        .child(render_inline_button("Open file", cx, {
                             let selected_path = selected_path.clone();
                             move |cx| {
                                 if let Some(path) = selected_path.clone() {
@@ -2300,7 +2300,7 @@ fn render_global_log_search_results<T: 'static>(
                                 cx.notify();
                             }
                         }))
-                        .child(render_inline_button("Copy Match", cx, {
+                        .child(render_inline_button("Copy match", cx, {
                             let selected_line = selected_line.clone();
                             move |cx| {
                                 if let Some(line) = selected_line.clone() {
@@ -2682,16 +2682,6 @@ mod tests {
     }
 }
 
-fn render_path_row<C: IntoElement>(
-    id: &str,
-    title: &str,
-    description: &str,
-    actions: C,
-    stacked: bool,
-) -> impl IntoElement + use<C> {
-    settings_path_row(id, title, description, actions, stacked)
-}
-
 fn open_logging_directory(path: PathBuf, label: &'static str) {
     if let Err(error) = std::fs::create_dir_all(&path) {
         backend::push_ui_action(backend::UiAction::ShowWarningToast {
@@ -2759,13 +2749,6 @@ fn render_inline_button<T: 'static, F: Fn(&mut Context<T>) + 'static>(
     cx: &mut Context<T>,
     on_click: F,
 ) -> impl IntoElement + use<T, F> {
-    let label = match label {
-        "Open Log" => "Open log",
-        "Copy Preview" => "Copy preview",
-        "Copy Match" => "Copy match",
-        "Open File" => "Open file",
-        other => other,
-    };
     quiet_action_button(
         format!(
             "advanced-log-viewer-{}",

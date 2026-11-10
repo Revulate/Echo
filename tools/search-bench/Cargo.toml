@@ -1,9 +1,10 @@
 [package]
-name = "echo-search-bench"
-version = "0.1.0"
+name = "search-bench"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
-echo-core = { path = "../../crates/echo-core" }
+echo-core.workspace = true

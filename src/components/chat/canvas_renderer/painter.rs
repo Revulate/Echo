@@ -5,10 +5,10 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 
-use super::eviction_cache::EvictionTrackingCache;
 use super::global_layout_cache;
 use super::layout::LayoutCacheKey;
 use super::relayout_trace::{self, RelayoutCause, VisibleGeometryTrace};
+use echo_render_core::eviction_cache::EvictionTrackingCache;
 use gpui::{HighlightStyle, StyledText, *};
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
@@ -25,14 +25,11 @@ use crate::emote_renderer;
 use crate::managers::frame_rate_controller;
 use crate::theme::colors;
 
-use super::font_metrics::scaled_font_size;
-use super::hit_testing::HitboxManager;
 use super::layout::{
     CanvasMessageLayout, EmbedPlatform, HitboxKind, ImagePaintCommand, LayoutSegment, OverlayEmote,
     SELECTION_COLOR, ShapedLineData, TextPaintCommand, is_animated_url, is_svg_image_url,
     line_height, message_content_fingerprint, quantize_width, text_height, width_from_quantized,
 };
-use super::selection::{SelectionPoint, SelectionRanges, SelectionState};
 use super::text_shaping::build_message_layout;
 use super::tooltip::TooltipState;
 use crate::backend::settings;
@@ -40,14 +37,20 @@ use crate::components::overlays::{
     ContextMenuState, clear_global_tooltip_if_source, clear_global_tooltip_if_source_in_window,
     show_canvas_hitbox_tooltip,
 };
+use echo_chat_render::font_metrics::scaled_font_size;
+use echo_chat_render::hit_testing::HitboxManager;
+use echo_chat_render::selection::{SelectionPoint, SelectionRanges, SelectionState};
 use echo_chat_render::width_bucket::{WIDTH_BUCKET_FORCE_APPLY_MS, WIDTH_BUCKET_STABILIZE_MS};
 
+mod accessibility;
+mod async_layouts;
+#[cfg(feature = "gpui-bench")]
+mod benchmark_hooks;
 mod deleted_display;
 mod direct_paint;
 mod element_images;
 mod element_render;
 mod element_widgets;
-mod frame_visible_rows;
 mod height_anchor;
 mod image_paint;
 mod interaction;
@@ -70,10 +73,8 @@ mod state;
 mod text_paint;
 mod trace;
 mod viewport_element;
-mod visible_row_pipeline;
 mod visible_rows;
 mod wake;
-use self::wake::AnimationPatchOutcome;
 mod width_bucket;
 
 use self::deleted_display::DeletedDisplayState;
@@ -81,7 +82,7 @@ use self::direct_paint::{
     ViewportPaintRow, can_paint_visible_row_in_viewport_canvas, prepare_viewport_paint_row,
     reuse_prepared_viewport_paint_row,
 };
-use self::element_render::{ElementRenderPlan, render_message_at_position};
+use self::element_render::{ElementRenderPlan, FallbackRowFrame, render_message_at_position};
 use self::layout_store::LayoutStore;
 use self::model::MessageListModel;
 use self::perf::{
@@ -97,66 +98,12 @@ use self::state::{
 };
 use self::trace::{CanvasRenderTraceGuard, RENDER_TRACE_ENABLED, SCROLL_SMOKE_TRACE_ENABLED};
 use self::viewport_element::render_visible_rows_viewport_element;
-use self::visible_rows::{ScrollDirection, VisibleRenderRow, VisibleRowBuildFrameState};
+use self::visible_rows::{ScrollDirection, VisibleRenderRow};
+use self::wake::AnimationPatchOutcome;
 
-/// Maximum number of layouts to cache (LRU eviction after this limit)
-/// PERF: 800 sufficient for ~200 visible messages × 4 width variants
-const LAYOUT_CACHE_CAPACITY: usize = 800;
-/// Layout cache capacity per split. Held constant across active/inactive so a
-/// backgrounded split keeps its laid-out geometry (switching back is a cache
-/// hit, not a cold re-layout). See `CanvasMessageList::set_active`.
-const ACTIVE_LAYOUT_CACHE_CAPACITY: usize = 640;
-/// Rows on each side of the last viewport whose layouts a split keeps while
-/// its tab is hidden. See `CanvasMessageList::trim_layouts_for_hidden_tab`.
-const HIDDEN_TAB_LAYOUT_MARGIN_ROWS: usize = 64;
+/// Splits narrower than this show the jump-to-live pill as a bare arrow.
 const JUMP_TO_LIVE_COMPACT_WIDTH: f32 = 200.0;
-/// Estimated height used while async layout is pending (keeps scrolling responsive under load).
-const ESTIMATED_MESSAGE_HEIGHT: f32 = 42.0;
-/// Newest prepended history rows to pre-layout first.
-///
-/// These are the rows immediately above the pre-existing viewport after a
-/// history prepend, so resolving them early prevents scrollback spacing from
-/// changing as soon as the user scrolls upward.
-const HISTORY_PREPEND_ASYNC_PRIME_LIMIT: usize = 192;
-/// Minimum first snapshot size where estimated-height seeding is cheaper than a full rebuild.
-const INITIAL_SNAPSHOT_FAST_PATH_MIN_MESSAGES: usize = 32;
-/// Per-update synchronous layout budget before we defer to async layout.
-/// This prevents long UI-thread stalls during resize storms / burst message loads.
-const SYNC_LAYOUT_BUDGET_MS: u64 = 4;
-/// Budget message scans for embed fetch discovery per render tick.
-const EMBED_SCAN_MESSAGE_BUDGET: usize = 48;
-/// Budget message scans for emote preload discovery per render tick.
-const EMOTE_PRELOAD_MESSAGE_BUDGET: usize = 64;
-/// Static-range emote preload rescan interval (keeps preload progress moving without 60fps scans).
-const EMOTE_PRELOAD_INTERVAL_MS: u128 = 120;
-/// Periodic aggregated render/layout diagnostics log cadence.
-const RENDER_PERF_LOG_INTERVAL_MS: u128 = 2000;
-/// Per-UI-thread shaped text cache for direct canvas text paint.
-///
-/// This is intentionally separate from GPUI's frame-local layout cache: animation
-/// ticks repaint the same visible rows repeatedly, and recreating `ShapedLine`
-/// objects still pays font/run setup even when glyph layout is cached.
-const TEXT_SHAPE_CACHE_CAPACITY: usize = 4096;
-/// Number of visible stale layouts to rebuild synchronously per tick (visible-first refresh).
-const STALE_VISIBLE_SYNC_REFRESH_BUDGET: usize = 4;
-/// Visible background-built layouts to replace with GPUI-measured layouts per frame.
-const VISIBLE_FALLBACK_METRIC_REFRESH_BUDGET: usize = 2;
-/// Visible missing layouts to rebuild synchronously per frame after cache eviction.
-const VISIBLE_CACHE_MISS_SYNC_REBUILD_BUDGET: usize = 4;
-/// How long a message stays emphasized after opening it from search results.
-const SEARCH_RESULT_FOCUS_DURATION_MS: u64 = 1600;
-/// Background stale-layout scan budget per tick (offscreen phased refresh).
-const STALE_BACKGROUND_SCAN_BUDGET: usize = 48;
-/// Low stale-layout scan budget for mounted sibling splits that are visible but not focused.
-const STALE_INACTIVE_BACKGROUND_SCAN_BUDGET: usize = 8;
-/// Full rebuilds should only prime the rows the user is likely to see next.
-///
-/// The remaining offscreen rows keep fallback/estimated heights and are laid out on demand when
-/// they enter the viewport. This prevents startup/resize rebuilds from queueing hundreds of
-/// background layouts in one UI-frame.
-const FULL_REBUILD_LAYOUT_PRIME_BUDGET: usize = 160;
-/// Adaptive upper bound for incremental same-size buffer rotations before falling back.
-const MAX_INCREMENTAL_ROTATION_ABS: usize = 256;
+
 /// A diagnostic timer that avoids reading the platform clock when its consumer
 /// is disabled. Keeping this in the painter module makes the steady-state branch
 /// consistent across render, visible-row, and paint-emission instrumentation.
@@ -202,7 +149,7 @@ pub struct CanvasMessageList {
     pub channel_name: String,
     /// Stable owning split for source-aware message context-menu actions.
     source_split_id: crate::state::SplitId,
-    /// PERF: Cached ElementId to avoid format!() allocation every frame
+    /// Cached ElementId to avoid format!() allocation every frame
     cached_element_id: ElementId,
     /// Whether to show timestamps
     pub show_timestamp: bool,
@@ -350,19 +297,6 @@ impl CanvasMessageList {
             .message_order
             .get(start..end)
             .unwrap_or(&[])
-    }
-
-    /// Release retained wake loops and report whether benchmark-only async
-    /// layout work has drained, allowing GPUI's leak detector to tear down the
-    /// benchmark window without weakening leak detection globally.
-    #[cfg(feature = "gpui-bench")]
-    pub fn prepare_benchmark_teardown(&mut self) -> bool {
-        self.release_animation_waker();
-        self.release_async_layout_waker();
-        self.release_image_load_waker();
-        self.release_width_stabilization_waker();
-        self.poll_async_layouts();
-        !self.async_layout_manager.has_in_flight()
     }
 
     /// Cheap change key for the visible-row set consumed by Activity read tracking.
@@ -618,7 +552,7 @@ impl CanvasMessageList {
     }
 }
 
-/// Determine the appropriate cursor style based on hitbox type
+/// The "Paused" badge shown while auto-scroll is held by a pause modifier.
 fn render_pause_indicator() -> AnyElement {
     div()
         .absolute()
@@ -641,8 +575,8 @@ fn render_pause_indicator() -> AnyElement {
         .into_any_element()
 }
 
-/// Memory optimization: Ensure all state is properly cleared when channel is closed
-/// This prevents memory leaks from cached indices that would otherwise persist
+/// Stops this split's wake loops and releases the process-wide state it
+/// registered (animation census, global tooltip) when the split closes.
 impl Drop for CanvasMessageList {
     fn drop(&mut self) {
         if let Some(owner) = self.wake_state.animation_census_owner {
@@ -662,20 +596,15 @@ impl Drop for CanvasMessageList {
         }
         clear_global_tooltip_if_source(&self.interaction_state.tooltip_overlay_source_id);
 
-        let entries_cleared = self.layout_store.layouts.len()
+        let entries_released = self.layout_store.layouts.len()
             + self.message_model.message_index.len()
             + self.layout_store.runtime.cached_width_index.len()
             + self.preload_state.pending_embed_fetches.len();
 
-        self.layout_store.layouts.clear();
-        self.message_model.clear_all();
-        self.layout_store.runtime.cached_width_index.clear();
-        self.preload_state.pending_embed_fetches.clear();
-
         crate::log_ui!(debug,
             channel_id = %self.channel_id,
-            entries_cleared,
-            "CanvasMessageList dropped, state cleared"
+            entries_released,
+            "CanvasMessageList dropped"
         );
     }
 }

@@ -8,8 +8,8 @@
 //! - Text inputs
 //! - Radio button groups
 //! - Color pickers
-#![allow(clippy::too_many_arguments)]
 //! - Setting rows with label + description
+#![allow(clippy::too_many_arguments)]
 
 pub use crate::components::ui::{focus_ring, is_button_activation_key as is_activation_key};
 
@@ -105,14 +105,19 @@ impl SettingsMetrics {
     /// Gap between the text and control columns of a split row.
     pub const ROW_COLUMN_GAP: f32 = Spacing::LG;
 
-    /// Dimensions for the additive calm row layout.
-    pub const CALM_ROW_MIN_HEIGHT: f32 = 48.0;
-    pub const CALM_CONTROL_WIDTH: f32 = 200.0;
-    pub const CALM_SLIDER_CONTROL_WIDTH: f32 = 360.0;
-    pub const CALM_COLOR_CONTROL_WIDTH: f32 = 260.0;
+    /// Minimum height of a setting row.
+    pub const ROW_MIN_HEIGHT: f32 = 48.0;
+    /// Width of a setting row's control column.
+    pub const ROW_CONTROL_WIDTH: f32 = 200.0;
+    /// Control column width for slider rows.
+    pub const ROW_SLIDER_CONTROL_WIDTH: f32 = 360.0;
+    /// Control column width for colour rows.
+    pub const ROW_COLOR_CONTROL_WIDTH: f32 = 260.0;
     pub const COLOR_EDITOR_MIN_WIDTH: f32 = 180.0;
-    pub const CALM_LABEL_TEXT: f32 = FontSize::MD;
-    pub const CALM_HELPER_TEXT: f32 = FontSize::SM;
+    /// Setting-row label.
+    pub const ROW_LABEL_TEXT: f32 = FontSize::MD;
+    /// Setting-row help line and "Modified" marker.
+    pub const ROW_HELPER_TEXT: f32 = FontSize::SM;
 
     /// Row height in the settings navigation tree.
     pub const TREE_ROW_HEIGHT: f32 = 28.0;
@@ -408,10 +413,7 @@ impl Element for SettingTargetElement {
         self.body.paint(window, cx);
         if self.matched {
             let width = if self.selected { px(3.0) } else { px(1.0) };
-            let height = bounds
-                .size
-                .height
-                .min(px(SettingsMetrics::CALM_ROW_MIN_HEIGHT));
+            let height = bounds.size.height.min(px(SettingsMetrics::ROW_MIN_HEIGHT));
             let color = if self.selected {
                 colors::text_secondary()
             } else {
@@ -712,7 +714,7 @@ pub fn setting_row<C: IntoElement>(
         modified,
         reset,
         stacked,
-        SettingsMetrics::CALM_CONTROL_WIDTH,
+        SettingsMetrics::ROW_CONTROL_WIDTH,
     )
 }
 
@@ -733,7 +735,7 @@ pub fn setting_slider_row<C: IntoElement>(
         modified,
         reset,
         stacked,
-        SettingsMetrics::CALM_SLIDER_CONTROL_WIDTH,
+        SettingsMetrics::ROW_SLIDER_CONTROL_WIDTH,
     )
 }
 
@@ -767,7 +769,7 @@ pub fn settings_path_row<C: IntoElement>(
         .min_w_0()
         .flex()
         .flex_col()
-        .child(setting_row_layout(
+        .child(setting_row_with_enabled(
             id.to_string(),
             label,
             None,
@@ -775,7 +777,7 @@ pub fn settings_path_row<C: IntoElement>(
             false,
             None,
             stacked,
-            SettingsMetrics::CALM_CONTROL_WIDTH,
+            SettingsMetrics::ROW_CONTROL_WIDTH,
             !stacked,
             true,
         ))
@@ -786,7 +788,7 @@ pub fn settings_path_row<C: IntoElement>(
                 .flex()
                 .items_center()
                 .whitespace_nowrap()
-                .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                 .text_color(colors::text_secondary())
                 .child(div().min_w_0().flex_shrink_1().truncate().child(prefix))
                 .child(div().flex_shrink_0().child(suffix)),
@@ -803,7 +805,7 @@ pub fn setting_row_with_control_width<C: IntoElement>(
     stacked: bool,
     control_width: f32,
 ) -> Stateful<Div> {
-    setting_row_layout(
+    setting_row_with_enabled(
         id,
         label,
         help,
@@ -827,7 +829,7 @@ pub fn setting_compact_row<C: IntoElement>(
     reset: Option<AnyElement>,
     stacked: bool,
 ) -> Stateful<Div> {
-    setting_row_layout(
+    setting_row_with_enabled(
         id,
         label,
         help,
@@ -835,40 +837,13 @@ pub fn setting_compact_row<C: IntoElement>(
         modified,
         reset,
         stacked,
-        SettingsMetrics::CALM_CONTROL_WIDTH,
+        SettingsMetrics::ROW_CONTROL_WIDTH,
         true,
         true,
     )
 }
 
-/// Disabled rows dim text without fading contrast-qualified controls.
-pub fn setting_row_with_enabled<C: IntoElement>(
-    id: impl Into<SharedString>,
-    label: &str,
-    help: Option<&str>,
-    control: C,
-    modified: bool,
-    reset: Option<AnyElement>,
-    stacked: bool,
-    control_width: f32,
-    compact: bool,
-    enabled: bool,
-) -> Stateful<Div> {
-    setting_row_layout(
-        id,
-        label,
-        help,
-        control,
-        modified,
-        reset,
-        stacked,
-        control_width,
-        compact,
-        enabled,
-    )
-}
-
-fn calm_row_text(label: &str, help: Option<&str>, modified: bool, enabled: bool) -> Div {
+fn row_text_block(label: &str, help: Option<&str>, modified: bool, enabled: bool) -> Div {
     div()
         .min_w_0()
         .flex_1()
@@ -883,7 +858,7 @@ fn calm_row_text(label: &str, help: Option<&str>, modified: bool, enabled: bool)
                 .gap(px(Spacing::SM))
                 .child(mark_search_match(
                     div()
-                        .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(if enabled {
                             colors::text_primary()
@@ -896,7 +871,7 @@ fn calm_row_text(label: &str, help: Option<&str>, modified: bool, enabled: bool)
                 .when(modified, |row| {
                     row.child(
                         div()
-                            .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                            .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                             .text_color(colors::text_secondary())
                             .child("Modified"),
                     )
@@ -906,7 +881,7 @@ fn calm_row_text(label: &str, help: Option<&str>, modified: bool, enabled: bool)
             text.child(
                 div()
                     .min_w_0()
-                    .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                    .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                     .text_color(if enabled {
                         colors::text_secondary()
                     } else {
@@ -918,7 +893,9 @@ fn calm_row_text(label: &str, help: Option<&str>, modified: bool, enabled: bool)
         })
 }
 
-fn setting_row_layout<C: IntoElement>(
+/// The one row layout behind every `setting_*row` helper. Disabled rows dim
+/// their text without fading contrast-qualified controls.
+pub fn setting_row_with_enabled<C: IntoElement>(
     id: impl Into<SharedString>,
     label: &str,
     help: Option<&str>,
@@ -963,7 +940,7 @@ fn setting_row_layout<C: IntoElement>(
         .id(id.into())
         .w_full()
         .min_w_0()
-        .min_h(px(SettingsMetrics::CALM_ROW_MIN_HEIGHT))
+        .min_h(px(SettingsMetrics::ROW_MIN_HEIGHT))
         .flex();
     if compact {
         root.py(px(Spacing::XS))
@@ -976,14 +953,14 @@ fn setting_row_layout<C: IntoElement>(
                     .flex()
                     .items_center()
                     .gap(px(Spacing::SM))
-                    .child(calm_row_text(label, None, modified, enabled))
+                    .child(row_text_block(label, None, modified, enabled))
                     .child(control),
             )
             .when_some(help, |row, help| {
                 row.child(
                     div()
                         .min_w_0()
-                        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                         .text_color(if enabled {
                             colors::text_secondary()
                         } else {
@@ -1003,7 +980,7 @@ fn setting_row_layout<C: IntoElement>(
                     row.items_center()
                 }
             })
-            .child(calm_row_text(label, help, modified, enabled))
+            .child(row_text_block(label, help, modified, enabled))
             .child(control)
     }
 }
@@ -1077,7 +1054,7 @@ pub fn quiet_action_button<T: 'static>(
     .border_1()
     .border_color(colors::border())
     .bg(colors::bg_surface())
-    .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+    .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
     .text_color(if danger {
         colors::signal_red()
     } else {
@@ -1185,6 +1162,55 @@ impl SettingsPageUi {
     }
 }
 
+/// A searchable compact switch row for one boolean setting, with a reset to
+/// `default` while the value differs from it.
+pub fn setting_toggle_row<T: 'static, F>(
+    descriptor: SettingDescriptor,
+    value: bool,
+    default: bool,
+    help: &'static str,
+    stacked: bool,
+    cx: &mut Context<T>,
+    set: F,
+) -> impl IntoElement + use<T, F>
+where
+    F: Fn(bool) + Clone + 'static,
+{
+    let reset = set.clone();
+    let modified = value != default;
+    setting_target(
+        descriptor,
+        setting_compact_row(
+            descriptor.id,
+            descriptor.label,
+            Some(help),
+            labelled_toggle(
+                SharedString::from(format!("toggle-{}", descriptor.control_id)),
+                descriptor.label,
+                value,
+                cx,
+                move |enabled, cx| {
+                    set(enabled);
+                    cx.notify();
+                },
+            ),
+            modified,
+            modified.then(|| {
+                setting_reset(
+                    format!("reset-{}", descriptor.control_id),
+                    descriptor.label,
+                    cx,
+                    move |cx| {
+                        reset(default);
+                        cx.notify();
+                    },
+                )
+            }),
+            stacked,
+        ),
+    )
+}
+
 /// Independent reset action; activation preserves each setting's backend setter.
 pub fn setting_reset<T: 'static>(
     id: impl Into<SharedString>,
@@ -1223,7 +1249,7 @@ pub fn setting_reset_with_window<T: 'static>(
     .flex_shrink_0()
     .px(px(Spacing::SM))
     .py(px(Spacing::XS))
-    .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+    .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
     .child("Reset")
     .into_any_element()
 }
@@ -1401,7 +1427,7 @@ pub fn settings_disclosure_with_layout<T: 'static, C: IntoElement>(
             .on_a11y_action(AccessibleAction::Collapse, move |_, window, cx| {
                 collapse.set_expanded(false, window, cx);
             })
-            .h(px(SettingsMetrics::CALM_ROW_MIN_HEIGHT))
+            .h(px(SettingsMetrics::ROW_MIN_HEIGHT))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -1415,7 +1441,7 @@ pub fn settings_disclosure_with_layout<T: 'static, C: IntoElement>(
                     .gap(px(Spacing::XXS))
                     .child(
                         div()
-                            .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                            .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(colors::text_primary())
                             .child(label.to_string()),
@@ -1432,7 +1458,7 @@ pub fn settings_disclosure_with_layout<T: 'static, C: IntoElement>(
                                         div()
                                             .min_w_0()
                                             .flex_1()
-                                            .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                                            .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                                             .text_color(colors::text_secondary())
                                             .text_ellipsis()
                                             .whitespace_nowrap()
@@ -1451,7 +1477,7 @@ pub fn settings_disclosure_with_layout<T: 'static, C: IntoElement>(
                         div()
                             .min_w_0()
                             .max_w(relative(0.30))
-                            .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                            .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                             .text_color(colors::text_secondary())
                             .text_ellipsis()
                             .whitespace_nowrap()
@@ -1488,7 +1514,7 @@ fn disclosure_modified_count(count: usize) -> Div {
     div()
         .flex_shrink_0()
         .whitespace_nowrap()
-        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
         .text_color(colors::text_secondary())
         .child(format!("{count} modified"))
 }
@@ -1514,7 +1540,7 @@ fn settings_summary_row_with_chevron<T: 'static>(
     .aria_description(SharedString::from(summary.to_string()))
     .w_full()
     .min_w_0()
-    .min_h(px(SettingsMetrics::CALM_ROW_MIN_HEIGHT))
+    .min_h(px(SettingsMetrics::ROW_MIN_HEIGHT))
     .flex()
     .items_center()
     .gap(px(Spacing::SM))
@@ -1527,14 +1553,14 @@ fn settings_summary_row_with_chevron<T: 'static>(
             .gap(px(SettingsMetrics::LABEL_GAP))
             .child(
                 div()
-                    .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                    .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(colors::text_primary())
                     .child(label.to_string()),
             )
             .child(
                 div()
-                    .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+                    .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
                     .text_color(colors::text_secondary())
                     .child(summary.to_string()),
             ),
@@ -1722,7 +1748,7 @@ pub fn settings_subheading(label: &str) -> Stateful<Div> {
         .role(Role::Heading)
         .aria_label(SharedString::from(label.to_string()))
         .aria_level(3)
-        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
         .font_weight(FontWeight::MEDIUM)
         .text_color(colors::text_secondary())
         .child(label.to_string())
@@ -1780,65 +1806,13 @@ fn settings_group_surface<C: IntoElement>(
                     .role(Role::Heading)
                     .aria_label(SharedString::from(label.to_string()))
                     .aria_level(2)
-                    .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                    .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors::text_primary())
                     .child(label.to_string()),
             )
         })
         .child(content)
-}
-
-/// A group of settings under a level-three heading.
-///
-/// Flat groups with rules: a 13px medium heading over a body fenced by subtle
-/// top/bottom rules, with no generic side border, rounded rectangle, or
-/// indentation. The former card treatment stacked several equally weighted
-/// boxes beneath a subsection heading that differed from them only by a faint
-/// color change, so nothing carried the hierarchy. Complex editors, lists,
-/// color pickers, and uploader mappings still supply their own internal
-/// container where one is structurally necessary.
-pub fn setting_group<C: IntoElement>(title: &str, children: C) -> impl IntoElement + use<C> {
-    setting_group_titled(title, children)
-}
-
-/// Group heading plus content. See [`setting_group`] — both spellings now share
-/// the flat treatment; the pair is kept because ~90 call sites import one or
-/// the other (frequently aliased as `render_setting_group`).
-pub fn setting_group_titled<C: IntoElement>(title: &str, content: C) -> impl IntoElement + use<C> {
-    let surface = colors::settings_group_surface();
-    let rule = colors::settings_group_rule(surface);
-    let slug = control_slug(title);
-
-    div()
-        .id(SharedString::from(format!("settings-group-{slug}")))
-        .role(Role::Group)
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(px(SettingsMetrics::GROUP_GAP))
-        .child(
-            div()
-                .id("heading")
-                .role(Role::Heading)
-                .aria_label(SharedString::from(title.to_string()))
-                .aria_level(3)
-                .text_size(px(SettingsMetrics::LABEL_TEXT))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors::text_primary())
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .py(px(SettingsMetrics::GROUP_GAP))
-                .border_t_1()
-                .border_b_1()
-                .border_color(rule)
-                .child(content),
-        )
 }
 
 /// Shared empty-state treatment for list sections: boxed + centered.
@@ -1861,10 +1835,9 @@ pub fn empty_state(message: impl Into<SharedString>) -> impl IntoElement {
         )
 }
 
-/// Style A secondary/primary button: compact pill used inside list-row and
-/// editor-form actions (Edit/Delete/Save/Cancel-style controls). Byte-identical
-/// helper that was hand-copied across commands.rs, nicknames.rs, filters.rs,
-/// moderation.rs, and highlights.rs (blacklist rows).
+/// Compact primary/secondary pill for list-row and editor-form actions
+/// (Edit, Delete, Save, Cancel). Its element id derives from the label; use
+/// [`button_keyed`] where one label repeats on a surface.
 pub fn button<T: 'static, F: Fn(&mut Context<T>) + 'static>(
     label: &'static str,
     primary: bool,
@@ -1955,9 +1928,8 @@ pub fn button_keyed<T: 'static, F: Fn(&mut Context<T>) + 'static, I: Into<Shared
     })
 }
 
-/// Style B action button: standalone action control with a destructive (red)
-/// treatment option. Identical (minus a per-file id-prefix string) across
-/// general.rs, privacy.rs, and proxy.rs. Derives its element id from the
+/// Standalone action control with an optional destructive (red) treatment.
+/// Derives its element id from the
 /// label, so it is only for SINGLETON buttons (unique label per surface);
 /// repeated list-row actions must use [`action_button_keyed`] so each row
 /// gets a distinct element id.
@@ -2219,7 +2191,7 @@ pub fn toggle_with_enabled<
     .child(toggle_track(is_on, enabled))
 }
 
-/// Compact switch with an explicit accessible name for a calm setting row.
+/// Compact switch with an explicit accessible name, for a setting row.
 pub fn labelled_toggle<T: 'static>(
     id: impl Into<SharedString>,
     label: &str,
@@ -2409,7 +2381,7 @@ fn render_settings_choice_menu<T: 'static>(
         div()
             .min_w_0()
             .flex_1()
-            .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+            .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
             .text_color(colors::text_primary())
             .text_ellipsis()
             .whitespace_nowrap()
@@ -2491,7 +2463,7 @@ fn render_settings_choice_menu<T: 'static>(
                             .on_a11y_action(AccessibleAction::Click, move |_, window, cx| {
                                 accessible(window, cx);
                             })
-                            .text_size(px(SettingsMetrics::CALM_LABEL_TEXT))
+                            .text_size(px(SettingsMetrics::ROW_LABEL_TEXT))
                             .text_color(colors::text_primary())
                             .child(option.label.clone())
                             .when(selected == Some(option.value.as_str()), |row| {
@@ -2656,7 +2628,6 @@ fn snap_slider_value(value: f32, min: f32, max: f32, step: f32) -> f32 {
 /// Slider semantics for a custom-drawn slider: `Role::Slider` with its label
 /// and value attributes, a tab stop with the focus ring, arrow/Page/Home/End
 /// keys, and AccessKit increment/decrement. Values snap to `step`.
-#[allow(clippy::too_many_arguments)]
 pub fn slider_keyboard<T: 'static, F: Fn(f32, &mut Context<T>) + Clone + 'static>(
     element: Stateful<Div>,
     label: &'static str,
@@ -3192,7 +3163,7 @@ fn render_color_editor<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clon
                 );
             let trigger = if let Some(row) = row {
                 setting_row_with_control_width(row.id, &row.label, row.help.as_deref(), trigger,
-                    row.modified, row.reset, row.stacked, SettingsMetrics::CALM_COLOR_CONTROL_WIDTH).into_any_element()
+                    row.modified, row.reset, row.stacked, SettingsMetrics::ROW_COLOR_CONTROL_WIDTH).into_any_element()
             } else { trigger.into_any_element() };
             root.child(trigger)
         })
@@ -3319,7 +3290,6 @@ fn render_color_editor<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clon
                                             &editor_key_for_default,
                                             color,
                                             false,
-                                            alpha_mode,
                                         );
                                         if let Some(value) = commit_color_editor(
                                             &editor_key_for_default,
@@ -3456,7 +3426,7 @@ pub fn reset_color_editor_draft<T: 'static>(
         state.is_clear = persisted_value.is_none();
         state.dirty = false;
         state.invalid = false;
-        refresh_color_editor_text(state, mode);
+        refresh_color_editor_text(state);
     });
     sync_color_editor_input_text(&key, true, window, cx);
 }
@@ -3519,7 +3489,7 @@ fn with_color_editor_state(key: &str, update: impl FnOnce(&mut ColorEditorState)
     update(state);
 }
 
-fn refresh_color_editor_text(state: &mut ColorEditorState, _mode: ColorAlphaMode) {
+fn refresh_color_editor_text(state: &mut ColorEditorState) {
     state.value_text = state.draft.to_rgb_hex();
 }
 
@@ -3566,13 +3536,13 @@ fn toggle_color_editor(key: &str) {
     }
 }
 
-fn set_color_editor_value(key: &str, value: ColorValue, is_clear: bool, mode: ColorAlphaMode) {
+fn set_color_editor_value(key: &str, value: ColorValue, is_clear: bool) {
     with_color_editor_state(key, |state| {
         state.draft = value;
         state.is_clear = is_clear;
         state.dirty = true;
         state.invalid = false;
-        refresh_color_editor_text(state, mode);
+        refresh_color_editor_text(state);
     });
 }
 
@@ -3596,11 +3566,11 @@ fn commit_color_editor(key: &str, mode: ColorAlphaMode) -> Option<Option<String>
     state.invalid = false;
     let value = (!state.is_clear).then(|| state.draft.to_hex(mode));
     if state.persisted_value == value {
-        refresh_color_editor_text(state, mode);
+        refresh_color_editor_text(state);
         return None;
     }
     state.persisted_value = value.clone();
-    refresh_color_editor_text(state, mode);
+    refresh_color_editor_text(state);
     Some(value)
 }
 
@@ -3767,7 +3737,7 @@ where
                                 &mut state.dirty,
                                 &mut state.invalid,
                             );
-                            refresh_color_editor_text(state, mode);
+                            refresh_color_editor_text(state);
                         });
                     }
                     if is_blur {
@@ -3874,7 +3844,7 @@ fn color_spectrum_plane<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clo
             next_value.clamp(0.0, 1.0),
             alpha,
         );
-        set_color_editor_value(&key_for_keys, color, false, mode);
+        set_color_editor_value(&key_for_keys, color, false);
         if let Some(committed) = commit_color_editor(&key_for_keys, mode) {
             on_change_for_keys(committed, cx);
         }
@@ -3932,7 +3902,7 @@ fn color_spectrum_plane<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clo
             let next_saturation = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
             let next_value = 1.0 - (relative_y / height.max(1.0)).clamp(0.0, 1.0);
             let color = ColorValue::from_hsv(hue, next_saturation, next_value, alpha);
-            set_color_editor_value(&key_for_check, color, false, mode);
+            set_color_editor_value(&key_for_check, color, false);
             if let Some(value) = commit_color_editor(&key_for_check, mode) {
                 on_change_for_drag(value, cx);
             }
@@ -3953,7 +3923,7 @@ fn color_spectrum_plane<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clo
             let next_saturation = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
             let next_value = 1.0 - (relative_y / height.max(1.0)).clamp(0.0, 1.0);
             let color = ColorValue::from_hsv(hue, next_saturation, next_value, alpha);
-            set_color_editor_value(&key_for_click, color, false, mode);
+            set_color_editor_value(&key_for_click, color, false);
             if let Some(value) = commit_color_editor(&key_for_click, mode) {
                 on_change_for_click(value, cx);
             }
@@ -4026,7 +3996,7 @@ fn color_hue_rail<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone + '
         };
         cx.stop_propagation();
         let color = ColorValue::from_hsv(next_hue.clamp(0.0, 1.0), saturation, value, alpha);
-        set_color_editor_value(&key_for_keys, color, false, mode);
+        set_color_editor_value(&key_for_keys, color, false);
         if let Some(committed) = commit_color_editor(&key_for_keys, mode) {
             on_change_for_keys(committed, cx);
         }
@@ -4097,7 +4067,7 @@ fn color_hue_rail<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone + '
                     let width: f32 = event.bounds.size.width.into();
                     let next_hue = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
                     let color = ColorValue::from_hsv(next_hue, saturation, value, alpha);
-                    set_color_editor_value(&key_for_check, color, false, mode);
+                    set_color_editor_value(&key_for_check, color, false);
                     if let Some(value) = commit_color_editor(&key_for_check, mode) {
                         on_change_for_drag(value, cx);
                     }
@@ -4115,7 +4085,7 @@ fn color_hue_rail<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone + '
                     let width: f32 = bounds.size.width.into();
                     let next_hue = (relative_x / width.max(1.0)).clamp(0.0, 1.0);
                     let color = ColorValue::from_hsv(next_hue, saturation, value, alpha);
-                    set_color_editor_value(&key_for_click, color, false, mode);
+                    set_color_editor_value(&key_for_click, color, false);
                     if let Some(value) = commit_color_editor(&key_for_click, mode) {
                         on_change_for_click(value, cx);
                     }
@@ -4195,7 +4165,7 @@ fn color_alpha_rail<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone +
         };
         cx.stop_propagation();
         let color = ColorValue::from_hsv(hue, saturation, value, next_alpha);
-        set_color_editor_value(&key_for_keys, color, false, mode);
+        set_color_editor_value(&key_for_keys, color, false);
         if let Some(committed) = commit_color_editor(&key_for_keys, mode) {
             on_change_for_keys(committed, cx);
         }
@@ -4268,7 +4238,7 @@ fn color_alpha_rail<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone +
                     let next_alpha =
                         ((relative_x / width.max(1.0)).clamp(0.0, 1.0) * 255.0).round() as u8;
                     let color = ColorValue::from_hsv(hue, saturation, value, next_alpha);
-                    set_color_editor_value(&key_for_check, color, false, mode);
+                    set_color_editor_value(&key_for_check, color, false);
                     if let Some(value) = commit_color_editor(&key_for_check, mode) {
                         on_change_for_drag(value, cx);
                     }
@@ -4287,7 +4257,7 @@ fn color_alpha_rail<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone +
                     let next_alpha =
                         ((relative_x / width.max(1.0)).clamp(0.0, 1.0) * 255.0).round() as u8;
                     let color = ColorValue::from_hsv(hue, saturation, value, next_alpha);
-                    set_color_editor_value(&key_for_click, color, false, mode);
+                    set_color_editor_value(&key_for_click, color, false);
                     if let Some(value) = commit_color_editor(&key_for_click, mode) {
                         on_change_for_click(value, cx);
                     }
@@ -4482,7 +4452,7 @@ fn color_presets<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone + 's
                             let element_id = SharedString::from(format!("{key}-preset-{index}"));
                             let mouse_listener =
                                 cx.listener(move |_this, _event: &ClickEvent, window, cx| {
-                                    set_color_editor_value(&key, color, false, mode);
+                                    set_color_editor_value(&key, color, false);
                                     if let Some(value) = commit_color_editor(&key, mode) {
                                         on_change(value, cx);
                                     }
@@ -4496,7 +4466,7 @@ fn color_presets<T: 'static, F: Fn(Option<String>, &mut Context<T>) + Clone + 's
                                         return;
                                     }
                                     cx.stop_propagation();
-                                    set_color_editor_value(&key_for_keys, color, false, mode);
+                                    set_color_editor_value(&key_for_keys, color, false);
                                     if let Some(value) = commit_color_editor(&key_for_keys, mode) {
                                         on_change_for_keys(value, cx);
                                     }

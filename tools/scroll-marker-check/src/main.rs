@@ -1,3 +1,7 @@
+//! Contract: scroll-bar marker classification and priority in
+//! `src/backend/scroll_markers.rs` for search results, moderation notices,
+//! mentions, whispers and each highlight type.
+
 mod settings {
     pub fn get_thread_highlight_show_in_mentions() -> bool {
         false
@@ -5,52 +9,7 @@ mod settings {
 }
 
 mod models {
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum HighlightType {
-        Whisper,
-        Mention,
-        User {
-            username: String,
-        },
-        ParticipatedReply {
-            username: String,
-        },
-        Badge {
-            badge: String,
-        },
-        HighlightedMessage,
-        FirstMessage,
-        ReturningChatter,
-        Subscription,
-        Raid,
-        BitsBadge,
-        Announcement {
-            color: Option<String>,
-        },
-        WatchStreak,
-        Phrase {
-            pattern: String,
-        },
-        CustomPhrase {
-            pattern: String,
-            color: Option<String>,
-        },
-        CustomUser {
-            username: String,
-            color: Option<String>,
-        },
-        CustomBadge {
-            badge: String,
-            color: Option<String>,
-        },
-        SelfMessage,
-        Elevated,
-        ChannelPointRedeem {
-            reward_id: String,
-            reward_title: String,
-            reward_cost: u32,
-        },
-    }
+    pub use echo_core::message::HighlightType;
 }
 
 #[path = "../../../src/backend/scroll_markers.rs"]

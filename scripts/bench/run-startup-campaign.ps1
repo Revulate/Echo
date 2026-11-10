@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Repeat measure-startup.ps1 for a number of observations and summarize the
+startup milestones (median and p95).
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Scenario,
@@ -17,14 +22,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Get-Percentile {
-    param([double[]]$Values, [double]$Percentile)
-    if ($Values.Count -eq 0) { return $null }
-    $sorted = @($Values | Sort-Object)
-    $index = [Math]::Ceiling(($Percentile / 100.0) * $sorted.Count) - 1
-    return [Math]::Round([double]$sorted[[Math]::Max(0, [int]$index)], 3)
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Invoke-StartupObservation {
     param([string]$App, [string]$Path, [string[]]$Arguments, [string]$WorkingDirectory, [string]$LogPath, [int]$Index)

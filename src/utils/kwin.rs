@@ -293,7 +293,7 @@ where
 /// KWin loads scripts from a file path, so the snippet goes in Echo's private
 /// runtime directory until it has run.
 fn write_script(plugin: &str, script: &str) -> Result<String, String> {
-    let root = crate::benchmark_profile::runtime_root()
+    let root = crate::storage_roots::runtime_root()
         .ok_or_else(|| "Echo's runtime directory is unavailable".to_string())?;
     std::fs::DirBuilder::new()
         .recursive(true)

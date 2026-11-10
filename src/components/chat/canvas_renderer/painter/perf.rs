@@ -127,11 +127,9 @@ fn counts_label(names: &[&str], counts: &[u64]) -> String {
 pub(super) struct RenderPerfAggregateStats {
     pub(super) frames: u64,
     pub(super) layout_total_us: u128,
-    pub(super) async_poll_total_us: u128,
     pub(super) elem_build_total_us: u128,
     pub(super) visible_rows_total: u64,
     pub(super) visible_span_total: u64,
-    pub(super) completed_async_layouts_total: u64,
     pub(super) layout_cache_hits_total: u64,
     pub(super) layout_cache_misses_total: u64,
     pub(super) layout_hit_split_cache_total: u64,

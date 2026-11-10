@@ -23,6 +23,29 @@ pub fn composer_account() -> Option<String> {
     crate::backend::settings::get_username().map(|login| login.trim().to_ascii_lowercase())
 }
 
+/// Where a chatter list's rows came from. The label also names the list in
+/// its status line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatterListSource {
+    /// Twitch's live chatter list.
+    Twitch,
+    /// Chatters seen this session, used when the live list is unavailable.
+    Observed,
+    Moderators,
+    Vips,
+}
+
+impl ChatterListSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Twitch => "Twitch",
+            Self::Observed => "observed",
+            Self::Moderators => "Twitch moderators",
+            Self::Vips => "Twitch VIPs",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatterListEntry {
     pub username: String,
@@ -117,14 +140,14 @@ pub enum UiAction {
     /// Reload the currently open chatter list using its active source.
     RefreshChatterList {
         channel: String,
-        source: String,
+        source: Option<ChatterListSource>,
     },
     /// Show a populated chatter list overlay.
     ShowChatterList {
         channel: String,
         chatters: Vec<ChatterListEntry>,
         total_count: usize,
-        source: String,
+        source: ChatterListSource,
         /// Rows are already normalized and ordered by Twitch login on the
         /// background command path. The UI can install identity indices for
         /// its default view instead of sorting the full result again.
@@ -136,13 +159,13 @@ pub enum UiAction {
     /// Surface a chatter-list load failure without discarding the current rows.
     ChatterListLoadFailed {
         channel: String,
-        source: String,
+        source: Option<ChatterListSource>,
         error: String,
     },
     /// Remove a chatter-list entry after its remote moderation action succeeds.
     RemoveChatterListEntry {
         channel: String,
-        source: String,
+        source: ChatterListSource,
         username: String,
     },
     /// Insert @mention into the matching open channel input when available.

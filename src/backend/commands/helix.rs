@@ -12,7 +12,7 @@ use crate::backend::twitch_api::{
     HelixAuthExt, TWITCH_HTTP_CLIENT, get_cached_channel_id, get_user_id_cached,
     renew_helix_session, send_helix_idempotent,
 };
-use crate::backend::ui_actions::ChatterListEntry;
+use crate::backend::ui_actions::{ChatterListEntry, ChatterListSource};
 use serde::Deserialize;
 use std::collections::HashSet;
 use url::Url;
@@ -282,24 +282,40 @@ pub(crate) fn whisper_contract_snapshot() -> WhisperContractSnapshot {
     }
 }
 
-pub fn whisper_compose_block_reason() -> Option<String> {
-    if let Err(error) = ensure_helix_command_token() {
-        return Some(error);
+/// Why whispers cannot be composed right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WhisperComposeBlock {
+    Auth(CommandAuthBlock),
+    /// Signed in, but the account's Twitch identity is still loading.
+    IdentityLoading,
+}
+
+impl std::fmt::Display for WhisperComposeBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auth(block) => block.fmt(f),
+            Self::IdentityLoading => f.write_str(
+                "Whisper sending is waiting for the active Twitch account identity to finish loading.",
+            ),
+        }
+    }
+}
+
+pub fn whisper_compose_block_reason() -> Option<WhisperComposeBlock> {
+    if let Err(block) = ensure_helix_command_token() {
+        return Some(WhisperComposeBlock::Auth(block));
     }
     crate::backend::auth::capture_authenticated_user_resource()
         .is_none()
-        .then(|| {
-            "Whisper sending is waiting for the active Twitch account identity to finish loading."
-                .to_string()
-        })
+        .then_some(WhisperComposeBlock::IdentityLoading)
 }
 
 /// Send a Twitch whisper through Helix: resolve the recipient through Helix,
 /// POST `/helix/whispers`, and publish local history only after Twitch
 /// confirms success and the initiating account is current.
 pub async fn cmd_whisper(target: &str, message: &str) -> CommandResult {
-    if let Err(error) = ensure_helix_command_token() {
-        return CommandResult::Error(error);
+    if let Err(block) = ensure_helix_command_token() {
+        return CommandResult::Error(block.into());
     }
     let auth =
         match crate::backend::auth::capture_authenticated_user_resource() {
@@ -543,17 +559,13 @@ pub async fn manage_suspicious_user_status(
         username.clone()
     };
 
-    let broadcaster_id = match get_channel_id_for_command(channel).await {
-        Ok(id) => id,
-        Err(error) => return CommandResult::Error(error),
-    };
-    let moderator_id = match get_current_user_id().await {
-        Ok(id) => id,
-        Err(error) => return CommandResult::Error(error),
-    };
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id: moderator_id,
+        token,
+    } = match HelixCommandContext::resolve(channel).await {
+        Ok(context) => context,
+        Err(error) => return error,
     };
 
     let base_url = format!(
@@ -620,9 +632,9 @@ pub async fn manage_held_automod_message(
         Ok(id) => id,
         Err(error) => return CommandResult::Error(error),
     };
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let body = serde_json::json!({
@@ -938,10 +950,10 @@ impl RoleListKind {
         }
     }
 
-    fn source(self) -> &'static str {
+    fn source(self) -> ChatterListSource {
         match self {
-            Self::Moderators => "Twitch moderators",
-            Self::Vips => "Twitch VIPs",
+            Self::Moderators => ChatterListSource::Moderators,
+            Self::Vips => ChatterListSource::Vips,
         }
     }
 }
@@ -1046,9 +1058,9 @@ async fn fetch_role_list(
 
 async fn cmd_role_list(channel: &str, kind: RoleListKind) -> CommandResult {
     let channel = channel.trim_start_matches('#').to_lowercase();
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
     let broadcaster_id = match get_channel_id_for_command(&channel).await {
         Ok(id) => id,
@@ -1080,7 +1092,7 @@ async fn cmd_role_list(channel: &str, kind: RoleListKind) -> CommandResult {
             channel: channel.clone(),
             chatters: entries,
             total_count: count,
-            source: kind.source().to_string(),
+            source: kind.source(),
             login_sorted: true,
             is_loading: false,
         },
@@ -1391,9 +1403,9 @@ pub async fn cmd_poll(channel: &str, args: &str) -> CommandResult {
         Ok(id) => id,
         Err(error) => return CommandResult::Error(error),
     };
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let choices: Vec<_> = poll
@@ -1535,10 +1547,11 @@ fn prediction_totals(prediction: &PredictionData) -> (u64, u64) {
         })
 }
 
+/// The channel's most recent prediction, or `None` when it has never run one.
 async fn fetch_latest_prediction(
     broadcaster_id: &str,
     token: &str,
-) -> Result<PredictionData, String> {
+) -> Result<Option<PredictionData>, String> {
     let url = format!(
         "https://api.twitch.tv/helix/predictions?broadcaster_id={}&first=1",
         urlencoding::encode(broadcaster_id)
@@ -1560,11 +1573,7 @@ async fn fetch_latest_prediction(
 
     let predictions: PredictionsResponse = serde_json::from_str(&text)
         .map_err(|error| format!("Failed to parse predictions response: {error}"))?;
-    predictions
-        .data
-        .into_iter()
-        .next()
-        .ok_or_else(|| "Failed to find any predictions".to_string())
+    Ok(predictions.data.into_iter().next())
 }
 
 async fn update_prediction_status(
@@ -1671,7 +1680,8 @@ async fn close_prediction(channel: &str, action: PredictionCloseAction) -> Comma
     };
 
     let prediction = match fetch_latest_prediction(&broadcaster_id, &token).await {
-        Ok(prediction) => prediction,
+        Ok(Some(prediction)) => prediction,
+        Ok(None) => return CommandResult::Error("Failed to find any predictions".to_string()),
         Err(error) => return CommandResult::Error(error),
     };
 
@@ -1742,8 +1752,8 @@ pub async fn cmd_completeprediction(channel: &str, args: &str) -> CommandResult 
     };
 
     let prediction = match fetch_latest_prediction(&broadcaster_id, &token).await {
-        Ok(prediction) => prediction,
-        Err(error) if error == "Failed to find any predictions" => {
+        Ok(Some(prediction)) => prediction,
+        Ok(None) => {
             return CommandResult::Error(
                 "You must start a prediction before you can complete one".to_string(),
             );
@@ -1850,7 +1860,8 @@ impl PollCloseAction {
     }
 }
 
-async fn fetch_latest_poll(broadcaster_id: &str, token: &str) -> Result<PollData, String> {
+/// The channel's most recent poll, or `None` when it has never run one.
+async fn fetch_latest_poll(broadcaster_id: &str, token: &str) -> Result<Option<PollData>, String> {
     let url = format!(
         "https://api.twitch.tv/helix/polls?broadcaster_id={}&first=1",
         urlencoding::encode(broadcaster_id)
@@ -1872,11 +1883,7 @@ async fn fetch_latest_poll(broadcaster_id: &str, token: &str) -> Result<PollData
 
     let polls: PollsResponse = serde_json::from_str(&text)
         .map_err(|error| format!("Failed to parse polls response: {error}"))?;
-    polls
-        .data
-        .into_iter()
-        .next()
-        .ok_or_else(|| "Failed to find any polls".to_string())
+    Ok(polls.data.into_iter().next())
 }
 
 async fn update_poll_status(
@@ -1965,7 +1972,8 @@ async fn close_active_poll(channel: &str, action: PollCloseAction) -> CommandRes
     };
 
     let poll = match fetch_latest_poll(&broadcaster_id, &token).await {
-        Ok(poll) => poll,
+        Ok(Some(poll)) => poll,
+        Ok(None) => return CommandResult::Error("Failed to find any polls".to_string()),
         Err(error) => return CommandResult::Error(error),
     };
     if poll.status != "ACTIVE" {
@@ -2044,7 +2052,7 @@ async fn fetch_all_chatters(
                     channel: channel.to_string(),
                     total_count: total.unwrap_or(entries.len()),
                     chatters: entries,
-                    source: "Twitch".to_string(),
+                    source: ChatterListSource::Twitch,
                     login_sorted: true,
                     is_loading: true,
                 },
@@ -2101,18 +2109,13 @@ pub async fn cmd_chatters(channel: &str) -> CommandResult {
             channel: channel.clone(),
             chatters: entries,
             total_count: total.unwrap_or(loaded_count),
-            source: "Twitch".to_string(),
+            source: ChatterListSource::Twitch,
             login_sorted: true,
             is_loading: false,
         },
     );
 
     CommandResult::Success(Some(format_chatters_status(&channel, loaded_count, total)))
-}
-
-/// /test-chatters
-pub async fn cmd_test_chatters(channel: &str) -> CommandResult {
-    cmd_chatters(channel).await
 }
 
 /// /mods
@@ -2125,15 +2128,17 @@ pub async fn cmd_vips(channel: &str) -> CommandResult {
     cmd_role_list(channel, RoleListKind::Vips).await
 }
 
-pub async fn refresh_chatter_list_source(channel: &str, source: &str) -> CommandResult {
-    if source.eq_ignore_ascii_case("Twitch moderators") {
-        cmd_mods(channel).await
-    } else if source.eq_ignore_ascii_case("Twitch VIPs") {
-        cmd_vips(channel).await
-    } else if source.eq_ignore_ascii_case("observed") {
-        super::local::cmd_observed_chatters(channel, None)
-    } else {
-        cmd_chatters(channel).await
+/// Reload a chatter list from `source`; an unknown source reloads Twitch's
+/// live chatter list.
+pub async fn refresh_chatter_list_source(
+    channel: &str,
+    source: Option<ChatterListSource>,
+) -> CommandResult {
+    match source {
+        Some(ChatterListSource::Moderators) => cmd_mods(channel).await,
+        Some(ChatterListSource::Vips) => cmd_vips(channel).await,
+        Some(ChatterListSource::Observed) => super::local::cmd_observed_chatters(channel, None),
+        Some(ChatterListSource::Twitch) | None => cmd_chatters(channel).await,
     }
 }
 
@@ -2145,19 +2150,13 @@ pub async fn cmd_announce(channel: &str, command: &str, message: &str) -> Comman
 
     let color = super::helix_core::announcement_color(command);
 
-    let broadcaster_id = match get_cached_channel_id(channel) {
-        Some(id) => id,
-        None => return CommandResult::Error("Channel ID not found".to_string()),
-    };
-
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
-    };
-
-    let user_id = match get_current_user_id().await {
-        Ok(id) => id,
-        Err(e) => return CommandResult::Error(e),
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id,
+        token,
+    } = match HelixCommandContext::resolve(channel).await {
+        Ok(context) => context,
+        Err(error) => return error,
     };
 
     let url = super::helix_core::announcement_url(&broadcaster_id, &user_id);
@@ -2177,20 +2176,8 @@ pub async fn cmd_announce(channel: &str, command: &str, message: &str) -> Comman
         Ok(resp) if resp.status().is_success() => {
             CommandResult::Success(Some(format!("Announcement sent ({})", color)))
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let text = crate::backend::http::error_body(resp).await;
-            if let Some(error) =
-                renewed_session_error(status, &token, &text, "Announce failed").await
-            {
-                return error;
-            }
-            CommandResult::http_error(
-                status.as_u16(),
-                format!("Announce failed ({status}): {text}"),
-            )
-        }
-        Err(e) => CommandResult::DeliveryUnknown(format!("Announce request failed: {e}")),
+        Ok(resp) => helix_failure(resp, &token, "Announce").await,
+        Err(e) => helix_transport_failure(e, "Announce"),
     }
 }
 
@@ -2201,19 +2188,13 @@ pub async fn cmd_shoutout(channel: &str, args: &str) -> CommandResult {
         return CommandResult::Error("Usage: /shoutout <username>".to_string());
     }
 
-    let broadcaster_id = match get_cached_channel_id(channel) {
-        Some(id) => id,
-        None => return CommandResult::Error("Channel ID not found".to_string()),
-    };
-
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
-    };
-
-    let user_id = match get_current_user_id().await {
-        Ok(id) => id,
-        Err(e) => return CommandResult::Error(e),
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id,
+        token,
+    } = match HelixCommandContext::resolve(channel).await {
+        Ok(context) => context,
+        Err(error) => return error,
     };
 
     let target_id = match get_user_id_cached(username).await {
@@ -2237,20 +2218,8 @@ pub async fn cmd_shoutout(channel: &str, args: &str) -> CommandResult {
         Ok(resp) if resp.status().is_success() => {
             CommandResult::Success(Some(format!("Shoutout sent to {}", username)))
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let text = crate::backend::http::error_body(resp).await;
-            if let Some(error) =
-                renewed_session_error(status, &token, &text, "Shoutout failed").await
-            {
-                return error;
-            }
-            CommandResult::http_error(
-                status.as_u16(),
-                format!("Shoutout failed ({status}): {text}"),
-            )
-        }
-        Err(e) => CommandResult::DeliveryUnknown(format!("Shoutout request failed: {e}")),
+        Ok(resp) => helix_failure(resp, &token, "Shoutout").await,
+        Err(e) => helix_transport_failure(e, "Shoutout"),
     }
 }
 
@@ -2269,14 +2238,14 @@ struct CreateClipEntry {
 
 /// /clip
 pub async fn cmd_clip(channel: &str) -> CommandResult {
-    let broadcaster_id = match get_cached_channel_id(channel) {
-        Some(id) => id,
-        None => return CommandResult::Error("Channel ID not found".to_string()),
+    let broadcaster_id = match get_channel_id_for_command(channel).await {
+        Ok(id) => id,
+        Err(error) => return CommandResult::Error(error),
     };
 
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let url = format!(
@@ -2305,15 +2274,8 @@ pub async fn cmd_clip(channel: &str) -> CommandResult {
                 _ => CommandResult::Success(Some("Clip created!".to_string())),
             }
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let text = crate::backend::http::error_body(resp).await;
-            if let Some(error) = renewed_session_error(status, &token, &text, "Clip failed").await {
-                return error;
-            }
-            CommandResult::http_error(status.as_u16(), format!("Clip failed ({status}): {text}"))
-        }
-        Err(e) => CommandResult::DeliveryUnknown(format!("Clip request failed: {e}")),
+        Ok(resp) => helix_failure(resp, &token, "Clip").await,
+        Err(e) => helix_transport_failure(e, "Clip"),
     }
 }
 
@@ -2324,9 +2286,9 @@ pub async fn cmd_marker(channel: &str, args: &str) -> CommandResult {
         Err(e) => return CommandResult::Error(e),
     };
 
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let body = match super::helix_core::marker_body(&broadcaster_id, args) {
@@ -2364,16 +2326,8 @@ pub async fn cmd_marker(channel: &str, args: &str) -> CommandResult {
                 Err(_) => CommandResult::Success(Some("Stream marker created".to_string())),
             }
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let text = crate::backend::http::error_body(resp).await;
-            if let Some(error) = renewed_session_error(status, &token, &text, "Marker failed").await
-            {
-                return error;
-            }
-            CommandResult::http_error(status.as_u16(), format!("Marker failed ({status}): {text}"))
-        }
-        Err(e) => CommandResult::DeliveryUnknown(format!("Marker request failed: {e}")),
+        Ok(resp) => helix_failure(resp, &token, "Marker").await,
+        Err(e) => helix_transport_failure(e, "Marker"),
     }
 }
 
@@ -2387,9 +2341,9 @@ async fn modify_channel_info(
         Err(e) => return CommandResult::Error(e),
     };
 
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let url = super::helix_core::channel_info_url(&broadcaster_id);
@@ -2464,17 +2418,13 @@ struct ShieldModeData {
 }
 
 async fn update_shield_mode(channel: &str, active: bool) -> CommandResult {
-    let broadcaster_id = match get_channel_id_for_command(channel).await {
-        Ok(id) => id,
-        Err(error) => return CommandResult::Error(error),
-    };
-    let moderator_id = match get_current_user_id().await {
-        Ok(id) => id,
-        Err(error) => return CommandResult::Error(error),
-    };
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id: moderator_id,
+        token,
+    } = match HelixCommandContext::resolve(channel).await {
+        Ok(context) => context,
+        Err(error) => return error,
     };
     let url = format!(
         "https://api.twitch.tv/helix/moderation/shield_mode?broadcaster_id={}&moderator_id={}",
@@ -2552,9 +2502,9 @@ pub async fn cmd_color(args: &str) -> CommandResult {
         Ok(id) => id,
         Err(error) => return CommandResult::Error(error),
     };
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
     let body = serde_json::json!({
         "user_id": user_id,
@@ -2598,9 +2548,9 @@ pub async fn cmd_commercial(channel: &str, args: &str) -> CommandResult {
         Ok(id) => id,
         Err(error) => return CommandResult::Error(error),
     };
-    let token = match get_token() {
-        Some(token) => token,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
     let body = serde_json::json!({
         "broadcaster_id": broadcaster_id,
@@ -2624,20 +2574,8 @@ pub async fn cmd_commercial(channel: &str, args: &str) -> CommandResult {
             },
             Err(_) => CommandResult::Success(Some("Commercial started".to_string())),
         },
-        Ok(resp) => {
-            let status = resp.status();
-            let text = crate::backend::http::error_body(resp).await;
-            if let Some(error) =
-                renewed_session_error(status, &token, &text, "Commercial failed").await
-            {
-                return error;
-            }
-            CommandResult::http_error(
-                status.as_u16(),
-                format!("Commercial failed ({status}): {text}"),
-            )
-        }
-        Err(error) => CommandResult::DeliveryUnknown(format!("Commercial request failed: {error}")),
+        Ok(resp) => helix_failure(resp, &token, "Commercial").await,
+        Err(error) => helix_transport_failure(error, "Commercial"),
     }
 }
 
@@ -2648,9 +2586,9 @@ pub async fn cmd_setgame(channel: &str, args: &str) -> CommandResult {
         Err(usage) => return CommandResult::Error(usage),
     };
 
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let category = match send_helix_idempotent(&token, |token| {
@@ -2696,14 +2634,14 @@ pub async fn cmd_raid(channel: &str, args: &str) -> CommandResult {
         return CommandResult::Error("Usage: /raid <channel>".to_string());
     }
 
-    let broadcaster_id = match get_cached_channel_id(channel) {
-        Some(id) => id,
-        None => return CommandResult::Error("Channel ID not found".to_string()),
+    let broadcaster_id = match get_channel_id_for_command(channel).await {
+        Ok(id) => id,
+        Err(error) => return CommandResult::Error(error),
     };
 
-    let token = match get_token() {
-        Some(t) => t,
-        None => return CommandResult::Error("Not authenticated".to_string()),
+    let token = match ensure_helix_command_token() {
+        Ok(token) => token,
+        Err(block) => return CommandResult::Error(block.into()),
     };
 
     let target_id = match get_user_id_cached(target).await {
@@ -2809,11 +2747,14 @@ pub(crate) async fn cmd_warn_with_auth(
         return CommandResult::Error("Usage: /warn <username> <reason>".to_string());
     }
 
-    let (broadcaster_id, user_id, token) =
-        match helix_moderation_context_with_auth(channel, auth).await {
-            Ok(context) => context,
-            Err(error) => return CommandResult::Error(error),
-        };
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id,
+        token,
+    } = match helix_moderation_context_with_auth(channel, auth).await {
+        Ok(context) => context,
+        Err(error) => return CommandResult::Error(error),
+    };
 
     let target_id = match get_user_id_cached(username).await {
         Ok(id) => id,
@@ -2850,16 +2791,27 @@ pub(crate) async fn cmd_warn_with_auth(
         Ok(resp) if resp.status().is_success() => {
             CommandResult::Success(Some(format!("Warning sent to {}", username)))
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let text = crate::backend::http::error_body(resp).await;
-            if let Some(error) = renewed_session_error(status, &token, &text, "Warn failed").await {
-                return error;
-            }
-            CommandResult::http_error(status.as_u16(), format!("Warn failed ({status}): {text}"))
-        }
-        Err(e) => CommandResult::DeliveryUnknown(format!("Warn request failed: {e}")),
+        Ok(resp) => helix_failure(resp, &token, "Warn").await,
+        Err(e) => helix_transport_failure(e, "Warn"),
     }
+}
+
+/// The failure of a Helix command whose response was not a success: an expired
+/// session is renewed and reported as "try again", anything else as
+/// `"{action} failed ({status}): {body}"`.
+async fn helix_failure(resp: reqwest::Response, token: &str, action: &str) -> CommandResult {
+    let status = resp.status();
+    let text = crate::backend::http::error_body(resp).await;
+    let failure = format!("{action} failed");
+    if let Some(error) = renewed_session_error(status, token, &text, &failure).await {
+        return error;
+    }
+    CommandResult::http_error(status.as_u16(), format!("{failure} ({status}): {text}"))
+}
+
+/// A Helix command request that got no response; it may still have been applied.
+fn helix_transport_failure(error: reqwest::Error, action: &str) -> CommandResult {
+    CommandResult::DeliveryUnknown(format!("{action} request failed: {error}"))
 }
 
 /// A Helix 401 for a request that is not re-sent: renew the session so the next
@@ -2879,41 +2831,85 @@ async fn renewed_session_error(
     )
 }
 
-/// Friendly authentication blockers for Helix command paths, mirroring the
-/// `ensure_authenticated_send_ready` wording used by the IRC send path.
-fn ensure_helix_command_token() -> Result<String, String> {
-    if crate::backend::irc::is_anonymous_mode() {
-        return Err(
-            "Cannot run Twitch commands while Echo is connected anonymously. Turn off Anonymous in the account switcher, re-authenticate the active Twitch account, or wait for the authenticated reconnect to finish."
-                .to_string(),
-        );
-    }
+/// Why the active account cannot run Helix commands, mirroring
+/// [`crate::backend::irc::SendBlock`] for the IRC send path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandAuthBlock {
+    Anonymous,
+    NeedsReauth,
+    NoAccount,
+    NoToken { username: String },
+}
 
-    if crate::backend::auth::get_needs_reauth() {
-        return Err(
-            "Cannot run Twitch commands until the active Twitch account is re-authenticated."
-                .to_string(),
-        );
-    }
-
-    let Some(username) = get_username().filter(|username| !username.trim().is_empty()) else {
-        return Err("Cannot run Twitch commands without an active Twitch account.".to_string());
-    };
-
-    match get_token().filter(|token| !token.trim().is_empty()) {
-        Some(token) => Ok(token),
-        None => Err(format!(
-            "Cannot run Twitch commands as {username}; the active account has no Twitch token. Re-authenticate the account."
-        )),
+impl std::fmt::Display for CommandAuthBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => f.write_str(
+                "Cannot run Twitch commands while Echo is connected anonymously. Turn off Anonymous in the account switcher, re-authenticate the active Twitch account, or wait for the authenticated reconnect to finish.",
+            ),
+            Self::NeedsReauth => f.write_str(
+                "Cannot run Twitch commands until the active Twitch account is re-authenticated.",
+            ),
+            Self::NoAccount => {
+                f.write_str("Cannot run Twitch commands without an active Twitch account.")
+            }
+            Self::NoToken { username } => write!(
+                f,
+                "Cannot run Twitch commands as {username}; the active account has no Twitch token. Re-authenticate the account."
+            ),
+        }
     }
 }
 
-/// Resolve (broadcaster_id, moderator_id, token) for moderator-scoped Helix calls.
-async fn helix_moderation_context(channel: &str) -> Result<(String, String, String), String> {
-    let token = ensure_helix_command_token()?;
-    let broadcaster_id = get_channel_id_for_command(channel).await?;
-    let moderator_id = get_current_user_id().await?;
-    Ok((broadcaster_id, moderator_id, token))
+impl From<CommandAuthBlock> for String {
+    fn from(block: CommandAuthBlock) -> Self {
+        block.to_string()
+    }
+}
+
+/// The active account's Helix token, or why commands cannot run.
+fn ensure_helix_command_token() -> Result<String, CommandAuthBlock> {
+    if crate::backend::irc::is_anonymous_mode() {
+        return Err(CommandAuthBlock::Anonymous);
+    }
+
+    if crate::backend::auth::get_needs_reauth() {
+        return Err(CommandAuthBlock::NeedsReauth);
+    }
+
+    let Some(username) = get_username().filter(|username| !username.trim().is_empty()) else {
+        return Err(CommandAuthBlock::NoAccount);
+    };
+
+    get_token()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or(CommandAuthBlock::NoToken { username })
+}
+
+/// The channel, account and token a Helix command acts with. For moderator
+/// endpoints `user_id` is the moderator id.
+struct HelixCommandContext {
+    broadcaster_id: String,
+    user_id: String,
+    token: String,
+}
+
+impl HelixCommandContext {
+    /// Resolve the active account's token first, so a signed-out user gets the
+    /// authentication message rather than a lookup failure.
+    async fn resolve(channel: &str) -> Result<Self, CommandResult> {
+        let token =
+            ensure_helix_command_token().map_err(|block| CommandResult::Error(block.into()))?;
+        let broadcaster_id = get_channel_id_for_command(channel)
+            .await
+            .map_err(CommandResult::Error)?;
+        let user_id = get_current_user_id().await.map_err(CommandResult::Error)?;
+        Ok(Self {
+            broadcaster_id,
+            user_id,
+            token,
+        })
+    }
 }
 
 /// Resolve moderation request inputs from one account-generation snapshot. The
@@ -2921,7 +2917,7 @@ async fn helix_moderation_context(channel: &str) -> Result<(String, String, Stri
 async fn helix_moderation_context_with_auth(
     channel: &str,
     auth: &crate::backend::auth::AuthenticatedUserResource,
-) -> Result<(String, String, String), String> {
+) -> Result<HelixCommandContext, String> {
     if !auth.is_current() {
         return Err(
             "The active Twitch account changed before moderation could be updated. Try again."
@@ -2935,11 +2931,11 @@ async fn helix_moderation_context_with_auth(
                 .to_string(),
         );
     }
-    Ok((
+    Ok(HelixCommandContext {
         broadcaster_id,
-        auth.user_id.clone(),
-        auth.access_token.clone(),
-    ))
+        user_id: auth.user_id.clone(),
+        token: auth.access_token.clone(),
+    })
 }
 
 fn capture_moderation_auth()
@@ -2969,11 +2965,14 @@ async fn apply_ban_state_by_user_id_with_auth(
         return CommandResult::Error("Usage: id:<userID>".to_string());
     }
 
-    let (broadcaster_id, moderator_id, token) =
-        match helix_moderation_context_with_auth(channel, auth).await {
-            Ok(context) => context,
-            Err(error) => return CommandResult::Error(error),
-        };
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id: moderator_id,
+        token,
+    } = match helix_moderation_context_with_auth(channel, auth).await {
+        Ok(context) => context,
+        Err(error) => return CommandResult::Error(error),
+    };
     let url = format!(
         "https://api.twitch.tv/helix/moderation/bans?broadcaster_id={}&moderator_id={}",
         urlencoding::encode(&broadcaster_id),
@@ -3035,11 +3034,14 @@ async fn remove_ban_state_by_user_id_with_auth(
         return CommandResult::Error("Usage: id:<userID>".to_string());
     }
 
-    let (broadcaster_id, moderator_id, token) =
-        match helix_moderation_context_with_auth(channel, auth).await {
-            Ok(context) => context,
-            Err(error) => return CommandResult::Error(error),
-        };
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id: moderator_id,
+        token,
+    } = match helix_moderation_context_with_auth(channel, auth).await {
+        Ok(context) => context,
+        Err(error) => return CommandResult::Error(error),
+    };
     let url = format!(
         "https://api.twitch.tv/helix/moderation/bans?broadcaster_id={}&moderator_id={}&user_id={}",
         urlencoding::encode(&broadcaster_id),
@@ -3183,11 +3185,14 @@ pub(crate) async fn delete_chat_messages_with_auth(
     message_id: Option<&str>,
     auth: &crate::backend::auth::AuthenticatedUserResource,
 ) -> CommandResult {
-    let (broadcaster_id, moderator_id, token) =
-        match helix_moderation_context_with_auth(channel, auth).await {
-            Ok(context) => context,
-            Err(error) => return CommandResult::Error(error),
-        };
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id: moderator_id,
+        token,
+    } = match helix_moderation_context_with_auth(channel, auth).await {
+        Ok(context) => context,
+        Err(error) => return CommandResult::Error(error),
+    };
     let mut url = format!(
         "https://api.twitch.tv/helix/moderation/chat?broadcaster_id={}&moderator_id={}",
         urlencoding::encode(&broadcaster_id),
@@ -3238,9 +3243,13 @@ async fn update_chat_settings(
     patch: serde_json::Value,
     success_message: String,
 ) -> CommandResult {
-    let (broadcaster_id, moderator_id, token) = match helix_moderation_context(channel).await {
+    let HelixCommandContext {
+        broadcaster_id,
+        user_id: moderator_id,
+        token,
+    } = match HelixCommandContext::resolve(channel).await {
         Ok(context) => context,
-        Err(error) => return CommandResult::Error(error),
+        Err(error) => return error,
     };
     let url = format!(
         "https://api.twitch.tv/helix/chat/settings?broadcaster_id={}&moderator_id={}",
@@ -3404,7 +3413,7 @@ pub async fn cmd_followers_only_off(channel: &str) -> CommandResult {
 pub async fn cmd_unraid(channel: &str) -> CommandResult {
     let token = match ensure_helix_command_token() {
         Ok(token) => token,
-        Err(error) => return CommandResult::Error(error),
+        Err(block) => return CommandResult::Error(block.into()),
     };
     let broadcaster_id = match get_channel_id_for_command(channel).await {
         Ok(id) => id,
@@ -3463,7 +3472,7 @@ async fn set_user_block_state(args: &str, block: bool) -> CommandResult {
             let verb = if block { "Blocked" } else { "Unblocked" };
             CommandResult::Success(Some(format!("{verb} {username} on Twitch")))
         }
-        Err(error) => CommandResult::Error(error),
+        Err(error) => CommandResult::Error(error.into()),
     }
 }
 

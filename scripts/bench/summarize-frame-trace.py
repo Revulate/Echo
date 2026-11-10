@@ -7,7 +7,7 @@ import argparse
 import csv
 from pathlib import Path
 
-from benchlib import append_notes, ensure_object, load_json, slug, utc_stamp, write_json
+from benchlib import append_notes, ensure_object, load_json, percentile, slug, utc_stamp, write_json
 
 
 FRAME_TIME_COLUMNS = (
@@ -24,21 +24,6 @@ FRAME_TIME_COLUMNS = (
     "duration_ms",
     "DurationMs",
 )
-
-
-def percentile(sorted_values: list[float], percent: float) -> float | None:
-    if not sorted_values:
-        return None
-    if len(sorted_values) == 1:
-        return round(sorted_values[0], 6)
-    rank = (percent / 100.0) * (len(sorted_values) - 1)
-    lower = int(rank)
-    upper = min(lower + 1, len(sorted_values) - 1)
-    if lower == upper:
-        return round(sorted_values[lower], 6)
-    weight = rank - lower
-    value = (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
-    return round(value, 6)
 
 
 def find_frame_time_column(columns: list[str]) -> str | None:

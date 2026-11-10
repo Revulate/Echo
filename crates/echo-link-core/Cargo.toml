@@ -3,14 +3,14 @@ name = "echo-link-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "GPUI-free link classification and provider URL parsing for Echo"
+description = "GPUI-free link classification, provider URL parsing and image-uploader presets for Echo"
 license.workspace = true
 repository.workspace = true
 publish = false
 
 [dependencies]
 http = "1"
-regex = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-url = "2.5"
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true

@@ -1,12 +1,12 @@
-//! Input Manager - Extracted from app.rs monolith
+//! Composer input state.
 //!
 //! Handles:
-//! - Per-split input text management
+//! - Per-split draft text, caret, selection and undo history
 //! - Message history navigation (up/down arrows)
 //! - Placeholder input management
 //!
-//! Note: Reply state is now per-split in SplitPane.
-//! Note: Focus management remains in EchoApp since FocusHandle requires App context.
+//! Reply state is per split in `SplitPane`; focus stays in `EchoApp` because
+//! `FocusHandle` requires an `App` context.
 
 use crate::components::ui::input::InputState;
 use crate::state::SplitId;
@@ -93,25 +93,63 @@ pub struct PlaceholderInput {
     pub _subscriptions: Rc<Vec<Subscription>>,
 }
 
-/// Manager entity for input state and behavior
+/// Everything the composer keeps for one split's draft.
 ///
-/// Note: Focus handle is kept in EchoApp since FocusHandle requires App context.
-/// Note: Reply state is per-split in SplitPane, not here.
-/// This struct manages input data/state only.
+/// One struct per split means a split's draft lifecycle (clear, close, prune)
+/// is a single map operation instead of one per field.
+#[derive(Default)]
+struct SplitDraft {
+    /// `None` until the split has a draft; `Some("")` is a draft that was emptied.
+    text: Option<String>,
+    /// Caret byte offset. `None` keeps the caret at the end of the text.
+    cursor: Option<usize>,
+    selection: Option<Range<usize>>,
+    edit_transaction: Option<DraftEditTransaction>,
+    undo: Vec<DraftEditSnapshot>,
+    redo: Vec<DraftEditSnapshot>,
+    ime_composition_start: Option<DraftEditSnapshot>,
+    /// Position in the channel's sent-message history while navigating it.
+    history_index: Option<usize>,
+    /// The draft stashed by the first Up, restored by Down past the newest entry.
+    stashed_input: Option<String>,
+    /// The history entry last recalled into the draft.
+    recalled_text: Option<String>,
+}
+
+impl SplitDraft {
+    /// Replace the draft with `text`, caret at its end and no selection.
+    fn show_text(&mut self, text: String) {
+        self.cursor = Some(text.len());
+        self.text = Some(text);
+        self.selection = None;
+    }
+
+    /// Show a history entry and remember it as the recalled text.
+    fn show_recalled(&mut self, text: String) {
+        self.recalled_text = Some(text.clone());
+        self.show_text(text);
+    }
+}
+
+/// Whether `range` is a non-empty selection on UTF-8 boundaries of `text`.
+fn is_selection_in(text: &str, range: &Range<usize>) -> bool {
+    range.start < range.end
+        && range.end <= text.len()
+        && text.is_char_boundary(range.start)
+        && text.is_char_boundary(range.end)
+}
+
+/// Composer input state for every split.
+///
+/// The focus handle stays in `EchoApp` because `FocusHandle` needs an `App`
+/// context; reply state is per split in `SplitPane`. Empty splits keep their
+/// channel chooser in `placeholder_inputs`, which has its own lifecycle.
+#[derive(Default)]
 pub struct InputManager {
-    pub input_texts: HashMap<SplitId, String>,
-    pub cursor_positions: HashMap<SplitId, usize>,
-    selection_ranges: HashMap<SplitId, Range<usize>>,
+    drafts: HashMap<SplitId, SplitDraft>,
     focused_split: Option<SplitId>,
-    edit_transactions: HashMap<SplitId, DraftEditTransaction>,
-    undo_stacks: HashMap<SplitId, Vec<DraftEditSnapshot>>,
-    redo_stacks: HashMap<SplitId, Vec<DraftEditSnapshot>>,
-    ime_composition_starts: HashMap<SplitId, DraftEditSnapshot>,
 
     pub input_history: HashMap<String, Vec<String>>,
-    pub history_index: HashMap<SplitId, Option<usize>>,
-    pub temp_input: HashMap<SplitId, Option<String>>,
-    recalled_text: HashMap<SplitId, String>,
 
     pub placeholder_inputs: HashMap<SplitId, PlaceholderInput>,
     pub focused_placeholder: Option<SplitId>,
@@ -119,79 +157,79 @@ pub struct InputManager {
 
 impl InputManager {
     pub fn new() -> Self {
-        Self {
-            input_texts: HashMap::new(),
-            cursor_positions: HashMap::new(),
-            selection_ranges: HashMap::new(),
-            focused_split: None,
-            edit_transactions: HashMap::new(),
-            undo_stacks: HashMap::new(),
-            redo_stacks: HashMap::new(),
-            ime_composition_starts: HashMap::new(),
-            input_history: HashMap::new(),
-            history_index: HashMap::new(),
-            temp_input: HashMap::new(),
-            recalled_text: HashMap::new(),
-            placeholder_inputs: HashMap::new(),
-            focused_placeholder: None,
+        Self::default()
+    }
+
+    fn slot(&self, split_id: SplitId) -> Option<&SplitDraft> {
+        self.drafts.get(&split_id)
+    }
+
+    fn slot_mut(&mut self, split_id: SplitId) -> &mut SplitDraft {
+        self.drafts.entry(split_id).or_default()
+    }
+
+    /// The split's draft text, or `None` when it has no draft.
+    pub fn draft(&self, split_id: SplitId) -> Option<&String> {
+        self.slot(split_id)?.text.as_ref()
+    }
+
+    /// Whether the split has a draft, even an empty one.
+    pub fn has_draft(&self, split_id: SplitId) -> bool {
+        self.draft(split_id).is_some()
+    }
+
+    /// Replace the draft text without touching the caret, selection or undo history.
+    pub fn set_draft_text(&mut self, split_id: SplitId, text: String) {
+        self.slot_mut(split_id).text = Some(text);
+    }
+
+    /// Drop the draft text without touching the caret, selection or undo history.
+    pub fn remove_draft_text(&mut self, split_id: SplitId) {
+        if let Some(draft) = self.drafts.get_mut(&split_id) {
+            draft.text = None;
         }
     }
-}
 
-impl Default for InputManager {
-    fn default() -> Self {
-        Self::new()
+    /// The caret exactly as stored, `None` when it tracks the end of the draft.
+    pub fn stored_cursor(&self, split_id: SplitId) -> Option<usize> {
+        self.slot(split_id)?.cursor
     }
-}
 
-impl InputManager {
+    /// Leave history navigation and forget the stashed draft, keeping the
+    /// recalled entry.
+    pub fn drop_history_stash(&mut self, split_id: SplitId) {
+        if let Some(draft) = self.drafts.get_mut(&split_id) {
+            draft.history_index = None;
+            draft.stashed_input = None;
+        }
+    }
+
     /// Current draft text for a split, or `""` when no draft exists.
     pub fn text_for_split(&self, split_id: SplitId) -> &str {
-        self.input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("")
+        self.draft(split_id).map(String::as_str).unwrap_or("")
     }
 
     pub fn cursor_for_split(&self, split_id: SplitId) -> usize {
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
+        let text = self.text_for_split(split_id);
         let cursor = self
-            .cursor_positions
-            .get(&split_id)
-            .copied()
+            .slot(split_id)
+            .and_then(|draft| draft.cursor)
             .unwrap_or(text.len());
         Self::clamp_cursor(text, cursor)
     }
 
     /// Current non-empty UTF-8-safe selection for a composer draft.
     pub fn selection_for_split(&self, split_id: SplitId) -> Option<Range<usize>> {
-        let range = self.selection_ranges.get(&split_id)?.clone();
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
-        (range.start < range.end
-            && range.end <= text.len()
-            && text.is_char_boundary(range.start)
-            && text.is_char_boundary(range.end))
-        .then_some(range)
+        let range = self.slot(split_id)?.selection.clone()?;
+        is_selection_in(self.text_for_split(split_id), &range).then_some(range)
     }
 
     pub fn set_cursor_for_split(&mut self, split_id: SplitId, cursor: usize) {
         self.break_edit_transaction(split_id);
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
-        self.cursor_positions
-            .insert(split_id, Self::clamp_cursor(text, cursor));
-        self.selection_ranges.remove(&split_id);
+        let cursor = Self::clamp_cursor(self.text_for_split(split_id), cursor);
+        let draft = self.slot_mut(split_id);
+        draft.cursor = Some(cursor);
+        draft.selection = None;
     }
 
     /// Restore an exact cursor/selection snapshot owned by the disposable UI
@@ -204,30 +242,12 @@ impl InputManager {
         selection: Option<Range<usize>>,
     ) {
         self.break_edit_transaction(split_id);
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
-        match cursor {
-            Some(cursor) => {
-                self.cursor_positions
-                    .insert(split_id, Self::clamp_cursor(text, cursor));
-            }
-            None => {
-                self.cursor_positions.remove(&split_id);
-            }
-        }
-        if let Some(selection) = selection.filter(|range| {
-            range.start < range.end
-                && range.end <= text.len()
-                && text.is_char_boundary(range.start)
-                && text.is_char_boundary(range.end)
-        }) {
-            self.selection_ranges.insert(split_id, selection);
-        } else {
-            self.selection_ranges.remove(&split_id);
-        }
+        let text = self.text_for_split(split_id);
+        let cursor = cursor.map(|cursor| Self::clamp_cursor(text, cursor));
+        let selection = selection.filter(|range| is_selection_in(text, range));
+        let draft = self.slot_mut(split_id);
+        draft.cursor = cursor;
+        draft.selection = selection;
     }
 
     /// Move the caret and update a mouse-drag selection without recording an
@@ -241,23 +261,16 @@ impl InputManager {
         focus: usize,
     ) -> bool {
         self.break_edit_transaction(split_id);
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
+        let text = self.text_for_split(split_id);
         let anchor = Self::clamp_cursor(text, anchor);
         let focus = Self::clamp_cursor(text, focus);
         let previous_cursor = self.cursor_for_split(split_id);
         let previous_selection = self.selection_for_split(split_id);
         let next_selection = (anchor != focus).then_some(anchor.min(focus)..anchor.max(focus));
 
-        self.cursor_positions.insert(split_id, focus);
-        if let Some(selection) = next_selection.clone() {
-            self.selection_ranges.insert(split_id, selection);
-        } else {
-            self.selection_ranges.remove(&split_id);
-        }
+        let draft = self.slot_mut(split_id);
+        draft.cursor = Some(focus);
+        draft.selection = next_selection.clone();
 
         previous_cursor != focus || previous_selection != next_selection
     }
@@ -272,7 +285,8 @@ impl InputManager {
         self.record_undo_state(split_id);
         let cursor = self.cursor_for_split(split_id);
         let selection = self.selection_for_split(split_id);
-        let text = self.input_texts.entry(split_id).or_default();
+        let draft = self.slot_mut(split_id);
+        let text = draft.text.get_or_insert_default();
         let next_cursor = if let Some(range) = selection {
             text.replace_range(range.clone(), inserted);
             range.start + inserted.len()
@@ -280,8 +294,8 @@ impl InputManager {
             text.insert_str(cursor, inserted);
             cursor + inserted.len()
         };
-        self.cursor_positions.insert(split_id, next_cursor);
-        self.selection_ranges.remove(&split_id);
+        draft.cursor = Some(next_cursor);
+        draft.selection = None;
         true
     }
 
@@ -296,11 +310,7 @@ impl InputManager {
         record_undo: bool,
     ) -> Option<Range<usize>> {
         self.set_focused_split(Some(split_id));
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
+        let text = self.text_for_split(split_id);
         let typing = range.is_none()
             && self.selection_for_split(split_id).is_none()
             && !inserted.is_empty()
@@ -325,15 +335,16 @@ impl InputManager {
                 self.record_undo_state(split_id);
             }
         }
-        self.input_texts
-            .entry(split_id)
-            .or_default()
+        let draft = self.slot_mut(split_id);
+        draft
+            .text
+            .get_or_insert_default()
             .replace_range(range.clone(), inserted);
         let inserted_range = range.start..range.start + inserted.len();
-        self.cursor_positions.insert(split_id, inserted_range.end);
-        self.selection_ranges.remove(&split_id);
+        draft.cursor = Some(inserted_range.end);
+        draft.selection = None;
         if record_undo {
-            self.redo_stacks.remove(&split_id);
+            draft.redo.clear();
         }
         if record_undo && typing {
             self.finish_grouped_edit(split_id, DraftEditKind::Typing);
@@ -358,11 +369,7 @@ impl InputManager {
             return false;
         }
 
-        let current_text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
+        let current_text = self.text_for_split(split_id);
         if range.start > range.end
             || range.end > current_text.len()
             || !current_text.is_char_boundary(range.start)
@@ -396,12 +403,13 @@ impl InputManager {
 
         let cursor = range.start + replacement.len() + existing_whitespace_len;
         self.record_undo_state(split_id);
-        self.input_texts
-            .entry(split_id)
-            .or_default()
+        let draft = self.slot_mut(split_id);
+        draft
+            .text
+            .get_or_insert_default()
             .replace_range(range, &replacement);
-        self.cursor_positions.insert(split_id, cursor);
-        self.selection_ranges.remove(&split_id);
+        draft.cursor = Some(cursor);
+        draft.selection = None;
         true
     }
 
@@ -450,7 +458,7 @@ impl InputManager {
         let cursor = self.cursor_for_split(split_id);
         let selection = self.selection_for_split(split_id);
         let next = Self::clamp_cursor(self.text_for_split(split_id), next);
-        self.cursor_positions.insert(split_id, next);
+        self.slot_mut(split_id).cursor = Some(next);
         self.update_selection_from_anchor(
             split_id,
             selection.clone(),
@@ -471,22 +479,19 @@ impl InputManager {
         let cursor = self.cursor_for_split(split_id);
         let selection = self.selection_for_split(split_id);
         if !extend_selection && let Some(range) = selection {
-            self.cursor_positions.insert(split_id, range.start);
-            self.selection_ranges.remove(&split_id);
+            let draft = self.slot_mut(split_id);
+            draft.cursor = Some(range.start);
+            draft.selection = None;
             return true;
         }
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
+        let text = self.text_for_split(split_id);
         let next = if by_word {
             Self::previous_word_boundary(text, cursor)
         } else {
             Self::previous_grapheme_boundary(text, cursor)
         };
         if next != cursor {
-            self.cursor_positions.insert(split_id, next);
+            self.slot_mut(split_id).cursor = Some(next);
             self.update_selection_from_anchor(split_id, selection, cursor, next, extend_selection);
             return true;
         }
@@ -503,22 +508,19 @@ impl InputManager {
         let cursor = self.cursor_for_split(split_id);
         let selection = self.selection_for_split(split_id);
         if !extend_selection && let Some(range) = selection {
-            self.cursor_positions.insert(split_id, range.end);
-            self.selection_ranges.remove(&split_id);
+            let draft = self.slot_mut(split_id);
+            draft.cursor = Some(range.end);
+            draft.selection = None;
             return true;
         }
-        let text = self
-            .input_texts
-            .get(&split_id)
-            .map(String::as_str)
-            .unwrap_or("");
+        let text = self.text_for_split(split_id);
         let next = if by_word {
             Self::next_word_boundary(text, cursor)
         } else {
             Self::next_grapheme_boundary(text, cursor)
         };
         if next != cursor {
-            self.cursor_positions.insert(split_id, next);
+            self.slot_mut(split_id).cursor = Some(next);
             self.update_selection_from_anchor(split_id, selection, cursor, next, extend_selection);
             return true;
         }
@@ -543,7 +545,8 @@ impl InputManager {
         } else {
             self.record_undo_state(split_id);
         }
-        let text = self.input_texts.entry(split_id).or_default();
+        let draft = self.slot_mut(split_id);
+        let text = draft.text.get_or_insert_default();
         let start = if let Some(range) = selection {
             text.replace_range(range.clone(), "");
             range.start
@@ -556,8 +559,8 @@ impl InputManager {
             text.replace_range(start..cursor, "");
             start
         };
-        self.cursor_positions.insert(split_id, start);
-        self.selection_ranges.remove(&split_id);
+        draft.cursor = Some(start);
+        draft.selection = None;
         if grouped {
             self.finish_grouped_edit(split_id, kind);
         }
@@ -569,11 +572,7 @@ impl InputManager {
         self.set_focused_split(Some(split_id));
         let cursor = self.cursor_for_split(split_id);
         let selection = self.selection_for_split(split_id);
-        let text_len = self
-            .input_texts
-            .get(&split_id)
-            .map(|text| text.len())
-            .unwrap_or_default();
+        let text_len = self.text_for_split(split_id).len();
         if selection.is_none() && cursor >= text_len {
             return false;
         }
@@ -588,7 +587,8 @@ impl InputManager {
         } else {
             self.record_undo_state(split_id);
         }
-        let text = self.input_texts.entry(split_id).or_default();
+        let draft = self.slot_mut(split_id);
+        let text = draft.text.get_or_insert_default();
         let next_cursor = if let Some(range) = selection {
             text.replace_range(range.clone(), "");
             range.start
@@ -601,8 +601,8 @@ impl InputManager {
             text.replace_range(cursor..end, "");
             cursor
         };
-        self.cursor_positions.insert(split_id, next_cursor);
-        self.selection_ranges.remove(&split_id);
+        draft.cursor = Some(next_cursor);
+        draft.selection = None;
         if grouped {
             self.finish_grouped_edit(split_id, kind);
         }
@@ -610,12 +610,11 @@ impl InputManager {
         true
     }
 
-    /// Select the entire draft, matching Ctrl/Cmd+A behavior in a native input.
     /// Select the word (or whitespace run) containing `offset` — the native
     /// double-click contract. Returns false when nothing changes.
     pub fn select_word_at(&mut self, split_id: SplitId, offset: usize) -> bool {
         self.break_edit_transaction(split_id);
-        let Some(text) = self.input_texts.get(&split_id) else {
+        let Some(text) = self.draft(split_id) else {
             return false;
         };
         let range = Self::word_run_at(text, offset);
@@ -626,8 +625,9 @@ impl InputManager {
         if previous.as_ref() == Some(&range) && self.cursor_for_split(split_id) == range.end {
             return false;
         }
-        self.cursor_positions.insert(split_id, range.end);
-        self.selection_ranges.insert(split_id, range);
+        let draft = self.slot_mut(split_id);
+        draft.cursor = Some(range.end);
+        draft.selection = Some(range);
         true
     }
 
@@ -660,13 +660,10 @@ impl InputManager {
         start..end
     }
 
+    /// Select the entire draft, matching Ctrl/Cmd+A behavior in a native input.
     pub fn select_all(&mut self, split_id: SplitId) -> bool {
         self.break_edit_transaction(split_id);
-        let text_len = self
-            .input_texts
-            .get(&split_id)
-            .map(|text| text.len())
-            .unwrap_or_default();
+        let text_len = self.text_for_split(split_id).len();
         if text_len == 0 {
             return false;
         }
@@ -675,16 +672,16 @@ impl InputManager {
         {
             return false;
         }
-        self.selection_ranges.insert(split_id, 0..text_len);
-        self.cursor_positions.insert(split_id, text_len);
+        let draft = self.slot_mut(split_id);
+        draft.selection = Some(0..text_len);
+        draft.cursor = Some(text_len);
         true
     }
 
     /// Copy the active selection without changing the draft.
     pub fn copy_selection(&self, split_id: SplitId) -> Option<String> {
         let range = self.selection_for_split(split_id)?;
-        self.input_texts
-            .get(&split_id)
+        self.draft(split_id)
             .map(|text| text[range].to_string())
             .filter(|text| !text.is_empty())
     }
@@ -693,18 +690,18 @@ impl InputManager {
     pub fn cut_selection(&mut self, split_id: SplitId) -> Option<String> {
         let range = self.selection_for_split(split_id)?;
         let copied = self
-            .input_texts
-            .get(&split_id)
+            .draft(split_id)
             .map(|text| text[range.clone()].to_string())?;
         if copied.is_empty() {
             return None;
         }
         self.record_undo_state(split_id);
-        if let Some(text) = self.input_texts.get_mut(&split_id) {
+        let draft = self.slot_mut(split_id);
+        if let Some(text) = draft.text.as_mut() {
             text.replace_range(range.clone(), "");
         }
-        self.cursor_positions.insert(split_id, range.start);
-        self.selection_ranges.remove(&split_id);
+        draft.cursor = Some(range.start);
+        draft.selection = None;
         Some(copied)
     }
 
@@ -720,30 +717,27 @@ impl InputManager {
         if self.selection_for_split(split_id).as_ref() != Some(&range) {
             return None;
         }
-        let text = self.input_texts.get(&split_id)?;
+        let text = self.draft(split_id)?;
         if text.get(range.clone()) != Some(expected_text) {
             return None;
         }
         let removed = expected_text.to_string();
         self.record_undo_state(split_id);
-        self.input_texts
-            .get_mut(&split_id)?
-            .replace_range(range.clone(), "");
-        self.cursor_positions.insert(split_id, range.start);
-        self.selection_ranges.remove(&split_id);
+        let draft = self.drafts.get_mut(&split_id)?;
+        draft.text.as_mut()?.replace_range(range.clone(), "");
+        draft.cursor = Some(range.start);
+        draft.selection = None;
         Some(removed)
     }
 
     pub fn can_undo(&self, split_id: SplitId) -> bool {
-        self.undo_stacks
-            .get(&split_id)
-            .is_some_and(|stack| !stack.is_empty())
+        self.slot(split_id)
+            .is_some_and(|draft| !draft.undo.is_empty())
     }
 
     pub fn can_redo(&self, split_id: SplitId) -> bool {
-        self.redo_stacks
-            .get(&split_id)
-            .is_some_and(|stack| !stack.is_empty())
+        self.slot(split_id)
+            .is_some_and(|draft| !draft.redo.is_empty())
     }
 
     /// Restore the previous split-local draft edit, if any.
@@ -753,14 +747,14 @@ impl InputManager {
         }
         self.break_edit_transaction(split_id);
         let Some(snapshot) = self
-            .undo_stacks
+            .drafts
             .get_mut(&split_id)
-            .and_then(|stack| stack.pop())
+            .and_then(|draft| draft.undo.pop())
         else {
             return false;
         };
         let current = self.snapshot(split_id);
-        Self::push_history_snapshot(self.redo_stacks.entry(split_id).or_default(), current);
+        Self::push_history_snapshot(&mut self.slot_mut(split_id).redo, current);
         self.restore_snapshot(split_id, snapshot);
         true
     }
@@ -772,39 +766,34 @@ impl InputManager {
         }
         self.break_edit_transaction(split_id);
         let Some(snapshot) = self
-            .redo_stacks
+            .drafts
             .get_mut(&split_id)
-            .and_then(|stack| stack.pop())
+            .and_then(|draft| draft.redo.pop())
         else {
             return false;
         };
         let current = self.snapshot(split_id);
-        Self::push_history_snapshot(self.undo_stacks.entry(split_id).or_default(), current);
+        Self::push_history_snapshot(&mut self.slot_mut(split_id).undo, current);
         self.restore_snapshot(split_id, snapshot);
         true
     }
 
-    /// Clear only the editable-draft state for a split. Channel history and
-    /// placeholder-channel state intentionally remain owned by their existing
-    /// lifecycle paths.
+    /// Clear the split's whole draft: text, caret, undo history and history
+    /// navigation. Channel history and placeholder-channel state are owned by
+    /// their own lifecycle paths and stay.
     pub fn clear_draft_for_split(&mut self, split_id: SplitId) {
-        self.break_edit_transaction(split_id);
-        self.ime_composition_starts.remove(&split_id);
-        self.input_texts.remove(&split_id);
-        self.cursor_positions.remove(&split_id);
-        self.selection_ranges.remove(&split_id);
-        self.undo_stacks.remove(&split_id);
-        self.redo_stacks.remove(&split_id);
-        self.reset_history_navigation(split_id);
+        self.drafts.remove(&split_id);
     }
 
     /// Forget the history position and the stashed draft, e.g. when the
     /// split's channel changes.
     pub fn reset_history_navigation(&mut self, split_id: SplitId) {
-        self.break_edit_transaction(split_id);
-        self.history_index.remove(&split_id);
-        self.temp_input.remove(&split_id);
-        self.recalled_text.remove(&split_id);
+        if let Some(draft) = self.drafts.get_mut(&split_id) {
+            draft.edit_transaction = None;
+            draft.history_index = None;
+            draft.stashed_input = None;
+            draft.recalled_text = None;
+        }
     }
 
     /// Insert an emote into the input at the given channel/path
@@ -822,18 +811,12 @@ impl InputManager {
 
     /// Prepare a whisper command without overwriting an unrelated active draft.
     pub fn compose_whisper(&mut self, split_id: SplitId, username: &str) -> bool {
-        let trimmed = self
-            .input_texts
-            .get(&split_id)
-            .map(|input_text| input_text.trim_start().to_string())
-            .unwrap_or_default();
+        let trimmed = self.text_for_split(split_id).trim_start();
 
         if trimmed.is_empty() || trimmed.starts_with("/w ") {
             self.record_undo_state(split_id);
-            let input_text = self.input_texts.entry(split_id).or_default();
-            *input_text = format!("/w {} ", username);
-            self.cursor_positions.insert(split_id, input_text.len());
-            self.selection_ranges.remove(&split_id);
+            self.slot_mut(split_id)
+                .show_text(format!("/w {} ", username));
             self.reset_history_navigation(split_id);
             true
         } else {
@@ -845,23 +828,28 @@ impl InputManager {
     /// stashed by the first Up comes back on Down only while the text still
     /// matches the recalled entry.
     pub fn end_history_navigation(&mut self, split_id: SplitId) {
-        self.history_index.remove(&split_id);
+        if let Some(draft) = self.drafts.get_mut(&split_id) {
+            draft.history_index = None;
+        }
     }
 
     /// Begin a marked-text transaction. Repeated preedit replacements use the
     /// captured baseline and become one undo step only when committed.
     pub(crate) fn begin_ime_composition(&mut self, split_id: SplitId) {
-        if self.ime_composition_starts.contains_key(&split_id) {
+        if self
+            .slot(split_id)
+            .is_some_and(|draft| draft.ime_composition_start.is_some())
+        {
             return;
         }
         self.break_edit_transaction(split_id);
         let baseline = self.snapshot(split_id);
-        self.ime_composition_starts.insert(split_id, baseline);
+        self.slot_mut(split_id).ime_composition_start = Some(baseline);
     }
 
     /// Commit a marked-text transaction as one undoable draft edit.
     pub(crate) fn commit_ime_composition(&mut self, split_id: SplitId) -> bool {
-        let Some(baseline) = self.ime_composition_starts.remove(&split_id) else {
+        let Some(baseline) = self.take_ime_composition_start(split_id) else {
             return false;
         };
         self.break_edit_transaction(split_id);
@@ -875,13 +863,17 @@ impl InputManager {
     /// Cancel a marked-text transaction and restore its exact prior draft
     /// state without disturbing the existing undo or redo stacks.
     pub(crate) fn cancel_ime_composition(&mut self, split_id: SplitId) -> bool {
-        let Some(baseline) = self.ime_composition_starts.remove(&split_id) else {
+        let Some(baseline) = self.take_ime_composition_start(split_id) else {
             return false;
         };
         self.break_edit_transaction(split_id);
         let changed = self.snapshot_differs(split_id, &baseline);
         self.restore_snapshot(split_id, baseline);
         changed
+    }
+
+    fn take_ime_composition_start(&mut self, split_id: SplitId) -> Option<DraftEditSnapshot> {
+        self.drafts.get_mut(&split_id)?.ime_composition_start.take()
     }
 
     /// Navigate to previous message in history (up arrow)
@@ -895,37 +887,32 @@ impl InputManager {
             return None;
         }
 
-        let current_index = self.history_index.get(&split_id).copied().flatten();
+        let current_index = self.slot(split_id).and_then(|draft| draft.history_index);
         if current_index.is_none_or(|idx| idx > 0) {
             self.record_undo_state(split_id);
         }
+        let current_text = self.text_for_split(split_id).to_string();
         let channel_history = self.input_history.get(channel)?;
+        let draft = self.drafts.entry(split_id).or_default();
 
         match current_index {
             None => {
-                let current_text = self.input_texts.get(&split_id).cloned().unwrap_or_default();
-                let unchanged_recall = self.temp_input.contains_key(&split_id)
-                    && self.recalled_text.get(&split_id) == Some(&current_text);
+                let unchanged_recall = draft.stashed_input.is_some()
+                    && draft.recalled_text.as_ref() == Some(&current_text);
                 if !unchanged_recall {
-                    self.temp_input.insert(split_id, Some(current_text));
+                    draft.stashed_input = Some(current_text);
                 }
                 let last_idx = channel_history.len() - 1;
-                self.history_index.insert(split_id, Some(last_idx));
+                draft.history_index = Some(last_idx);
                 let text = channel_history[last_idx].clone();
-                self.recalled_text.insert(split_id, text.clone());
-                self.input_texts.insert(split_id, text.clone());
-                self.cursor_positions.insert(split_id, text.len());
-                self.selection_ranges.remove(&split_id);
+                draft.show_recalled(text.clone());
                 Some(text)
             }
             Some(idx) if idx > 0 => {
                 let new_idx = idx - 1;
-                self.history_index.insert(split_id, Some(new_idx));
+                draft.history_index = Some(new_idx);
                 let text = channel_history[new_idx].clone();
-                self.recalled_text.insert(split_id, text.clone());
-                self.input_texts.insert(split_id, text.clone());
-                self.cursor_positions.insert(split_id, text.len());
-                self.selection_ranges.remove(&split_id);
+                draft.show_recalled(text.clone());
                 Some(text)
             }
             _ => None,
@@ -935,56 +922,44 @@ impl InputManager {
     /// Navigate to next message in history (down arrow)
     pub fn history_down(&mut self, channel: &str, split_id: SplitId) -> Option<String> {
         self.break_edit_transaction(split_id);
-        let current_index = self.history_index.get(&split_id).copied().flatten();
+        let current_index = self.slot(split_id).and_then(|draft| draft.history_index);
         if current_index.is_none() {
-            let current_text = self
-                .input_texts
-                .get(&split_id)
-                .map(String::as_str)
-                .unwrap_or_default();
-            if !self.temp_input.contains_key(&split_id)
-                || self
-                    .recalled_text
-                    .get(&split_id)
-                    .is_some_and(|recalled| recalled != current_text)
-            {
+            let current_text = self.text_for_split(split_id);
+            let can_restore = self.slot(split_id).is_some_and(|draft| {
+                draft.stashed_input.is_some()
+                    && draft
+                        .recalled_text
+                        .as_deref()
+                        .is_none_or(|recalled| recalled == current_text)
+            });
+            if !can_restore {
                 return None;
             }
         }
         self.record_undo_state(split_id);
         let channel_history = self.input_history.get(channel)?;
+        let draft = self.drafts.entry(split_id).or_default();
 
         match current_index {
             Some(idx) => {
                 if idx + 1 < channel_history.len() {
                     let new_idx = idx + 1;
-                    self.history_index.insert(split_id, Some(new_idx));
+                    draft.history_index = Some(new_idx);
                     let text = channel_history[new_idx].clone();
-                    self.recalled_text.insert(split_id, text.clone());
-                    self.input_texts.insert(split_id, text.clone());
-                    self.cursor_positions.insert(split_id, text.len());
-                    self.selection_ranges.remove(&split_id);
+                    draft.show_recalled(text.clone());
                     Some(text)
                 } else {
-                    self.history_index.insert(split_id, None);
-                    self.recalled_text.remove(&split_id);
-                    let restored = self
-                        .temp_input
-                        .remove(&split_id)
-                        .flatten()
-                        .unwrap_or_default();
-                    self.input_texts.insert(split_id, restored.clone());
-                    self.cursor_positions.insert(split_id, restored.len());
-                    self.selection_ranges.remove(&split_id);
+                    draft.history_index = None;
+                    draft.recalled_text = None;
+                    let restored = draft.stashed_input.take().unwrap_or_default();
+                    draft.show_text(restored.clone());
                     Some(restored)
                 }
             }
             None => {
-                self.recalled_text.remove(&split_id);
-                let restored = self.temp_input.remove(&split_id)?.unwrap_or_default();
-                self.input_texts.insert(split_id, restored.clone());
-                self.cursor_positions.insert(split_id, restored.len());
-                self.selection_ranges.remove(&split_id);
+                draft.recalled_text = None;
+                let restored = draft.stashed_input.take()?;
+                draft.show_text(restored.clone());
                 Some(restored)
             }
         }
@@ -993,17 +968,7 @@ impl InputManager {
     /// Clean up input state for splits that no longer exist in the layout
     /// This prevents memory leaks when splits are rearranged or closed
     pub fn cleanup_split_ids(&mut self, valid_ids: &std::collections::HashSet<SplitId>) {
-        self.input_texts
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.cursor_positions
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.selection_ranges
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.undo_stacks
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.edit_transactions
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.ime_composition_starts
+        self.drafts
             .retain(|split_id, _| valid_ids.contains(split_id));
         if self
             .focused_split
@@ -1011,14 +976,6 @@ impl InputManager {
         {
             self.focused_split = None;
         }
-        self.redo_stacks
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.history_index
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.temp_input
-            .retain(|split_id, _| valid_ids.contains(split_id));
-        self.recalled_text
-            .retain(|split_id, _| valid_ids.contains(split_id));
         self.placeholder_inputs
             .retain(|split_id, _| valid_ids.contains(split_id));
         if self
@@ -1048,22 +1005,24 @@ impl InputManager {
 
     fn snapshot(&self, split_id: SplitId) -> DraftEditSnapshot {
         DraftEditSnapshot {
-            text: self.input_texts.get(&split_id).cloned().unwrap_or_default(),
+            text: self.text_for_split(split_id).to_string(),
             cursor: self.cursor_for_split(split_id),
             selection: self.selection_for_split(split_id),
         }
     }
 
     fn break_edit_transaction(&mut self, split_id: SplitId) {
-        self.edit_transactions.remove(&split_id);
+        if let Some(draft) = self.drafts.get_mut(&split_id) {
+            draft.edit_transaction = None;
+        }
     }
 
     fn record_grouped_edit(&mut self, split_id: SplitId, kind: DraftEditKind) {
         let cursor = self.cursor_for_split(split_id);
         let len = self.text_for_split(split_id).len();
         let continuation = self
-            .edit_transactions
-            .get(&split_id)
+            .slot(split_id)
+            .and_then(|draft| draft.edit_transaction.as_ref())
             .is_some_and(|transaction| {
                 transaction.kind == kind
                     && transaction.next_cursor == cursor
@@ -1076,15 +1035,13 @@ impl InputManager {
     }
 
     fn finish_grouped_edit(&mut self, split_id: SplitId, kind: DraftEditKind) {
-        self.edit_transactions.insert(
-            split_id,
-            DraftEditTransaction {
-                kind,
-                next_cursor: self.cursor_for_split(split_id),
-                next_len: self.text_for_split(split_id).len(),
-                edited_at: Instant::now(),
-            },
-        );
+        let transaction = DraftEditTransaction {
+            kind,
+            next_cursor: self.cursor_for_split(split_id),
+            next_len: self.text_for_split(split_id).len(),
+            edited_at: Instant::now(),
+        };
+        self.slot_mut(split_id).edit_transaction = Some(transaction);
     }
 
     fn record_undo_state(&mut self, split_id: SplitId) {
@@ -1095,16 +1052,16 @@ impl InputManager {
     }
 
     fn record_undo_snapshot(&mut self, split_id: SplitId, snapshot: DraftEditSnapshot) {
-        let stack = self.undo_stacks.entry(split_id).or_default();
-        let is_duplicate = stack.last().is_some_and(|last| {
+        let draft = self.slot_mut(split_id);
+        let is_duplicate = draft.undo.last().is_some_and(|last| {
             last.text == snapshot.text
                 && last.cursor == snapshot.cursor
                 && last.selection == snapshot.selection
         });
         if !is_duplicate {
-            Self::push_history_snapshot(stack, snapshot);
+            Self::push_history_snapshot(&mut draft.undo, snapshot);
         }
-        self.redo_stacks.remove(&split_id);
+        draft.redo.clear();
     }
 
     fn snapshot_differs(&self, split_id: SplitId, baseline: &DraftEditSnapshot) -> bool {
@@ -1123,21 +1080,17 @@ impl InputManager {
     }
 
     fn restore_snapshot(&mut self, split_id: SplitId, snapshot: DraftEditSnapshot) {
-        let cursor = Self::clamp_cursor(&snapshot.text, snapshot.cursor);
-        let selection = snapshot.selection.and_then(|range| {
-            (range.start < range.end
-                && range.end <= snapshot.text.len()
-                && snapshot.text.is_char_boundary(range.start)
-                && snapshot.text.is_char_boundary(range.end))
-            .then_some(range)
-        });
-        self.input_texts.insert(split_id, snapshot.text);
-        self.cursor_positions.insert(split_id, cursor);
-        if let Some(selection) = selection {
-            self.selection_ranges.insert(split_id, selection);
-        } else {
-            self.selection_ranges.remove(&split_id);
-        }
+        let DraftEditSnapshot {
+            text,
+            cursor,
+            selection,
+        } = snapshot;
+        let cursor = Self::clamp_cursor(&text, cursor);
+        let selection = selection.filter(|range| is_selection_in(&text, range));
+        let draft = self.slot_mut(split_id);
+        draft.text = Some(text);
+        draft.cursor = Some(cursor);
+        draft.selection = selection;
     }
 
     fn update_selection_from_anchor(
@@ -1148,28 +1101,22 @@ impl InputManager {
         cursor_after_move: usize,
         extend_selection: bool,
     ) {
-        if !extend_selection {
-            self.selection_ranges.remove(&split_id);
-            return;
-        }
-
-        let anchor = selection
-            .map(|range| {
-                if cursor_before_move == range.start {
-                    range.end
-                } else {
-                    range.start
-                }
-            })
-            .unwrap_or(cursor_before_move);
-        if anchor == cursor_after_move {
-            self.selection_ranges.remove(&split_id);
+        let next = if extend_selection {
+            let anchor = selection
+                .map(|range| {
+                    if cursor_before_move == range.start {
+                        range.end
+                    } else {
+                        range.start
+                    }
+                })
+                .unwrap_or(cursor_before_move);
+            (anchor != cursor_after_move)
+                .then(|| anchor.min(cursor_after_move)..anchor.max(cursor_after_move))
         } else {
-            self.selection_ranges.insert(
-                split_id,
-                anchor.min(cursor_after_move)..anchor.max(cursor_after_move),
-            );
-        }
+            None
+        };
+        self.slot_mut(split_id).selection = next;
     }
 
     // Editing callers already canonicalize the cursor with cursor_for_split.

@@ -16,13 +16,9 @@ mod chat_state;
 pub mod emote_preferences;
 mod emote_state;
 pub mod layout_eviction;
-mod message_buffer;
 pub mod message_retention;
 mod split_pane;
-mod tab_state;
 pub mod ui_invalidation;
-pub mod version_manager;
-mod workspace_state;
 
 /// Install the root lookups that the GPUI-free state crates cannot reach on
 /// their own. Idempotent, and safe to call before the backend is initialized:
@@ -48,12 +44,12 @@ pub use app_state::{ActivitySection, AppState};
 pub use chat_backend::{ChatBackend, ChatBackendEvent};
 pub use chat_observer::ChatStateObserver;
 pub use chat_state::{ChatState, ChatStateEvent, ReplyState};
-pub use emote_state::{EmoteStateEvent, EmoteStateManager};
-pub use message_buffer::{MessageBuffer, MessageReconcileAction};
-pub use split_pane::{SplitId, SplitPane, SplitPaneEvent};
-pub use tab_state::{TabHighlightState, TabState, TabVisibility};
-pub use version_manager::VersionRegistry;
-pub use workspace_state::{
+pub use echo_core::message_buffer::{MessageBuffer, MessageReconcileAction};
+pub use echo_core::tab_state::{TabHighlightState, TabState, TabVisibility};
+pub use echo_core::version_registry::VersionRegistry;
+pub use echo_core::workspace::{
     AddSplitDirection, DragDropState, DropZone, SplitNode, SplitOrientation, is_placeholder,
     new_placeholder,
 };
+pub use emote_state::{EmoteStateEvent, EmoteStateManager};
+pub use split_pane::{SplitId, SplitPane, SplitPaneEvent};

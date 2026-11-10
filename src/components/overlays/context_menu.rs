@@ -5,7 +5,6 @@
 //! - Users (copy identity, mention, whisper, optional user-card access)
 //! - Emotes (copy code, open image/page, copy image/page links, display rules)
 //! - Links (open, copy)
-#![allow(clippy::too_many_arguments)]
 
 use super::traits::Openable;
 use crate::backend;
@@ -159,27 +158,31 @@ pub struct ContextMenuState {
     pub submenu_selected_index: Option<usize>,
 }
 
+/// The chat message a message menu acts on.
+#[derive(Clone, Debug)]
+pub struct MessageMenuTarget {
+    pub message_id: String,
+    pub content: String,
+    pub sender: String,
+    pub display_name: String,
+    pub timestamp: i64,
+    pub channel: String,
+    pub source_split_id: Option<SplitId>,
+    /// Twitch USERNOTICE and local system rows have stable IDs for
+    /// deduplication, but Twitch does not allow replying to or moderating
+    /// them as ordinary chat messages.
+    pub allow_remote_actions: bool,
+    pub is_whisper: bool,
+    /// The row's highlight, which enables "Why is this highlighted?".
+    pub highlight_type: Option<backend::HighlightType>,
+}
+
 /// Types of context menus
 #[derive(Clone, Debug, Default)]
 pub enum ContextMenuType {
     #[default]
     None,
-    Message {
-        message_id: String,
-        content: String,
-        sender: String,
-        display_name: String,
-        timestamp: i64,
-        channel: String,
-        source_split_id: Option<SplitId>,
-        /// Twitch USERNOTICE and local system rows have stable IDs for
-        /// deduplication, but Twitch does not allow replying to or moderating
-        /// them as ordinary chat messages.
-        allow_remote_actions: bool,
-        is_whisper: bool,
-        /// The row's highlight, which enables "Why is this highlighted?".
-        highlight_type: Option<backend::HighlightType>,
-    },
+    Message(MessageMenuTarget),
     Emote {
         emotes: Vec<EmoteContextTarget>,
         /// Channel the emote was seen in, for "Only in #channel" rules.
@@ -222,36 +225,12 @@ impl Openable for ContextMenuState {
 }
 
 impl ContextMenuState {
-    pub fn open_message(
-        x: f32,
-        y: f32,
-        message_id: String,
-        content: String,
-        sender: String,
-        display_name: String,
-        timestamp: i64,
-        channel: String,
-        source_split_id: Option<SplitId>,
-        allow_remote_actions: bool,
-        is_whisper: bool,
-        highlight_type: Option<backend::HighlightType>,
-    ) -> Self {
+    pub fn open_message(x: f32, y: f32, message: MessageMenuTarget) -> Self {
         Self {
             is_open: true,
             x,
             y,
-            menu_type: ContextMenuType::Message {
-                message_id,
-                content,
-                sender,
-                display_name,
-                timestamp,
-                channel,
-                source_split_id,
-                allow_remote_actions,
-                is_whisper,
-                highlight_type,
-            },
+            menu_type: ContextMenuType::Message(message),
             selected_index: None,
             active_submenu: None,
             submenu_selected_index: None,
@@ -820,29 +799,7 @@ impl ContextMenu {
     fn build_items_for(&self, menu_type: &ContextMenuType) -> Vec<ContextMenuItem> {
         match menu_type {
             ContextMenuType::None => vec![],
-            ContextMenuType::Message {
-                message_id,
-                content,
-                sender,
-                display_name,
-                timestamp,
-                channel,
-                source_split_id,
-                allow_remote_actions,
-                is_whisper,
-                highlight_type,
-            } => self.build_message_menu(
-                message_id,
-                content,
-                sender,
-                display_name,
-                *timestamp,
-                channel,
-                *source_split_id,
-                *allow_remote_actions,
-                *is_whisper,
-                highlight_type.as_ref(),
-            ),
+            ContextMenuType::Message(message) => self.build_message_menu(message),
             ContextMenuType::Emote {
                 emotes,
                 rule_channel,
@@ -979,24 +936,19 @@ impl ContextMenu {
         items
     }
 
-    fn build_message_menu(
-        &self,
-        message_id: &str,
-        content: &str,
-        sender: &str,
-        display_name: &str,
-        timestamp: i64,
-        channel: &str,
-        source_split_id: Option<SplitId>,
-        allow_remote_actions: bool,
-        is_whisper: bool,
-        highlight_type: Option<&backend::HighlightType>,
-    ) -> Vec<ContextMenuItem> {
-        let content = content.to_string();
-        let sender = sender.to_string();
-        let channel = channel.to_string();
-        let message_id = message_id.to_string();
-        let display_name = display_name.to_string();
+    fn build_message_menu(&self, message: &MessageMenuTarget) -> Vec<ContextMenuItem> {
+        let MessageMenuTarget {
+            message_id,
+            content,
+            sender,
+            display_name,
+            timestamp,
+            channel,
+            source_split_id,
+            allow_remote_actions,
+            is_whisper,
+            highlight_type,
+        } = message.clone();
         let copied_display_name = if display_name.trim().is_empty() {
             sender.clone()
         } else {
@@ -1103,7 +1055,7 @@ impl ContextMenu {
             }
         }
 
-        if let Some(highlight_type) = highlight_type.cloned() {
+        if let Some(highlight_type) = highlight_type {
             items.push(ContextMenuItem::divider());
             items.push(ContextMenuItem::action(
                 "Why is this highlighted?",

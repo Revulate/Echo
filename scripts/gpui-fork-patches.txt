@@ -1,5 +1,13 @@
-# Ordered GPUI fork patch series. Keep this file as the single source of truth
-# for both setup-gpui-fork.ps1 and setup-gpui-fork.sh.
+# The GPUI fork: Zed at the revision the root Cargo.toml pins (the `rev` of the
+# gpui, gpui_platform and reqwest_client entries in [workspace.dependencies]),
+# plus the patches below applied in order with `git am`. setup-gpui-fork.sh and
+# setup-gpui-fork.ps1 read this file; docs/GPUI_FORK.md describes each patch.
+#
+# fork-tree is the git tree id of the fork after the last patch. It changes
+# whenever the base revision or any patch changes; recompute it with
+# `git -C ../zed-gpui-fork rev-parse 'HEAD^{tree}'` after rebuilding the series.
+fork-tree = 7a802743da3a4ba05833b47153b01f2cf567904f
+
 patches/gpui-paint-fork.patch
 patches/gpui-image-features.patch
 patches/gpui-gpu-timestamps.patch

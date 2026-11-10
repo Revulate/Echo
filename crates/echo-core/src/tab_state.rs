@@ -137,7 +137,7 @@ pub struct TabState {
     pub active_split_path: Vec<usize>,
 
     /// Whether to show highlight indicators (mentions, etc.) on this tab
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub highlights_enabled: bool,
 
     /// Whether the layout is locked (prevents accidental split changes)
@@ -165,27 +165,10 @@ pub struct TabState {
     pub mark_unread_on_new: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl TabState {
     /// Create a new tab with a single placeholder pane
     pub fn new() -> Self {
-        Self {
-            id: Uuid::new_v4().to_string(),
-            custom_title: None,
-            layout: Arc::new(SplitNode::leaf(new_placeholder())),
-            is_selected: false,
-            active_split_path: Vec::new(),
-            highlights_enabled: true,
-            is_locked: false,
-            visibility: TabVisibility::default(),
-            is_live: false,
-            has_unread: false,
-            highlight_state: TabHighlightState::None,
-            mark_unread_on_new: false,
-        }
+        Self::with_layout(SplitNode::leaf(new_placeholder()))
     }
 
     /// Create a new tab with an existing layout (for migration or duplication)
@@ -343,7 +326,7 @@ impl TabState {
     /// Used for autocomplete and input context
     pub fn active_channel(&self) -> Option<String> {
         let active_path = self.valid_active_split_path();
-        if let Some(channel) = self.layout.get_channel_ref_at_path(&active_path)
+        if let Some(channel) = self.layout.channel_ref_at_path(&active_path)
             && !is_placeholder(channel)
             && let Some(channel) = crate::channel_identity::resolve_layout_channel(channel)
         {
@@ -402,7 +385,7 @@ impl TabState {
     pub fn valid_active_split_path(&self) -> Vec<usize> {
         if self
             .layout
-            .get_channel_at_path(&self.active_split_path)
+            .channel_at_path(&self.active_split_path)
             .is_some()
         {
             return self.active_split_path.clone();
@@ -413,7 +396,7 @@ impl TabState {
 
     /// Persist a new active split path when it resolves in this tab.
     pub fn set_active_split_path(&mut self, path: Vec<usize>) -> bool {
-        if self.layout.get_channel_at_path(&path).is_none() {
+        if self.layout.channel_at_path(&path).is_none() {
             return false;
         }
         if self.active_split_path == path {
@@ -454,7 +437,7 @@ impl TabState {
         // A perpendicular split can complete an exact 2x2 block. Rotate it now,
         // while both band dividers still agree, so each visual row owns its own
         // divider instead of sharing one that spans the whole block.
-        let placeholder_id = self.layout.get_split_id_at_path(&placeholder_path);
+        let placeholder_id = self.layout.split_id_at_path(&placeholder_path);
         if self.normalize_completed_grid_block(target_path)
             && let Some(rotated) = placeholder_id.and_then(|id| self.split_path_for_id(id))
         {
@@ -474,7 +457,7 @@ impl TabState {
         path: &[usize],
     ) -> Option<(SplitId, crate::workspace::AddSplitDirection)> {
         let (&child_idx, parent_path) = path.split_last()?;
-        let parent = self.layout.get_node_at_path(parent_path)?;
+        let parent = self.layout.node_at_path(parent_path)?;
 
         let SplitNode::Split { children, .. } = parent else {
             return None;
@@ -576,7 +559,7 @@ impl TabState {
         let leaves: Vec<_> = bounds
             .into_iter()
             .filter_map(|(path, rect)| {
-                (self.layout.get_channel_ref_at_path(&path).is_some())
+                (self.layout.channel_ref_at_path(&path).is_some())
                     .then(|| LeafBounds::from_rect(rect))
                     .flatten()
                     .map(|bounds| (path, bounds))
@@ -672,8 +655,8 @@ impl TabState {
         }
 
         let active_path = self.valid_active_split_path();
-        let active_split_id = self.layout.get_split_id_at_path(&active_path);
-        let closed_split_id = self.layout.get_split_id_at_path(path);
+        let active_split_id = self.layout.split_id_at_path(&active_path);
+        let closed_split_id = self.layout.split_id_at_path(path);
         let replacement_split_id = (active_split_id == closed_split_id)
             .then(|| self.close_replacement_split_id(path))
             .flatten();
@@ -715,12 +698,20 @@ impl TabState {
         Arc::make_mut(&mut self.layout).set_deleted_mode_at_path(path, mode)
     }
 
-    /// Adjust split ratio at path
-    pub fn adjust_ratio(&mut self, path: &[usize], child_idx: usize, delta: f32) -> bool {
+    /// [`SplitNode::adjust_ratio`] on this tab's layout; a locked tab applies
+    /// nothing and returns `0.0`.
+    pub fn adjust_ratio(
+        &mut self,
+        path: &[usize],
+        child_idx: usize,
+        delta: f32,
+        extent: f32,
+        minimums: &[f32],
+    ) -> f32 {
         if self.is_locked {
-            return false;
+            return 0.0;
         }
-        Arc::make_mut(&mut self.layout).adjust_ratio(path, child_idx, delta)
+        Arc::make_mut(&mut self.layout).adjust_ratio(path, child_idx, delta, extent, minimums)
     }
 
     /// Give every child of the split at `path` an equal share.
@@ -741,7 +732,7 @@ impl TabState {
             return false;
         }
 
-        let active_id = self.layout.get_split_id_at_path(&self.active_split_path);
+        let active_id = self.layout.split_id_at_path(&self.active_split_path);
         if !Arc::make_mut(&mut self.layout).transpose_2x2_at_path(path) {
             return false;
         }
@@ -767,7 +758,7 @@ impl TabState {
 
         let rotatable = self
             .layout
-            .get_node_at_path(&block_path)
+            .node_at_path(&block_path)
             .is_some_and(|node| node.is_column_major_2x2() && node.can_transpose_2x2());
         if !rotatable {
             return false;
@@ -784,11 +775,11 @@ impl TabState {
         // Swap the whole leaves, not just their channel strings: split-local
         // state (draft text, reply target, chat view) is keyed by SplitId, so
         // moving only the name would leave that state on the old position.
-        let node_a = match self.layout.get_node_at_path(path_a) {
+        let node_a = match self.layout.node_at_path(path_a) {
             Some(node @ SplitNode::Leaf { .. }) => node.clone(),
             _ => return false,
         };
-        let node_b = match self.layout.get_node_at_path(path_b) {
+        let node_b = match self.layout.node_at_path(path_b) {
             Some(node @ SplitNode::Leaf { .. }) => node.clone(),
             _ => return false,
         };
@@ -809,7 +800,7 @@ impl TabState {
     }
 
     /// Insert a new split relative to a target path
-    pub fn insert_split_relative(
+    fn insert_split_relative(
         &mut self,
         path: &[usize],
         direction: crate::workspace::AddSplitDirection,
@@ -835,7 +826,7 @@ impl TabState {
 
         let active_split_id = self
             .layout
-            .get_split_id_at_path(&self.valid_active_split_path());
+            .split_id_at_path(&self.valid_active_split_path());
 
         // For center zone, swap instead
         if zone == DropZone::Center {
@@ -844,11 +835,11 @@ impl TabState {
 
         // Resolve source/target using stable split IDs so path shifts during
         // mutation do not cause us to move/overwrite the wrong pane.
-        let source_split_id = match self.layout.get_split_id_at_path(source_path) {
+        let source_split_id = match self.layout.split_id_at_path(source_path) {
             Some(id) => id,
             None => return false,
         };
-        let target_split_id = match self.layout.get_split_id_at_path(target_path) {
+        let target_split_id = match self.layout.split_id_at_path(target_path) {
             Some(id) => id,
             None => return false,
         };
@@ -858,7 +849,7 @@ impl TabState {
 
         // Capture the source node before removal so its stable SplitId and
         // split-local state keys survive drag/drop moves.
-        let Some(source_node) = self.layout.get_node_at_path(source_path).cloned() else {
+        let Some(source_node) = self.layout.node_at_path(source_path).cloned() else {
             return false;
         };
         if !matches!(source_node, SplitNode::Leaf { .. }) {
@@ -918,7 +909,7 @@ impl TabState {
             DropZone::Right => AddSplitDirection::Right,
             DropZone::Center => return false,
         };
-        let Some(source_node) = self.layout.get_node_at_path(source_path).cloned() else {
+        let Some(source_node) = self.layout.node_at_path(source_path).cloned() else {
             return false;
         };
         if !matches!(source_node, SplitNode::Leaf { .. }) {
@@ -926,7 +917,7 @@ impl TabState {
         }
         let active_split_id = self
             .layout
-            .get_split_id_at_path(&self.valid_active_split_path());
+            .split_id_at_path(&self.valid_active_split_path());
         let Some(mut compacted) = self.layout.as_ref().clone().remove_at_path(source_path) else {
             return false;
         };
@@ -941,7 +932,7 @@ impl TabState {
 
     fn close_replacement_split_id(&self, path: &[usize]) -> Option<SplitId> {
         let (&child_idx, parent_path) = path.split_last()?;
-        let SplitNode::Split { children, .. } = self.layout.get_node_at_path(parent_path)? else {
+        let SplitNode::Split { children, .. } = self.layout.node_at_path(parent_path)? else {
             return None;
         };
         if child_idx >= children.len() || children.len() < 2 {
@@ -1140,13 +1131,13 @@ mod tests {
         );
         let mut tab = TabState::with_layout(layout);
         tab.set_active_split_path(vec![2]);
-        let active_id = tab.layout.get_split_id_at_path(&[2]);
+        let active_id = tab.layout.split_id_at_path(&[2]);
 
         tab.close_pane_by_path(&[0]);
 
         assert_eq!(tab.active_split_path, vec![1]);
         assert_eq!(
-            tab.layout.get_split_id_at_path(&tab.active_split_path),
+            tab.layout.split_id_at_path(&tab.active_split_path),
             active_id
         );
     }
@@ -1164,13 +1155,13 @@ mod tests {
         );
         let mut tab = TabState::with_layout(layout);
         tab.set_active_split_path(vec![1]);
-        let expected_id = tab.layout.get_split_id_at_path(&[2]);
+        let expected_id = tab.layout.split_id_at_path(&[2]);
 
         tab.close_pane_by_path(&[1]);
 
         assert_eq!(tab.active_split_path, vec![1]);
         assert_eq!(
-            tab.layout.get_split_id_at_path(&tab.active_split_path),
+            tab.layout.split_id_at_path(&tab.active_split_path),
             expected_id
         );
     }
@@ -1188,13 +1179,13 @@ mod tests {
         );
         let mut tab = TabState::with_layout(layout);
         tab.set_active_split_path(vec![2]);
-        let expected_id = tab.layout.get_split_id_at_path(&[1]);
+        let expected_id = tab.layout.split_id_at_path(&[1]);
 
         tab.close_pane_by_path(&[2]);
 
         assert_eq!(tab.active_split_path, vec![1]);
         assert_eq!(
-            tab.layout.get_split_id_at_path(&tab.active_split_path),
+            tab.layout.split_id_at_path(&tab.active_split_path),
             expected_id
         );
     }
@@ -1218,13 +1209,13 @@ mod tests {
         );
         let mut tab = TabState::with_layout(layout);
         tab.set_active_split_path(vec![1, 0]);
-        let expected_id = tab.layout.get_split_id_at_path(&[1, 1]);
+        let expected_id = tab.layout.split_id_at_path(&[1, 1]);
 
         tab.close_pane_by_path(&[1, 0]);
 
         assert_eq!(tab.active_split_path, vec![1]);
         assert_eq!(
-            tab.layout.get_split_id_at_path(&tab.active_split_path),
+            tab.layout.split_id_at_path(&tab.active_split_path),
             expected_id
         );
     }
@@ -1242,13 +1233,13 @@ mod tests {
         );
         let mut tab = TabState::with_layout(layout);
         tab.set_active_split_path(vec![1]);
-        let active_id = tab.layout.get_split_id_at_path(&[1]);
+        let active_id = tab.layout.split_id_at_path(&[1]);
 
         assert!(tab.move_split(&[0], &[2], DropZone::Right));
 
         assert_eq!(tab.active_split_path, vec![0]);
         assert_eq!(
-            tab.layout.get_split_id_at_path(&tab.active_split_path),
+            tab.layout.split_id_at_path(&tab.active_split_path),
             active_id
         );
     }
@@ -1269,8 +1260,8 @@ mod tests {
     fn moving_a_split_to_the_bottom_edge_spans_the_full_width() {
         let mut tab = three_side_by_side();
         tab.set_active_split_path(vec![1]);
-        let active_id = tab.layout.get_split_id_at_path(&[1]);
-        let moved_id = tab.layout.get_split_id_at_path(&[0]);
+        let active_id = tab.layout.split_id_at_path(&[1]);
+        let moved_id = tab.layout.split_id_at_path(&[0]);
 
         assert!(tab.move_split_to_edge(&[0], DropZone::Bottom));
 
@@ -1286,18 +1277,12 @@ mod tests {
         assert_eq!(*orientation, SplitOrientation::Horizontal);
         assert_eq!(children.len(), 2);
         assert_eq!(ratios, &vec![0.5, 0.5]);
-        assert_eq!(tab.layout.get_channel_at_path(&[1]).as_deref(), Some("a"));
-        assert_eq!(tab.layout.get_split_id_at_path(&[1]), moved_id);
+        assert_eq!(tab.layout.channel_at_path(&[1]).as_deref(), Some("a"));
+        assert_eq!(tab.layout.split_id_at_path(&[1]), moved_id);
+        assert_eq!(tab.layout.channel_at_path(&[0, 0]).as_deref(), Some("b"));
+        assert_eq!(tab.layout.channel_at_path(&[0, 1]).as_deref(), Some("c"));
         assert_eq!(
-            tab.layout.get_channel_at_path(&[0, 0]).as_deref(),
-            Some("b")
-        );
-        assert_eq!(
-            tab.layout.get_channel_at_path(&[0, 1]).as_deref(),
-            Some("c")
-        );
-        assert_eq!(
-            tab.layout.get_split_id_at_path(&tab.active_split_path),
+            tab.layout.split_id_at_path(&tab.active_split_path),
             active_id
         );
     }
@@ -1327,7 +1312,7 @@ mod tests {
         };
         assert_eq!(*orientation, SplitOrientation::Horizontal);
         assert_eq!(children.len(), 3);
-        assert_eq!(tab.layout.get_channel_at_path(&[0]).as_deref(), Some("z"));
+        assert_eq!(tab.layout.channel_at_path(&[0]).as_deref(), Some("z"));
         assert!((ratios.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         assert!((ratios[0] - 1.0 / 3.0).abs() < 1e-5);
         assert!(ratios[1] > ratios[2]);
@@ -1346,8 +1331,8 @@ mod tests {
 
         assert!(tab.move_split_to_edge(&[1], DropZone::Top));
 
-        assert_eq!(tab.layout.get_channel_at_path(&[0]).as_deref(), Some("b"));
-        assert_eq!(tab.layout.get_channel_at_path(&[1]).as_deref(), Some("a"));
+        assert_eq!(tab.layout.channel_at_path(&[0]).as_deref(), Some("b"));
+        assert_eq!(tab.layout.channel_at_path(&[1]).as_deref(), Some("a"));
         assert!(!tab.move_split_to_edge(&[0], DropZone::Center));
     }
 }

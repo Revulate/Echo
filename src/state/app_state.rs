@@ -3,6 +3,7 @@
 //! Each tab owns its own split layout.
 
 use super::{TabHighlightState, TabState, TabVisibility};
+use crate::backend::lock_utils::MutexExt;
 use crate::backend::{self, ChatMessage, ConnectionStatus, StreamInfo, WhisperThread};
 use crate::config;
 use gpui::*;
@@ -24,18 +25,14 @@ const CHANNEL_CONNECT_IDLE_RECHECK: std::time::Duration = std::time::Duration::f
 fn request_channel_connection(channel: String, priority: backend::channel_lifecycle::LoadPriority) {
     backend::channel_lifecycle::get_lifecycle_manager().request_connection(channel, priority);
     let (generation, wake) = &CHANNEL_CONNECT_SIGNAL;
-    let mut generation = generation
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut generation = generation.lock_or_recover();
     *generation = generation.wrapping_add(1);
     wake.notify_one();
 }
 
 fn wait_for_channel_connect_request(seen: &mut u64) {
     let (generation, wake) = &CHANNEL_CONNECT_SIGNAL;
-    let guard = generation
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = generation.lock_or_recover();
     let (guard, _) = wake
         .wait_timeout_while(guard, CHANNEL_CONNECT_IDLE_RECHECK, |generation| {
             *generation == *seen
@@ -44,13 +41,19 @@ fn wait_for_channel_connect_request(seen: &mut u64) {
     *seen = *guard;
 }
 
-/// Pending joins: channel -> (watch start, lowercased name).
-type ChannelConnectProbes = HashMap<String, (std::time::Instant, String)>;
-
 /// Channels waiting for their IRC join, plus whether the shared probe task is
 /// running.
-static CHANNEL_CONNECT_PROBES: std::sync::Mutex<(Option<ChannelConnectProbes>, bool)> =
-    std::sync::Mutex::new((None, false));
+struct ChannelConnectProbes {
+    /// Pending joins: channel -> (watch start, lowercased name).
+    pending: Option<HashMap<String, (std::time::Instant, String)>>,
+    task_running: bool,
+}
+
+static CHANNEL_CONNECT_PROBES: std::sync::Mutex<ChannelConnectProbes> =
+    std::sync::Mutex::new(ChannelConnectProbes {
+        pending: None,
+        task_running: false,
+    });
 
 /// Cuts a slow-poll sleep short when a new join starts being watched.
 static CHANNEL_CONNECT_PROBE_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
@@ -72,19 +75,17 @@ const CHANNEL_CONNECT_PROBE_GIVE_UP: std::time::Duration = std::time::Duration::
 /// Watch a connecting channel with one shared probe task on the backend
 /// runtime instead of a thread per channel.
 fn watch_channel_connect(channel: String) {
-    let mut probes = CHANNEL_CONNECT_PROBES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut probes = CHANNEL_CONNECT_PROBES.lock_or_recover();
     let lower = channel.to_lowercase();
     probes
-        .0
+        .pending
         .get_or_insert_with(HashMap::new)
         .insert(channel, (std::time::Instant::now(), lower));
-    if probes.1 {
+    if probes.task_running {
         CHANNEL_CONNECT_PROBE_WAKE.notify_one();
         return;
     }
-    probes.1 = true;
+    probes.task_running = true;
     drop(probes);
 
     backend::bridge::get_runtime().spawn(async {
@@ -94,10 +95,8 @@ fn watch_channel_connect(channel: String) {
                 _ = tokio::time::sleep(interval) => {}
                 _ = CHANNEL_CONNECT_PROBE_WAKE.notified() => {}
             }
-            let mut probes = CHANNEL_CONNECT_PROBES
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let pending = probes.0.get_or_insert_with(HashMap::new);
+            let mut probes = CHANNEL_CONNECT_PROBES.lock_or_recover();
+            let pending = probes.pending.get_or_insert_with(HashMap::new);
             let lifecycle = backend::channel_lifecycle::get_lifecycle_manager();
             let mut any_fresh = false;
             pending.retain(|channel, (started, lower)| {
@@ -125,8 +124,8 @@ fn watch_channel_connect(channel: String) {
                 false
             });
             if pending.is_empty() {
-                probes.0 = None;
-                probes.1 = false;
+                probes.pending = None;
+                probes.task_running = false;
                 break;
             }
             interval = if any_fresh {
@@ -180,8 +179,8 @@ impl Default for ActivityPanelState {
 
 /// Global application state
 pub struct AppState {
-    /// List of tabs (each with its own split layout)
-    /// PERF: Arc for O(1) clone in render, use tabs_mut() for mutations
+    /// List of tabs (each with its own split layout). Shared so render can
+    /// clone it cheaply; mutate through `tabs_mut()`.
     pub tabs: Arc<Vec<TabState>>,
     /// Index of the active tab
     pub active_tab_idx: usize,
@@ -197,9 +196,9 @@ pub struct AppState {
     pub stream_info: HashMap<String, Option<StreamInfo>>,
     /// The one global combined Activity feed and its source filters.
     pub activity_panel: ActivityPanelState,
-    /// PERF: Cached mentions data (Arc for O(1) clone in render)
+    /// Cached mentions, shared so render can clone them cheaply.
     pub cached_mentions: Arc<Vec<(String, ChatMessage)>>,
-    /// PERF: Cached whisper threads (Arc for O(1) clone in render)
+    /// Cached whisper threads, shared so render can clone them cheaply.
     pub cached_whispers: Arc<Vec<WhisperThread>>,
     /// Splits whose channel chooser is open, with the channel each showed
     /// before. The old channel stays joined until the change is committed.
@@ -213,6 +212,23 @@ pub struct AppState {
 }
 
 const MAX_CLOSED_TAB_BATCHES: usize = 10;
+
+/// Whether the tab at `idx` sits directly beside the tab at `active`.
+fn is_adjacent_tab(idx: usize, active: usize) -> bool {
+    idx.abs_diff(active) == 1
+}
+
+/// How urgently a tab's channels connect: the active tab now, its neighbours
+/// as a prefetch, and every other tab in the background queue.
+fn tab_load_priority(idx: usize, active: usize) -> backend::channel_lifecycle::LoadPriority {
+    if idx == active {
+        backend::channel_lifecycle::LoadPriority::Immediate
+    } else if is_adjacent_tab(idx, active) {
+        backend::channel_lifecycle::LoadPriority::Prefetch
+    } else {
+        backend::channel_lifecycle::LoadPriority::Background
+    }
+}
 
 fn migrated_or_default_tabs() -> Vec<TabState> {
     if let Some(migrated) = config::migrate_workspace_to_tabs() {
@@ -231,32 +247,16 @@ fn migrated_or_default_tabs() -> Vec<TabState> {
 
 impl AppState {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        if crate::benchmark_ui_fixture::disposable_workspace_enabled() {
-            let chat_backend = cx.new(|_cx| super::ChatBackend::new());
+        if crate::bench::ui_fixture::disposable_workspace_enabled() {
             let mut placeholder = TabState::new();
             placeholder.is_selected = true;
-            let mut state = Self {
-                tabs: Arc::new(vec![placeholder]),
-                active_tab_idx: 0,
-                connection_status: ConnectionStatus::Disconnected,
-                is_authenticated: false,
-                username: None,
-                chat_backend,
-                stream_info: HashMap::new(),
-                activity_panel: ActivityPanelState::default(),
-                cached_mentions: Arc::new(Vec::new()),
-                cached_whispers: Arc::new(Vec::new()),
-                pending_channel_changes: HashMap::new(),
-                main_window: None,
-                closed_tabs: std::collections::VecDeque::new(),
-                closed_tab_generation: 0,
-            };
-            let snapshot = crate::benchmark_ui_fixture::seed_app_state(&mut state);
+            let mut state = Self::with_tabs(vec![placeholder], 0, cx);
+            let snapshot = crate::bench::ui_fixture::seed_app_state(&mut state);
             debug_assert!(snapshot.is_some(), "UI fixture failed to seed");
             return state;
         }
 
-        let tabs = if let Some(channel) = crate::benchmark_profile::live_channel() {
+        let tabs = if let Some(channel) = crate::bench::live_channel::requested_channel() {
             let mut tab = TabState::new();
             tab.is_selected = true;
             let assigned = tab.set_channel_at_path(&[], channel.to_string());
@@ -296,13 +296,11 @@ impl AppState {
         let active_tab_idx = tabs.iter().position(|t| t.is_selected).unwrap_or(0);
         let popup_channels = backend::settings::get_open_chat_popup_channels();
 
-        let network_lanes_suppressed = crate::benchmark_profile::network_lanes_suppressed();
+        let network_lanes_suppressed = crate::bench::network_lanes_suppressed();
         let mut startup_asset_channels = Vec::new();
         let mut connected = HashSet::new();
 
         for (idx, tab) in tabs.iter().enumerate() {
-            let tab_offset = (idx as i32) - (active_tab_idx as i32);
-
             for channel in tab.channels() {
                 if !connected.insert(channel.clone()) {
                     continue;
@@ -311,13 +309,7 @@ impl AppState {
                     continue;
                 }
 
-                let priority = if idx == active_tab_idx {
-                    backend::channel_lifecycle::LoadPriority::Immediate
-                } else if tab_offset.abs() == 1 {
-                    backend::channel_lifecycle::LoadPriority::Prefetch
-                } else {
-                    backend::channel_lifecycle::LoadPriority::Background
-                };
+                let priority = tab_load_priority(idx, active_tab_idx);
 
                 if priority != backend::channel_lifecycle::LoadPriority::Background
                     && !backend::whispers::is_whispers_channel(&channel)
@@ -361,12 +353,14 @@ impl AppState {
                 popup_only_channel_count,
                 tabs.iter()
                     .enumerate()
-                    .filter(|(idx, _)| (*idx as i32 - active_tab_idx as i32).abs() == 1)
+                    .filter(|(idx, _)| is_adjacent_tab(*idx, active_tab_idx))
                     .map(|(_, t)| t.channels().len())
                     .sum::<usize>(),
                 tabs.iter()
                     .enumerate()
-                    .filter(|(idx, _)| (*idx as i32 - active_tab_idx as i32).abs() > 1)
+                    .filter(|(idx, _)| {
+                        *idx != active_tab_idx && !is_adjacent_tab(*idx, active_tab_idx)
+                    })
                     .map(|(_, t)| t.channels().len())
                     .sum::<usize>()
             );
@@ -379,10 +373,7 @@ impl AppState {
                     .spawn(move || {
                         use backend::channel_lifecycle::get_lifecycle_manager;
                         let lifecycle = get_lifecycle_manager();
-                        let mut seen_request = *CHANNEL_CONNECT_SIGNAL
-                            .0
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut seen_request = *CHANNEL_CONNECT_SIGNAL.0.lock_or_recover();
 
                         loop {
                             if let Some((priority, channel)) = lifecycle.next_to_connect() {
@@ -415,15 +406,18 @@ impl AppState {
             backend::load_channel_assets_batch(startup_asset_channels.clone());
         }
 
-        let chat_backend = cx.new(|_cx| super::ChatBackend::new());
+        Self::with_tabs(tabs, active_tab_idx, cx)
+    }
 
+    /// A disconnected, signed-out state over `tabs` with a fresh chat backend.
+    fn with_tabs(tabs: Vec<TabState>, active_tab_idx: usize, cx: &mut Context<Self>) -> Self {
         Self {
             tabs: Arc::new(tabs),
             active_tab_idx,
             connection_status: ConnectionStatus::Disconnected,
             is_authenticated: false,
             username: None,
-            chat_backend,
+            chat_backend: cx.new(|_cx| super::ChatBackend::new()),
             stream_info: HashMap::new(),
             activity_panel: ActivityPanelState::default(),
             cached_mentions: Arc::new(Vec::new()),
@@ -433,6 +427,18 @@ impl AppState {
             closed_tabs: std::collections::VecDeque::new(),
             closed_tab_generation: 0,
         }
+    }
+
+    /// Create the chat channel entity for `channel` unless it exists; returns
+    /// whether it was created.
+    fn ensure_chat_channel(&mut self, channel: &str, cx: &mut Context<Self>) -> bool {
+        if self.chat_backend.read(cx).get_channel(channel).is_some() {
+            return false;
+        }
+        self.chat_backend.update(cx, |backend, cx| {
+            backend.get_or_create_channel(channel, cx);
+        });
+        true
     }
 
     /// Put the pre-chooser channel back on a split whose chooser was dismissed.
@@ -679,26 +685,18 @@ impl AppState {
         };
 
         for channel in active_channels {
-            let channel_exists = self.chat_backend.read(cx).get_channel(&channel).is_some();
-            if !channel_exists {
-                self.chat_backend.update(cx, |backend, cx| {
-                    backend.get_or_create_channel(&channel, cx);
-                });
-            }
+            self.ensure_chat_channel(&channel, cx);
         }
 
-        for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            let tab_offset = (tab_idx as i32) - (idx as i32);
-            if tab_offset.abs() == 1 {
-                for channel in tab.channels() {
-                    let channel_exists = self.chat_backend.read(cx).get_channel(&channel).is_some();
-                    if !channel_exists {
-                        self.chat_backend.update(cx, |backend, cx| {
-                            backend.get_or_create_channel(&channel, cx);
-                        });
-                    }
-                }
-            }
+        let adjacent_channels: Vec<String> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(tab_idx, _)| is_adjacent_tab(*tab_idx, idx))
+            .flat_map(|(_, tab)| tab.channels())
+            .collect();
+        for channel in adjacent_channels {
+            self.ensure_chat_channel(&channel, cx);
         }
 
         self.rebalance_message_retention(cx);
@@ -756,8 +754,7 @@ impl AppState {
         }
 
         for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            let tab_offset = (tab_idx as i32) - (idx as i32);
-            if tab_offset.abs() == 1 {
+            if is_adjacent_tab(tab_idx, idx) {
                 for channel in tab.channels() {
                     if !lifecycle.is_connected(&channel) {
                         request_channel_connection(
@@ -834,13 +831,7 @@ impl AppState {
                 all_channels.push(channel.clone());
             }
 
-            let channel_exists = self.chat_backend.read(cx).get_channel(&channel).is_some();
-
-            if !channel_exists {
-                self.chat_backend.update(cx, |backend, cx| {
-                    backend.get_or_create_channel(&channel, cx);
-                });
-
+            if self.ensure_chat_channel(&channel, cx) {
                 if !backend::whispers::is_whispers_channel(&channel) {
                     backend::preload_channel_emotes_predictive(&channel);
                 }
@@ -1040,7 +1031,7 @@ impl AppState {
     ) {
         let first_new = self.tabs.len();
         self.tabs_mut().extend(tabs);
-        if crate::benchmark_profile::network_lanes_suppressed() {
+        if crate::bench::network_lanes_suppressed() {
             return;
         }
         let active_idx = active_tab_id
@@ -1050,14 +1041,7 @@ impl AppState {
         let mut requested = HashSet::new();
         let mut asset_channels = Vec::new();
         for (idx, tab) in self.tabs.iter().enumerate().skip(first_new) {
-            let tab_offset = (idx as i32) - (active_idx as i32);
-            let priority = if idx == active_idx {
-                backend::channel_lifecycle::LoadPriority::Immediate
-            } else if tab_offset.abs() == 1 {
-                backend::channel_lifecycle::LoadPriority::Prefetch
-            } else {
-                backend::channel_lifecycle::LoadPriority::Background
-            };
+            let priority = tab_load_priority(idx, active_idx);
             for channel in tab.channels() {
                 if lifecycle.is_connected(&channel) || !requested.insert(channel.clone()) {
                     continue;
@@ -1182,7 +1166,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Toggle a legacy section-specific activity action.
+    /// Toggle the rail from a section-specific action (a hotkey or command).
     ///
     /// Invoking the action for the visible section closes the rail; invoking a
     /// different action switches sections without creating another sidebar.
@@ -1245,22 +1229,14 @@ impl AppState {
         self.activity_panel.open
     }
 
-    /// Compatibility helper for section-scoped hotkey matching.
-    pub fn activity_hotkey_scope(&self) -> (bool, bool) {
-        (
-            self.activity_section_open(ActivitySection::Mentions),
-            self.activity_section_open(ActivitySection::Whispers),
-        )
-    }
-
     /// Refresh activity data immediately after a backend mutation.
     pub fn refresh_activity<T: 'static>(&mut self, cx: &mut Context<T>) {
         self.refresh_sidebar_caches();
         cx.notify();
     }
 
-    /// PERF: Refresh cached sidebar data (call from polling loop, not render)
-    /// Uses O(1) global mentions buffer instead of O(C×M) scan of all channels
+    /// Refresh cached sidebar data. Call from the polling loop, not render; the
+    /// mentions come from the global mentions buffer, not a scan of every channel.
     pub fn refresh_sidebar_caches(&mut self) {
         self.cached_mentions = Arc::new(backend::get_global_mentions(100));
 
@@ -1349,7 +1325,7 @@ impl AppState {
         }
     }
 
-    /// PERF: Clean up orphaned chat states and stream info
+    /// Clean up orphaned chat states and stream info.
     /// Call this periodically or after removing tabs/channels to prevent memory leaks
     pub fn cleanup_orphaned_states(&mut self, cx: &mut gpui::Context<Self>) {
         let active_channels: HashSet<String> = self

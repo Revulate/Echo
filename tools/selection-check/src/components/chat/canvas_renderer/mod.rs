@@ -5,6 +5,7 @@ pub mod eviction_cache {
 pub mod layout {
     use std::hash::{Hash, Hasher};
 
+    #[allow(dead_code)] // matched by selection.rs; the fixtures build text-only layouts
     #[derive(Clone, Debug)]
     pub enum LayoutSegment {
         Text,
@@ -20,11 +21,13 @@ pub mod layout {
     #[derive(Clone, Debug)]
     pub struct CanvasMessageLayout {
         pub source_text: String,
+        #[allow(dead_code)] // read by selection.rs's own unit tests
         pub source_char_positions: Vec<f32>,
         pub segments: Vec<LayoutSegment>,
     }
 
     impl CanvasMessageLayout {
+        #[allow(dead_code)] // used by selection.rs's own unit tests
         pub fn new(_message_id: String, _channel: &str) -> Self {
             Self {
                 source_text: String::new(),
@@ -82,5 +85,9 @@ pub mod layout {
     }
 }
 
+// echo-chat-render depends on GPUI, so the selection model is compiled from
+// source against the layout stubs above. Word ranges, image-source mapping and
+// clipboard formatting are not driven here.
 #[path = "../../../../../../crates/echo-chat-render/src/selection.rs"]
+#[allow(dead_code)]
 pub mod selection;

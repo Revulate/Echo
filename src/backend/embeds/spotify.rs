@@ -51,11 +51,11 @@ impl SpotifyEmbedProvider {
         let response = match SPOTIFY_HTTP_CLIENT.get(endpoint).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                tracing::debug!(status = %response.status(), "Spotify oEmbed request failed");
+                crate::log_net!(debug, status = %response.status(), "Spotify oEmbed request failed");
                 return basic_metadata(link_info, resource_kind);
             }
             Err(error) => {
-                tracing::debug!("Spotify oEmbed request failed: {error}");
+                crate::log_net!(debug, "Spotify oEmbed request failed: {error}");
                 return basic_metadata(link_info, resource_kind);
             }
         };

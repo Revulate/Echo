@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Summarize a saved GPU metric CSV trace.
+summarize-gpu-trace.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -19,97 +24,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "value"
-    }
-
-    return $slug
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
-
-function ConvertTo-NullableDouble {
-    param(
-        [object]$Value
-    )
-
-    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
-        return $null
-    }
-
-    $parsed = 0.0
-    if ([double]::TryParse(
-        [string]$Value,
-        [System.Globalization.NumberStyles]::Float,
-        [System.Globalization.CultureInfo]::InvariantCulture,
-        [ref]$parsed
-    )) {
-        return $parsed
-    }
-
-    return $null
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Normalize-ColumnName {
     param(
@@ -148,36 +63,6 @@ function Resolve-TraceColumn {
     }
 
     return $null
-}
-
-function Get-Percentile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [double[]]$SortedValues,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateRange(0, 100)]
-        [double]$Percentile
-    )
-
-    if ($SortedValues.Count -eq 0) {
-        return $null
-    }
-
-    if ($SortedValues.Count -eq 1) {
-        return [Math]::Round($SortedValues[0], 6)
-    }
-
-    $rank = ($Percentile / 100.0) * ($SortedValues.Count - 1)
-    $lower = [Math]::Floor($rank)
-    $upper = [Math]::Ceiling($rank)
-    if ($lower -eq $upper) {
-        return [Math]::Round($SortedValues[$lower], 6)
-    }
-
-    $weight = $rank - $lower
-    $value = ($SortedValues[$lower] * (1.0 - $weight)) + ($SortedValues[$upper] * $weight)
-    return [Math]::Round($value, 6)
 }
 
 function Get-MetricMultiplier {
@@ -282,12 +167,12 @@ function New-SeriesSummary {
         column = $Column
         unit = $Unit
         sample_count = $values.Count
-        min = Get-Percentile -SortedValues $sorted -Percentile 0
+        min = Get-Percentile -Values $sorted -Percentile 0
         avg = [Math]::Round($total / $values.Count, 6)
-        p50 = Get-Percentile -SortedValues $sorted -Percentile 50
-        p95 = Get-Percentile -SortedValues $sorted -Percentile 95
-        p99 = Get-Percentile -SortedValues $sorted -Percentile 99
-        max = Get-Percentile -SortedValues $sorted -Percentile 100
+        p50 = Get-Percentile -Values $sorted -Percentile 50
+        p95 = Get-Percentile -Values $sorted -Percentile 95
+        p99 = Get-Percentile -Values $sorted -Percentile 99
+        max = Get-Percentile -Values $sorted -Percentile 100
         lower_is_better = $LowerIsBetter
     }
 }

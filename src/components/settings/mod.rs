@@ -1,8 +1,9 @@
 //! Settings modal for Echo GPUI
 //!
 //! Full settings modal and native popout with compact shared navigation.
-//! Ordinary settings are organized into two plain-language groups; developer
-//! tools stay behind an explicit disclosure and out of default search results.
+//! Settings are organized into seven pages plus Advanced (see
+//! [`settings_navigation`]); developer diagnostics stay behind an explicit
+//! disclosure and out of default search results.
 //!
 //! Features:
 //! - Keyboard navigation (Tab/Arrow keys)

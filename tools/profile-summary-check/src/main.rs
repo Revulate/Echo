@@ -1,3 +1,7 @@
+//! Fixture: flattens Echo profile summary JSON files (render, layout, atlas and
+//! emote-stage counters) into one CSV row per file.
+//! Usage: `profile-summary-check <profile.summary.json> [...]`.
+
 use std::env;
 use std::fs;
 use std::path::Path;

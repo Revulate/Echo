@@ -6,8 +6,6 @@
 //! Performance: ASCII chat uses a byte scanner (IRC emote tag positions are
 //! byte-equivalent for ASCII), avoiding the char-position Vec allocation. The
 //! Unicode path keeps char→byte mapping for emoji and non-ASCII emote ranges.
-//! string view optimization.
-#![allow(clippy::too_many_arguments)] // Parser needs all context at once for performance
 
 use echo_emote_core::Emote;
 use rustc_hash::FxHashMap;
@@ -676,7 +674,7 @@ pub fn parse_emotes_tag(tag: &str) -> TwitchEmoteMap {
 /// dropping spans that fall entirely inside the stripped prefix (the leading
 /// `@user ` mention Twitch prepends to reply messages).
 ///
-/// PERF: builds the final map in one pass instead of parsing the full map and
+/// Builds the final map in one pass instead of parsing the full map and
 /// then filtering it into a second one.
 pub fn parse_emotes_tag_with_offset(tag: &str, strip_offset: usize) -> TwitchEmoteMap {
     let mut result = FxHashMap::default();

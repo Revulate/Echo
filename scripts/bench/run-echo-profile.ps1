@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Launch Echo with profiler logging enabled and record raw profile artifacts for
+one run. run-echo-profile.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [string]$RunDir = "",
@@ -36,154 +41,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function Resolve-ExecutablePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (Test-Path $Path) {
-        return (Resolve-Path $Path).Path
-    }
-
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-        return $command.Source
-    }
-
-    throw "LaunchPath '$Path' was not found as a file or executable command."
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $args = @{
-        Scenario = $Scenario
-        EchoPath = $LaunchPath
-        EchoBuildType = $EchoBuildType
-        CacheState = $CacheState
-        NetworkState = $NetworkState
-        FixtureName = $FixtureName
-        Notes = $Notes
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-        $args.OutputRoot = $OutputRoot
-    }
-
-    $output = & $initializer @args
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
-
-function Set-TemporaryEnv {
-    param(
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Previous,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    if (-not $Previous.ContainsKey($Name)) {
-        $Previous[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
-    }
-
-    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
-}
-
-function Restore-Env {
-    param(
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Previous
-    )
-
-    foreach ($entry in $Previous.GetEnumerator()) {
-        if ($null -eq $entry.Value) {
-            [Environment]::SetEnvironmentVariable([string]$entry.Key, $null, "Process")
-        } else {
-            [Environment]::SetEnvironmentVariable([string]$entry.Key, [string]$entry.Value, "Process")
-        }
-    }
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Stop-ProfileProcess {
     param(
@@ -260,8 +118,17 @@ function Stop-ProfileProcess {
 }
 
 $repoRoot = Resolve-RepoRoot
-$scenarioDir = Initialize-RunDirectory -RepoRoot $repoRoot
-$resolvedLaunchPath = Resolve-ExecutablePath -Path $LaunchPath
+$scenarioDir = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $Scenario
+    OutputRoot = $OutputRoot
+    EchoPath = $LaunchPath
+    EchoBuildType = $EchoBuildType
+    CacheState = $CacheState
+    NetworkState = $NetworkState
+    FixtureName = $FixtureName
+    Notes = $Notes
+}
+$resolvedLaunchPath = Resolve-ExecutablePath -Path $LaunchPath -Label "LaunchPath"
 $resolvedWorkingDirectory = if (-not [string]::IsNullOrWhiteSpace($LaunchWorkingDirectory)) {
     (New-Item -ItemType Directory -Force -Path $LaunchWorkingDirectory).FullName
 } else {

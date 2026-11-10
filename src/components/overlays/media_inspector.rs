@@ -5,26 +5,16 @@
 //! bounded URI image cache; this module owns no downloader, cache, player, or
 //! persisted window preference.
 
-use crate::backend::lock_utils::MutexExt;
+use crate::components::ui::{Retarget, SingletonWindow};
 use crate::theme::colors;
 use crate::theme::tokens::Spacing;
 use gpui::*;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 const MEDIA_INSPECTOR_SIZE: (f32, f32) = (960.0, 720.0);
 const MEDIA_INSPECTOR_MIN_SIZE: (f32, f32) = (320.0, 240.0);
 
-static MEDIA_INSPECTOR_OPEN: AtomicBool = AtomicBool::new(false);
-static MEDIA_INSPECTOR_HANDLE: LazyLock<Mutex<Option<AnyWindowHandle>>> =
-    LazyLock::new(|| Mutex::new(None));
-static PENDING_MEDIA_SOURCE: Mutex<Option<String>> = Mutex::new(None);
-
-fn mark_media_inspector_closed() {
-    MEDIA_INSPECTOR_OPEN.store(false, Ordering::SeqCst);
-    *MEDIA_INSPECTOR_HANDLE.lock_or_recover() = None;
-    *PENDING_MEDIA_SOURCE.lock_or_recover() = None;
-}
+/// Pending payload: the image source to show next.
+static MEDIA_INSPECTOR: SingletonWindow<String> = SingletonWindow::new();
 
 /// Open the reusable inspector, or retarget and focus the existing window.
 ///
@@ -37,23 +27,14 @@ pub fn open_media_inspector(source_url: String, cx: &mut App) {
         return;
     }
 
-    if MEDIA_INSPECTOR_OPEN.load(Ordering::SeqCst) {
-        *PENDING_MEDIA_SOURCE.lock_or_recover() = Some(source_url.clone());
-        let handle = *MEDIA_INSPECTOR_HANDLE.lock_or_recover();
-        if let Some(handle) = handle
-            && handle
-                .update(cx, |_, window, cx| {
-                    cx.activate(true);
-                    window.activate_window();
-                    window.refresh();
-                })
-                .is_ok()
-        {
-            return;
+    let source_url = match MEDIA_INSPECTOR.retarget(source_url, cx) {
+        Retarget::Retargeted => return,
+        Retarget::NotOpen(source_url) => source_url,
+        Retarget::Stale(source_url) => {
+            MEDIA_INSPECTOR.mark_closed();
+            source_url
         }
-
-        mark_media_inspector_closed();
-    }
+    };
 
     let window_size = size(px(MEDIA_INSPECTOR_SIZE.0), px(MEDIA_INSPECTOR_SIZE.1));
     let (bounds, display_id) = crate::utils::popup_window_placement(None, window_size, cx);
@@ -80,8 +61,8 @@ pub fn open_media_inspector(source_url: String, cx: &mut App) {
             ..Default::default()
         },
         move |window, cx| {
-            *MEDIA_INSPECTOR_HANDLE.lock_or_recover() = Some(window.window_handle());
-            MEDIA_INSPECTOR_OPEN.store(true, Ordering::SeqCst);
+            MEDIA_INSPECTOR.set_handle(window.window_handle());
+            MEDIA_INSPECTOR.mark_open();
             cx.new(|cx| {
                 let inspector = MediaInspector::new(source_url.clone(), cx);
                 window.focus(&inspector.focus_handle, cx);
@@ -91,7 +72,7 @@ pub fn open_media_inspector(source_url: String, cx: &mut App) {
     );
 
     if open_result.is_err() {
-        mark_media_inspector_closed();
+        MEDIA_INSPECTOR.mark_closed();
     }
 }
 
@@ -111,7 +92,7 @@ impl MediaInspector {
     }
 
     fn apply_pending_source(&mut self) {
-        let next_source = PENDING_MEDIA_SOURCE.lock_or_recover().take();
+        let next_source = MEDIA_INSPECTOR.take_pending();
         if let Some(source_url) = next_source.filter(|source_url| !source_url.trim().is_empty()) {
             self.source_url = SharedString::from(source_url);
         }
@@ -120,7 +101,7 @@ impl MediaInspector {
 
 impl Drop for MediaInspector {
     fn drop(&mut self) {
-        mark_media_inspector_closed();
+        MEDIA_INSPECTOR.mark_closed();
     }
 }
 

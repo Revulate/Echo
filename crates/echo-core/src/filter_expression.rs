@@ -6,7 +6,8 @@ const MAX_FILTER_NESTING: usize = 64;
 const MAX_FILTER_DEPTH: usize = 256;
 const MAX_FILTER_CHAIN_TERMS: usize = 4096;
 
-/// Test context for filter evaluation
+/// The message, author and channel fields a filter expression is evaluated
+/// against.
 #[derive(Debug, Clone, Default)]
 pub struct FilterContext {
     pub content: String,

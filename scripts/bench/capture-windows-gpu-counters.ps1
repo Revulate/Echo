@@ -1,3 +1,9 @@
+<#
+.SYNOPSIS
+Sample Windows GPU engine and GPU memory performance counters for one process
+(launched or existing), with optional periodic memory maps, and summarize
+growth and plateau behaviour.
+#>
 [CmdletBinding()]
 param(
     [int]$TargetProcessId = 0,
@@ -42,6 +48,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 Add-Type -TypeDefinition @"
 using System;
@@ -84,23 +91,6 @@ public static class EchoGpuCounterWindowCloser
     }
 }
 "@
-
-function Resolve-RepoRoot {
-    return (Resolve-Path (Join-Path (Split-Path -Parent $PSCommandPath) "..\..")).Path
-}
-
-function Resolve-ExecutablePath {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if (Test-Path $Path) {
-        return (Resolve-Path $Path).Path
-    }
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-        return $command.Source
-    }
-    throw "Executable '$Path' was not found."
-}
 
 function Stop-OwnedProcess {
     param(
@@ -184,20 +174,6 @@ function Invoke-MemoryMapSnapshot {
         throw "Memory-map snapshot '$Label' did not return an artifact path."
     }
     return [string]$output[-1]
-}
-
-function Get-Percentile {
-    param([double[]]$Values, [double]$Percentile)
-
-    if ($Values.Count -eq 0) { return $null }
-    $sorted = [double[]]@($Values | Sort-Object)
-    if ($sorted.Count -eq 1) { return $sorted[0] }
-    $rank = ($Percentile / 100.0) * ($sorted.Count - 1)
-    $lower = [Math]::Floor($rank)
-    $upper = [Math]::Ceiling($rank)
-    if ($lower -eq $upper) { return $sorted[$lower] }
-    $weight = $rank - $lower
-    return ($sorted[$lower] * (1.0 - $weight)) + ($sorted[$upper] * $weight)
 }
 
 function Get-SeriesSummary {

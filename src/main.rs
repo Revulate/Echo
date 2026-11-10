@@ -21,16 +21,8 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 #[cfg(all(feature = "alloc-profile", not(feature = "dhat-heap")))]
 #[global_allocator]
-static GLOBAL: echo_gpui::alloc_profile::CountingAllocator =
-    echo_gpui::alloc_profile::CountingAllocator::new();
-
-#[cfg(all(
-    not(feature = "alloc-profile"),
-    not(feature = "dhat-heap"),
-    any(target_os = "linux", all(windows, feature = "windows-mimalloc"))
-))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: echo_gpui::diagnostics::alloc_profile::CountingAllocator =
+    echo_gpui::diagnostics::alloc_profile::CountingAllocator::new();
 
 use echo_gpui::assets::EchoAssets;
 use echo_gpui::components::ui::{Root, open_native_window};
@@ -38,7 +30,8 @@ use echo_gpui::state::AppState;
 use echo_gpui::utils::main_window_restore_bounds;
 use echo_gpui::{EchoApp, identity};
 use echo_gpui::{
-    backend, cache, components, demo, fps_profiler, log, managers, profiling, state, theme,
+    backend, cache, components, diagnostics::demo, diagnostics::fps_profiler,
+    diagnostics::profiling, log, managers, state, theme,
 };
 use gpui::*;
 use reqwest_client::ReqwestClient;
@@ -49,6 +42,22 @@ use std::{sync::Arc, time::Duration};
 /// cannot pin GPUI's fallback loader indefinitely; this is an idle-read timeout,
 /// not a total download deadline.
 const GPUI_MEDIA_BODY_READ_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Unfocused-window frame interval forced by `ECHO_INACTIVE_THROTTLE=1`: 30 fps.
+const FORCED_INACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(33_333);
+
+/// GPUI's frame gate for an unfocused main window. `ECHO_INACTIVE_THROTTLE`
+/// forces 30 fps when on, disables the gate when off, and otherwise leaves the
+/// scheduler's default.
+fn inactive_frame_interval() -> Option<Duration> {
+    match echo_core::env::tristate("ECHO_INACTIVE_THROTTLE") {
+        echo_core::env::Tristate::On => Some(FORCED_INACTIVE_FRAME_INTERVAL),
+        echo_core::env::Tristate::Off => None,
+        echo_core::env::Tristate::Default => Some(Duration::from_millis(
+            managers::dynamic_tick_scheduler::inactive_frame_gate_interval_ms(),
+        )),
+    }
+}
 
 /// Record the main window's GPU adapter under the session header, once.
 fn log_gpu_adapter(window: &Window) {
@@ -118,7 +127,7 @@ fn restrict_dll_search_path() {
 }
 
 fn main() {
-    configure_allocator();
+    allocator::configure();
     #[cfg(windows)]
     restrict_dll_search_path();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -134,10 +143,12 @@ fn main() {
     }
 
     backend::reliability::install_panic_hook();
-    echo_gpui::startup_metrics::initialize_clock();
+    echo_gpui::diagnostics::startup_metrics::initialize_clock();
     components::chat::canvas_renderer::install_render_ports();
 
-    if let Err(error) = echo_gpui::benchmark_profile::initialize() {
+    if let Err(error) =
+        echo_gpui::storage_roots::initialize().and_then(|()| echo_gpui::bench::initialize())
+    {
         eprintln!("Echo benchmark profile initialization failed: {error}");
         std::process::exit(1);
     }
@@ -156,13 +167,13 @@ fn main() {
     }
 
     #[cfg(windows)]
-    if !echo_gpui::benchmark_ui_fixture::single_instance_bypass_enabled()
+    if !echo_gpui::bench::ui_fixture::single_instance_bypass_enabled()
         && !windows_activation::acquire_single_instance()
     {
         return;
     }
     #[cfg(target_os = "linux")]
-    if !echo_gpui::benchmark_ui_fixture::single_instance_bypass_enabled()
+    if !echo_gpui::bench::ui_fixture::single_instance_bypass_enabled()
         && !linux_activation::acquire_single_instance()
     {
         return;
@@ -170,17 +181,19 @@ fn main() {
 
     profiling::init();
 
-    echo_gpui::alloc_profile::init();
+    echo_gpui::diagnostics::alloc_profile::init();
 
-    echo_gpui::dhat_profile::start();
+    echo_gpui::diagnostics::dhat_profile::start();
 
     log::init();
     state::install_domain_ports();
-    echo_gpui::startup_metrics::record("process_created");
+    echo_gpui::diagnostics::startup_metrics::record(
+        echo_gpui::diagnostics::startup_metrics::StartupMarker::ProcessCreated,
+    );
 
     backend::updates::start_staged_installer_cleanup();
 
-    start_mimalloc_trim_thread();
+    allocator::start_trim_thread();
 
     fps_profiler::init();
     backend::metrics::init();
@@ -221,17 +234,21 @@ fn main() {
             backend::http::ensure_rustls_crypto_provider();
             if prewarm_handle.is_finished() {
                 if let Err(e) = prewarm_handle.join() {
-                    tracing::warn!("Prewarm thread panicked: {:?}", e);
+                    echo_gpui::log_app!(warn, "Prewarm thread panicked: {:?}", e);
                 }
-                echo_gpui::startup_metrics::record("prewarm_joined");
+                echo_gpui::diagnostics::startup_metrics::record(
+                    echo_gpui::diagnostics::startup_metrics::StartupMarker::PrewarmJoined,
+                );
             } else {
-                echo_gpui::startup_metrics::record("prewarm_detached");
+                echo_gpui::diagnostics::startup_metrics::record(
+                    echo_gpui::diagnostics::startup_metrics::StartupMarker::PrewarmDetached,
+                );
             }
 
             match build_gpui_http_client() {
                 Ok(http_client) => cx.set_http_client(Arc::new(http_client)),
                 Err(e) => {
-                    tracing::error!("Failed to create HTTP client: {e}");
+                    echo_gpui::log_net!(error, "Failed to create HTTP client: {e}");
                     backend::reliability::note_startup_degraded_feature(
                         "Network media support is degraded",
                         format!(
@@ -258,18 +275,24 @@ fn main() {
             })
             .detach();
 
-            echo_gpui::startup_metrics::record("gpui_http_client_ready");
+            echo_gpui::diagnostics::startup_metrics::record(
+                echo_gpui::diagnostics::startup_metrics::StartupMarker::GpuiHttpClientReady,
+            );
             #[cfg(unix)]
             quit_on_termination_signals(cx);
             backend::initialize();
-            echo_gpui::startup_metrics::record("backend_initialized");
+            echo_gpui::diagnostics::startup_metrics::record(
+                echo_gpui::diagnostics::startup_metrics::StartupMarker::BackendInitialized,
+            );
 
             cx.set_reduce_motion(backend::settings::get_reduce_decorative_motion());
 
             cache::uri_layer::init(cx);
 
             state::emote_preferences::init_preferences();
-            echo_gpui::startup_metrics::record("caches_initialized");
+            echo_gpui::diagnostics::startup_metrics::record(
+                echo_gpui::diagnostics::startup_metrics::StartupMarker::CachesInitialized,
+            );
 
             components::ui::init(cx);
 
@@ -280,8 +303,9 @@ fn main() {
 
             cx.set_text_rendering_mode(TextRenderingMode::Subpixel);
 
-            theme::init(cx);
-            echo_gpui::startup_metrics::record("theme_initialized");
+            echo_gpui::diagnostics::startup_metrics::record(
+                echo_gpui::diagnostics::startup_metrics::StartupMarker::ThemeInitialized,
+            );
 
             let (main_window_width, main_window_height) = backend::settings::get_main_window_size();
             let restore_size = size(px(main_window_width), px(main_window_height));
@@ -296,19 +320,11 @@ fn main() {
                 WindowBounds::Windowed(restore_bounds)
             };
 
-            let inactive_frame_interval = match std::env::var("ECHO_INACTIVE_THROTTLE")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "1" | "true" => Some(std::time::Duration::from_micros(33_333)),
-                "0" | "off" | "false" => None,
-                _ => Some(std::time::Duration::from_millis(
-                    managers::dynamic_tick_scheduler::inactive_frame_gate_interval_ms(),
-                )),
-            };
+            let inactive_frame_interval = inactive_frame_interval();
 
-            echo_gpui::startup_metrics::record("main_window_opening");
+            echo_gpui::diagnostics::startup_metrics::record(
+                echo_gpui::diagnostics::startup_metrics::StartupMarker::MainWindowOpening,
+            );
             if let Err(e) = open_native_window(
                 cx,
                 WindowOptions {
@@ -352,14 +368,16 @@ fn main() {
                     #[cfg(windows)]
                     windows_tray::install(window);
                     #[cfg(windows)]
-                    if !echo_gpui::benchmark_ui_fixture::single_instance_bypass_enabled()
-                        && !echo_gpui::benchmark_profile::is_enabled()
+                    if !echo_gpui::bench::ui_fixture::single_instance_bypass_enabled()
+                        && !echo_gpui::storage_roots::is_isolated()
                     {
                         windows_activation::install(window);
                     }
                     #[cfg(target_os = "linux")]
                     linux_activation::install(window, cx);
-                    echo_gpui::startup_metrics::record("main_window_created");
+                    echo_gpui::diagnostics::startup_metrics::record(
+                        echo_gpui::diagnostics::startup_metrics::StartupMarker::MainWindowCreated,
+                    );
                     window.on_next_frame(|window, _| log_gpu_adapter(window));
                     components::chat::canvas_renderer::initialize_font_metrics(window, cx);
 
@@ -367,21 +385,23 @@ fn main() {
                     let popup_app_state = app_state.clone();
                     let echo_app = cx.new(|cx| EchoApp::new(app_state.clone(), window, cx));
                     let root = cx.new(|cx| Root::new(echo_app, window, cx));
-                    echo_gpui::startup_metrics::record("layout_restored");
+                    echo_gpui::diagnostics::startup_metrics::record(
+                        echo_gpui::diagnostics::startup_metrics::StartupMarker::LayoutRestored,
+                    );
 
-                    if echo_gpui::benchmark_profile::live_channel().is_some() {
+                    if echo_gpui::bench::live_channel::requested_channel().is_some() {
                         let state = app_state.read(cx);
                         if let Err(error) =
-                            echo_gpui::benchmark_profile::start_live_channel_readiness_probe(
+                            echo_gpui::bench::live_channel::start_readiness_probe(
                             state.active_tab().active_channel(),
                             state.active_tab().channels(),
                         ) {
-                            tracing::error!(%error, "Live benchmark readiness probe did not start");
+                            echo_gpui::log_app!(error, %error, "Live benchmark readiness probe did not start");
                             std::process::exit(1);
                         }
                     }
 
-                    if !echo_gpui::benchmark_ui_fixture::disposable_workspace_enabled() {
+                    if !echo_gpui::bench::ui_fixture::disposable_workspace_enabled() {
                         cx.defer(move |cx| {
                             components::chat::restore_open_channel_popups(popup_app_state, cx);
                         });
@@ -394,11 +414,7 @@ fn main() {
                 // running would keep the single-instance lock, so every later
                 // launch would only try to activate it.
                 cx.quit();
-                return;
             }
-
-            #[cfg(debug_assertions)]
-            tracing::info!("Echo GPUI window opened successfully");
         });
 
     #[cfg(windows)]
@@ -485,81 +501,90 @@ fn quit_on_termination_signals(cx: &mut App) {
     .detach();
 }
 
-/// mimalloc v3 `mi_option_page_commit_on_demand`; libmimalloc-sys has no
-/// constant for it yet.
-#[cfg(all(
-    not(feature = "alloc-profile"),
-    not(feature = "dhat-heap"),
-    any(target_os = "linux", all(windows, feature = "windows-mimalloc"))
-))]
-const MI_OPTION_PAGE_COMMIT_ON_DEMAND: libmimalloc_sys::mi_option_t = 40;
-
-/// Commit mimalloc page memory as it is first used instead of a whole page at
-/// a time.
+/// mimalloc, the global allocator whenever no profiling allocator replaces it.
 ///
-/// Same-binary stress A/Bs (2 splits, 100 msg/s) measured 50-72 MB less private
-/// commit with unchanged working set and CPU. A `MIMALLOC_PAGE_COMMIT_ON_DEMAND`
-/// environment value still wins, so the default stays easy to A/B.
+/// This is the only place that spells the predicate; everything that talks to
+/// mimalloc directly lives inside it, so nothing calls into an allocator that
+/// is not installed.
 #[cfg(all(
     not(feature = "alloc-profile"),
     not(feature = "dhat-heap"),
     any(target_os = "linux", all(windows, feature = "windows-mimalloc"))
 ))]
-fn configure_allocator() {
-    if std::env::var_os("MIMALLOC_PAGE_COMMIT_ON_DEMAND").is_none() {
-        // SAFETY: mi_option_set only updates an option slot; it is called
-        // before Echo starts any other thread.
-        unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) };
+mod allocator {
+    #[global_allocator]
+    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+    /// mimalloc v3 `mi_option_page_commit_on_demand`; libmimalloc-sys has no
+    /// constant for it yet.
+    const MI_OPTION_PAGE_COMMIT_ON_DEMAND: libmimalloc_sys::mi_option_t = 40;
+
+    /// Commit mimalloc page memory as it is first used instead of a whole page at
+    /// a time.
+    ///
+    /// Same-binary stress A/Bs (2 splits, 100 msg/s) measured 50-72 MB less private
+    /// commit with unchanged working set and CPU. A `MIMALLOC_PAGE_COMMIT_ON_DEMAND`
+    /// environment value still wins, so the default stays easy to A/B.
+    pub(crate) fn configure() {
+        if std::env::var_os("MIMALLOC_PAGE_COMMIT_ON_DEMAND").is_none() {
+            // SAFETY: mi_option_set only updates an option slot; it is called
+            // before Echo starts any other thread.
+            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) };
+        }
+    }
+
+    /// Start an opt-in forced mimalloc collection loop.
+    ///
+    /// Mimalloc already applies its own purge policy. A background forced collection
+    /// can reduce retained RSS for particular long-running workloads, but it also wakes
+    /// a thread and scans allocator state, so distribution builds leave it disabled
+    /// unless an operator supplies a positive interval.
+    pub(crate) fn start_trim_thread() {
+        let Some(raw_interval) = echo_core::env::value("ECHO_MIMALLOC_TRIM_INTERVAL_SECS") else {
+            return;
+        };
+        let Ok(interval_secs) = raw_interval.parse::<u64>() else {
+            echo_gpui::log_app!(
+                warn,
+                "Ignoring invalid ECHO_MIMALLOC_TRIM_INTERVAL_SECS; expected a non-negative integer"
+            );
+            return;
+        };
+        if interval_secs == 0 {
+            return;
+        }
+
+        match std::thread::Builder::new()
+            .name("mimalloc-trim".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+                    // SAFETY: mi_collect is documented as a thread-safe mimalloc API.
+                    unsafe { libmimalloc_sys::mi_collect(true) };
+                }
+            }) {
+            Ok(_) => echo_gpui::log_app!(
+                info,
+                interval_secs,
+                "Periodic forced mimalloc collection enabled"
+            ),
+            Err(error) => {
+                echo_gpui::log_app!(warn, %error, "Failed to start mimalloc collection thread")
+            }
+        }
     }
 }
 
+/// The system or a profiling allocator is installed; there is nothing to tune.
 #[cfg(not(all(
     not(feature = "alloc-profile"),
     not(feature = "dhat-heap"),
     any(target_os = "linux", all(windows, feature = "windows-mimalloc"))
 )))]
-fn configure_allocator() {}
-
-/// Start an opt-in forced mimalloc collection loop.
-///
-/// Mimalloc already applies its own purge policy. A background forced collection
-/// can reduce retained RSS for particular long-running workloads, but it also wakes
-/// a thread and scans allocator state, so distribution builds leave it disabled
-/// unless an operator supplies a positive interval.
-#[cfg(any(target_os = "linux", all(windows, feature = "windows-mimalloc")))]
-fn start_mimalloc_trim_thread() {
-    let Some(raw_interval) = std::env::var_os("ECHO_MIMALLOC_TRIM_INTERVAL_SECS") else {
-        return;
-    };
-    let Some(interval_secs) = raw_interval
-        .to_str()
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
-        tracing::warn!(
-            "Ignoring invalid ECHO_MIMALLOC_TRIM_INTERVAL_SECS; expected a non-negative integer"
-        );
-        return;
-    };
-    if interval_secs == 0 {
-        return;
-    }
-
-    match std::thread::Builder::new()
-        .name("mimalloc-trim".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(interval_secs));
-                // SAFETY: mi_collect is documented as a thread-safe mimalloc API.
-                unsafe { libmimalloc_sys::mi_collect(true) };
-            }
-        }) {
-        Ok(_) => tracing::info!(interval_secs, "Periodic forced mimalloc collection enabled"),
-        Err(error) => tracing::warn!(%error, "Failed to start mimalloc collection thread"),
-    }
+mod allocator {
+    pub(crate) fn configure() {}
+    pub(crate) fn start_trim_thread() {}
 }
-
-#[cfg(not(any(target_os = "linux", all(windows, feature = "windows-mimalloc"))))]
-fn start_mimalloc_trim_thread() {}
 
 fn handle_version_command(args: &[String]) -> bool {
     let is_version_command = matches!(

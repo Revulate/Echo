@@ -1,14 +1,10 @@
-#![allow(dead_code)]
-
-//! Narrow deterministic coverage for whisper-thread summaries, ordering, unread
-//! transitions, and sent/received formatting. Harness stubs intentionally do not
+//! Contract: whisper-thread summaries, ordering, unread transitions and
+//! sent/received formatting in `src/backend/whispers.rs`. Harness stubs intentionally do not
 //! validate bounded message-buffer capacity, slot parsing/hashing, observer delivery,
 //! retokenization, or frame-wakeup effects; those require their owning integration
 //! boundaries.
 
 mod state {
-    use std::sync::Arc;
-
     #[derive(Clone, Debug, Default)]
     pub struct MessageBuffer {
         messages: Vec<crate::backend::models::ChatMessage>,
@@ -28,10 +24,6 @@ mod state {
             self.messages.retain(|message| keep(message));
             before - self.messages.len()
         }
-        #[allow(dead_code)]
-        pub fn snapshot(&mut self) -> Arc<Vec<crate::backend::models::ChatMessage>> {
-            Arc::new(self.messages.clone())
-        }
     }
 
     pub mod ui_invalidation {
@@ -43,10 +35,16 @@ mod state {
     }
 }
 
+// Stubs for the `crate::backend` items `whispers.rs` uses. Some variants and the
+// blocked-user policy are only reached from paths this check does not drive.
+#[allow(dead_code)]
 mod backend {
     pub mod activity_persistence {
         pub fn mark_dirty() {}
-        pub fn retire_account_visibility_commit_held() {}
+        pub fn retire_account_visibility_commit_held(
+            _commit: &crate::backend::blocked_users::VisibilityCommit,
+        ) {
+        }
     }
 
     pub mod lock_utils {
@@ -54,36 +52,7 @@ mod backend {
     }
 
     pub mod models {
-        use std::sync::Arc;
-        #[derive(Clone, Debug, Default)]
-        pub struct ChatMessage {
-            pub id: Arc<str>,
-            pub channel: Arc<str>,
-            pub emote_lookup_channel: Option<Arc<str>>,
-            pub emote_lookup_source_id: Option<Arc<str>>,
-            pub sender: Arc<str>,
-            pub display_name: Arc<str>,
-            pub content: Arc<str>,
-            pub color: Option<Arc<str>>,
-            pub badges: Vec<Arc<str>>,
-            pub timestamp: i64,
-            pub slots: Arc<[()]>,
-            pub structure_hash: u64,
-            pub reply: Option<()>,
-            pub flags: MessageFlags,
-            pub twitch_emotes_tag: Option<Arc<str>>,
-            pub twitch_gifs_tag: Option<Arc<str>>,
-            pub user_id: Option<Arc<str>>,
-            pub reply_emote_offset: usize,
-        }
-        #[derive(Clone, Debug, Default)]
-        pub struct MessageFlags {
-            pub highlight_type: Option<HighlightType>,
-        }
-        #[derive(Clone, Debug)]
-        pub enum HighlightType {
-            Whisper,
-        }
+        pub use echo_core::message::*;
     }
 
     pub mod auth {
@@ -115,12 +84,10 @@ mod backend {
             _channel: &str,
             _sender: super::emotes::EmoteSender,
             _emotes: &FxHashMap<usize, (String, usize)>,
-        ) -> Vec<()> {
+        ) -> Vec<echo_core::slot::MessageSlot> {
             Vec::new()
         }
-        pub fn compute_structure_hash(_slots: &[()]) -> u64 {
-            0
-        }
+        pub use echo_core::slot::compute_structure_hash;
     }
 
     pub mod irc {
@@ -133,7 +100,7 @@ mod backend {
 
     pub mod observers {
         use super::models::ChatMessage;
-        use std::sync::{Arc, LazyLock};
+        use std::sync::LazyLock;
         #[derive(Clone)]
         #[allow(clippy::large_enum_variant)]
         pub enum ChannelEvent {
@@ -148,8 +115,6 @@ mod backend {
         pub fn get_observer_registry() -> &'static Registry {
             &REGISTRY
         }
-        #[allow(dead_code)]
-        fn _arc(_: Arc<str>) {}
     }
 
     // Minimal stub of backend::blocked_users for the #[path]-included
@@ -174,10 +139,16 @@ mod backend {
         pub fn visibility_policy_snapshot() -> Option<BlockedVisibilityPolicy> {
             None
         }
-        pub fn visibility_commit_guard() -> std::sync::MutexGuard<'static, ()> {
+        pub struct VisibilityCommit {
+            _gate: std::sync::MutexGuard<'static, ()>,
+        }
+
+        pub fn visibility_commit_guard() -> VisibilityCommit {
             static GATE: std::sync::LazyLock<std::sync::Mutex<()>> =
                 std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-            GATE.lock().expect("whisper fixture gate poisoned")
+            VisibilityCommit {
+                _gate: GATE.lock().expect("whisper fixture gate poisoned"),
+            }
         }
     }
 
@@ -199,16 +170,11 @@ mod managers {
     }
 }
 
-impl state::MessageBuffer {
-    // Keep the production path's private buffer type available at crate::state::MessageBuffer.
-}
-
 #[path = "../../../src/backend/whispers.rs"]
-#[allow(clippy::needless_update)]
+#[allow(dead_code)] // account-clear, activity and blocked-user paths are not driven here
 mod whispers;
 
-use std::hint::black_box;
-use std::time::Instant;
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 
 fn main() {
     whispers::record_received("Alice", "hello", 10);
@@ -242,30 +208,7 @@ fn main() {
     assert!(!mark_all_read_again);
     let unread_after_mark_all_read = whispers::unread_count();
 
-    let iterations = 250_000usize;
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for index in 0..iterations {
-        let user = if index & 1 == 0 { "Alice" } else { "Bob" };
-        whispers::record_received(
-            black_box(user),
-            black_box("message"),
-            black_box(index as i64),
-        );
-        whispers::record_sent(
-            black_box(user),
-            black_box("fixture-user-id"),
-            black_box("ack"),
-            black_box(index as i64),
-        );
-        checksum = checksum.wrapping_add(whispers::get_threads().len());
-    }
-    let elapsed = start.elapsed();
-    let units = iterations * 2;
-    let ns_per_unit = elapsed.as_nanos() as f64 / units as f64;
-    let units_per_second = units as f64 / elapsed.as_secs_f64();
-
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(WhisperSmokeRows {
         threads: &threads,
         initial_unread_count,
@@ -276,10 +219,6 @@ fn main() {
         unread_after_mark_all_read,
         mark_all_read_again,
     });
-    println!(
-        "track,whisper_threads,{},{:.2},{:.0},{}",
-        units, ns_per_unit, units_per_second, checksum
-    );
 }
 
 struct WhisperSmokeRows<'a> {
@@ -304,78 +243,69 @@ fn print_smoke_rows(rows: WhisperSmokeRows<'_>) {
         unread_after_mark_all_read,
         mark_all_read_again,
     } = rows;
-    print_fixture(
+    assert_fixture(
         "whisper_last_received_sender",
-        &whispers::last_received_sender().unwrap_or_default(),
+        whispers::last_received_sender().unwrap_or_default(),
         "Bob",
     );
-    print_fixture("whisper_thread_count", &threads.len().to_string(), "2");
-    print_fixture("whisper_latest_username", &threads[0].username, "Bob");
-    print_fixture("whisper_latest_message", &threads[0].last_message, "ping");
-    print_fixture(
+    assert_fixture("whisper_thread_count", threads.len().to_string(), "2");
+    assert_fixture("whisper_latest_username", &threads[0].username, "Bob");
+    assert_fixture("whisper_latest_message", &threads[0].last_message, "ping");
+    assert_fixture(
         "whisper_latest_unread_count",
-        &threads[0].unread_count.to_string(),
+        threads[0].unread_count.to_string(),
         "1",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_latest_timestamp",
-        &threads[0].last_timestamp.to_string(),
+        threads[0].last_timestamp.to_string(),
         "30",
     );
-    print_fixture("whisper_older_username", &threads[1].username, "alice");
-    print_fixture(
+    assert_fixture("whisper_older_username", &threads[1].username, "alice");
+    assert_fixture(
         "whisper_older_message",
         &threads[1].last_message,
         "You: reply",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_older_unread_count",
-        &threads[1].unread_count.to_string(),
+        threads[1].unread_count.to_string(),
         "0",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_older_timestamp",
-        &threads[1].last_timestamp.to_string(),
+        threads[1].last_timestamp.to_string(),
         "20",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_initial_unread_count",
-        &initial_unread_count.to_string(),
+        initial_unread_count.to_string(),
         "1",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_mark_read_case_insensitive",
         bool_text(mark_alice_read),
         "false",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_unread_after_mark_read",
-        &unread_after_mark_read.to_string(),
+        unread_after_mark_read.to_string(),
         "1",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_mark_missing_read",
         bool_text(mark_missing_read),
         "false",
     );
-    print_fixture("whisper_mark_all_read", bool_text(mark_all_read), "true");
-    print_fixture(
+    assert_fixture("whisper_mark_all_read", bool_text(mark_all_read), "true");
+    assert_fixture(
         "whisper_unread_after_mark_all_read",
-        &unread_after_mark_all_read.to_string(),
+        unread_after_mark_all_read.to_string(),
         "0",
     );
-    print_fixture(
+    assert_fixture(
         "whisper_mark_all_read_again",
         bool_text(mark_all_read_again),
         "false",
     );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }

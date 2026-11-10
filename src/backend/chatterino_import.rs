@@ -48,7 +48,7 @@ pub enum SourceOrigin {
 }
 
 fn override_dir() -> Option<PathBuf> {
-    std::env::var_os(IMPORT_DIR_ENV)
+    echo_core::env::os_value(IMPORT_DIR_ENV)
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
 }
@@ -60,7 +60,7 @@ pub fn discover_settings_dir() -> Option<(PathBuf, SourceOrigin)> {
         let settings_dir = settings_dir_for(&dir).unwrap_or(dir);
         return Some((settings_dir, SourceOrigin::Override));
     }
-    let data_dir = crate::benchmark_profile::external_data_dir()?;
+    let data_dir = crate::storage_roots::external_data_dir()?;
     let home_dir = dirs::home_dir();
     let roots = default_roots(Platform::current(), Some(&data_dir), home_dir.as_deref());
     discover(&roots).map(|dir| (dir, SourceOrigin::Detected))
@@ -71,8 +71,7 @@ pub fn discover_settings_dir() -> Option<(PathBuf, SourceOrigin)> {
 /// ran. A benchmark profile or fixture hides it unless
 /// `ECHO_CHATTERINO_IMPORT_DIR` names a folder, which keeps it testable.
 pub fn first_run_prompt_dir() -> Option<PathBuf> {
-    let isolated =
-        crate::benchmark_profile::is_enabled() || crate::benchmark_ui_fixture::is_enabled();
+    let isolated = crate::storage_roots::is_isolated() || crate::bench::ui_fixture::is_enabled();
     if (isolated && override_dir().is_none())
         || !settings::settings_file_was_missing_at_startup()
         || settings::get_chatterino_import_prompt_dismissed()
@@ -741,7 +740,7 @@ pub fn write_import(
     }
 
     if let Some(tabs) = staged_tabs
-        && !crate::benchmark_ui_fixture::should_suppress_persistence()
+        && !crate::bench::ui_fixture::should_suppress_persistence()
         && let Err(error) = crate::config::save_tabs_and_wait(tabs, WRITE_TIMEOUT)
     {
         // tabs.json is written atomically, so a failed write left it intact.

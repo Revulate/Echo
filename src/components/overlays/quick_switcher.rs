@@ -12,12 +12,13 @@
 use super::traits::{Openable, OverlayPointerIsolation};
 use crate::backend::bridge::followed_live::{self, FollowedLiveStatus, FollowedLiveStream};
 use crate::components::chat::chat_ui::{format_uptime, format_viewer_count};
+use crate::components::common::count_label::capped_count_label;
 use crate::components::ui::ButtonExt;
 use crate::components::ui::input::{Escape, Input, InputEvent, InputState};
 use crate::state::SplitId;
 use crate::theme::colors;
 use crate::theme::tokens::{Radii, RadiiPixels};
-use crate::utils::fuzzy_score;
+use echo_core::quick_switch::{QuickSwitchCandidate, rank_channels};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::collections::HashSet;
@@ -158,7 +159,7 @@ impl QuickSwitcher {
     ) {
         self.open_logins = channels
             .iter()
-            .map(|item| item.channel.trim_start_matches('#').to_ascii_lowercase())
+            .map(|item| echo_core::channel_identity::normalize_channel_key(&item.channel))
             .collect();
         self.channels = channels;
         self.mode = mode;
@@ -329,48 +330,20 @@ impl QuickSwitcher {
             return;
         }
 
-        if self.query.is_empty() {
-            let mut ordered: Vec<usize> = (0..self.channels.len()).collect();
-            ordered.sort_by(|a_idx, b_idx| {
-                let a = &self.channels[*a_idx];
-                let b = &self.channels[*b_idx];
-                b.mention_count.cmp(&a.mention_count).then_with(|| {
-                    self.recent_rank(&a.channel)
-                        .cmp(&self.recent_rank(&b.channel))
-                        .then_with(|| b.is_live.cmp(&a.is_live))
-                        .then_with(|| a.channel.cmp(&b.channel))
-                })
-            });
-            self.filtered.extend(ordered);
-            return;
-        }
-
-        let mut matches: Vec<(usize, f64)> = self
+        let candidates: Vec<QuickSwitchCandidate<'_>> = self
             .channels
             .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                fuzzy_score(&self.query, &item.channel).map(|score| (idx, score))
+            .map(|item| QuickSwitchCandidate {
+                channel: &item.channel,
+                mention_count: item.mention_count,
+                is_live: item.is_live,
             })
             .collect();
-
-        matches.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
-            let a = &self.channels[*a_idx];
-            let b = &self.channels[*b_idx];
-            b_score
-                .partial_cmp(a_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.mention_count.cmp(&a.mention_count))
-                .then_with(|| {
-                    self.recent_rank(&a.channel)
-                        .cmp(&self.recent_rank(&b.channel))
-                })
-                .then_with(|| b.is_live.cmp(&a.is_live))
-                .then_with(|| a.channel.cmp(&b.channel))
-        });
-
-        self.filtered
-            .extend(matches.into_iter().map(|(idx, _score)| idx));
+        self.filtered.extend(rank_channels(
+            &self.query,
+            &candidates,
+            &self.recent_channels,
+        ));
     }
 
     /// Followed live rows for the query, at most [`MAX_SWITCHER_LIVE_ROWS`].
@@ -424,13 +397,6 @@ impl QuickSwitcher {
                 && (!self.followed_filtered.is_empty()
                     || (self.query.trim().is_empty()
                         && self.followed_status != FollowedLiveStatus::SignedOut)))
-    }
-
-    fn recent_rank(&self, channel: &str) -> usize {
-        self.recent_channels
-            .iter()
-            .position(|recent| recent.eq_ignore_ascii_case(channel))
-            .unwrap_or(usize::MAX)
     }
 
     fn touch_recent_channel(&mut self, channel: &str) {
@@ -962,11 +928,9 @@ impl Render for QuickSwitcher {
                                                         .text_xs()
                                                         .font_weight(FontWeight::SEMIBOLD)
                                                         .text_color(colors::mention_border())
-                                                        .child(if item.mention_count > 99 {
-                                                            "99+".to_string()
-                                                        } else {
-                                                            item.mention_count.to_string()
-                                                        }),
+                                                        .child(capped_count_label(
+                                                            item.mention_count,
+                                                        )),
                                                 )
                                             })
                                             .into_any_element()

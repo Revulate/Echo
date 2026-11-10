@@ -107,10 +107,8 @@ struct WindowMonitorSample {
 /// 2) Platform display refresh (Windows)
 /// 3) Default fallback
 fn detect_max_anim_fps_hz() -> (u64, &'static str) {
-    if let Some(fps) = std::env::var("ECHO_ANIM_MAX_FPS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|fps| fps.clamp(30, 360))
+    if let Some(fps) =
+        echo_core::env::parsed::<u64>("ECHO_ANIM_MAX_FPS").map(|fps| fps.clamp(30, 360))
     {
         return (fps, "env");
     }

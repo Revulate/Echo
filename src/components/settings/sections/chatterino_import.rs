@@ -523,7 +523,7 @@ fn disabled_quiet_button(id: &'static str, label: &str) -> Stateful<Div> {
         .border_1()
         .border_color(colors::border())
         .bg(colors::bg_surface())
-        .text_size(px(SettingsMetrics::CALM_HELPER_TEXT))
+        .text_size(px(SettingsMetrics::ROW_HELPER_TEXT))
         .text_color(colors::text_secondary())
         .child(label.to_string())
         .disabled_button()

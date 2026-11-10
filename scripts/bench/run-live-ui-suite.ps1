@@ -1,3 +1,9 @@
+<#
+.SYNOPSIS
+Run Echo against live Twitch chat without sending anything, sample the process,
+capture screenshots and optionally drive UI fixture checkpoints, then check the
+log with profile-log-check.
+#>
 [CmdletBinding()]
 param(
     [string]$LaunchPath = "target\release\echo.exe",
@@ -24,7 +30,7 @@ param(
     [switch]$CursorStabilityCheckpoints,
     [switch]$PopupMonitorCheckpoints,
     [switch]$LinkPreviewMatrix,
-    [string]$LinkPreviewMatrixChannel = "revulate",
+    [string]$LinkPreviewMatrixChannel = "examplechannel",
 
     [ValidateRange(0, 100000)]
     [int]$MinimumEmotePickerCatalogSize = 4000
@@ -32,6 +38,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 Add-Type -TypeDefinition @"
 using System;
@@ -552,24 +559,6 @@ public static class EchoLiveUiNativeMethods
     }
 }
 "@
-
-function Resolve-ExecutablePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (Test-Path $Path) {
-        return (Resolve-Path $Path).Path
-    }
-
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-        return $command.Source
-    }
-
-    throw "Executable '$Path' was not found."
-}
 
 function Save-WindowScreenshot {
     param(
@@ -1560,7 +1549,7 @@ $linkPreviewNonce = ""
 if ($LinkPreviewMatrix) {
     $linkPreviewNonce = [Guid]::NewGuid().ToString("N")
     [void](New-Item -ItemType Directory -Force -Path $linkPreviewProfileRoot)
-    # benchmark_profile owns Echo's log root, so the native marker waiters
+    # storage_roots owns Echo's log root, so the native marker waiters
     # must tail the profile-routed log instead of the ordinary run root.
     $runtimeLogPath = Join-Path (Join-Path $linkPreviewProfileRoot "logs") "echo.log"
     $localReplay = [ordered]@{

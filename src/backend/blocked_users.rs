@@ -57,11 +57,19 @@ static CACHE: LazyLock<RwLock<BlockedUserCache>> =
 static PUBLISHED_MEMBERSHIP: LazyLock<ArcSwap<BlockedMembership>> =
     LazyLock::new(|| ArcSwap::from_pointee(BlockedMembership::default()));
 
+/// Holding the visibility commit gate. Functions named `*_commit_held` take a
+/// `&VisibilityCommit` so they can only run inside that critical section.
+pub(crate) struct VisibilityCommit {
+    _gate: MutexGuard<'static, ()>,
+}
+
 /// Serialize membership publication and the final externally-visible commit of
 /// chat/history/whisper producers. Callers must acquire this before CACHE and
 /// must never hold it across network or parsing work.
-pub(crate) fn visibility_commit_guard() -> MutexGuard<'static, ()> {
-    VISIBILITY_COMMIT_GATE.lock()
+pub(crate) fn visibility_commit_guard() -> VisibilityCommit {
+    VisibilityCommit {
+        _gate: VISIBILITY_COMMIT_GATE.lock(),
+    }
 }
 
 #[derive(Clone)]
@@ -98,7 +106,11 @@ pub(crate) struct PendingVisibilityRelease {
 /// Register a backend-only row while the first block-list baseline is pending.
 /// The caller owns the visibility commit gate. A full queue rejects the newest
 /// row in O(1); callers must check capacity before mutating the chat buffer.
-pub(crate) fn defer_channel_row_visibility_commit_held(channel: &str, message_id: &str) -> bool {
+pub(crate) fn defer_channel_row_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+    channel: &str,
+    message_id: &str,
+) -> bool {
     let mut pending = PENDING_VISIBILITY.lock();
     if pending.channel_rows.len() >= MAX_PENDING_CHANNEL_ROWS {
         return false;
@@ -113,7 +125,9 @@ pub(crate) fn defer_channel_row_visibility_commit_held(channel: &str, message_id
 
 /// Remaining globally bounded row capacity. The caller owns the visibility
 /// commit gate, so admission followed by registration cannot race a producer.
-pub(crate) fn pending_channel_capacity_remaining_commit_held() -> usize {
+pub(crate) fn pending_channel_capacity_remaining_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+) -> usize {
     MAX_PENDING_CHANNEL_ROWS.saturating_sub(PENDING_VISIBILITY.lock().channel_rows.len())
 }
 
@@ -126,6 +140,7 @@ pub(crate) fn should_log_pending_channel_overflow() -> bool {
 /// current account's initial block-list attempt becomes authoritative or
 /// deliberately fails open. The queue is FIFO and explicitly bounded.
 pub(crate) fn defer_whisper_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
     sender_user_id: &str,
     sender_login: &str,
     message: crate::backend::models::ChatMessage,
@@ -154,7 +169,10 @@ pub(crate) fn defer_whisper_visibility_commit_held(
 
 /// Take only pending work owned by the terminal authentication epoch. Blocked
 /// whispers are discarded before their content leaves this module.
-pub(crate) fn take_pending_visibility_commit_held(auth_epoch: u64) -> PendingVisibilityRelease {
+pub(crate) fn take_pending_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+    auth_epoch: u64,
+) -> PendingVisibilityRelease {
     if AUTH_EPOCH.load(Ordering::Acquire) != auth_epoch {
         return PendingVisibilityRelease::default();
     }
@@ -194,13 +212,18 @@ pub(crate) fn take_pending_visibility_commit_held(auth_epoch: u64) -> PendingVis
 
 /// The caller has armed the per-channel ChatState handoff while still holding
 /// the visibility gate, so retained UI snapshots can no longer observe a gap.
-pub(crate) fn release_resident_visibility_commit_held() {
+pub(crate) fn release_resident_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+) {
     RESIDENT_VISIBILITY_REVOKED.store(false, Ordering::Release);
 }
 
 /// Snapshot the backend-only row IDs for one channel. The caller owns the
 /// visibility commit gate, making this coherent with terminal prune/release.
-pub(crate) fn pending_channel_row_ids_commit_held(channel: &str) -> HashSet<String> {
+pub(crate) fn pending_channel_row_ids_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+    channel: &str,
+) -> HashSet<String> {
     let auth_epoch = AUTH_EPOCH.load(Ordering::Acquire);
     PENDING_VISIBILITY
         .lock()
@@ -211,7 +234,9 @@ pub(crate) fn pending_channel_row_ids_commit_held(channel: &str) -> HashSet<Stri
         .collect()
 }
 
-fn clear_pending_visibility_commit_held() -> Vec<PendingChannelRow> {
+fn clear_pending_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+) -> Vec<PendingChannelRow> {
     let mut pending = PENDING_VISIBILITY.lock();
     pending.whispers.clear();
     PENDING_CHANNEL_OVERFLOW_WARNED.store(false, Ordering::Release);
@@ -444,8 +469,12 @@ pub(crate) fn finish_auth_transition_without_session(auth_epoch: u64) {
             false
         }
     };
-    let effects = current
-        .then(|| crate::backend::irc::finalize_pending_blocked_visibility_commit_held(auth_epoch));
+    let effects = current.then(|| {
+        crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
+            &visibility_commit,
+            auth_epoch,
+        )
+    });
     drop(visibility_commit);
     if let Some(effects) = effects {
         crate::backend::irc::dispatch_blocked_visibility_effects(effects);
@@ -461,7 +490,7 @@ pub(crate) fn begin_auth_transition(preserve_last_good: bool) -> u64 {
     let visibility_commit = visibility_commit_guard();
     let auth_epoch = AUTH_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
     REFRESH_SEQUENCE.fetch_add(1, Ordering::AcqRel);
-    let abandoned_rows = clear_pending_visibility_commit_held();
+    let abandoned_rows = clear_pending_visibility_commit_held(&visibility_commit);
     let (retains_authoritative_membership, retired_membership) = {
         let mut cache = CACHE.write_or_recover();
         let retains_authoritative_membership = preserve_last_good && cache.membership_complete;
@@ -473,13 +502,17 @@ pub(crate) fn begin_auth_transition(preserve_last_good: bool) -> u64 {
         let retired_membership = PUBLISHED_MEMBERSHIP.swap(Arc::clone(&cache.membership));
         (retains_authoritative_membership, retired_membership)
     };
-    let whisper_clear = (!retains_authoritative_membership)
-        .then(crate::backend::whispers::clear_account_state_visibility_commit_held);
+    let whisper_clear = (!retains_authoritative_membership).then(|| {
+        crate::backend::whispers::clear_account_state_visibility_commit_held(&visibility_commit)
+    });
     let must_establish_authority = crate::backend::settings::get_enable_twitch_blocked_users()
         && !retains_authoritative_membership;
     INITIAL_VISIBILITY_PENDING.store(must_establish_authority, Ordering::Release);
     RESIDENT_VISIBILITY_REVOKED.store(must_establish_authority, Ordering::Release);
-    crate::backend::irc::discard_pending_blocked_visibility_rows_commit_held(abandoned_rows);
+    crate::backend::irc::discard_pending_blocked_visibility_rows_commit_held(
+        &visibility_commit,
+        abandoned_rows,
+    );
     drop(visibility_commit);
     drop(retired_membership);
     if let Some(whisper_clear) = whisper_clear {
@@ -499,7 +532,9 @@ pub(crate) fn is_auth_epoch_current(auth_epoch: u64) -> bool {
 /// Current account-visibility epoch. Callers use this only while already
 /// holding the visibility commit gate to release staged rows when integration
 /// is deliberately disabled (a fail-open policy transition).
-pub(crate) fn current_auth_epoch_visibility_commit_held() -> u64 {
+pub(crate) fn current_auth_epoch_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+) -> u64 {
     AUTH_EPOCH.load(Ordering::Acquire)
 }
 
@@ -575,8 +610,12 @@ pub(crate) fn fail_auth_transition(auth_epoch: u64, error: impl Into<String>) {
             changed = true;
         }
     }
-    let effects = changed
-        .then(|| crate::backend::irc::finalize_pending_blocked_visibility_commit_held(auth_epoch));
+    let effects = changed.then(|| {
+        crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
+            &visibility_commit,
+            auth_epoch,
+        )
+    });
     drop(visibility_commit);
     if let Some(effects) = effects {
         crate::backend::irc::dispatch_blocked_visibility_effects(effects);
@@ -883,6 +922,7 @@ pub(crate) async fn refresh(ticket: RefreshTicket) -> Result<RefreshOutcome, Str
 
     if let Some(error) = publication_error {
         let effects = crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
+            &visibility_commit,
             ticket.session.auth_epoch,
         );
         drop(visibility_commit);
@@ -893,6 +933,7 @@ pub(crate) async fn refresh(ticket: RefreshTicket) -> Result<RefreshOutcome, Str
     }
 
     let effects = crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
+        &visibility_commit,
         ticket.session.auth_epoch,
     );
     drop(visibility_commit);
@@ -1197,9 +1238,13 @@ pub(crate) fn apply_block_state_if_current(
         )
     };
 
-    let changed_channels = blocked
-        .then(crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held)
-        .unwrap_or_default();
+    let changed_channels = if blocked {
+        crate::backend::irc::apply_blocked_user_filter_to_buffers_visibility_commit_held(
+            &visibility_commit,
+        )
+    } else {
+        HashSet::new()
+    };
     drop(visibility_commit);
     drop(retired_membership);
     crate::backend::irc::dispatch_blocked_channel_refreshes(changed_channels);
@@ -1213,25 +1258,79 @@ pub(crate) fn apply_block_state_if_current(
 /// Apply one Twitch block mutation through the account session captured by
 /// the caller. Every surface (commands, Settings, and user cards) shares this
 /// bounded request path so account fencing and local publication cannot drift.
+/// Why a block or unblock did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockStateFailure {
+    /// The token lacks `user:manage:blocked_users`.
+    NeedsReauth,
+    TimedOut,
+    /// The active account changed before or while the request ran.
+    AccountChanged,
+    Failed,
+}
+
+/// A failed block or unblock: its cause and a message for the user.
+#[derive(Debug)]
+pub(crate) struct BlockStateError {
+    kind: BlockStateFailure,
+    message: String,
+}
+
+impl BlockStateError {
+    fn new(kind: BlockStateFailure, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self::new(BlockStateFailure::Failed, message)
+    }
+
+    pub(crate) fn kind(&self) -> BlockStateFailure {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for BlockStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<BlockStateError> for String {
+    fn from(error: BlockStateError) -> Self {
+        error.message
+    }
+}
+
 pub(crate) async fn set_block_state_for_session(
     session: ActiveAuthSession,
     user: BlockedUser,
     blocked: bool,
-) -> Result<(), String> {
+) -> Result<(), BlockStateError> {
     let user_id = user.user_id.trim();
     let user_login = user.user_login.trim().trim_start_matches('@');
     if user_id.is_empty() || user_login.is_empty() {
-        return Err("A stable Twitch user identity is required".to_string());
+        return Err(BlockStateError::failed(
+            "A stable Twitch user identity is required",
+        ));
     }
 
     let active_login = crate::backend::settings::get_username_lowercase();
     if user_id == session.owner_user_id()
         || (!active_login.is_empty() && user_login.eq_ignore_ascii_case(&active_login))
     {
-        return Err("The active Twitch account cannot block itself".to_string());
+        return Err(BlockStateError::failed(
+            "The active Twitch account cannot block itself",
+        ));
     }
     if !session_is_current(&session) {
-        return Err("The active Twitch account changed before the request started".to_string());
+        return Err(BlockStateError::new(
+            BlockStateFailure::AccountChanged,
+            "The active Twitch account changed before the request started",
+        ));
     }
 
     let url = format!(
@@ -1253,7 +1352,15 @@ pub(crate) async fn set_block_state_for_session(
     let remote_result = tokio::time::timeout(MUTATION_TIMEOUT, async move {
         let response = request.await.map_err(|error| {
             let action = if blocked { "Block" } else { "Unblock" };
-            format!("{action} request failed: {}", error.without_url())
+            let kind = if error.is_timeout() {
+                BlockStateFailure::TimedOut
+            } else {
+                BlockStateFailure::Failed
+            };
+            BlockStateError::new(
+                kind,
+                format!("{action} request failed: {}", error.without_url()),
+            )
         })?;
 
         if response.status().is_success() {
@@ -1265,19 +1372,18 @@ pub(crate) async fn set_block_state_for_session(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) {
-            return Err(
-                "Re-authenticate this account to grant user:manage:blocked_users".to_string(),
-            );
+            return Err(BlockStateError::new(
+                BlockStateFailure::NeedsReauth,
+                "Re-authenticate this account to grant user:manage:blocked_users",
+            ));
         }
         let detail = read_mutation_error_response(response).await;
         let action = if blocked { "block" } else { "unblock" };
-        if detail.is_empty() {
-            Err(format!("Twitch failed to {action} the user ({status})"))
+        Err(BlockStateError::failed(if detail.is_empty() {
+            format!("Twitch failed to {action} the user ({status})")
         } else {
-            Err(format!(
-                "Twitch failed to {action} the user ({status}): {detail}"
-            ))
-        }
+            format!("Twitch failed to {action} the user ({status}): {detail}")
+        }))
     })
     .await;
     match remote_result {
@@ -1285,7 +1391,10 @@ pub(crate) async fn set_block_state_for_session(
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             let action = if blocked { "Block" } else { "Unblock" };
-            return Err(format!("{action} request timed out"));
+            return Err(BlockStateError::new(
+                BlockStateFailure::TimedOut,
+                format!("{action} request timed out"),
+            ));
         }
     }
 
@@ -1296,7 +1405,12 @@ pub(crate) async fn set_block_state_for_session(
         Some(&user.display_name),
         blocked,
     )
-    .map_err(|error| format!("Twitch completed the request for the previous account: {error}"))
+    .map_err(|error| {
+        BlockStateError::new(
+            BlockStateFailure::AccountChanged,
+            format!("Twitch completed the request for the previous account: {error}"),
+        )
+    })
 }
 
 /// Spawn a UI-originated mutation while retaining its exact account session.
@@ -1320,16 +1434,15 @@ pub(crate) fn set_block_state_async_for_session(
                 });
             }
             Err(error) => {
-                let detail = if error.starts_with("Re-authenticate this account") {
-                    "Re-authenticate the active account and try again."
-                } else if error.contains("timed out") {
-                    "The Twitch request timed out."
-                } else if error.contains("active Twitch account changed")
-                    || error.contains("previous account")
-                {
-                    "The active Twitch account changed; try again."
-                } else {
-                    "Twitch could not complete the request."
+                let detail = match error.kind() {
+                    BlockStateFailure::NeedsReauth => {
+                        "Re-authenticate the active account and try again."
+                    }
+                    BlockStateFailure::TimedOut => "The Twitch request timed out.",
+                    BlockStateFailure::AccountChanged => {
+                        "The active Twitch account changed; try again."
+                    }
+                    BlockStateFailure::Failed => "Twitch could not complete the request.",
                 };
                 push_warning(
                     if blocked {
@@ -1624,6 +1737,7 @@ fn finish_refresh_error(ticket: &RefreshTicket, error: String) -> Result<Refresh
     };
     let effects = changed.then(|| {
         crate::backend::irc::finalize_pending_blocked_visibility_commit_held(
+            &visibility_commit,
             ticket.session.auth_epoch,
         )
     });

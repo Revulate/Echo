@@ -360,7 +360,8 @@ pub(crate) fn native_roots_tls_config() -> Arc<ClientConfig> {
     let (valid_count, invalid_count) = root_store.add_parsable_certificates(cert_result.certs);
 
     if error_count > 0 || invalid_count > 0 || valid_count == 0 {
-        tracing::warn!(
+        crate::log_net!(
+            warn,
             "Loaded {} native TLS roots for proxy transport ({} load errors, {} invalid certs)",
             valid_count,
             error_count,

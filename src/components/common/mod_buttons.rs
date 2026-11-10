@@ -1,6 +1,7 @@
-//! Shared moderation buttons for context menus and user cards
+//! Shared full-width moderation buttons for the chatter list and the mod log.
 //!
-//! Provides consistent styling for timeout and ban buttons across the UI.
+//! One look for timeout, ban, role and undo actions; the colour comes from
+//! [`ModButtonStyle`]. The user card keeps its own compact row.
 
 use crate::components::ui::ButtonExt;
 use crate::theme::colors;

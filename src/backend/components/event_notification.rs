@@ -1,3 +1,6 @@
+//! The EventSub event feed: recent events, unread counts, and the open
+//! prediction outcomes per channel.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::RwLock;
@@ -5,7 +8,7 @@ use std::sync::RwLock;
 use crate::backend::lock_utils::RwLockExt;
 
 /// Twitch event types
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TwitchEventType {
     Subscribe,
     Resubscribe,
@@ -40,7 +43,7 @@ pub enum TwitchEventType {
     ShieldModeEnd,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PredictionOutcomeSnapshot {
     pub id: String,
     pub title: String,

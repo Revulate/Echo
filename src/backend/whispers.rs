@@ -116,8 +116,10 @@ fn reserve_thread_slot(state: &mut WhisperState, incoming_key: &str) {
 /// Whisper previews and unread state are account-private. A full owner
 /// transition clears them under the global visibility transaction; same-owner
 /// token rotations deliberately retain them.
-pub(crate) fn clear_account_state_visibility_commit_held() -> AccountWhisperClear {
-    crate::backend::activity_persistence::retire_account_visibility_commit_held();
+pub(crate) fn clear_account_state_visibility_commit_held(
+    commit: &crate::backend::blocked_users::VisibilityCommit,
+) -> AccountWhisperClear {
+    crate::backend::activity_persistence::retire_account_visibility_commit_held(commit);
 
     let summaries_changed = {
         let mut state = WHISPERS.write_or_recover();
@@ -160,8 +162,9 @@ pub(crate) fn clear_account_state_visibility_commit_held() -> AccountWhisperClea
     }
 }
 
-pub(crate) fn snapshot_activity_visibility_commit_held()
--> (Vec<ActivityWhisperThread>, Option<String>) {
+pub(crate) fn snapshot_activity_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+) -> (Vec<ActivityWhisperThread>, Option<String>) {
     let state = WHISPERS.read_or_recover();
     let mut threads: Vec<_> = state
         .threads
@@ -225,6 +228,7 @@ fn sorted_deduped_messages(
 }
 
 pub(crate) fn restore_activity_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
     mut threads: Vec<ActivityWhisperThread>,
     last_received_sender: Option<String>,
 ) {
@@ -381,11 +385,14 @@ pub fn record_received(username: &str, message: &str, timestamp: i64) {
 
 /// Commit a deferred whisper while the blocked-user visibility gate is held.
 /// UI/sound/desktop effects are dispatched after the gate is released.
-pub(crate) fn record_received_visibility_commit_held(message: ChatMessage) -> WhisperPublication {
+pub(crate) fn record_received_visibility_commit_held(
+    commit: &crate::backend::blocked_users::VisibilityCommit,
+    message: ChatMessage,
+) -> WhisperPublication {
     if record_received_message_inner(&message) {
         crate::backend::activity_persistence::mark_dirty();
     }
-    publish_message_visibility_commit_held(message)
+    publish_message_visibility_commit_held(commit, message)
 }
 
 fn record_received_inner(username: &str, message: &str, timestamp: i64) -> bool {
@@ -485,7 +492,7 @@ pub fn record_sent(username: &str, user_id: &str, message: &str, timestamp: i64)
     thread.transient = false;
     push_thread_message(thread, chat_message.clone());
     drop(state);
-    let publication = publish_message_visibility_commit_held(chat_message);
+    let publication = publish_message_visibility_commit_held(&visibility_commit, chat_message);
     drop(visibility_commit);
     dispatch_publication(publication);
     crate::state::ui_invalidation::request(
@@ -494,7 +501,10 @@ pub fn record_sent(username: &str, user_id: &str, message: &str, timestamp: i64)
     crate::backend::activity_persistence::mark_dirty();
 }
 
-fn publish_message_visibility_commit_held(mut message: ChatMessage) -> WhisperPublication {
+fn publish_message_visibility_commit_held(
+    _commit: &crate::backend::blocked_users::VisibilityCommit,
+    mut message: ChatMessage,
+) -> WhisperPublication {
     let mut channels: Vec<String> = crate::backend::irc::CHAT_MESSAGES
         .iter()
         .map(|entry| entry.key().clone())

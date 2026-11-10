@@ -1,16 +1,17 @@
-//! Echo backend - IRC, auth, emotes, settings, and more.
-//!
-//! This module contains all the core logic for the Twitch chat client,
-//! ported from the original rust_lib_echo_flutter backend.
-
-pub mod lock_utils;
+//! Echo backend: Twitch IRC and EventSub, Helix, auth, emotes, badges,
+//! settings and the bridge the UI calls into.
 
 pub(crate) mod activity_persistence;
+pub mod activity_smoke;
+pub mod api_error;
+pub mod ascii_art;
 pub mod auth;
 pub mod badges;
 pub mod badges_core;
 pub mod blocked_users;
+pub mod bridge;
 pub mod browser_watching;
+pub mod channel_lifecycle;
 pub mod chat_replay;
 pub mod chatterino_import;
 pub mod chatters_core;
@@ -22,6 +23,7 @@ pub mod cosmetics_core;
 pub mod deduplicator;
 pub mod deleted_message_display;
 pub mod embed_thumbnails;
+pub mod embeds;
 pub mod emoji;
 pub mod emote_candidates;
 pub mod emote_provider_visibility;
@@ -30,7 +32,6 @@ pub mod emotes;
 pub mod event_text;
 pub mod eventsub;
 pub mod fakemsg_core;
-
 pub mod filters;
 pub mod filters_replace;
 pub mod followed_live;
@@ -39,63 +40,45 @@ pub mod highlight_priority;
 pub mod history;
 pub mod history_cache;
 pub mod history_filter;
+pub mod hotkeys;
 pub mod http;
 pub mod image_uploader;
 pub mod irc;
 pub mod link_types;
+pub mod lock_utils;
 pub mod memory_report;
 pub mod metrics;
 pub mod mod_buttons;
 pub mod models;
 pub mod moderation;
 pub mod notifications;
+pub mod observers;
 pub mod pinned_chat;
 pub mod power;
+pub mod pronouns;
+pub mod reliability;
 pub mod retry;
 pub mod scroll_markers;
 pub mod search;
 mod search_core;
 pub mod settings;
 pub mod shutdown_coordinator;
+pub mod similarity;
 pub mod slots;
 pub mod sound_events;
 pub mod sounds;
+pub mod streamer_mode;
 pub mod theme_files;
 pub mod twitch_api;
+pub mod types;
 pub mod ui_actions;
 pub mod updates;
 pub(crate) mod upload_coordinator;
 pub mod upload_history;
+pub mod user_notes;
 pub mod usernotice_core;
 pub mod whispers;
-
-pub mod hotkeys;
-
-pub mod streamer_mode;
-
-pub mod similarity;
-
-pub mod ascii_art;
-
-pub mod activity_smoke;
-
-pub mod embeds;
-
-pub mod observers;
-
-pub mod channel_lifecycle;
-
-pub mod types;
-
-pub mod bridge;
-
-pub mod user_notes;
-
-pub mod pronouns;
-
 pub mod ws;
-
-pub mod reliability;
 
 pub use bridge::{
     Account, AuthState, BadgeDisplayMode, ChatMessage, ConnectionStatus, Emote, EmoteCategory,
@@ -132,13 +115,12 @@ pub use bridge::{
     refresh_authenticated_user_emotes_async, remove_account, remove_filter, remove_global_mention,
     remove_recent_twitch_event, reset_metrics, send_message_async, send_message_or_command_async,
     send_reply_async, set_accent_color, set_anonymous_mode, set_badge_display_mode,
-    set_desktop_notifications_enabled, set_first_message_color, set_flash_on_mention,
-    set_font_scale, set_global_sound_enabled, set_global_sound_volume,
-    set_highlight_sound_channel_muted, set_mention_color, set_show_mention_in_title,
-    set_sound_event_enabled, set_sound_event_volume, set_subscription_color, set_tab_overflow_mode,
-    set_tab_theme, set_theme, set_thread_highlight_color, set_thread_highlight_enabled,
-    set_thread_highlight_show_in_mentions, set_thread_highlight_sound_enabled, set_whisper_color,
-    start_login, stream_info_gate_hash, switch_account, take_pending_open_new_tab,
+    set_desktop_notifications_enabled, set_flash_on_mention, set_font_scale,
+    set_global_sound_enabled, set_global_sound_volume, set_highlight_sound_channel_muted,
+    set_show_mention_in_title, set_sound_event_enabled, set_sound_event_volume,
+    set_tab_overflow_mode, set_tab_theme, set_theme, set_thread_highlight_enabled,
+    set_thread_highlight_show_in_mentions, set_thread_highlight_sound_enabled, start_login,
+    stream_info_gate_hash, switch_account, take_pending_open_new_tab,
     take_pending_open_whispers_split, test_sound, timeout_user, trim_inactive_channels,
     twitch_event_title, update_filter, upload_image_files_async, upload_pasted_image_async,
 };

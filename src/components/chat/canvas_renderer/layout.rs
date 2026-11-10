@@ -1,14 +1,13 @@
-//! Compatibility facade for the chat render layout model.
-//!
-//! The geometry model, paint commands, and hitbox types live in
-//! `echo-chat-render`. What stays here is the part that genuinely needs the
-//! application shell: theme colors, user settings, and the GPUI font-metrics
-//! provider used to reserve the timestamp column.
+//! The chat render layout model, re-exported from `echo-chat-render`, plus
+//! the parts that need the application shell: theme colors, user settings,
+//! and the timestamp column measured with the chat font metrics.
 
+use echo_chat_render::font_metrics::font_metrics;
 use gpui::{Hsla, Window};
 use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
+use super::bounded_map::ClearOnFullMap;
 use crate::backend::settings;
 use crate::theme::colors;
 use crate::utils::parse_hex_color_opt;
@@ -20,25 +19,34 @@ pub use echo_chat_render::layout::*;
 /// chat font so the column never touches the following badge/username run.
 const TIMESTAMP_COLUMN_PADDING_BASE: f32 = 3.0;
 
-/// Last-resort per-character advance, used only when the shared font metrics
-/// provider is unavailable (poisoned lock). Never used on the normal path.
-const TIMESTAMP_FALLBACK_CHARACTER_WIDTH: f32 = 7.0;
+/// One memoized timestamp column width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimestampProbeSlot {
+    /// [`timestamp_probe_key`] of the measurement; 0 marks an empty slot.
+    key: u64,
+    width: f32,
+    /// A full `shape_line` measurement, which wins over the glyph-advance
+    /// estimate and is re-taken only when the key moves.
+    exact: bool,
+}
 
-/// Memoized timestamp column widths: `(probe key, width, exact)` slots, most
-/// recent first, so windows on monitors with different scales don't evict
-/// each other's measurement every frame.
+/// Memoized timestamp column widths, most recent first, so windows on
+/// monitors with different scales don't evict each other's measurement every
+/// frame.
 ///
 /// The reserved column is measured from the compiled formatter's worst-case
 /// probe (`23`, `12`, `59`, `59`, `999`, `PM` arranged in the user's token
 /// order) instead of multiplying a character count by an estimated advance,
-/// which silently under-reserved for wide separators and over-reserved for
-/// digit-only patterns. Re-measuring happens once per formatter generation,
-/// font scale, and device pixel ratio, not per message.
-/// `(key, width, exact)` — `exact` marks a full `shape_line` measurement, which
-/// wins over the glyph-advance estimate and is re-taken only when the key moves.
-type TimestampWidthProbe = [(u64, f32, bool); 4];
+/// which under-reserves for wide separators and over-reserves for digit-only
+/// patterns. Re-measuring happens once per formatter generation, font scale,
+/// and device pixel ratio, not per message.
+type TimestampWidthProbe = [TimestampProbeSlot; 4];
 
-const EMPTY_TIMESTAMP_WIDTH_PROBE: TimestampWidthProbe = [(0, 0.0, false); 4];
+const EMPTY_TIMESTAMP_WIDTH_PROBE: TimestampWidthProbe = [TimestampProbeSlot {
+    key: 0,
+    width: 0.0,
+    exact: false,
+}; 4];
 
 static TIMESTAMP_WIDTH_PROBE: LazyLock<Mutex<TimestampWidthProbe>> =
     LazyLock::new(|| Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE));
@@ -58,14 +66,8 @@ fn timestamp_probe_key(generation: u64, font_scale: f32, scale_factor: f32) -> u
 ///
 /// The shared provider is populated once at startup with real `shape_line`
 /// measurements per glyph, so this is font-accurate rather than estimated.
-fn measure_timestamp_probe(probe: &str, font_scale: f32) -> f32 {
-    if let Some(provider) = super::font_metrics::calibrated_font_metrics() {
-        return provider.measure_string(probe, false);
-    }
-    match super::font_metrics::FONT_METRICS_PROVIDER.read() {
-        Ok(provider) => provider.measure_string(probe, false),
-        Err(_) => probe.chars().count() as f32 * TIMESTAMP_FALLBACK_CHARACTER_WIDTH * font_scale,
-    }
+fn measure_timestamp_probe(probe: &str) -> f32 {
+    font_metrics().measure_string(probe, false)
 }
 
 fn lock_timestamp_width_probe(
@@ -91,18 +93,18 @@ fn cached_timestamp_probe(
     let slots = lock_timestamp_width_probe(probe);
     slots
         .iter()
-        .find(|slot| slot.0 == key)
-        .filter(|slot| !require_exact || slot.2)
-        .map(|slot| slot.1)
+        .find(|slot| slot.key == key)
+        .filter(|slot| !require_exact || slot.exact)
+        .map(|slot| slot.width)
 }
 
 fn put_timestamp_probe(slots: &mut TimestampWidthProbe, key: u64, width: f32, exact: bool) {
     let index = slots
         .iter()
-        .position(|slot| slot.0 == key)
+        .position(|slot| slot.key == key)
         .unwrap_or(slots.len() - 1);
     slots[..=index].rotate_right(1);
-    slots[0] = (key, width, exact);
+    slots[0] = TimestampProbeSlot { key, width, exact };
 }
 
 /// Store a freshly measured probe width for `key`.
@@ -128,7 +130,7 @@ pub fn timestamp_width() -> f32 {
         return width;
     }
 
-    let width = measure_timestamp_probe(&formatter.width_probe, font_scale)
+    let width = measure_timestamp_probe(&formatter.width_probe)
         + TIMESTAMP_COLUMN_PADDING_BASE * font_scale;
     store_timestamp_probe(key, width, false);
     width
@@ -152,69 +154,10 @@ pub fn refresh_timestamp_width_probe(window: &mut Window) -> f32 {
         return width;
     }
 
-    let width = super::font_metrics::FONT_METRICS.measure_string_gpui(
-        &formatter.width_probe,
-        false,
-        window,
-    ) + TIMESTAMP_COLUMN_PADDING_BASE * font_scale;
+    let width = font_metrics().measure_string_gpui(&formatter.width_probe, false, window)
+        + TIMESTAMP_COLUMN_PADDING_BASE * font_scale;
     store_timestamp_probe(key, width, true);
     width
-}
-
-#[cfg(test)]
-mod timestamp_width_probe_tests {
-    use super::*;
-    use core::prelude::v1::test;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    #[test]
-    fn cache_distinguishes_key_and_exact_measurement() {
-        let probe = Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE);
-        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 11, 42.0, false);
-
-        assert_eq!(cached_timestamp_probe(&probe, 11, false), Some(42.0));
-        assert_eq!(cached_timestamp_probe(&probe, 11, true), None);
-        assert_eq!(cached_timestamp_probe(&probe, 12, false), None);
-
-        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 11, 43.0, true);
-        assert_eq!(cached_timestamp_probe(&probe, 11, true), Some(43.0));
-    }
-
-    #[test]
-    fn cache_keeps_recent_keys_for_several_scales() {
-        let probe = Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE);
-        for (key, width) in [(11, 40.0), (13, 50.0), (15, 60.0), (17, 70.0)] {
-            put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), key, width, true);
-        }
-        assert_eq!(cached_timestamp_probe(&probe, 11, true), Some(40.0));
-        assert_eq!(cached_timestamp_probe(&probe, 17, true), Some(70.0));
-
-        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 13, 51.0, true);
-        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 19, 80.0, true);
-        assert_eq!(cached_timestamp_probe(&probe, 11, true), None);
-        assert_eq!(cached_timestamp_probe(&probe, 13, true), Some(51.0));
-        assert_eq!(cached_timestamp_probe(&probe, 19, true), Some(80.0));
-    }
-
-    #[test]
-    fn poison_discards_partial_probe_and_allows_reuse() {
-        let probe = Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE);
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let mut probe = probe.lock().expect("test probe should start healthy");
-            probe[0] = (11, 13.0, true);
-            panic!("poison test probe");
-        }));
-
-        assert!(probe.is_poisoned());
-        assert_eq!(
-            *lock_timestamp_width_probe(&probe),
-            EMPTY_TIMESTAMP_WIDTH_PROBE
-        );
-        assert!(!probe.is_poisoned());
-
-        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 12, 21.0, true);
-        assert_eq!(cached_timestamp_probe(&probe, 12, true), Some(21.0));
-    }
 }
 
 /// Theme colors for a row's highlight treatment.
@@ -305,23 +248,22 @@ impl LowTrustColors for LowTrustTreatment {
     }
 }
 
-use dashmap::DashMap;
+/// Distinct user colors (times theme switches) kept before `COLOR_CACHE` resets.
+const COLOR_CACHE_CAPACITY: usize = 8192;
+/// Distinct timestamp buckets kept before `TIMESTAMP_CACHE` resets.
+const TIMESTAMP_CACHE_CAPACITY: usize = 8192;
 
-/// Lock-free color cache for efficient color parsing.
-/// PERF: Keyed on a fast FNV-1a hash of the hex string (u64) so cache hits do
-/// zero allocation and zero mutex contention from background layout workers.
-/// Twitch users have consistent colors, so this has ~95% hit rate.
-static COLOR_CACHE: LazyLock<DashMap<u64, Hsla>> = LazyLock::new(|| DashMap::with_capacity(1000));
+/// Parsed, theme-normalized user colors keyed on a hash of the hex string, so
+/// a hit allocates nothing; background layout workers read it too.
+static COLOR_CACHE: LazyLock<ClearOnFullMap<u64, Hsla>> =
+    LazyLock::new(|| ClearOnFullMap::new(1000, COLOR_CACHE_CAPACITY));
 
-/// FNV-1a hash of a hex color string for use as the COLOR_CACHE key.
+/// Hash of a hex color string for use as the `COLOR_CACHE` key.
 #[inline]
 fn color_key(hex: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in hex.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    let mut hasher = rustc_hash::FxHasher::default();
+    hex.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Theme discriminant folded into the COLOR_CACHE key.
@@ -346,26 +288,19 @@ fn theme_cache_token() -> u64 {
         | u64::from(colors::is_light_surface())
 }
 
-/// Get a cached parsed color, or parse and cache it
-/// PERF: Lock-free DashMap lookup keyed on a hashed hex string (no per-miss
-/// String allocation, no worker-thread mutex contention)
+/// Get a cached parsed color, or parse and cache it.
 ///
 /// Every caller passes a Twitch-supplied user color, so the parsed value is
 /// normalized for the active theme before it is cached.
 pub fn get_cached_color(hex: &str) -> Hsla {
     let key = color_key(hex) ^ theme_cache_token().wrapping_mul(0x9E37_79B9_7F4A_7C15);
     if let Some(color) = COLOR_CACHE.get(&key) {
-        return *color;
+        return color;
     }
 
     let color = parse_hex_color_opt(hex)
         .map(colors::normalize_user_color)
         .unwrap_or_else(colors::text_primary);
-    // Distinct colors x theme switches grow without bound over a long
-    // session; reset like TIMESTAMP_CACHE rather than track recency.
-    if COLOR_CACHE.len() >= 8192 {
-        COLOR_CACHE.clear();
-    }
     COLOR_CACHE.insert(key, color);
     color
 }
@@ -379,12 +314,12 @@ struct TimestampCacheKey {
     generation: u64,
 }
 
-/// Lock-free OS-local timestamp cache. Minute and second patterns share their
+/// Formatted OS-local timestamps. Minute and second patterns share their
 /// natural time bucket; millisecond patterns key the exact message timestamp.
 /// The cache is bounded because high-volume millisecond formatting otherwise
 /// produces one unique key per message.
-static TIMESTAMP_CACHE: LazyLock<DashMap<TimestampCacheKey, String>> =
-    LazyLock::new(|| DashMap::with_capacity(4096));
+static TIMESTAMP_CACHE: LazyLock<ClearOnFullMap<TimestampCacheKey, String>> =
+    LazyLock::new(|| ClearOnFullMap::new(4096, TIMESTAMP_CACHE_CAPACITY));
 
 /// Get a cached OS-local timestamp using the active compiled formatter.
 pub fn get_cached_timestamp(timestamp: i64) -> String {
@@ -394,13 +329,70 @@ pub fn get_cached_timestamp(timestamp: i64) -> String {
         generation: formatter.generation,
     };
     if let Some(s) = TIMESTAMP_CACHE.get(&key) {
-        return s.clone();
+        return s;
     }
     let time_str = format_message_timestamp_with_formatter(timestamp, &formatter)
         .unwrap_or_else(|| "unknown".to_string());
-    if TIMESTAMP_CACHE.len() >= 8192 {
-        TIMESTAMP_CACHE.clear();
-    }
     TIMESTAMP_CACHE.insert(key, time_str.clone());
     time_str
+}
+
+#[cfg(test)]
+mod timestamp_width_probe_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn cache_distinguishes_key_and_exact_measurement() {
+        let probe = Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE);
+        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 11, 42.0, false);
+
+        assert_eq!(cached_timestamp_probe(&probe, 11, false), Some(42.0));
+        assert_eq!(cached_timestamp_probe(&probe, 11, true), None);
+        assert_eq!(cached_timestamp_probe(&probe, 12, false), None);
+
+        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 11, 43.0, true);
+        assert_eq!(cached_timestamp_probe(&probe, 11, true), Some(43.0));
+    }
+
+    #[test]
+    fn cache_keeps_recent_keys_for_several_scales() {
+        let probe = Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE);
+        for (key, width) in [(11, 40.0), (13, 50.0), (15, 60.0), (17, 70.0)] {
+            put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), key, width, true);
+        }
+        assert_eq!(cached_timestamp_probe(&probe, 11, true), Some(40.0));
+        assert_eq!(cached_timestamp_probe(&probe, 17, true), Some(70.0));
+
+        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 13, 51.0, true);
+        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 19, 80.0, true);
+        assert_eq!(cached_timestamp_probe(&probe, 11, true), None);
+        assert_eq!(cached_timestamp_probe(&probe, 13, true), Some(51.0));
+        assert_eq!(cached_timestamp_probe(&probe, 19, true), Some(80.0));
+    }
+
+    #[test]
+    fn poison_discards_partial_probe_and_allows_reuse() {
+        let probe = Mutex::new(EMPTY_TIMESTAMP_WIDTH_PROBE);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let mut probe = probe.lock().expect("test probe should start healthy");
+            probe[0] = TimestampProbeSlot {
+                key: 11,
+                width: 13.0,
+                exact: true,
+            };
+            panic!("poison test probe");
+        }));
+
+        assert!(probe.is_poisoned());
+        assert_eq!(
+            *lock_timestamp_width_probe(&probe),
+            EMPTY_TIMESTAMP_WIDTH_PROBE
+        );
+        assert!(!probe.is_poisoned());
+
+        put_timestamp_probe(&mut lock_timestamp_width_probe(&probe), 12, 21.0, true);
+        assert_eq!(cached_timestamp_probe(&probe, 12, true), Some(21.0));
+    }
 }

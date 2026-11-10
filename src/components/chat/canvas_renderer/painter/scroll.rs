@@ -8,8 +8,7 @@ use super::*;
 /// keys off the durable `auto_scroll` flag, not this — so this only governs the
 /// geometry-change re-pin. Kept small enough that a deliberate ~one-line scroll-up
 /// reads as "not at bottom", but large enough to absorb sub-line offset/rounding
-/// drift so genuine bottom-following is not lost. (Was a blunt 40px, which counted
-/// clear scroll-ups as "at bottom".)
+/// drift so genuine bottom-following is not lost.
 const AT_BOTTOM_THRESHOLD_PX: f32 = 16.0;
 
 enum HoverPauseWakeStep {
@@ -327,13 +326,14 @@ impl CanvasMessageList {
 
     /// Synchronize raw window modifier state. The configured modifier is
     /// matched exactly, so Alt does not activate during Ctrl+Alt split actions.
-    pub fn set_chat_pause_modifiers(
-        &mut self,
-        control: bool,
-        alt: bool,
-        shift: bool,
-        platform: bool,
-    ) -> bool {
+    pub fn set_chat_pause_modifiers(&mut self, held: Modifiers) -> bool {
+        let Modifiers {
+            control,
+            alt,
+            shift,
+            platform,
+            ..
+        } = held;
         let pause_active =
             settings::get_chat_pause_modifier().matches(control, alt, shift, platform);
         let state = &self.scroll_controller.state;
@@ -607,5 +607,86 @@ impl CanvasMessageList {
         crate::backend::metrics::record_ui_notify_source("canvas.scroll_to_message");
         cx.notify();
         true
+    }
+}
+
+impl CanvasMessageList {
+    /// Detect scroll direction based on offset change
+    pub(super) fn detect_scroll_direction(&self) -> ScrollDirection {
+        let delta = self.scroll_controller.offset - self.scroll_controller.state.prev_scroll_offset;
+        if delta.abs() < 1.0 {
+            ScrollDirection::Static
+        } else if delta > 0.0 {
+            ScrollDirection::Down
+        } else {
+            ScrollDirection::Up
+        }
+    }
+
+    /// Calculate scroll velocity for adaptive preload margins
+    /// Returns normalized value: 0.0 = static, 1.0 = very fast scrolling
+    pub(super) fn calculate_scroll_velocity(&self) -> f32 {
+        let scroll_delta =
+            (self.scroll_controller.offset - self.scroll_controller.state.prev_scroll_offset).abs();
+        (scroll_delta / 100.0).min(1.0)
+    }
+
+    /// Calculate adaptive preload margins based on scroll direction and velocity
+    /// Returns (messages_behind, messages_ahead) for preloading
+    pub(super) fn get_adaptive_preload_margins(
+        &self,
+        direction: ScrollDirection,
+    ) -> (usize, usize) {
+        let velocity = self.calculate_scroll_velocity();
+        let scale = 1.0 + velocity * 1.5;
+
+        let (base_behind, base_ahead) = match direction {
+            ScrollDirection::Down => (20, 40),
+            ScrollDirection::Up => (50, 20),
+            ScrollDirection::Static => (30, 30),
+        };
+
+        (
+            (base_behind as f32 * scale) as usize,
+            (base_ahead as f32 * scale) as usize,
+        )
+    }
+
+    /// Update the EMA-debounced scroll-acceleration signal (2nd derivative of offset).
+    ///
+    /// Sampled once per scroll tick from the current normalized velocity versus the
+    /// velocity captured on the previous tick. Only *positive* acceleration (a fling
+    /// ramping up) feeds the signal; deceleration or direction reversal lets it decay.
+    /// The EMA both smooths single-frame jitter (so a momentary spike does not balloon
+    /// the lookahead window) and clamps the result into `0.0..=1.0`.
+    ///
+    /// Pure CPU bookkeeping over offsets we already track — no platform/GPU dependency.
+    pub(super) fn update_acceleration_signal(&mut self) {
+        const ACCEL_EMA_ALPHA: f32 = 0.35;
+        const ACCEL_JITTER_FLOOR: f32 = 0.02;
+
+        let velocity = self.calculate_scroll_velocity();
+        let prev_velocity = self.scroll_controller.state.prev_velocity;
+        self.scroll_controller.state.prev_velocity = velocity;
+
+        let raw_accel = (velocity - prev_velocity).max(0.0);
+        let target = if raw_accel < ACCEL_JITTER_FLOOR {
+            0.0
+        } else {
+            raw_accel
+        };
+
+        let ema = self.scroll_controller.state.accel_ema;
+        self.scroll_controller.state.accel_ema =
+            (ema + ACCEL_EMA_ALPHA * (target - ema)).clamp(0.0, 1.0);
+    }
+
+    /// Predictive extension applied to the dominant-direction lookahead margin,
+    /// driven by the debounced acceleration signal. Returns extra rows to dispatch
+    /// ahead of the fling, hard-clamped so a noisy signal cannot over-expand the
+    /// window (and waste worker throughput) on jitter.
+    pub(super) fn predictive_lookahead_boost(&self) -> usize {
+        const MAX_PREDICTIVE_AHEAD: f32 = 30.0;
+        (self.scroll_controller.state.accel_ema * MAX_PREDICTIVE_AHEAD) as usize
     }
 }

@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Ratchet: literal colors, spacing, radii and text sizes in src/components may
+only decrease against scripts/ui-literals-baseline.txt.
+#>
 [CmdletBinding()]
 param(
     [switch]$SelfTest,
@@ -14,9 +19,6 @@ $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $componentsRoot = Join-Path $repositoryRoot "src/components"
 $baselinePath = Join-Path $PSScriptRoot "ui-literals-baseline.txt"
-
-# Paths relative to src/components whose literals are data, not styling.
-$allowedFiles = @()
 
 $categories = [ordered]@{
     color     = '\bhsla\(\s*-?[0-9.]|\brgba?\(\s*0x|(?<!\w)(black|white)\(\)'
@@ -91,10 +93,6 @@ div().bg(colors::backdrop()).text_color(colors::white_alpha(0.5)).border_color(t
 $totals = [ordered]@{}
 foreach ($name in $categories.Keys) { $totals[$name] = 0 }
 Get-ChildItem -LiteralPath $componentsRoot -Recurse -File -Filter "*.rs" | ForEach-Object {
-    $relativePath = [IO.Path]::GetRelativePath($componentsRoot, $_.FullName) -replace "\\", "/"
-    if ($relativePath -in $allowedFiles) {
-        return
-    }
     $counts = Measure-Literals ([IO.File]::ReadAllText($_.FullName))
     foreach ($name in $categories.Keys) { $totals[$name] += $counts[$name] }
 }

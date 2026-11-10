@@ -77,8 +77,8 @@ fn timeout_id_args(args: &str) -> Result<Option<(&str, u64, Option<&str>)>, Stri
 
 /// Send a raw IRC command to a channel
 async fn send_irc(channel: &str, message: &str) -> CommandResult {
-    if let Err(error) = ensure_authenticated_send_ready() {
-        return CommandResult::Error(error);
+    if let Err(block) = ensure_authenticated_send_ready() {
+        return CommandResult::Error(block.to_string());
     }
     let channel = match ensure_channel_send_ready(channel) {
         Ok(channel) => channel,
@@ -101,8 +101,8 @@ pub async fn cmd_raw(args: &str) -> CommandResult {
     if raw.is_empty() {
         return CommandResult::Error("Usage: /raw <irc message>".to_string());
     }
-    if let Err(error) = ensure_authenticated_send_ready() {
-        return CommandResult::Error(error);
+    if let Err(block) = ensure_authenticated_send_ready() {
+        return CommandResult::Error(block.to_string());
     }
 
     let message = match IRCMessage::parse(raw) {

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 /// Connect to a Twitch channel
-/// PERF: Uses immediate join when IRC is already connected (bypasses 5-second poll)
+/// Uses immediate join when IRC is already connected (bypasses 5-second poll)
 pub fn connect_channel(channel: &str) {
     if crate::backend::whispers::is_whispers_channel(channel) {
         crate::backend::irc::CHAT_MESSAGES
@@ -24,7 +24,7 @@ pub fn connect_channel(channel: &str) {
         return;
     }
     crate::backend::irc::note_channel_opened(channel);
-    if crate::benchmark_profile::network_lanes_suppressed() {
+    if crate::bench::network_lanes_suppressed() {
         crate::log_irc!(
             debug,
             "Offline benchmark suppressed channel connection for {}",
@@ -387,7 +387,7 @@ pub fn send_message_from_draft_async(
     origin: Option<SendDraftOrigin>,
 ) {
     let mut completion = ComposerSendCompletion::new(&channel, "Message", origin);
-    if let Err(error) = crate::benchmark_profile::reject_live_outbound_user_action("chat message") {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("chat message") {
         crate::log_irc!(warn, "{error}");
         completion.failed(&error.into());
         return;
@@ -419,9 +419,7 @@ pub fn send_message_or_command_from_draft_async(
     origin: Option<SendDraftOrigin>,
 ) {
     let mut completion = ComposerSendCompletion::new(&channel, "Command", origin);
-    if let Err(error) =
-        crate::benchmark_profile::reject_live_outbound_user_action("chat submission")
-    {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("chat submission") {
         crate::log_irc!(warn, "{error}");
         completion.failed(&error.into());
         return;
@@ -571,7 +569,7 @@ pub fn send_reply_from_draft_async(
     origin: Option<SendDraftOrigin>,
 ) {
     let mut completion = ComposerSendCompletion::new(&channel, "Reply", origin);
-    if let Err(error) = crate::benchmark_profile::reject_live_outbound_user_action("chat reply") {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("chat reply") {
         crate::log_irc!(warn, "{error}");
         completion.failed(&error.into());
         return;
@@ -611,9 +609,7 @@ pub fn upload_pasted_image_async(
     if channel.is_empty() {
         return false;
     }
-    if let Err(error) =
-        crate::benchmark_profile::reject_live_outbound_user_action("image paste upload")
-    {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("image paste upload") {
         crate::log_irc!(warn, "{error}");
         add_upload_error(&channel, &error);
         return true;
@@ -659,9 +655,7 @@ pub fn upload_image_files_async(
     if channel.is_empty() {
         return 0;
     }
-    if let Err(error) =
-        crate::benchmark_profile::reject_live_outbound_user_action("image file upload")
-    {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("image file upload") {
         crate::log_irc!(warn, "{error}");
         add_upload_error(&channel, &error);
         return 0;
@@ -956,7 +950,7 @@ fn add_upload_success(
         match crate::utils::set_clipboard_text(&result.image_link) {
             Ok(()) => " and copied link".to_string(),
             Err(err) => {
-                tracing::warn!("Failed to copy uploaded image link: {err}");
+                crate::log_ui!(warn, "Failed to copy uploaded image link: {err}");
                 format!(" (copy failed: {err})")
             }
         }
@@ -1055,8 +1049,10 @@ pub fn get_user_message_context(channel: &str, username: &str, limit: u32) -> Us
             return context;
         }
         let channel = channel.to_lowercase();
-        let pending_ids =
-            crate::backend::blocked_users::pending_channel_row_ids_commit_held(&channel);
+        let pending_ids = crate::backend::blocked_users::pending_channel_row_ids_commit_held(
+            &visibility_commit,
+            &channel,
+        );
         let Some(buffer) = crate::backend::irc::CHAT_MESSAGES.get(&channel) else {
             return context;
         };
@@ -1118,7 +1114,10 @@ pub fn get_user_message_context_fingerprint(channel: &str, username: &str) -> u6
         return 0;
     }
     let channel = channel.to_lowercase();
-    let pending_ids = crate::backend::blocked_users::pending_channel_row_ids_commit_held(&channel);
+    let pending_ids = crate::backend::blocked_users::pending_channel_row_ids_commit_held(
+        &visibility_commit,
+        &channel,
+    );
     let Some(buffer) = crate::backend::irc::CHAT_MESSAGES.get(&channel) else {
         return 0;
     };
@@ -1149,7 +1148,10 @@ pub fn get_user_message_context_fingerprint(channel: &str, username: &str) -> u6
 }
 
 /// Get recent chatters for autocomplete
-pub fn get_recent_chatters(channel: &str, limit: usize) -> Vec<(String, String, Option<String>)> {
+pub fn get_recent_chatters(
+    channel: &str,
+    limit: usize,
+) -> Vec<crate::backend::irc::ObservedChatter> {
     crate::backend::irc::get_recent_chatters(channel, limit)
 }
 
@@ -1251,20 +1253,11 @@ pub fn live_uptime_minutes(info: Option<&StreamInfo>) -> i64 {
         })
 }
 
+/// Change key for stream info; it hashes the fields `StreamInfo`'s `Eq` compares.
 pub fn stream_info_gate_hash(info: Option<&StreamInfo>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = ahash::AHasher::default();
-    match info {
-        None => 0u8.hash(&mut hasher),
-        Some(info) => {
-            1u8.hash(&mut hasher);
-            info.title.hash(&mut hasher);
-            info.game_name.hash(&mut hasher);
-            info.viewer_count.hash(&mut hasher);
-            info.started_at.hash(&mut hasher);
-            info.is_live.hash(&mut hasher);
-        }
-    }
+    info.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1296,7 +1289,7 @@ async fn fetch_stream_info(channel: &str) -> Option<StreamInfo> {
         }
         // A logged-out user of a build without the proxy hits this on every
         // poll; that is expected, so it stays out of the WARN log.
-        Err(e) if e == crate::backend::constants::API_PROXY_NOT_CONFIGURED => {
+        Err(e) if e.is_proxy_not_configured() => {
             crate::log_net!(debug, "Skipped stream info for {}: {}", channel, e);
             None
         }
@@ -1344,7 +1337,7 @@ pub fn queue_stream_info_refresh(
     mut channels: Vec<String>,
     last_hashes: Vec<(String, u64)>,
 ) -> bool {
-    if crate::benchmark_ui_fixture::disposable_workspace_enabled() {
+    if crate::bench::ui_fixture::disposable_workspace_enabled() {
         return false;
     }
 
@@ -1438,7 +1431,7 @@ pub async fn get_stream_info_async(channel: &str) -> Option<StreamInfo> {
 }
 
 /// Get channel ID from login name (checks cache first for O(1) lookup)
-/// PERF: Non-blocking version for use on UI thread
+/// Non-blocking version for use on UI thread
 pub fn get_channel_id_cached(channel: &str) -> Option<String> {
     crate::backend::twitch_api::get_cached_channel_id(channel)
 }
@@ -1498,12 +1491,14 @@ pub fn get_unread_whisper_count() -> u32 {
     crate::backend::whispers::unread_count()
 }
 
+pub use crate::backend::commands::helix::{CommandAuthBlock, WhisperComposeBlock};
+
 /// Return the current reason whisper compose/send should be treated as unavailable.
-pub fn get_whisper_compose_block_reason() -> Option<String> {
+pub fn get_whisper_compose_block_reason() -> Option<WhisperComposeBlock> {
     crate::backend::commands::helix::whisper_compose_block_reason()
 }
 
-/// PERF: Get global mentions from O(1) ring buffer
+/// Get global mentions from O(1) ring buffer
 /// Returns (channel, message) tuples sorted by timestamp descending (most recent first)
 pub fn get_global_mentions(limit: u32) -> Vec<(String, ChatMessage)> {
     if crate::backend::blocked_users::resident_visibility_revoked() {

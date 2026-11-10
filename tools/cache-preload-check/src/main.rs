@@ -1,3 +1,6 @@
+//! Contract: channel emote preload planning in `crates/echo-cache-policy`
+//! (eager limit, URL cap, plan summaries); the report is built in `lib.rs`.
+
 use std::io;
 
 fn main() {

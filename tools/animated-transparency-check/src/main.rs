@@ -1,12 +1,11 @@
-//! Regression proof for animated-emote transparency and loop continuity.
+//! Contract: animated-emote transparency and loop continuity.
 //!
 //! Four independent checks, no GUI:
 //!
-//! 1. `overlay_subframe_onto_canvas` (the actual fix): a sub-frame overlaid onto
+//! 1. `overlay_subframe_onto_canvas`: a sub-frame overlaid onto
 //!    a running canvas must keep pixels outside the sub-frame, keep canvas pixels
 //!    under fully-transparent source pixels, and overwrite under opaque source
-//!    pixels. This is the behavior that stops a partial frame from showing only
-//!    its own delta region.
+//!    pixels, so a partial frame never shows only its own delta region.
 //!
 //! 2. End-to-end: a synthetic 2-frame transparent GIF whose second frame is a
 //!    small sub-frame with disposal=Keep must decode so that frame 2 still
@@ -20,7 +19,7 @@
 //! 4. The bounded cache seam policy must begin warming frame zero across the
 //!    final refill window without expanding the regular one-frame lookahead.
 //!
-//! Run: `cargo run -p echo-animated-transparency-check`
+//! Run: `cargo run -p animated-transparency-check`
 
 use echo_gpui::cache::frame_layer::animation_loop_seam_prefetch_due;
 use echo_gpui::image_decode::{

@@ -21,6 +21,10 @@ use gpui::*;
 
 pub use echo_core::overlay_state::{Toast, ToastAction, ToastManagerState, ToastType};
 
+const TOAST_WIDTH: f32 = 340.0;
+const TOAST_SPACING: f32 = 8.0;
+const TOAST_MARGIN: f32 = 16.0;
+
 fn toast_colors(toast_type: &ToastType) -> (Hsla, Hsla, Hsla) {
     match toast_type {
         ToastType::Info => (
@@ -104,9 +108,9 @@ impl Render for ToastManager {
         let viewport_height = f32::from(viewport.height);
         let fit = crate::utils::fit_overlay_to_viewport(
             viewport,
-            ToastManagerState::TOAST_WIDTH,
+            TOAST_WIDTH,
             viewport_height,
-            ToastManagerState::MARGIN,
+            TOAST_MARGIN,
         );
 
         div()
@@ -119,7 +123,7 @@ impl Render for ToastManager {
             .occlude()
             .flex()
             .flex_col()
-            .gap(px(ToastManagerState::TOAST_SPACING))
+            .gap(px(TOAST_SPACING))
             .overflow_y_scroll()
             .overflow_x_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

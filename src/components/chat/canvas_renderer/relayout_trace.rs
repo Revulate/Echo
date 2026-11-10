@@ -14,9 +14,8 @@ use std::panic::Location;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-static RELAYOUT_TRACE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("ECHO_RELAYOUT_TRACE").is_some_and(|value| !value.is_empty() && value != "0")
-});
+static RELAYOUT_TRACE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| echo_core::env::flag("ECHO_RELAYOUT_TRACE"));
 
 static LAST_GLOBAL_CAUSE: Mutex<Option<RelayoutCause>> = Mutex::new(None);
 

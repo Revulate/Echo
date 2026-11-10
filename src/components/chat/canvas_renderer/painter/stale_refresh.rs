@@ -3,6 +3,13 @@
 use super::*;
 use crate::components::chat::canvas_renderer::async_layout::LayoutStatus;
 
+/// Number of visible stale layouts to rebuild synchronously per tick (visible-first refresh).
+const STALE_VISIBLE_SYNC_REFRESH_BUDGET: usize = 4;
+/// Background stale-layout scan budget per tick (offscreen phased refresh).
+const STALE_BACKGROUND_SCAN_BUDGET: usize = 48;
+/// Low stale-layout scan budget for mounted sibling splits that are visible but not focused.
+const STALE_INACTIVE_BACKGROUND_SCAN_BUDGET: usize = 8;
+
 impl CanvasMessageList {
     pub(super) fn refresh_stale_layouts_visible_first(
         &mut self,

@@ -69,7 +69,7 @@ impl FenwickTree {
 /// - O(log n) height update at any index
 /// - O(1) amortized buffer rotation (via VecDeque + offset tracking)
 ///
-/// PERF: Uses Fenwick tree for O(log n) updates instead of O(n) prefix sum rebuilds.
+/// Uses Fenwick tree for O(log n) updates instead of O(n) prefix sum rebuilds.
 /// This is critical for async layout completion which updates heights mid-buffer.
 #[derive(Debug, Clone)]
 pub struct HeightTree {
@@ -112,7 +112,7 @@ impl HeightTree {
     }
 
     /// Reserve capacity for additional heights
-    /// PERF: Prevents reallocations during incremental appends
+    /// Prevents reallocations during incremental appends
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.heights.reserve(additional);
@@ -272,8 +272,7 @@ impl HeightTree {
         self.heights.get(index).copied()
     }
 
-    /// Update height at specific index
-    /// O(log n) via Fenwick tree update - MAJOR IMPROVEMENT from O(n)
+    /// Update the height at `index` in O(log n).
     /// Returns true when an update was applied.
     pub fn update(&mut self, index: usize, new_height: f32) -> bool {
         if index >= self.heights.len() {

@@ -712,7 +712,7 @@ fn render_command_input<T: 'static>(
         .child(
             div()
                 .text_size(px(
-                    crate::components::settings::widgets::SettingsMetrics::CALM_LABEL_TEXT,
+                    crate::components::settings::widgets::SettingsMetrics::ROW_LABEL_TEXT,
                 ))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(colors::text_primary())

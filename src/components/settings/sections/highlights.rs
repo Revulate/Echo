@@ -5,9 +5,10 @@ use crate::backend::highlight_decision::{
     HighlightSample, HighlightTestOutcome, HighlightTestSound, test_highlight_sample,
 };
 use crate::backend::settings::{
-    HighlightBlacklistUser, HighlightRule, HighlightRuleTarget, add_highlight_blacklist_user,
-    add_highlight_rule, get_highlight_blacklist_users, get_highlight_rules,
-    remove_highlight_blacklist_user, remove_highlight_rule, update_highlight_blacklist_user,
+    HighlightBlacklistUser, HighlightColorKind, HighlightRule, HighlightRuleTarget,
+    add_highlight_blacklist_user, add_highlight_rule, get_highlight_blacklist_users,
+    get_highlight_colors, get_highlight_rules, remove_highlight_blacklist_user,
+    remove_highlight_rule, set_highlight_color, update_highlight_blacklist_user,
     update_highlight_rule,
 };
 use crate::components::settings::draft_input::{self, DraftField, DraftInput};
@@ -454,20 +455,7 @@ const HIGHLIGHT_TESTER_INCLUDE_DRAFT: SettingDescriptor = SettingDescriptor {
 fn get_highlight_settings() -> HighlightSettings {
     let local = backend::get_local_settings();
     HighlightSettings {
-        mention_color: local.mention_color,
-        whisper_color: local.whisper_color,
-        subscription_color: local.subscription_color,
-        first_message_color: local.first_message_color,
-        thread_highlight_color: local.thread_highlight_color,
-        watchstreak_color: crate::backend::settings::get_watchstreak_highlight_color(),
-        automod_color: crate::backend::settings::get_automod_highlight_color(),
-        announcement_color: crate::backend::settings::get_announcement_highlight_color(),
-        raid_color: crate::backend::settings::get_raid_highlight_color(),
-        bits_color: crate::backend::settings::get_bits_highlight_color(),
-        phrase_color: crate::backend::settings::get_phrase_highlight_color(),
-        redeem_color: crate::backend::settings::get_redeem_highlight_color(),
-        elevated_color: crate::backend::settings::get_elevated_highlight_color(),
-        self_message_color: crate::backend::settings::get_self_message_highlight_color(),
+        colors: get_highlight_colors(),
         enable_self_message_highlight: crate::backend::settings::get_enable_self_message_highlight(
         ),
         enable_elevated_highlight: crate::backend::settings::get_enable_elevated_highlight(),
@@ -481,20 +469,8 @@ fn get_highlight_settings() -> HighlightSettings {
 
 #[derive(Clone)]
 struct HighlightSettings {
-    mention_color: String,
-    whisper_color: String,
-    subscription_color: String,
-    first_message_color: String,
-    thread_highlight_color: String,
-    watchstreak_color: String,
-    automod_color: String,
-    announcement_color: String,
-    raid_color: String,
-    bits_color: String,
-    phrase_color: String,
-    redeem_color: String,
-    elevated_color: String,
-    self_message_color: String,
+    /// Indexed by [`HighlightColorKind::index`].
+    colors: [String; HighlightColorKind::COUNT],
     enable_self_message_highlight: bool,
     enable_elevated_highlight: bool,
     flash_on_mention: bool,
@@ -507,20 +483,7 @@ struct HighlightSettings {
 impl Default for HighlightSettings {
     fn default() -> Self {
         Self {
-            mention_color: backend::settings::DEFAULT_MENTION_COLOR.to_string(),
-            whisper_color: backend::settings::DEFAULT_WHISPER_COLOR.to_string(),
-            subscription_color: backend::settings::DEFAULT_SUBSCRIPTION_COLOR.to_string(),
-            first_message_color: backend::settings::DEFAULT_FIRST_MESSAGE_COLOR.to_string(),
-            thread_highlight_color: backend::settings::DEFAULT_THREAD_HIGHLIGHT_COLOR.to_string(),
-            watchstreak_color: backend::settings::DEFAULT_WATCHSTREAK_HIGHLIGHT_COLOR.to_string(),
-            automod_color: backend::settings::DEFAULT_AUTOMOD_HIGHLIGHT_COLOR.to_string(),
-            announcement_color: backend::settings::DEFAULT_ANNOUNCEMENT_HIGHLIGHT_COLOR.to_string(),
-            raid_color: backend::settings::DEFAULT_RAID_HIGHLIGHT_COLOR.to_string(),
-            bits_color: backend::settings::DEFAULT_BITS_HIGHLIGHT_COLOR.to_string(),
-            phrase_color: backend::settings::DEFAULT_PHRASE_HIGHLIGHT_COLOR.to_string(),
-            redeem_color: backend::settings::DEFAULT_REDEEM_HIGHLIGHT_COLOR.to_string(),
-            elevated_color: backend::settings::DEFAULT_ELEVATED_HIGHLIGHT_COLOR.to_string(),
-            self_message_color: backend::settings::DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR.to_string(),
+            colors: HighlightColorKind::ALL.map(|kind| kind.default_color().to_string()),
             enable_self_message_highlight: settings_defaults().enable_self_message_highlight,
             enable_elevated_highlight: settings_defaults().enable_elevated_highlight,
             flash_on_mention: settings_defaults().flash_on_mention,
@@ -530,6 +493,12 @@ impl Default for HighlightSettings {
             thread_highlight_show_in_mentions: settings_defaults()
                 .thread_highlight_show_in_mentions,
         }
+    }
+}
+
+impl HighlightSettings {
+    fn color(&self, kind: HighlightColorKind) -> &str {
+        &self.colors[kind.index()]
     }
 }
 
@@ -738,7 +707,7 @@ fn render_highlights_attention<T: 'static>(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(highlight_bool_row(
+                .child(crate::components::settings::widgets::setting_toggle_row(
                     FLASH_ON_MENTION,
                     settings.flash_on_mention,
                     defaults.flash_on_mention,
@@ -747,7 +716,7 @@ fn render_highlights_attention<T: 'static>(
                     cx,
                     backend::set_flash_on_mention,
                 ))
-                .child(highlight_bool_row(
+                .child(crate::components::settings::widgets::setting_toggle_row(
                     MENTION_IN_TITLE,
                     settings.show_mention_in_title,
                     defaults.show_mention_in_title,
@@ -756,7 +725,7 @@ fn render_highlights_attention<T: 'static>(
                     cx,
                     backend::set_show_mention_in_title,
                 ))
-                .child(highlight_bool_row(
+                .child(crate::components::settings::widgets::setting_toggle_row(
                     THREAD_HIGHLIGHT,
                     settings.thread_highlight_enabled,
                     defaults.thread_highlight_enabled,
@@ -786,7 +755,7 @@ fn render_highlights_attention<T: 'static>(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(highlight_bool_row(
+                                    .child(crate::components::settings::widgets::setting_toggle_row(
                                         SELF_MESSAGE_HIGHLIGHT,
                                         settings.enable_self_message_highlight,
                                         defaults.enable_self_message_highlight,
@@ -795,7 +764,7 @@ fn render_highlights_attention<T: 'static>(
                                         cx,
                                         crate::backend::settings::set_enable_self_message_highlight,
                                     ))
-                                    .child(highlight_bool_row(
+                                    .child(crate::components::settings::widgets::setting_toggle_row(
                                         ELEVATED_HIGHLIGHT,
                                         settings.enable_elevated_highlight,
                                         defaults.enable_elevated_highlight,
@@ -811,7 +780,7 @@ fn render_highlights_attention<T: 'static>(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(highlight_bool_row(
+                                    .child(crate::components::settings::widgets::setting_toggle_row(
                                         THREAD_HIGHLIGHT_MENTIONS,
                                         settings.thread_highlight_show_in_mentions,
                                         defaults.thread_highlight_show_in_mentions,
@@ -820,7 +789,7 @@ fn render_highlights_attention<T: 'static>(
                                         cx,
                                         backend::set_thread_highlight_show_in_mentions,
                                     ))
-                                    .child(highlight_bool_row(
+                                    .child(crate::components::settings::widgets::setting_toggle_row(
                                         THREAD_HIGHLIGHT_SOUND,
                                         settings.thread_highlight_sound_enabled,
                                         defaults.thread_highlight_sound_enabled,
@@ -833,7 +802,7 @@ fn render_highlights_attention<T: 'static>(
                             .child(settings_subtopic(
                                 "highlights-behavior-effects",
                                 "Effects",
-                                highlight_bool_row(
+                                crate::components::settings::widgets::setting_toggle_row(
                                     HIGHLIGHT_FLASH,
                                     crate::backend::settings::get_highlight_flash_enabled(),
                                     app_defaults.highlight_flash_enabled,
@@ -845,53 +814,6 @@ fn render_highlights_attention<T: 'static>(
                             ))
                     },
                 )),
-        ),
-    )
-}
-
-fn highlight_bool_row<T: 'static, F>(
-    descriptor: SettingDescriptor,
-    value: bool,
-    default: bool,
-    help: &'static str,
-    stacked: bool,
-    cx: &mut Context<T>,
-    set: F,
-) -> impl IntoElement + use<T, F>
-where
-    F: Fn(bool) + Clone + 'static,
-{
-    let modified = value != default;
-    let reset = set.clone();
-    setting_target(
-        descriptor,
-        crate::components::settings::widgets::setting_compact_row(
-            descriptor.id,
-            descriptor.label,
-            Some(help),
-            labelled_toggle(
-                SharedString::from(format!("toggle-{}", descriptor.control_id)),
-                descriptor.label,
-                value,
-                cx,
-                move |enabled, cx| {
-                    set(enabled);
-                    cx.notify();
-                },
-            ),
-            modified,
-            modified.then(|| {
-                setting_reset_with_window(
-                    format!("reset-{}", descriptor.control_id),
-                    descriptor.label,
-                    cx,
-                    move |_, cx| {
-                        reset(default);
-                        cx.notify();
-                    },
-                )
-            }),
-            stacked,
         ),
     )
 }
@@ -1006,43 +928,43 @@ fn render_highlight_colors<T: 'static>(
                 .flex_col()
                 .child(render_highlight_row(
                     MENTION_COLOR,
-                    &settings.mention_color,
-                    "mention",
+                    settings,
+                    HighlightColorKind::Mention,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     THREAD_COLOR,
-                    &settings.thread_highlight_color,
-                    "thread",
+                    settings,
+                    HighlightColorKind::Thread,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     WHISPER_COLOR,
-                    &settings.whisper_color,
-                    "whisper",
+                    settings,
+                    HighlightColorKind::Whisper,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     FIRST_MESSAGE_COLOR,
-                    &settings.first_message_color,
-                    "first_message",
+                    settings,
+                    HighlightColorKind::FirstMessage,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     SELF_MESSAGE_COLOR,
-                    &settings.self_message_color,
-                    "self_message",
+                    settings,
+                    HighlightColorKind::SelfMessage,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     PHRASE_COLOR,
-                    &settings.phrase_color,
-                    "phrase",
+                    settings,
+                    HighlightColorKind::Phrase,
                     stacked,
                     cx,
                 )),
@@ -1055,50 +977,50 @@ fn render_highlight_colors<T: 'static>(
                 .flex_col()
                 .child(render_highlight_row(
                     SUBSCRIPTION_COLOR,
-                    &settings.subscription_color,
-                    "subscription",
+                    settings,
+                    HighlightColorKind::Subscription,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     WATCHSTREAK_COLOR,
-                    &settings.watchstreak_color,
-                    "watchstreak",
+                    settings,
+                    HighlightColorKind::WatchStreak,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     ANNOUNCEMENT_COLOR,
-                    &settings.announcement_color,
-                    "announcement",
+                    settings,
+                    HighlightColorKind::Announcement,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     RAID_COLOR,
-                    &settings.raid_color,
-                    "raid",
+                    settings,
+                    HighlightColorKind::Raid,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     BITS_COLOR,
-                    &settings.bits_color,
-                    "bits",
+                    settings,
+                    HighlightColorKind::Bits,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     REDEEM_COLOR,
-                    &settings.redeem_color,
-                    "redeem",
+                    settings,
+                    HighlightColorKind::Redeem,
                     stacked,
                     cx,
                 ))
                 .child(render_highlight_row(
                     ELEVATED_COLOR,
-                    &settings.elevated_color,
-                    "elevated",
+                    settings,
+                    HighlightColorKind::Elevated,
                     stacked,
                     cx,
                 )),
@@ -1108,8 +1030,8 @@ fn render_highlight_colors<T: 'static>(
             "Moderation",
             render_highlight_row(
                 AUTOMOD_COLOR,
-                &settings.automod_color,
-                "automod",
+                settings,
+                HighlightColorKind::AutoMod,
                 stacked,
                 cx,
             ),
@@ -1780,7 +1702,7 @@ fn render_highlight_rule_editor<T: 'static>(
                         alpha_mode: ColorAlphaMode::Highlight {
                             default_alpha: (colors::highlight_alpha::PHRASE * 255.0).round() as u8,
                         },
-                        presets: highlight_color_presets(),
+                        presets: &HIGHLIGHT_COLOR_PRESETS,
                         allow_clear: true,
                         default_value: None,
                     },
@@ -2250,50 +2172,34 @@ fn highlight_rules_summary(
 }
 
 fn highlight_color_modified_count(settings: &HighlightSettings) -> usize {
-    [
-        ("mention", settings.mention_color.as_str()),
-        ("thread", settings.thread_highlight_color.as_str()),
-        ("whisper", settings.whisper_color.as_str()),
-        ("subscription", settings.subscription_color.as_str()),
-        ("first_message", settings.first_message_color.as_str()),
-        ("watchstreak", settings.watchstreak_color.as_str()),
-        ("automod", settings.automod_color.as_str()),
-        ("announcement", settings.announcement_color.as_str()),
-        ("raid", settings.raid_color.as_str()),
-        ("bits", settings.bits_color.as_str()),
-        ("phrase", settings.phrase_color.as_str()),
-        ("redeem", settings.redeem_color.as_str()),
-        ("elevated", settings.elevated_color.as_str()),
-        ("self_message", settings.self_message_color.as_str()),
-    ]
-    .into_iter()
-    .filter(|(kind, value)| {
-        !setting_colors_match(
-            value,
-            highlight_default_value(kind),
-            ColorAlphaMode::Highlight {
-                default_alpha: highlight_default_alpha(kind),
-            },
-        )
-    })
-    .count()
+    HighlightColorKind::ALL
+        .into_iter()
+        .filter(|kind| {
+            !setting_colors_match(
+                settings.color(*kind),
+                kind.default_color(),
+                ColorAlphaMode::Highlight {
+                    default_alpha: highlight_default_alpha(*kind),
+                },
+            )
+        })
+        .count()
 }
 
 fn render_highlight_row<T: 'static>(
     descriptor: SettingDescriptor,
-    color_hex: &str,
-    color_type: &str,
+    settings: &HighlightSettings,
+    kind: HighlightColorKind,
     stacked: bool,
     cx: &mut Context<T>,
 ) -> impl IntoElement + use<T> {
-    let default_alpha = highlight_default_alpha(color_type);
+    let color_hex = settings.color(kind);
+    let default_alpha = highlight_default_alpha(kind);
     let alpha_mode = ColorAlphaMode::Highlight { default_alpha };
-    let default_value = highlight_default_value(color_type);
+    let default_value = kind.default_color();
     let modified = !setting_colors_match(color_hex, default_value, alpha_mode);
-    let color_type_owned = color_type.to_string();
-    let picker_id = format!("highlight-{color_type}");
+    let picker_id = format!("highlight-{}", kind.key());
     let reset_picker_id = picker_id.clone();
-    let reset_color_type = color_type.to_string();
 
     setting_target(
         descriptor,
@@ -2305,7 +2211,7 @@ fn render_highlight_row<T: 'static>(
             Some(color_hex),
             ColorEditorOptions {
                 alpha_mode,
-                presets: highlight_color_presets(),
+                presets: &HIGHLIGHT_COLOR_PRESETS,
                 allow_clear: false,
                 default_value: Some(default_value),
             },
@@ -2316,7 +2222,7 @@ fn render_highlight_row<T: 'static>(
                     descriptor.label,
                     cx,
                     move |window, cx| {
-                        set_highlight_color(&reset_color_type, default_value);
+                        set_highlight_color(kind, default_value.to_string());
                         reset_color_editor_draft(
                             &reset_picker_id,
                             Some(default_value),
@@ -2333,7 +2239,7 @@ fn render_highlight_row<T: 'static>(
             cx,
             move |value, cx| {
                 if let Some(value) = value {
-                    set_highlight_color(&color_type_owned, &value);
+                    set_highlight_color(kind, value);
                 }
                 cx.notify();
             },
@@ -2342,69 +2248,47 @@ fn render_highlight_row<T: 'static>(
 }
 
 fn apply_highlight_color_preset(name: &str) {
-    match name {
+    use HighlightColorKind::{
+        AutoMod, FirstMessage, Mention, Subscription, Thread, WatchStreak, Whisper,
+    };
+    let colors: &[(HighlightColorKind, &str)] = match name {
         "default" => {
-            backend::set_mention_color(backend::settings::DEFAULT_MENTION_COLOR);
-            backend::set_whisper_color(backend::settings::DEFAULT_WHISPER_COLOR);
-            backend::set_subscription_color(backend::settings::DEFAULT_SUBSCRIPTION_COLOR);
-            backend::set_first_message_color(backend::settings::DEFAULT_FIRST_MESSAGE_COLOR);
-            backend::set_thread_highlight_color(backend::settings::DEFAULT_THREAD_HIGHLIGHT_COLOR);
-            crate::backend::settings::set_watchstreak_highlight_color(
-                backend::settings::DEFAULT_WATCHSTREAK_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_automod_highlight_color(
-                backend::settings::DEFAULT_AUTOMOD_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_announcement_highlight_color(
-                backend::settings::DEFAULT_ANNOUNCEMENT_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_raid_highlight_color(
-                backend::settings::DEFAULT_RAID_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_bits_highlight_color(
-                backend::settings::DEFAULT_BITS_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_phrase_highlight_color(
-                backend::settings::DEFAULT_PHRASE_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_redeem_highlight_color(
-                backend::settings::DEFAULT_REDEEM_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_elevated_highlight_color(
-                backend::settings::DEFAULT_ELEVATED_HIGHLIGHT_COLOR.to_string(),
-            );
-            crate::backend::settings::set_self_message_highlight_color(
-                backend::settings::DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR.to_string(),
-            );
+            for kind in HighlightColorKind::ALL {
+                set_highlight_color(kind, kind.default_color().to_string());
+            }
+            return;
         }
-        "muted" => {
-            backend::set_mention_color("#666666");
-            backend::set_whisper_color("#555555");
-            backend::set_subscription_color("#444444");
-            backend::set_first_message_color("#555555");
-            backend::set_thread_highlight_color("#5f514c");
-            crate::backend::settings::set_watchstreak_highlight_color("#666666".to_string());
-            crate::backend::settings::set_automod_highlight_color("#555555".to_string());
-        }
-        "vibrant" => {
-            backend::set_mention_color("#ff0000");
-            backend::set_whisper_color("#ff00ff");
-            backend::set_subscription_color("#00ff00");
-            backend::set_first_message_color("#ffff00");
-            backend::set_thread_highlight_color("#ff7a1a");
-            crate::backend::settings::set_watchstreak_highlight_color("#ffcc00".to_string());
-            crate::backend::settings::set_automod_highlight_color("#6b7280".to_string());
-        }
-        "ocean" => {
-            backend::set_mention_color("#00bcd4");
-            backend::set_whisper_color("#3f51b5");
-            backend::set_subscription_color("#009688");
-            backend::set_first_message_color("#4fc3f7");
-            backend::set_thread_highlight_color("#0f766e");
-            crate::backend::settings::set_watchstreak_highlight_color("#38bdf8".to_string());
-            crate::backend::settings::set_automod_highlight_color("#475569".to_string());
-        }
-        _ => {}
+        "muted" => &[
+            (Mention, "#666666"),
+            (Whisper, "#555555"),
+            (Subscription, "#444444"),
+            (FirstMessage, "#555555"),
+            (Thread, "#5f514c"),
+            (WatchStreak, "#666666"),
+            (AutoMod, "#555555"),
+        ],
+        "vibrant" => &[
+            (Mention, "#ff0000"),
+            (Whisper, "#ff00ff"),
+            (Subscription, "#00ff00"),
+            (FirstMessage, "#ffff00"),
+            (Thread, "#ff7a1a"),
+            (WatchStreak, "#ffcc00"),
+            (AutoMod, "#6b7280"),
+        ],
+        "ocean" => &[
+            (Mention, "#00bcd4"),
+            (Whisper, "#3f51b5"),
+            (Subscription, "#009688"),
+            (FirstMessage, "#4fc3f7"),
+            (Thread, "#0f766e"),
+            (WatchStreak, "#38bdf8"),
+            (AutoMod, "#475569"),
+        ],
+        _ => &[],
+    };
+    for (kind, hex) in colors {
+        set_highlight_color(*kind, (*hex).to_string());
     }
 }
 
@@ -2419,72 +2303,23 @@ const HIGHLIGHT_COLOR_PRESETS: [(&str, &str); 8] = [
     ("Pink", "#EC4899"),
 ];
 
-fn highlight_color_presets() -> &'static [(&'static str, &'static str)] {
-    &HIGHLIGHT_COLOR_PRESETS
-}
-
-fn highlight_default_value(color_type: &str) -> &'static str {
-    match color_type {
-        "mention" => backend::settings::DEFAULT_MENTION_COLOR,
-        "whisper" => backend::settings::DEFAULT_WHISPER_COLOR,
-        "subscription" => backend::settings::DEFAULT_SUBSCRIPTION_COLOR,
-        "first_message" => backend::settings::DEFAULT_FIRST_MESSAGE_COLOR,
-        "thread" => backend::settings::DEFAULT_THREAD_HIGHLIGHT_COLOR,
-        "watchstreak" => backend::settings::DEFAULT_WATCHSTREAK_HIGHLIGHT_COLOR,
-        "automod" => backend::settings::DEFAULT_AUTOMOD_HIGHLIGHT_COLOR,
-        "announcement" => backend::settings::DEFAULT_ANNOUNCEMENT_HIGHLIGHT_COLOR,
-        "raid" => backend::settings::DEFAULT_RAID_HIGHLIGHT_COLOR,
-        "bits" => backend::settings::DEFAULT_BITS_HIGHLIGHT_COLOR,
-        "phrase" => backend::settings::DEFAULT_PHRASE_HIGHLIGHT_COLOR,
-        "redeem" => backend::settings::DEFAULT_REDEEM_HIGHLIGHT_COLOR,
-        "elevated" => backend::settings::DEFAULT_ELEVATED_HIGHLIGHT_COLOR,
-        "self_message" => backend::settings::DEFAULT_SELF_MESSAGE_HIGHLIGHT_COLOR,
-        _ => backend::settings::DEFAULT_PHRASE_HIGHLIGHT_COLOR,
-    }
-}
-
-fn highlight_default_alpha(color_type: &str) -> u8 {
-    let alpha = match color_type {
-        "mention" => colors::highlight_alpha::MENTION,
-        "whisper" => colors::highlight_alpha::WHISPER,
-        "subscription" => colors::highlight_alpha::SUBSCRIPTION,
-        "first_message" => colors::highlight_alpha::FIRST_MESSAGE,
-        "thread" => colors::highlight_alpha::REPLY_THREAD,
-        "watchstreak" => colors::highlight_alpha::WATCH_STREAK,
-        "automod" => colors::highlight_alpha::AUTOMOD,
-        "announcement" => colors::highlight_alpha::ANNOUNCEMENT,
-        "raid" | "bits" => colors::highlight_alpha::HIGHLIGHTED,
-        "phrase" => colors::highlight_alpha::PHRASE,
-        "redeem" => colors::highlight_alpha::REDEEMED,
-        "elevated" => colors::highlight_alpha::ELEVATED,
-        "self_message" => colors::highlight_alpha::SELF_MESSAGE,
-        _ => colors::highlight_alpha::HIGHLIGHTED,
+fn highlight_default_alpha(kind: HighlightColorKind) -> u8 {
+    let alpha = match kind {
+        HighlightColorKind::Mention => colors::highlight_alpha::MENTION,
+        HighlightColorKind::Whisper => colors::highlight_alpha::WHISPER,
+        HighlightColorKind::Subscription => colors::highlight_alpha::SUBSCRIPTION,
+        HighlightColorKind::FirstMessage => colors::highlight_alpha::FIRST_MESSAGE,
+        HighlightColorKind::Thread => colors::highlight_alpha::REPLY_THREAD,
+        HighlightColorKind::WatchStreak => colors::highlight_alpha::WATCH_STREAK,
+        HighlightColorKind::AutoMod => colors::highlight_alpha::AUTOMOD,
+        HighlightColorKind::Announcement => colors::highlight_alpha::ANNOUNCEMENT,
+        HighlightColorKind::Raid | HighlightColorKind::Bits => colors::highlight_alpha::HIGHLIGHTED,
+        HighlightColorKind::Phrase => colors::highlight_alpha::PHRASE,
+        HighlightColorKind::Redeem => colors::highlight_alpha::REDEEMED,
+        HighlightColorKind::Elevated => colors::highlight_alpha::ELEVATED,
+        HighlightColorKind::SelfMessage => colors::highlight_alpha::SELF_MESSAGE,
     };
     (alpha * 255.0).round() as u8
-}
-
-fn set_highlight_color(color_type: &str, hex: &str) {
-    match color_type {
-        "mention" => backend::set_mention_color(hex),
-        "whisper" => backend::set_whisper_color(hex),
-        "subscription" => backend::set_subscription_color(hex),
-        "first_message" => backend::set_first_message_color(hex),
-        "thread" => backend::set_thread_highlight_color(hex),
-        "watchstreak" => crate::backend::settings::set_watchstreak_highlight_color(hex.to_string()),
-        "automod" => crate::backend::settings::set_automod_highlight_color(hex.to_string()),
-        "announcement" => {
-            crate::backend::settings::set_announcement_highlight_color(hex.to_string())
-        }
-        "raid" => crate::backend::settings::set_raid_highlight_color(hex.to_string()),
-        "bits" => crate::backend::settings::set_bits_highlight_color(hex.to_string()),
-        "phrase" => crate::backend::settings::set_phrase_highlight_color(hex.to_string()),
-        "redeem" => crate::backend::settings::set_redeem_highlight_color(hex.to_string()),
-        "elevated" => crate::backend::settings::set_elevated_highlight_color(hex.to_string()),
-        "self_message" => {
-            crate::backend::settings::set_self_message_highlight_color(hex.to_string())
-        }
-        _ => {}
-    }
 }
 
 fn render_highlight_blacklist_editor<T: 'static>(

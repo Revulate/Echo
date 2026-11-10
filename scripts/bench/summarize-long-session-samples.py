@@ -8,7 +8,7 @@ import csv
 from pathlib import Path
 from typing import Any
 
-from benchlib import append_notes, ensure_object, load_json, slug, utc_stamp, write_json
+from benchlib import append_notes, ensure_object, load_json, percentile, slug, utc_stamp, write_json
 
 
 ELAPSED_FIELDS = ("elapsed_ms", "time_ms", "timestamp_ms", "t_ms")
@@ -45,21 +45,6 @@ def parse_float(value: Any) -> float | None:
 
 def truthy_marker(value: Any) -> bool:
     return value is not None and str(value).strip().lower() in {"true", "1", "yes"}
-
-
-def percentile(sorted_values: list[float], percent: float) -> float | None:
-    if not sorted_values:
-        return None
-    if len(sorted_values) == 1:
-        return round(sorted_values[0], 6)
-    rank = (percent / 100.0) * (len(sorted_values) - 1)
-    lower = int(rank)
-    upper = min(lower + 1, len(sorted_values) - 1)
-    if lower == upper:
-        return round(sorted_values[lower], 6)
-    weight = rank - lower
-    value = (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
-    return round(value, 6)
 
 
 def series_summary(rows: list[dict[str, Any]], name: str, aliases: tuple[str, ...], observed_duration_minutes: float) -> dict[str, Any]:

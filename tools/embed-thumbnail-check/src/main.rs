@@ -1,14 +1,15 @@
+//! Contract: embed-thumbnail URL filtering, render decisions per thumbnail mode,
+//! provider thumbnail URLs, preview heights and aspect-ratio fitting in
+//! `src/backend/embed_thumbnails.rs`.
+
 #[path = "../../../src/backend/embed_thumbnails.rs"]
 mod embed_thumbnails;
 
+use check_support::FIXTURE_HEADER;
 use embed_thumbnails::{
     EmbedThumbnailMode, is_valid_embed_thumbnail_url, preview_height, should_render_thumbnail,
     thumbnail_dimensions,
 };
-use std::hint::black_box;
-use std::time::Instant;
-
-const ITERS: usize = 5_000_000;
 
 fn check_aspect_ratio_sizing() {
     use embed_thumbnails::fit_thumbnail_to_height;
@@ -177,11 +178,8 @@ fn main() {
         159.0
     );
 
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_provider_thumbnail_fixture_rows();
-    bench_render_decision(valid, reddit_preview);
-    bench_dimensions();
-    bench_preview_height();
 }
 
 fn print_provider_thumbnail_fixture_rows() {
@@ -198,86 +196,6 @@ fn print_provider_thumbnail_fixture_rows() {
             "thumbnail render decision mismatch for {}",
             case.provider
         );
-        println!(
-            "fixture,provider_thumbnail_{},1,0.00,0,{}",
-            case.provider, case.renderable as usize
-        );
+        println!("fixture,provider_thumbnail_{},pass", case.provider);
     }
-}
-
-fn bench_render_decision(valid: &str, invalid: &str) {
-    let urls = [Some(valid), Some(invalid), None, Some(valid)];
-    let modes = [
-        EmbedThumbnailMode::None,
-        EmbedThumbnailMode::Small,
-        EmbedThumbnailMode::Medium,
-        EmbedThumbnailMode::Large,
-    ];
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..ITERS {
-        let render =
-            should_render_thumbnail(black_box(modes[i & 3]), black_box(urls[(i >> 2) & 3]));
-        checksum = checksum.wrapping_add(render as usize);
-    }
-    print_measurement(
-        "resolve",
-        "thumbnail_render_decision",
-        ITERS,
-        start,
-        checksum,
-    );
-}
-
-fn bench_dimensions() {
-    let modes = [
-        EmbedThumbnailMode::None,
-        EmbedThumbnailMode::Small,
-        EmbedThumbnailMode::Medium,
-        EmbedThumbnailMode::Large,
-    ];
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..ITERS {
-        let dims = thumbnail_dimensions(black_box(modes[i & 3]));
-        if let Some((width, height)) = dims {
-            checksum = checksum.wrapping_add(width as usize + height as usize);
-        }
-    }
-    print_measurement("resolve", "thumbnail_dimensions", ITERS, start, checksum);
-}
-
-fn bench_preview_height() {
-    let modes = [
-        EmbedThumbnailMode::None,
-        EmbedThumbnailMode::Small,
-        EmbedThumbnailMode::Medium,
-        EmbedThumbnailMode::Large,
-    ];
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for i in 0..ITERS {
-        let height = preview_height(
-            black_box(modes[i & 3]),
-            black_box((i & 1) == 0),
-            black_box(12.0),
-            black_box(100.0),
-            black_box(76.0),
-        );
-        checksum = checksum.wrapping_add(height as usize);
-    }
-    print_measurement("resolve", "preview_height", ITERS, start, checksum);
-}
-
-fn print_measurement(kind: &str, name: &str, units: usize, start: Instant, checksum: usize) {
-    let elapsed = start.elapsed();
-    let ns_per_unit = elapsed.as_nanos() as f64 / units as f64;
-    let units_per_second = units as f64 / elapsed.as_secs_f64();
-    println!(
-        "{},{},{},{:.2},{:.0},{}",
-        kind, name, units, ns_per_unit, units_per_second, checksum
-    );
 }

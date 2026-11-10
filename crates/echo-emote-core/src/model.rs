@@ -1,12 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// One emote from any provider, as cached, persisted and rendered.
+///
+/// `url` is the default display copy; `url_1x`/`url_2x`/`url_4x` are the
+/// provider's sized copies when known. `width`/`height` are the logical 1x
+/// size, `None` when the provider did not report it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Emote {
     pub id: Arc<str>,
     pub name: Arc<str>,
     pub url: Arc<str>,
     pub provider: EmoteProvider,
+    /// Where the emote can be used, in its persisted encoding; read it through
+    /// [`Emote::scope`].
     #[serde(default)]
     pub channel: Option<Arc<str>>,
     #[serde(default)]
@@ -35,6 +42,8 @@ pub struct Emote {
     pub height: Option<u32>,
 }
 
+/// The service an emote comes from. Variant names are part of the persisted
+/// cache format.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum EmoteProvider {
@@ -57,11 +66,64 @@ impl EmoteProvider {
     }
 }
 
-pub fn emote_url_shared(emote: &Emote, selected: &str) -> Arc<str> {
-    if emote.url.as_ref() == selected {
-        return Arc::clone(&emote.url);
+/// [`Emote::channel`] prefix of a Twitch subscriber emote, followed by the
+/// owning channel's login.
+pub const SUBSCRIPTION_CHANNEL_PREFIX: &str = "sub:";
+/// [`Emote::channel`] of an emote from the signed-in user's 7TV personal set.
+pub const PERSONAL_SEVENTV_CHANNEL: &str = "personal:7tv";
+
+/// Where an emote can be used, decoded from [`Emote::channel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmoteScope<'a> {
+    /// Usable everywhere.
+    Global,
+    /// A channel's own set, keyed by channel login, or another provider
+    /// grouping such as Twitch's `twitch:prime`.
+    Channel(&'a str),
+    /// A Twitch subscriber emote of the given channel login.
+    Subscription(&'a str),
+    /// The signed-in user's 7TV personal set.
+    Personal,
+}
+
+/// Decode an [`Emote::channel`] value.
+pub fn emote_scope(channel: Option<&str>) -> EmoteScope<'_> {
+    match channel {
+        None => EmoteScope::Global,
+        Some(PERSONAL_SEVENTV_CHANNEL) => EmoteScope::Personal,
+        Some(channel) => match channel.strip_prefix(SUBSCRIPTION_CHANNEL_PREFIX) {
+            Some(owner) => EmoteScope::Subscription(owner),
+            None => EmoteScope::Channel(channel),
+        },
     }
-    for candidate in [&emote.url_1x, &emote.url_2x, &emote.url_4x] {
+}
+
+impl Emote {
+    /// Where this emote can be used.
+    pub fn scope(&self) -> EmoteScope<'_> {
+        emote_scope(self.channel.as_deref())
+    }
+}
+
+pub fn emote_url_shared(emote: &Emote, selected: &str) -> Arc<str> {
+    shared_variant_url(
+        &emote.url,
+        [&emote.url_1x, &emote.url_2x, &emote.url_4x],
+        selected,
+    )
+}
+
+/// The emote's own `Arc` for `selected` when it is one of its URLs, so callers
+/// share it instead of allocating a copy.
+pub(crate) fn shared_variant_url(
+    url: &Arc<str>,
+    variants: [&Option<Arc<str>>; 3],
+    selected: &str,
+) -> Arc<str> {
+    if url.as_ref() == selected {
+        return Arc::clone(url);
+    }
+    for candidate in variants {
         if let Some(url) = candidate.as_ref().filter(|url| url.as_ref() == selected) {
             return Arc::clone(url);
         }
@@ -79,6 +141,83 @@ pub fn emote_source_scale(emote: &Emote, url: &str) -> &'static str {
     )
 }
 
+/// Which of an emote's copies a URL is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceTier {
+    /// The `url_1x` copy.
+    One,
+    /// The `url_2x` copy.
+    Two,
+    /// The `url_4x` slot: the provider's largest copy (Twitch 3.0, BTTV 3x,
+    /// FFZ 4, 7TV 4x, or 7TV 3x when that is its largest file).
+    Largest,
+    /// The default display URL, or any URL that is none of the sized copies.
+    Default,
+}
+
+impl SourceTier {
+    pub fn of(
+        url_1x: Option<&str>,
+        url_2x: Option<&str>,
+        url_4x: Option<&str>,
+        selected: &str,
+    ) -> Self {
+        if url_1x == Some(selected) {
+            Self::One
+        } else if url_2x == Some(selected) {
+            Self::Two
+        } else if url_4x == Some(selected) {
+            Self::Largest
+        } else {
+            Self::Default
+        }
+    }
+
+    /// The provider's own name for this copy. It keys persisted media
+    /// identities, so the spellings are part of the cache format.
+    pub fn label(self, provider: EmoteProvider, selected: &str) -> &'static str {
+        match self {
+            Self::One => match provider {
+                EmoteProvider::Twitch => "1.0",
+                EmoteProvider::FFZ => "1",
+                _ => "1x",
+            },
+            Self::Two => match provider {
+                EmoteProvider::Twitch => "2.0",
+                EmoteProvider::FFZ => "2",
+                _ => "2x",
+            },
+            Self::Largest => match provider {
+                EmoteProvider::Twitch => "3.0",
+                EmoteProvider::BTTV => "3x",
+                EmoteProvider::FFZ => "4",
+                EmoteProvider::SevenTV if is_seventv_three_x_file(selected) => "3x",
+                _ => "4x",
+            },
+            Self::Default => "default",
+        }
+    }
+
+    /// Physical pixels per logical pixel of this copy.
+    pub fn density(self, provider: EmoteProvider, emote_id: &str, selected: &str) -> f32 {
+        match self {
+            Self::One | Self::Default => 1.0,
+            Self::Two => 2.0,
+            Self::Largest => match provider {
+                EmoteProvider::Twitch => crate::twitch_high_tier_density(emote_id),
+                EmoteProvider::SevenTV if is_seventv_three_x_file(selected) => 3.0,
+                _ => 4.0,
+            },
+        }
+    }
+}
+
+fn is_seventv_three_x_file(url: &str) -> bool {
+    url.rsplit('/')
+        .next()
+        .is_some_and(|file| file.starts_with("3x.") || file.starts_with("3x_"))
+}
+
 pub fn provider_variant_scale(
     provider: EmoteProvider,
     url_1x: Option<&str>,
@@ -86,55 +225,22 @@ pub fn provider_variant_scale(
     url_4x: Option<&str>,
     selected: &str,
 ) -> &'static str {
-    if url_1x == Some(selected) {
-        return match provider {
-            EmoteProvider::Twitch => "1.0",
-            EmoteProvider::FFZ => "1",
-            _ => "1x",
-        };
-    }
-    if url_2x == Some(selected) {
-        return match provider {
-            EmoteProvider::Twitch => "2.0",
-            EmoteProvider::FFZ => "2",
-            _ => "2x",
-        };
-    }
-    if url_4x == Some(selected) {
-        return match provider {
-            EmoteProvider::Twitch => "3.0",
-            EmoteProvider::BTTV => "3x",
-            EmoteProvider::FFZ => "4",
-            EmoteProvider::SevenTV
-                if selected
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|file| file.starts_with("3x.") || file.starts_with("3x_")) =>
-            {
-                "3x"
-            }
-            _ => "4x",
-        };
-    }
-    "default"
+    SourceTier::of(url_1x, url_2x, url_4x, selected).label(provider, selected)
 }
 
 pub fn emote_source_density(emote: &Emote, url: &str) -> f32 {
-    match emote_source_scale(emote, url) {
-        "2.0" | "2" | "2x" => 2.0,
-        "3.0" => crate::twitch_high_tier_density(&emote.id),
-        "3x" if emote.provider == EmoteProvider::SevenTV => 3.0,
-        "3x" | "4" | "4x" => 4.0,
-        _ => 1.0,
-    }
+    SourceTier::of(
+        emote.url_1x.as_deref(),
+        emote.url_2x.as_deref(),
+        emote.url_4x.as_deref(),
+        url,
+    )
+    .density(emote.provider, &emote.id, url)
 }
 
 /// Canonical 2x Twitch CDN URL for an emote id.
 pub fn twitch_emote_url(id: &str) -> String {
-    format!(
-        "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/2.0",
-        id
-    )
+    twitch_emote_url_with_scale(id, "2.0")
 }
 
 /// Twitch CDN URL for an emote id at an explicit scale.
@@ -143,21 +249,6 @@ pub fn twitch_emote_url_with_scale(id: &str, scale: &str) -> String {
         "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/{}",
         id, scale
     )
-}
-
-/// Normalize a channel name into the lowercase, '#'-free cache key.
-pub fn normalize_channel_key(channel: &str) -> String {
-    normalized_channel_key(channel).into_owned()
-}
-
-#[inline]
-pub fn normalized_channel_key(channel: &str) -> std::borrow::Cow<'_, str> {
-    let trimmed = channel.trim_start_matches('#');
-    if trimmed.bytes().all(|byte| !byte.is_ascii_uppercase()) {
-        std::borrow::Cow::Borrowed(trimmed)
-    } else {
-        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
-    }
 }
 
 /// Smaller copies of a provider emote image, largest first.

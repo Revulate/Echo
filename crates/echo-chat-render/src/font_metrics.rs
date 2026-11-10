@@ -10,14 +10,14 @@ use gpui::{
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, OnceLock, RwLock, RwLockWriteGuard};
+use std::sync::{LazyLock, OnceLock};
 
 /// Capacity for the per-thread GPUI width-measurement cache.
 const WIDTH_CACHE_CAPACITY: usize = 4096;
 
 /// Key for the cached GPUI width measurement.
 ///
-/// PERF: keyed on an `FxHash` of the text rather than an owned `String`, so a
+/// Keyed on an `FxHash` of the text rather than an owned `String`, so a
 /// cache hit needs no heap allocation (the previous `text.to_string()` ran on
 /// every lookup, including hits, and `measure_string_gpui` is called many times
 /// per layout). The owned `String` is never materialized for width memoization;
@@ -101,7 +101,7 @@ pub const DEFAULT_FONT_SIZE: f32 = 40.0 / 3.0;
 pub const BOLD_MULTIPLIER: f32 = 1.08;
 
 /// Get current font size scaled by the font_scale setting
-/// PERF: Called during layout and painting. font_scale read is a fast mutex lock.
+/// Called during layout and painting. font_scale read is a fast mutex lock.
 #[inline]
 pub fn scaled_font_size() -> f32 {
     DEFAULT_FONT_SIZE * ports::font_scale()
@@ -336,12 +336,6 @@ impl FontMetricsProvider {
         Some(shaped_line.width.as_f32())
     }
 
-    /// Whether the advances were measured with GPUI rather than estimated.
-    #[inline]
-    pub fn is_calibrated(&self) -> bool {
-        self.normal_metrics.is_initialized
-    }
-
     /// Get character width (uses cached value or estimates)
     #[inline]
     pub fn char_width(&self, ch: char, is_bold: bool) -> f32 {
@@ -375,7 +369,7 @@ impl FontMetricsProvider {
 
     /// Measure string width with GPUI for accuracy (when context available)
     ///
-    /// PERF: Routes through a per-thread width cache keyed on
+    /// Routes through a per-thread width cache keyed on
     /// `(text, bold, font_size)`. Wrap-checks re-measure the same tokens (esp.
     /// the literal space width) repeatedly; without the cache each call shaped a
     /// fresh `SharedString` uncached. The `shape_line` only runs on a miss.
@@ -452,156 +446,39 @@ impl Default for FontMetricsProvider {
     }
 }
 
-// ============================================================================
-// Global Instance
-// ============================================================================
+/// The estimated advance table windowless measurements use until
+/// [`initialize_font_metrics`] has measured the chat font with GPUI.
+static ESTIMATED_FONT_METRICS: LazyLock<FontMetricsProvider> =
+    LazyLock::new(FontMetricsProvider::new);
 
-/// Global font metrics provider instance
-///
-/// Uses estimated metrics initially, then can be initialized with GPUI
-/// measurements when Window/App context becomes available.
-pub static FONT_METRICS_PROVIDER: LazyLock<RwLock<FontMetricsProvider>> =
-    LazyLock::new(|| RwLock::new(FontMetricsProvider::new()));
-
-fn write_font_metrics_provider(
-    provider: &RwLock<FontMetricsProvider>,
-) -> RwLockWriteGuard<'_, FontMetricsProvider> {
-    match provider.write() {
-        Ok(provider) => provider,
-        Err(poisoned) => {
-            let mut provider_guard = poisoned.into_inner();
-            *provider_guard = FontMetricsProvider::new();
-            provider.clear_poison();
-            echo_core::log_ui!(warn, "Reset poisoned font metrics provider");
-            provider_guard
-        }
-    }
-}
-
-/// Immutable copy of the provider published once GPUI calibration finished,
-/// so measurements never wait on or race the provider lock.
+/// Immutable provider published once GPUI calibration finished, so
+/// measurements never take a lock.
 static CALIBRATED_FONT_METRICS: OnceLock<FontMetricsProvider> = OnceLock::new();
 
-/// The GPUI-calibrated metrics, once `initialize_font_metrics` has run.
+/// The chat font metrics: GPUI-calibrated advances once
+/// [`initialize_font_metrics`] ran, the estimated table before that.
 #[inline]
-pub fn calibrated_font_metrics() -> Option<&'static FontMetricsProvider> {
-    CALIBRATED_FONT_METRICS.get()
+pub fn font_metrics() -> &'static FontMetricsProvider {
+    CALIBRATED_FONT_METRICS
+        .get()
+        .unwrap_or_else(|| &ESTIMATED_FONT_METRICS)
 }
 
-/// Initialize the global font metrics with GPUI (call once during app startup)
+/// Measure the chat font with GPUI and publish the calibrated metrics.
+///
+/// Runs on the main thread (it needs a `Window`); later calls are no-ops.
 pub fn initialize_font_metrics(window: &mut Window, cx: &mut App) {
     if CALIBRATED_FONT_METRICS.get().is_some() {
         return;
     }
-    let mut provider = write_font_metrics_provider(&FONT_METRICS_PROVIDER);
+    let mut provider = FontMetricsProvider::new();
     provider.initialize_with_gpui(window, cx);
-    if provider.is_calibrated() {
-        let _ = CALIBRATED_FONT_METRICS.set(provider.clone());
-    }
+    let _ = CALIBRATED_FONT_METRICS.set(provider);
 }
-
-// ============================================================================
-// Compatibility Layer
-// ============================================================================
-
-/// Compatibility wrapper that matches the old FontMetrics API
-/// This allows gradual migration from the old system
-pub struct FontMetrics {
-    provider: Arc<FontMetricsProvider>,
-}
-
-impl FontMetrics {
-    pub fn new() -> Self {
-        Self {
-            provider: Arc::new(FontMetricsProvider::new()),
-        }
-    }
-
-    /// Windowless measurements use the GPUI-calibrated advances once
-    /// `initialize_font_metrics` ran, and the estimated table before that.
-    #[inline]
-    fn with_char_metrics<R>(&self, measure: impl FnOnce(&FontMetricsProvider) -> R) -> R {
-        measure(calibrated_font_metrics().unwrap_or(&self.provider))
-    }
-
-    pub fn measure_string_bold(&self, text: &str, is_bold: bool) -> f32 {
-        self.with_char_metrics(|provider| provider.measure_string(text, is_bold))
-    }
-
-    /// Measure text width accurately using GPUI text shaping
-    ///
-    /// This method uses GPUI's text system to shape the text with the actual font,
-    /// providing pixel-perfect width measurement that accounts for:
-    /// - Kerning pairs
-    /// - Ligatures
-    /// - Sub-pixel positioning
-    /// - Font-specific metrics
-    ///
-    /// Use this when you need accurate measurements on the main thread with a window available.
-    /// Falls back to cached metrics when window is None (background thread or async layout).
-    pub fn measure_string_gpui(&self, text: &str, is_bold: bool, window: &mut Window) -> f32 {
-        self.provider.measure_string_gpui(text, is_bold, window)
-    }
-
-    #[inline]
-    pub fn batch_char_positions_into(
-        &self,
-        text: &str,
-        start_x: f32,
-        is_bold: bool,
-        source_positions: &mut SmallVec<[f32; 48]>,
-        pending_positions: &mut SmallVec<[f32; 24]>,
-        source_text: &mut String,
-    ) -> f32 {
-        self.with_char_metrics(|provider| {
-            provider.batch_char_positions_into(
-                text,
-                start_x,
-                is_bold,
-                source_positions,
-                pending_positions,
-                source_text,
-            )
-        })
-    }
-}
-
-impl Default for FontMetrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Global FontMetrics instance (compatibility with existing code)
-pub static FONT_METRICS: LazyLock<FontMetrics> = LazyLock::new(FontMetrics::new);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    #[test]
-    fn poisoned_provider_resets_to_estimated_metrics_and_allows_reuse() {
-        let provider = RwLock::new(FontMetricsProvider::new());
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let mut provider = provider
-                .write()
-                .expect("test provider should start healthy");
-            provider.normal_metrics.is_initialized = true;
-            provider.bold_metrics.is_initialized = true;
-            provider.normal_metrics.average_width = 123.0;
-            panic!("poison test provider");
-        }));
-
-        assert!(provider.is_poisoned());
-        let provider_guard = write_font_metrics_provider(&provider);
-        assert!(!provider_guard.normal_metrics.is_initialized);
-        assert!(!provider_guard.bold_metrics.is_initialized);
-        assert_eq!(provider_guard.normal_metrics.average_width, 7.0);
-        drop(provider_guard);
-        assert!(!provider.is_poisoned());
-        assert!(provider.write().is_ok());
-    }
 
     #[test]
     fn test_estimated_char_widths() {

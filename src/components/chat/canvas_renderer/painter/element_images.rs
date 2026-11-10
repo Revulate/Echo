@@ -6,21 +6,16 @@ use crate::components::chat::canvas_renderer::layout;
 
 #[inline]
 fn get_visible_animated_render_image(url: &str) -> Option<Arc<RenderImage>> {
-    if let Some((render_image, metadata)) =
-        image_cache::get_current_animated_render_image_with_metadata(url)
-    {
-        emote_renderer::register_visible_metadata(metadata);
-        return Some(render_image);
+    if let Some(frame) = image_cache::animated_frame(url, image_cache::FrameQuery::Current) {
+        emote_renderer::register_visible_metadata(frame.metadata);
+        return Some(frame.image);
     }
 
     if matches!(
         image_cache::get_animated_cache_state(url),
         image_cache::AnimatedCacheState::NotLoaded
     ) {
-        image_cache::trigger_animated_decode_with_source(
-            url,
-            image_cache::PreloadSource::VisibleChat,
-        );
+        image_cache::trigger_animated_decode(url, image_cache::PreloadSource::VisibleChat);
     }
 
     None
@@ -39,7 +34,6 @@ pub(super) fn image_shows_still_frame(image_type: &layout::ImageType) -> bool {
 }
 
 /// Render an image segment (emote or badge)
-/// PERF: #[inline] for hot-path function called per-image-segment per-frame
 ///
 /// A `still` image draws only Echo's static first frame. Until that is
 /// resident it shows the placeholder, never GPUI's `img(url)`, which would play
@@ -141,7 +135,7 @@ pub(super) fn render_image_segment(
 }
 
 /// Render a shimmer placeholder for loading emotes
-/// PERF: Provides immediate visual feedback while emotes load
+/// Provides immediate visual feedback while emotes load
 /// Shows a subtle rounded rectangle that indicates content is loading
 #[inline]
 fn render_emote_placeholder(x: f32, y: f32, width: f32, height: f32) -> AnyElement {

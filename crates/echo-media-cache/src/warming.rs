@@ -5,9 +5,9 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_PRIORITY_ENTRIES: usize = 500;
@@ -17,7 +17,6 @@ const LEGACY_WARMING_CACHE_FILE: &str = "cache_warming.bincode.zst";
 const CACHE_VERSION: u32 = 1;
 const MAX_WARMING_COMPRESSED_BYTES: u64 = 1024 * 1024;
 const MAX_WARMING_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessStats {
@@ -354,77 +353,22 @@ fn save_to_file(path: &Path, priorities: &WarmingPriorities) -> Result<(), Strin
         .map_err(|error| format!("Postcard encode error: {error}"))?;
     let compressed = zstd::encode_all(encoded.as_slice(), 3)
         .map_err(|error| format!("Compress error: {error}"))?;
-    write_atomically(path, &compressed).map_err(|error| format!("Write error: {error}"))
+    crate::persist::write_atomically(path, |file| file.write_all(&compressed))
+        .map_err(|error| format!("Write error: {error}"))
 }
 
 fn read_zstd_limited(path: &Path) -> Result<Vec<u8>, String> {
-    // Capture a bounded immutable compressed payload before decoding; file
-    // metadata cannot safely constrain a file that grows while being read.
-    let compressed = read_compressed_bytes_limited(
-        fs::File::open(path).map_err(|error| format!("Read error: {error}"))?,
+    crate::persist::read_zstd_bounded(
+        path,
         MAX_WARMING_COMPRESSED_BYTES as usize,
-    )?;
-    let mut decoder = zstd::Decoder::new(Cursor::new(compressed))
-        .map_err(|error| format!("Decompress error: {error}"))?;
-    decoder
-        .window_log_max(25)
-        .map_err(|error| format!("Decompress window error: {error}"))?;
-    let mut decompressed = Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_WARMING_DECOMPRESSED_BYTES as u64 + 1)
-        .read_to_end(&mut decompressed)
-        .map_err(|error| format!("Decompress error: {error}"))?;
-    if decompressed.len() > MAX_WARMING_DECOMPRESSED_BYTES {
-        return Err(format!(
-            "Decompressed warming cache exceeds {MAX_WARMING_DECOMPRESSED_BYTES} byte limit"
-        ));
-    }
-    Ok(decompressed)
-}
-
-fn read_compressed_bytes_limited(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
-    let mut compressed = Vec::new();
-    reader
-        .by_ref()
-        .take(limit as u64 + 1)
-        .read_to_end(&mut compressed)
-        .map_err(|error| format!("Read error: {error}"))?;
-    if compressed.len() > limit {
-        return Err(format!(
-            "Compressed warming cache exceeds {limit} byte limit"
-        ));
-    }
-    Ok(compressed)
+        MAX_WARMING_DECOMPRESSED_BYTES,
+        "warming cache",
+    )
+    .map_err(|error| format!("Read error: {error}"))
 }
 
 fn legacy_path_for(current_path: &Path) -> PathBuf {
     current_path.with_file_name(LEGACY_WARMING_CACHE_FILE)
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = temporary_path_for(path);
-    let write_result = (|| {
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        echo_core::file_replace::replace_file(&temporary, path)
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn temporary_path_for(path: &Path) -> PathBuf {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| format!("{extension}.tmp-{}-{counter}", std::process::id()))
-        .unwrap_or_else(|| format!("tmp-{}-{counter}", std::process::id()));
-    path.with_extension(extension)
 }
 
 #[cfg(test)]
@@ -494,7 +438,10 @@ mod tests {
 
     #[test]
     fn compressed_warming_capture_rejects_over_limit_input() {
-        assert!(read_compressed_bytes_limited(Cursor::new([1, 2, 3]), 2).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WARMING_CACHE_FILE);
+        std::fs::write(&path, vec![0u8; MAX_WARMING_COMPRESSED_BYTES as usize + 1]).unwrap();
+        assert!(read_zstd_limited(&path).is_err());
     }
 
     #[test]

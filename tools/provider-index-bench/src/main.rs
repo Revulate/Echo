@@ -1,5 +1,8 @@
+//! Benchmark: the incremental emote provider-index refresh must produce the same
+//! index as a full rebuild and be at least 2x faster; exits non-zero otherwise.
+
 fn main() {
-    let result = echo_gpui::backend::emotes::benchmark_provider_index_refresh(41);
+    let result = echo_gpui::backend::emotes::benchmark_hooks::benchmark_provider_index_refresh(41);
     println!(
         "entries={} iterations={}",
         result.entries, result.iterations

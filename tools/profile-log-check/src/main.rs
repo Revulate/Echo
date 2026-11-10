@@ -1,3 +1,7 @@
+//! Fixture: summarizes Echo profile logs (warnings, errors, slow layout/pane/emote
+//! stages, scroll and refresh counters) as one CSV row per log.
+//! Usage: `profile-log-check <profile.log> [...]`.
+
 use std::env;
 use std::fs;
 use std::path::Path;

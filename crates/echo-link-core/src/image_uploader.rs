@@ -99,14 +99,9 @@ impl Default for ImageUploaderConfig {
     }
 }
 
+/// Links resolved from an uploader's response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadResult {
-    pub image_link: String,
-    pub deletion_link: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedUploadResponse {
     pub image_link: String,
     pub deletion_link: Option<String>,
 }
@@ -461,14 +456,14 @@ pub fn parse_upload_response(
     response_text: &str,
     image_link_template: &str,
     deletion_link_template: &str,
-) -> Result<ParsedUploadResponse, String> {
+) -> Result<UploadResult, String> {
     let image_link = resolve_response_template(image_link_template, response_text)?
         .ok_or_else(|| "Upload response did not contain an image link".to_string())?;
     let image_link = validate_resolved_url(&image_link, "image")?;
     let deletion_link = resolve_response_template(deletion_link_template, response_text)?
         .and_then(|link| validate_resolved_url(&link, "deletion").ok());
 
-    Ok(ParsedUploadResponse {
+    Ok(UploadResult {
         image_link,
         deletion_link,
     })

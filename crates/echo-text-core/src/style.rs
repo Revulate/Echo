@@ -8,6 +8,8 @@ pub enum EmojiStyle {
     Twemoji,
     #[serde(rename = "noto")]
     Noto,
+    /// Renders the Twemoji image set (see `emoji::get_emoji_url`); the
+    /// variant keeps its name so saved settings still load.
     #[serde(rename = "native")]
     Native,
 }

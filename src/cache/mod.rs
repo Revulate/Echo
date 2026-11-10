@@ -1,20 +1,19 @@
-//! Cache subsystem modules.
+//! App-side media cache: loading, decoding and residency of emote, badge and
+//! link images.
 //!
-//! The active runtime cache path is owned by `ImageCacheService`.
-//! `cache::loader` remains as a compatibility facade for hot-path callers.
-//!
-//! The picker-visibility and deferred image-release registries are cache
-//! runtime state and live in `echo-media-cache`; they are re-exported here so
-//! existing `crate::cache::...` callers are unchanged.
+//! `loader` schedules downloads, disk hydration, decoding and preloads, and
+//! is what the UI calls. The storage layers themselves (memory, frames, disk)
+//! and the picker-visibility and deferred image-release registries live in
+//! the GPUI-light `echo-media-cache` crate; `budget`, `disk_layer` and
+//! `frame_layer` expose them under `crate::cache`. `ImageCacheService` owns
+//! startup and shutdown of the cache runtime.
 
 mod animation_source;
 pub mod budget;
 pub mod disk_layer;
 pub mod frame_layer;
 pub mod loader;
-pub mod memory_layer;
 pub mod native_sizes;
-pub mod preload_plan;
 pub mod service;
 pub mod stats;
 pub mod uri_layer;

@@ -6,8 +6,7 @@ use super::*;
 /// Optional audit list for direct-paint image URLs.
 /// Set `ECHO_AUDIT_EMOTE_IDS` to comma-separated substrings (e.g. 7TV emote IDs).
 static AUDIT_EMOTE_ID_FILTERS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    std::env::var("ECHO_AUDIT_EMOTE_IDS")
-        .ok()
+    echo_core::env::value("ECHO_AUDIT_EMOTE_IDS")
         .map(|raw| {
             raw.split(',')
                 .map(str::trim)
@@ -185,7 +184,9 @@ fn paint_single_image_direct(
                             .push((key, AnimationSlotSource::Image(cmd.url.clone())));
                     }
                     if cmd.is_emote {
-                        crate::startup_metrics::record("first_visible_emote_paint");
+                        crate::diagnostics::startup_metrics::record(
+                            crate::diagnostics::startup_metrics::StartupMarker::FirstVisibleEmotePaint,
+                        );
                     }
                     return;
                 }
@@ -235,7 +236,9 @@ fn paint_single_image_direct(
     if let Some(img) = render_image {
         let _ = window.paint_image(bounds, bounds, Corners::default(), img, 0, false);
         if cmd.is_emote {
-            crate::startup_metrics::record("first_visible_emote_paint");
+            crate::diagnostics::startup_metrics::record(
+                crate::diagnostics::startup_metrics::StartupMarker::FirstVisibleEmotePaint,
+            );
         }
     } else {
         let (state, is_downloading) = image_cache::get_state_and_downloading(cmd.url.as_ref());
@@ -302,7 +305,9 @@ pub(super) fn paint_prepared_images_direct(
                 false,
             );
             if command.is_emote {
-                crate::startup_metrics::record("first_visible_emote_paint");
+                crate::diagnostics::startup_metrics::record(
+                    crate::diagnostics::startup_metrics::StartupMarker::FirstVisibleEmotePaint,
+                );
             }
             continue;
         }

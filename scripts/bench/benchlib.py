@@ -145,6 +145,25 @@ def series_stats(values: list[Any]) -> dict[str, int | None]:
     }
 
 
+def percentile(sorted_values: list[float], percent: float) -> float | None:
+    """Percentile of ascending-sorted values by linear interpolation between the
+    closest ranks (rank = percent / 100 * (n - 1); numpy "linear", Excel
+    PERCENTILE.INC), rounded to 6 decimals. BenchLib.psm1's Get-Percentile uses
+    the same definition. Returns None for empty input."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return round(sorted_values[0], 6)
+    rank = (percent / 100.0) * (len(sorted_values) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    if lower == upper:
+        return round(sorted_values[lower], 6)
+    weight = rank - lower
+    value = (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
+    return round(value, 6)
+
+
 def initialize_run_metadata(
     scenario_dir: Path,
     run_id: str,

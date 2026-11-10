@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Compare every test, contract tool and doctest in the root crate, the extracted
+# crates and the cache-preload-check tool against the reviewed baseline in
+# scripts/linux-test-inventory.tsv, then enforce the gpui::test shadowing guard
+# (see docs/LINUX_DEVELOPMENT.md). Adding, moving or renaming a test means
+# updating the baseline in the same change.
 set -euo pipefail
 
 # The baseline is byte-ordered. Pin collation so `sort` and `diff` agree on every
@@ -35,9 +40,6 @@ extract_tests() {
 check_test_scope() {
     local kind="$1"
     local output="$2"
-    local summary_key="${kind%_test}_tests"
-    local expected_count
-    local actual_count
     shift 2
     extract_tests "$@" | sed "s/^/$kind\t/" >"$output"
     awk -F '\t' -v kind="$kind" '$1 == kind' "$baseline" >"$output.expected"
@@ -50,28 +52,28 @@ check_test_scope() {
             "$kind" "$baseline" >&2
         return 1
     fi
-    expected_count="$(summary_value "$summary_key")"
-    actual_count="$(wc -l <"$output")"
-    if [[ "$actual_count" != "$expected_count" ]]; then
-        printf 'Linux test count drift for %s: expected=%s actual=%s\n' \
-            "$kind" "$expected_count" "$actual_count" >&2
-        return 1
-    fi
-    printf 'Inventory PASS scope=%s count=%s\n' "$kind" "$actual_count"
+    printf 'Inventory PASS scope=%s count=%s\n' "$kind" "$(wc -l <"$output")"
 }
 
 check_test_scope root_test "$tmp_dir/root-tests.tsv" src
 check_test_scope cache_preload_tool_test "$tmp_dir/cache-preload-tool-tests.tsv" tools/cache-preload-check/src
-check_test_scope autocomplete_core_test "$tmp_dir/autocomplete-core-tests.tsv" crates/echo-autocomplete-core
-check_test_scope cache_policy_test "$tmp_dir/cache-policy-tests.tsv" crates/echo-cache-policy
-check_test_scope chat_render_test "$tmp_dir/chat-render-tests.tsv" crates/echo-chat-render
-check_test_scope cosmetics_core_test "$tmp_dir/cosmetics-core-tests.tsv" crates/echo-cosmetics-core
-check_test_scope emote_core_test "$tmp_dir/emote-core-tests.tsv" crates/echo-emote-core
-check_test_scope link_core_test "$tmp_dir/link-core-tests.tsv" crates/echo-link-core
-check_test_scope media_cache_test "$tmp_dir/media-cache-tests.tsv" crates/echo-media-cache
-check_test_scope core_test "$tmp_dir/core-tests.tsv" crates/echo-core
-check_test_scope render_core_test "$tmp_dir/render-core-tests.tsv" crates/echo-render-core
-check_test_scope text_core_test "$tmp_dir/text-core-tests.tsv" crates/echo-text-core
+# Each extracted crate's baseline kind is its package name without the echo-
+# prefix, in snake case: crates/echo-cache-policy -> cache_policy_test.
+extracted_crate_dirs=()
+for crate_manifest in crates/*/Cargo.toml; do
+    extracted_crate_dirs+=("${crate_manifest%/Cargo.toml}")
+done
+
+crate_scope() {
+    local crate_name="${1##*/}"
+    crate_name="${crate_name#echo-}"
+    printf '%s' "${crate_name//-/_}"
+}
+
+for crate_dir in "${extracted_crate_dirs[@]}"; do
+    scope="$(crate_scope "$crate_dir")"
+    check_test_scope "${scope}_test" "$tmp_dir/$scope-tests.tsv" "$crate_dir"
+done
 
 contract_count="$(awk -F '\t' '$1 !~ /^#/ && $4 == "contract" { count++ } END { print count + 0 }' "$registry")"
 expected_contract_count="$(summary_value contract_tools)"
@@ -122,16 +124,9 @@ check_doctest_scope() {
 
 check_doctest_scope root src
 check_doctest_scope cache_preload_tool tools/cache-preload-check/src
-check_doctest_scope autocomplete_core crates/echo-autocomplete-core/src
-check_doctest_scope cache_policy crates/echo-cache-policy/src
-check_doctest_scope chat_render crates/echo-chat-render/src
-check_doctest_scope cosmetics_core crates/echo-cosmetics-core/src
-check_doctest_scope emote_core crates/echo-emote-core/src
-check_doctest_scope link_core crates/echo-link-core/src
-check_doctest_scope media_cache crates/echo-media-cache/src
-check_doctest_scope core crates/echo-core/src
-check_doctest_scope render_core crates/echo-render-core/src
-check_doctest_scope text_core crates/echo-text-core/src
+for crate_dir in "${extracted_crate_dirs[@]}"; do
+    check_doctest_scope "$(crate_scope "$crate_dir")" "$crate_dir/src"
+done
 
 # ----------------------------------------------------------------------------
 # gpui::test shadowing guard
@@ -142,7 +137,7 @@ check_doctest_scope text_core crates/echo-text-core/src
 # gpui's macro emits `#[test]` again, so expansion recurses; the root crate's
 # `#![recursion_limit = "4096"]` turns that into a multi-minute expansion and
 # eventually a stack overflow rather than a fast error. That is the real cause
-# of the historical "cargo test crashes rustc" report.
+# of rustc crashing on the root test target.
 #
 # The fix is one explicit import per test module: an explicit (non-glob) import
 # always wins over a glob, regardless of source order, so canonical rustfmt

@@ -9,7 +9,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
-use std::time::Instant;
 
 /// Maximum number of favorite emotes
 pub const MAX_FAVORITES: usize = 50;
@@ -17,7 +16,8 @@ pub const MAX_FAVORITES: usize = 50;
 /// Maximum number of recently used emotes to track
 pub const MAX_RECENT: usize = 25;
 
-/// Debounce interval for saves (milliseconds)
+/// Debounce interval the application's background save worker applies after
+/// a mutation (milliseconds).
 pub const SAVE_DEBOUNCE_MS: u128 = 500;
 
 static PORTS: OnceLock<EmotePreferencesPorts> = OnceLock::new();
@@ -98,8 +98,6 @@ pub struct EmotePreferences {
     dirty: bool,
     /// Identifies the snapshot so a completed background save cannot clear a newer mutation.
     revision: u64,
-    /// Last save timestamp
-    last_save: Instant,
     /// Set of favorite keys for O(1) lookup
     favorites_set: HashSet<String>,
 }
@@ -117,7 +115,6 @@ impl EmotePreferences {
             data: EmotePreferencesData::default(),
             dirty: false,
             revision: 0,
-            last_save: Instant::now(),
             favorites_set: HashSet::new(),
         }
     }
@@ -129,7 +126,6 @@ impl EmotePreferences {
             data,
             dirty: false,
             revision: 0,
-            last_save: Instant::now(),
             favorites_set,
         }
     }
@@ -148,21 +144,14 @@ impl EmotePreferences {
     /// Record that the current state has reached durable storage.
     pub fn mark_saved(&mut self) {
         self.dirty = false;
-        self.last_save = Instant::now();
     }
 
     /// Save preferences to disk
     pub fn save(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         persist(&self.data)?;
         self.dirty = false;
-        self.last_save = Instant::now();
         crate::log_emotes!(debug, "Saved emote preferences");
         Ok(())
-    }
-
-    /// Check if should save (debounced)
-    pub fn should_save(&self) -> bool {
-        self.dirty && self.last_save.elapsed().as_millis() >= SAVE_DEBOUNCE_MS
     }
 
     /// Try to save if needed (debounced)

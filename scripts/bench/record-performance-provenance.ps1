@@ -1,3 +1,9 @@
+<#
+.SYNOPSIS
+Record the provenance of a performance run: executable, cache tree and the
+CPU/GPU evidence files with their hashes, and whether the evidence was taken
+from the same executable.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -37,6 +43,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Get-Sha256Identity {
     param(
@@ -55,24 +62,6 @@ function Get-Sha256Identity {
         bytes = [int64]$item.Length
         last_write_time_utc = $item.LastWriteTimeUtc.ToString("o")
     }
-}
-
-function ConvertTo-RelativePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$BasePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$TargetPath
-    )
-
-    $baseFullPath = [System.IO.Path]::GetFullPath($BasePath)
-    if (-not $baseFullPath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
-        $baseFullPath += [System.IO.Path]::DirectorySeparatorChar
-    }
-
-    $relativeUri = ([System.Uri]::new($baseFullPath)).MakeRelativeUri([System.Uri]::new([System.IO.Path]::GetFullPath($TargetPath)))
-    return [System.Uri]::UnescapeDataString($relativeUri.ToString()).Replace("/", [System.IO.Path]::DirectorySeparatorChar)
 }
 
 function Get-CacheTreeIdentity {

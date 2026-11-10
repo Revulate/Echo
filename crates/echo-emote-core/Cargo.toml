@@ -9,4 +9,4 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { workspace = true, features = ["rc"] }

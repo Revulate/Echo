@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Periodic aggregated render/layout diagnostics log cadence.
+const RENDER_PERF_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
+
 impl CanvasMessageList {
     pub(super) fn reset_render_perf_frame_stats(&mut self) {
         self.render_perf_frame_stats = RenderPerfFrameStats::default();
@@ -50,11 +53,9 @@ impl CanvasMessageList {
     pub(super) fn flush_render_perf_aggregate_if_due(
         &mut self,
         layout_time: std::time::Duration,
-        async_poll_time: std::time::Duration,
         elem_build_time: std::time::Duration,
         visible_rows: usize,
         visible_span: usize,
-        completed_async_layouts: usize,
     ) {
         if !crate::backend::metrics::is_enabled() && !crate::log::enabled("perf_render") {
             return;
@@ -90,11 +91,9 @@ impl CanvasMessageList {
             let agg = &mut self.render_perf_agg_stats;
             agg.frames += 1;
             agg.layout_total_us += layout_time.as_micros();
-            agg.async_poll_total_us += async_poll_time.as_micros();
             agg.elem_build_total_us += elem_build_time.as_micros();
             agg.visible_rows_total += visible_rows as u64;
             agg.visible_span_total += visible_span as u64;
-            agg.completed_async_layouts_total += completed_async_layouts as u64;
             agg.layout_cache_hits_total += self.render_perf_frame_stats.layout_cache_hits as u64;
             agg.layout_cache_misses_total +=
                 self.render_perf_frame_stats.layout_cache_misses as u64;
@@ -186,7 +185,7 @@ impl CanvasMessageList {
             }
         }
 
-        if self.last_render_perf_log.elapsed().as_millis() < RENDER_PERF_LOG_INTERVAL_MS {
+        if self.last_render_perf_log.elapsed() < RENDER_PERF_LOG_INTERVAL {
             return;
         }
 
@@ -205,95 +204,6 @@ impl CanvasMessageList {
             }
         }
 
-        let (
-            frames,
-            avg_layout_ms,
-            avg_async_poll_ms,
-            avg_elem_ms,
-            avg_visible_rows,
-            avg_visible_span,
-            avg_cache_hits,
-            avg_cache_misses,
-            hit_split_cache,
-            hit_global_cache,
-            hit_async_ready,
-            miss_sync_shape,
-            avg_async_requests,
-            avg_async_completions,
-            animation_visible_row_reuse,
-            animation_frame_unchanged_skips,
-            animation_waker_checks,
-            stable_visible_row_reuse,
-            viewport_canvas_fast_path,
-            viewport_canvas_prepared_snapshot_reuse,
-            viewport_canvas_prepared_row_reuse,
-            viewport_canvas_scroll_snapshot_reuse,
-            viewport_canvas_prepared_text_lines,
-            viewport_canvas_prepared_static_images,
-            height_anchor_adjustments,
-            full_rebuilds,
-            order_resets,
-            rebuild_order,
-            rebuild_height,
-            rebuild_stale,
-            rebuild_force,
-            last_rebuild_reason,
-            last_order_reset_reason,
-            stable_gate_fail_mask,
-            stable_gate_fail_terms,
-            direct_rows,
-            element_fallback_rows,
-            element_fallback_terms,
-            animation_patch_terms,
-        ) = {
-            let agg = &self.render_perf_agg_stats;
-            let frames = agg.frames.max(1);
-            (
-                agg.frames,
-                agg.layout_total_us as f64 / frames as f64 / 1000.0,
-                agg.async_poll_total_us as f64 / frames as f64 / 1000.0,
-                agg.elem_build_total_us as f64 / frames as f64 / 1000.0,
-                agg.visible_rows_total as f64 / frames as f64,
-                agg.visible_span_total as f64 / frames as f64,
-                agg.layout_cache_hits_total as f64 / frames as f64,
-                agg.layout_cache_misses_total as f64 / frames as f64,
-                agg.layout_hit_split_cache_total,
-                agg.layout_hit_global_cache_total,
-                agg.layout_hit_async_ready_total,
-                agg.layout_miss_sync_shape_total,
-                agg.async_layout_requests_total as f64 / frames as f64,
-                agg.completed_async_layouts_total as f64 / frames as f64,
-                agg.animation_visible_row_reuse_total,
-                agg.animation_frame_unchanged_skips_total,
-                agg.animation_waker_checks_total,
-                agg.stable_visible_row_reuse_total,
-                agg.viewport_canvas_fast_path_total,
-                agg.viewport_canvas_prepared_snapshot_reuse_total,
-                agg.viewport_canvas_prepared_row_reuse_total,
-                agg.viewport_canvas_scroll_snapshot_reuse_total,
-                agg.viewport_canvas_prepared_text_lines_total,
-                agg.viewport_canvas_prepared_static_images_total,
-                agg.height_anchor_adjustments_total,
-                agg.full_layout_rebuilds_total,
-                agg.message_order_resets_total,
-                agg.rebuild_reason_order_total,
-                agg.rebuild_reason_height_total,
-                agg.rebuild_reason_stale_total,
-                agg.rebuild_reason_force_refresh_total,
-                rebuild_reason_flags_label(agg.last_rebuild_reason_flags),
-                agg.last_order_reset_reason.unwrap_or("none"),
-                agg.stable_gate_fail_mask,
-                stable_gate_failures_label(&agg.stable_gate_fail_counts),
-                agg.direct_rows_total,
-                agg.element_fallback_rows_total,
-                element_fallback_reasons_label(&agg.element_fallback_reason_counts),
-                animation_patch_outcomes_label(
-                    &agg.animation_patch_outcomes,
-                    &agg.animation_unslotted_reasons,
-                    &agg.animation_patch_failures,
-                ),
-            )
-        };
         let layout_worker = crate::components::chat::canvas_renderer::layout_worker_diagnostics();
         let split_queue_wait = self.async_layout_manager.take_queue_wait();
         let split_queue_wait_avg_us = split_queue_wait
@@ -301,46 +211,61 @@ impl CanvasMessageList {
             .checked_div(split_queue_wait.count)
             .unwrap_or(0);
 
+        let agg = &self.render_perf_agg_stats;
+        let frames = agg.frames.max(1) as f64;
+        let per_frame = |total: u64| total as f64 / frames;
+        let per_frame_ms = |total_us: u128| total_us as f64 / frames / 1000.0;
+        let last_rebuild_reason = rebuild_reason_flags_label(agg.last_rebuild_reason_flags);
+        let stable_gate_fail_terms = stable_gate_failures_label(&agg.stable_gate_fail_counts);
+        let element_fallback_terms =
+            element_fallback_reasons_label(&agg.element_fallback_reason_counts);
+        let animation_patch_terms = animation_patch_outcomes_label(
+            &agg.animation_patch_outcomes,
+            &agg.animation_unslotted_reasons,
+            &agg.animation_patch_failures,
+        );
+        let stable_gate_fail_mask = agg.stable_gate_fail_mask;
+
         crate::log_perf_render!(
             debug,
             channel_id = %self.channel_id,
-            frames,
-            avg_layout_ms,
-            avg_async_poll_ms,
-            avg_elem_ms,
-            avg_visible_rows,
-            avg_visible_span,
-            avg_cache_hits,
-            avg_cache_misses,
-            hit_split_cache,
-            hit_global_cache,
-            hit_async_ready,
-            miss_sync_shape,
-            avg_async_requests,
-            avg_async_completions,
-            animation_visible_row_reuse,
-            animation_frame_unchanged_skips,
-            animation_waker_checks,
-            stable_visible_row_reuse,
-            viewport_canvas_fast_path,
-            viewport_canvas_prepared_snapshot_reuse,
-            viewport_canvas_prepared_row_reuse,
-            viewport_canvas_scroll_snapshot_reuse,
-            viewport_canvas_prepared_text_lines,
-            viewport_canvas_prepared_static_images,
-            height_anchor_adjustments,
-            full_rebuilds,
-            order_resets,
-            rebuild_order,
-            rebuild_height,
-            rebuild_stale,
-            rebuild_force,
+            frames = agg.frames,
+            avg_layout_ms = per_frame_ms(agg.layout_total_us),
+            avg_elem_ms = per_frame_ms(agg.elem_build_total_us),
+            avg_visible_rows = per_frame(agg.visible_rows_total),
+            avg_visible_span = per_frame(agg.visible_span_total),
+            avg_cache_hits = per_frame(agg.layout_cache_hits_total),
+            avg_cache_misses = per_frame(agg.layout_cache_misses_total),
+            hit_split_cache = agg.layout_hit_split_cache_total,
+            hit_global_cache = agg.layout_hit_global_cache_total,
+            hit_async_ready = agg.layout_hit_async_ready_total,
+            miss_sync_shape = agg.layout_miss_sync_shape_total,
+            avg_async_requests = per_frame(agg.async_layout_requests_total),
+            animation_visible_row_reuse = agg.animation_visible_row_reuse_total,
+            animation_frame_unchanged_skips = agg.animation_frame_unchanged_skips_total,
+            animation_waker_checks = agg.animation_waker_checks_total,
+            stable_visible_row_reuse = agg.stable_visible_row_reuse_total,
+            viewport_canvas_fast_path = agg.viewport_canvas_fast_path_total,
+            viewport_canvas_prepared_snapshot_reuse =
+                agg.viewport_canvas_prepared_snapshot_reuse_total,
+            viewport_canvas_prepared_row_reuse = agg.viewport_canvas_prepared_row_reuse_total,
+            viewport_canvas_scroll_snapshot_reuse = agg.viewport_canvas_scroll_snapshot_reuse_total,
+            viewport_canvas_prepared_text_lines = agg.viewport_canvas_prepared_text_lines_total,
+            viewport_canvas_prepared_static_images =
+                agg.viewport_canvas_prepared_static_images_total,
+            height_anchor_adjustments = agg.height_anchor_adjustments_total,
+            full_rebuilds = agg.full_layout_rebuilds_total,
+            order_resets = agg.message_order_resets_total,
+            rebuild_order = agg.rebuild_reason_order_total,
+            rebuild_height = agg.rebuild_reason_height_total,
+            rebuild_stale = agg.rebuild_reason_stale_total,
+            rebuild_force = agg.rebuild_reason_force_refresh_total,
             last_rebuild_reason = %last_rebuild_reason,
-            last_order_reset_reason,
+            last_order_reset_reason = agg.last_order_reset_reason.unwrap_or("none"),
             stable_gate_fail_mask = format_args!("{stable_gate_fail_mask:#06x}"),
             stable_gate_fail_terms = %stable_gate_fail_terms,
-            direct_rows,
-            element_fallback_rows,
+            direct_rows = agg.direct_rows_total,
+            element_fallback_rows = agg.element_fallback_rows_total,
             element_fallback_terms = %element_fallback_terms,
             animation_patch_terms = %animation_patch_terms,
             queue_depth = layout_worker.queue_depth,

@@ -8,6 +8,7 @@
 use super::traits::{Openable, OverlayPointerIsolation};
 use crate::backend::{self, ModAction, ModActionType};
 use crate::components::common::mod_buttons::{ModButtonStyle, render_mod_button};
+use crate::components::common::moderation_policy;
 use crate::components::ui::ButtonExt;
 use crate::theme::colors;
 use crate::utils::format_time_24h_sec;
@@ -469,27 +470,13 @@ fn render_mod_action(index: usize, action: &ModAction) -> impl IntoElement + use
     let details = masked_mod_action_details(action, hide_details);
     let channel = masked_mod_action_channel(action, hide_details);
     let timestamp_str = format_time_24h_sec(action.timestamp);
-    let can_run_quick_action = if matches!(
-        action.action_type,
-        ModActionType::Mod | ModActionType::Unmod | ModActionType::Vip | ModActionType::Unvip
-    ) {
-        crate::components::common::moderation_policy::can_manage_role_target(
-            &action.channel,
-            &action.username,
-        )
+    let can_run_quick_action = QuickActionPolicy::for_action(action.action_type)
+        .can_show(&action.channel, &action.username);
+    let quick_actions = if hide_details || action.masked || !can_run_quick_action {
+        None
     } else {
-        crate::components::common::moderation_policy::can_moderate_target(
-            &action.channel,
-            &action.username,
-            &[],
-        )
+        Some(render_mod_action_buttons(index, action))
     };
-    let quick_actions =
-        if hide_details || mod_action_identity_is_masked(action) || !can_run_quick_action {
-            None
-        } else {
-            Some(render_mod_action_buttons(index, action))
-        };
 
     div()
         .py_2()
@@ -602,14 +589,113 @@ fn masked_mod_action_channel(action: &ModAction, hide_details: bool) -> String {
     }
 }
 
-fn mod_action_identity_is_masked(action: &ModAction) -> bool {
-    action.username == "Hidden user"
-        || action.username == "Hidden channel"
-        || action.channel == "hidden"
+/// Which authority check admits a mod-log quick action, both at render time
+/// and again at the bridge boundary.
+#[derive(Clone, Copy)]
+enum QuickActionPolicy {
+    /// Ban/timeout/unban: any channel moderator.
+    Moderation,
+    /// Moderator/VIP role changes: broadcaster only.
+    RoleManagement,
+}
+
+impl QuickActionPolicy {
+    fn for_action(action_type: ModActionType) -> Self {
+        match action_type {
+            ModActionType::Mod
+            | ModActionType::Unmod
+            | ModActionType::Vip
+            | ModActionType::Unvip => Self::RoleManagement,
+            _ => Self::Moderation,
+        }
+    }
+
+    fn can_show(self, channel: &str, username: &str) -> bool {
+        match self {
+            Self::Moderation => moderation_policy::can_moderate_target(channel, username, &[]),
+            Self::RoleManagement => moderation_policy::can_manage_role_target(channel, username),
+        }
+    }
+
+    fn recheck(self, channel: &str, username: &str) -> bool {
+        match self {
+            Self::Moderation => moderation_policy::recheck_moderation_target(channel, username),
+            Self::RoleManagement => {
+                moderation_policy::recheck_role_management_target(channel, username)
+            }
+        }
+    }
+}
+
+/// One button offered next to a logged action, usually its inverse.
+struct QuickAction {
+    label: &'static str,
+    style: ModButtonStyle,
+    run: fn(&str, &str),
+}
+
+const UNBAN: QuickAction = QuickAction {
+    label: "Unban",
+    style: ModButtonStyle::Success,
+    run: |channel, username| backend::bridge::unban_user(channel, username),
+};
+const UNTIMEOUT: QuickAction = QuickAction {
+    label: "Untimeout",
+    style: ModButtonStyle::Success,
+    run: |channel, username| backend::bridge::unban_user(channel, username),
+};
+const BAN: QuickAction = QuickAction {
+    label: "Ban",
+    style: ModButtonStyle::Danger,
+    run: |channel, username| backend::bridge::ban_user(channel, username, None),
+};
+const TIMEOUT_10M: QuickAction = QuickAction {
+    label: "10m",
+    style: ModButtonStyle::Warning,
+    run: |channel, username| backend::bridge::timeout_user(channel, username, 600, None),
+};
+const UNMOD: QuickAction = QuickAction {
+    label: "Unmod",
+    style: ModButtonStyle::Warning,
+    run: |channel, username| backend::bridge::unmod_user(channel, username),
+};
+const MOD: QuickAction = QuickAction {
+    label: "Mod",
+    style: ModButtonStyle::Success,
+    run: |channel, username| backend::bridge::mod_user(channel, username),
+};
+const UNVIP: QuickAction = QuickAction {
+    label: "Unvip",
+    style: ModButtonStyle::Warning,
+    run: |channel, username| backend::bridge::unvip_user(channel, username),
+};
+const VIP: QuickAction = QuickAction {
+    label: "VIP",
+    style: ModButtonStyle::Success,
+    run: |channel, username| backend::bridge::vip_user(channel, username),
+};
+
+/// Quick actions for a logged action, in display order.
+fn quick_actions(action_type: ModActionType) -> &'static [QuickAction] {
+    match action_type {
+        ModActionType::Ban => &[UNBAN],
+        ModActionType::Unban => &[BAN],
+        ModActionType::Timeout => &[UNTIMEOUT, BAN],
+        ModActionType::Delete => &[BAN, TIMEOUT_10M],
+        ModActionType::Mod => &[UNMOD],
+        ModActionType::Unmod => &[MOD],
+        ModActionType::Vip => &[UNVIP],
+        ModActionType::Unvip => &[VIP],
+        ModActionType::Clear
+        | ModActionType::Warning
+        | ModActionType::ShieldEnable
+        | ModActionType::ShieldDisable => &[],
+    }
 }
 
 fn render_mod_action_buttons(index: usize, action: &ModAction) -> impl IntoElement + use<> {
     let action_type = action.action_type;
+    let policy = QuickActionPolicy::for_action(action_type);
     let channel = action.channel.clone();
     let username = action.username.clone();
 
@@ -621,160 +707,14 @@ fn render_mod_action_buttons(index: usize, action: &ModAction) -> impl IntoEleme
         .flex()
         .flex_wrap()
         .gap_1()
-        .when(matches!(action_type, ModActionType::Ban), {
+        .children(quick_actions(action_type).iter().map(|quick| {
             let channel = channel.clone();
             let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "Unban",
-                    ModButtonStyle::Success,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_moderation_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::unban_user(&channel, &username);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(matches!(action_type, ModActionType::Unban), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "Ban",
-                    ModButtonStyle::Danger,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_moderation_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::ban_user(&channel, &username, None);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(matches!(action_type, ModActionType::Mod), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "Unmod",
-                    ModButtonStyle::Warning,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_role_management_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::unmod_user(&channel, &username);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(matches!(action_type, ModActionType::Unmod), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "Mod",
-                    ModButtonStyle::Success,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_role_management_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::mod_user(&channel, &username);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(matches!(action_type, ModActionType::Vip), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "Unvip",
-                    ModButtonStyle::Warning,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_role_management_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::unvip_user(&channel, &username);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(matches!(action_type, ModActionType::Unvip), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "VIP",
-                    ModButtonStyle::Success,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_role_management_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::vip_user(&channel, &username);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(matches!(action_type, ModActionType::Timeout), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "Untimeout",
-                    ModButtonStyle::Success,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_moderation_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::unban_user(&channel, &username);
-                        }
-                    },
-                ))
-            }
-        })
-        .when(
-            matches!(action_type, ModActionType::Delete | ModActionType::Timeout),
-            {
-                let channel = channel.clone();
-                let username = username.clone();
-                move |row| {
-                    row.child(render_mod_button(
-                        "Ban",
-                        ModButtonStyle::Danger,
-                        move |_event, _window, _cx| {
-                            if crate::components::common::moderation_policy::recheck_moderation_target(
-                                &channel, &username,
-                            ) {
-                                crate::backend::bridge::ban_user(&channel, &username, None);
-                            }
-                        },
-                    ))
+            let run = quick.run;
+            render_mod_button(quick.label, quick.style, move |_event, _window, _cx| {
+                if policy.recheck(&channel, &username) {
+                    run(&channel, &username);
                 }
-            },
-        )
-        .when(matches!(action_type, ModActionType::Delete), {
-            let channel = channel.clone();
-            let username = username.clone();
-            move |row| {
-                row.child(render_mod_button(
-                    "10m",
-                    ModButtonStyle::Warning,
-                    move |_event, _window, _cx| {
-                        if crate::components::common::moderation_policy::recheck_moderation_target(
-                            &channel, &username,
-                        ) {
-                            crate::backend::bridge::timeout_user(&channel, &username, 600, None);
-                        }
-                    },
-                ))
-            }
-        })
+            })
+        }))
 }

@@ -7,15 +7,13 @@ pub(crate) fn available_settings_width(surface: f32, sidebar: f32, inset: f32) -
 }
 
 use super::settings_navigation::{
-    SettingsCategoryId, SettingsLocation, SettingsSearchModel, SettingsSectionId,
-    SettingsSubsectionId, canonical_section, category_descriptor, section_slug,
-    subsection_descriptor,
+    SettingsLocation, SettingsSearchModel, SettingsSectionId, SettingsSubsectionId,
+    canonical_section, section_slug, subsection_descriptor,
 };
 
 /// Browsing tree nodes and exact setting results while searching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SettingsTreeNode {
-    Category(SettingsCategoryId),
     Page(SettingsSectionId),
     Anchor(SettingsSectionId, SettingsSubsectionId),
     Setting(
@@ -26,10 +24,9 @@ pub enum SettingsTreeNode {
 }
 
 impl SettingsTreeNode {
-    /// Content destination for this node. Categories are pure containers.
+    /// Content destination for this node.
     pub fn location(self) -> Option<SettingsLocation> {
         match self {
-            Self::Category(_) => None,
             Self::Page(section) => Some(SettingsLocation::page(section)),
             Self::Anchor(section, subsection) => {
                 Some(SettingsLocation::anchor(section, subsection))
@@ -44,7 +41,6 @@ impl SettingsTreeNode {
     /// Zero-based depth, which is also the indentation level.
     pub fn level(self) -> usize {
         match self {
-            Self::Category(_) => 0,
             Self::Page(_) => 0,
             Self::Anchor(..) => 1,
             Self::Setting(_, Some(_), _) => 2,
@@ -54,12 +50,6 @@ impl SettingsTreeNode {
 
     pub(crate) fn element_fragment(self) -> String {
         match self {
-            Self::Category(id) => format!(
-                "category-{}",
-                category_descriptor(id)
-                    .map(|category| category.slug)
-                    .unwrap_or("general")
-            ),
             Self::Page(id) => format!("page-{}", section_slug(id)),
             Self::Anchor(section, subsection) => format!(
                 "anchor-{}-{}",
@@ -109,11 +99,7 @@ pub(crate) fn visible_settings_rows(
     selected_setting: Option<&str>,
 ) -> Vec<SettingsTreeRow> {
     let searching = model.is_searching();
-    let sections: Vec<_> = model
-        .tree()
-        .iter()
-        .flat_map(|category| &category.sections)
-        .collect();
+    let sections: Vec<_> = model.tree().iter().collect();
     let mut rows = Vec::new();
     for (index, section) in sections.iter().enumerate() {
         let descriptor = section.descriptor;
@@ -274,11 +260,6 @@ mod tests {
             &model,
             SettingsLocation::page(SettingsSectionId::Theme),
             None,
-        );
-        assert!(
-            !rows
-                .iter()
-                .any(|row| matches!(row.node, SettingsTreeNode::Category(_)))
         );
         let page = rows
             .iter()

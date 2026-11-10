@@ -9,8 +9,9 @@ pub mod visibility;
 
 pub use categories::{EmoteCategory, group_emotes_into_categories};
 pub use model::{
-    Emote, EmoteProvider, emote_source_scale, emote_url_shared, normalize_channel_key,
-    normalized_channel_key, provider_variant_scale, twitch_emote_url, twitch_emote_url_with_scale,
+    Emote, EmoteProvider, EmoteScope, PERSONAL_SEVENTV_CHANNEL, SUBSCRIPTION_CHANNEL_PREFIX,
+    emote_scope, emote_source_scale, emote_url_shared, provider_variant_scale, twitch_emote_url,
+    twitch_emote_url_with_scale,
 };
 pub use twitch_dimensions::{twitch_base_dimensions, twitch_high_tier_density};
 pub use view::{EmoteCategoryView, EmoteView};
@@ -99,18 +100,63 @@ mod tests {
             bttv: false,
             ffz: false,
         };
-        assert!(emote_provider_visible(
-            EmoteProviderVisibilityKey::Twitch,
-            hidden
-        ));
-        assert!(emote_provider_visible(
-            EmoteProviderVisibilityKey::Emoji,
-            hidden
-        ));
-        assert!(!emote_provider_visible(
-            EmoteProviderVisibilityKey::SevenTv,
-            hidden
-        ));
+        assert!(emote_provider_visible(EmoteProvider::Twitch, hidden));
+        assert!(emote_provider_visible(EmoteProvider::Emoji, hidden));
+        assert!(!emote_provider_visible(EmoteProvider::SevenTV, hidden));
+    }
+
+    /// Labels key persisted media identities and densities size emotes, so
+    /// both must keep their exact values for every provider and tier.
+    #[test]
+    fn source_tier_labels_and_densities_are_stable() {
+        use EmoteProvider::*;
+        let cases: &[(EmoteProvider, &str, &str, f32)] = &[
+            (Twitch, "https://cdn/x/1x.webp", "1.0", 1.0),
+            (Twitch, "https://cdn/x/2x.webp", "2.0", 2.0),
+            // Modern Twitch ids; legacy ids follow `twitch_high_tier_density`.
+            (Twitch, "https://cdn/x/4x.webp", "3.0", 4.0),
+            (Twitch, "https://cdn/x/default.webp", "default", 1.0),
+            (FFZ, "https://cdn/x/1x.webp", "1", 1.0),
+            (FFZ, "https://cdn/x/2x.webp", "2", 2.0),
+            (FFZ, "https://cdn/x/4x.webp", "4", 4.0),
+            (BTTV, "https://cdn/x/1x.webp", "1x", 1.0),
+            (BTTV, "https://cdn/x/2x.webp", "2x", 2.0),
+            (BTTV, "https://cdn/x/4x.webp", "3x", 4.0),
+            (SevenTV, "https://cdn/x/1x.webp", "1x", 1.0),
+            (SevenTV, "https://cdn/x/2x.webp", "2x", 2.0),
+            (SevenTV, "https://cdn/x/4x.webp", "4x", 4.0),
+            (Emoji, "https://cdn/x/4x.webp", "4x", 4.0),
+            (Emoji, "https://other", "default", 1.0),
+        ];
+        for &(provider, url, label, density) in cases {
+            let emote = emote("x", provider, None);
+            assert_eq!(emote_source_scale(&emote, url), label, "{provider:?} {url}");
+            assert_eq!(
+                model::emote_source_density(&emote, url),
+                density,
+                "{provider:?} {url}"
+            );
+        }
+        let mut seventv = (*emote("x", SevenTV, None)).clone();
+        seventv.url_4x = Some(Arc::from("https://cdn.7tv.app/emote/x/3x.webp"));
+        let three_x = seventv.url_4x.as_deref().unwrap();
+        assert_eq!(emote_source_scale(&seventv, three_x), "3x");
+        assert_eq!(model::emote_source_density(&seventv, three_x), 3.0);
+    }
+
+    #[test]
+    fn channel_values_decode_into_scopes() {
+        assert_eq!(emote_scope(None), EmoteScope::Global);
+        assert_eq!(emote_scope(Some("forsen")), EmoteScope::Channel("forsen"));
+        assert_eq!(
+            emote_scope(Some("sub:forsen")),
+            EmoteScope::Subscription("forsen")
+        );
+        assert_eq!(emote_scope(Some("personal:7tv")), EmoteScope::Personal);
+        assert_eq!(
+            emote_scope(Some("twitch:prime")),
+            EmoteScope::Channel("twitch:prime")
+        );
     }
 
     #[test]

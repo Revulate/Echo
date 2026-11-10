@@ -1,3 +1,6 @@
+//! Per-split composer send state: whether the account can send in a channel
+//! now (slow mode, a timeout, a ban) and the wording of a rejection.
+
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -384,7 +387,7 @@ fn normalized_account(account: &str) -> String {
 }
 
 fn normalized_channel(channel: &str) -> String {
-    channel.trim().trim_start_matches('#').to_ascii_lowercase()
+    echo_core::channel_identity::normalize_channel_key(channel.trim())
 }
 
 fn ceil_seconds(remaining: Duration) -> u64 {

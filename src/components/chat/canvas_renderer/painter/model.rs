@@ -7,7 +7,10 @@ use std::sync::Arc;
 use crate::backend::ChatMessage;
 use crate::config::MAX_CACHED_MESSAGES;
 
-use super::super::height_tree::HeightTree;
+use echo_render_core::height_tree::HeightTree;
+
+/// Estimated height used while async layout is pending (keeps scrolling responsive under load).
+const ESTIMATED_MESSAGE_HEIGHT: f32 = 42.0;
 
 pub(super) struct MessageListModel {
     pub(super) messages: Arc<Vec<Arc<ChatMessage>>>,
@@ -32,7 +35,7 @@ impl MessageListModel {
             message_index_base: 0,
             height_tree: HeightTree::with_capacity(MAX_CACHED_MESSAGES),
             total_height: 0.0,
-            measured_height_mean: super::ESTIMATED_MESSAGE_HEIGHT,
+            measured_height_mean: ESTIMATED_MESSAGE_HEIGHT,
             measured_height_samples: 0,
         }
     }
@@ -104,15 +107,5 @@ impl MessageListModel {
         for idx in 0..self.message_order.len() {
             self.insert_message_index(self.message_order[idx].clone(), idx);
         }
-    }
-
-    #[inline]
-    pub(super) fn clear_all(&mut self) {
-        self.messages = Arc::new(Vec::new());
-        self.message_order.clear();
-        self.message_index.clear();
-        self.message_index_base = 0;
-        self.height_tree.clear();
-        self.total_height = 0.0;
     }
 }

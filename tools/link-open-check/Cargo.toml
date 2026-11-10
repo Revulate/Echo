@@ -1,10 +1,12 @@
 [package]
 name = "link-open-check"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
-open = "5"
-url = "2.5"
+check-support.workspace = true
+open.workspace = true
+url.workspace = true

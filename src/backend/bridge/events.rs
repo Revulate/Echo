@@ -65,7 +65,7 @@ pub fn request_hover_link_metadata(
 }
 
 /// Schedule a batched version update (debounced to 100ms)
-/// PERF: Prevents layout thrashing by batching rapid embed completions
+/// Prevents layout thrashing by batching rapid embed completions
 fn schedule_version_update() {
     PENDING_VERSION_INCREMENTS.fetch_add(1, Ordering::Relaxed);
 
@@ -441,23 +441,17 @@ pub fn is_embed_expanded_state(message_id: &str, embed_id: u32, url: &str) -> bo
 
 /// Poll connection status
 pub fn poll_connection_status() -> ConnectionStatus {
-    crate::backend::irc::get_connection_status().into()
+    crate::backend::irc::get_connection_status()
 }
 
 /// Poll Twitch events (subs, raids, etc.)
 pub fn poll_twitch_events() -> Vec<TwitchEvent> {
     crate::backend::components::event_notification::pop_events()
-        .into_iter()
-        .map(|e| e.into())
-        .collect()
 }
 
 /// Return recent Twitch events for Activity Events.
 pub fn get_recent_twitch_events(limit: usize) -> Vec<TwitchEvent> {
     crate::backend::components::event_notification::recent_events(limit)
-        .into_iter()
-        .map(|e| e.into())
-        .collect()
 }
 
 /// Return only EventSub rows that still require attention.
@@ -478,9 +472,6 @@ pub fn mark_recent_twitch_events_read_for_channels(channels: &[String]) -> bool 
 /// Return the latest open prediction outcomes observed through EventSub for a channel.
 pub fn get_active_prediction_outcomes(channel: &str) -> Vec<PredictionOutcomeSnapshot> {
     crate::backend::components::event_notification::active_prediction_outcomes(channel)
-        .into_iter()
-        .map(|outcome| outcome.into())
-        .collect()
 }
 
 /// Clear the in-app Twitch event notification history.
@@ -500,9 +491,7 @@ pub fn remove_recent_twitch_event(timestamp: i64) -> bool {
 
 /// Allow or deny a held AutoMod message without blocking the UI thread.
 pub fn manage_held_automod_message_async(message_id: String, allow: bool, event_timestamp: i64) {
-    if let Err(error) =
-        crate::benchmark_profile::reject_live_outbound_user_action("AutoMod decision")
-    {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("AutoMod decision") {
         crate::log_irc!(warn, "{error}");
         crate::backend::push_ui_action(crate::backend::UiAction::ShowWarningToast {
             message: "Live benchmark blocked AutoMod action".to_string(),
@@ -561,9 +550,7 @@ pub fn manage_suspicious_user_status_async(
     action: crate::backend::commands::helix::SuspiciousUserAction,
     event_timestamp: i64,
 ) {
-    if let Err(error) =
-        crate::benchmark_profile::reject_live_outbound_user_action("suspicious-user decision")
-    {
+    if let Err(error) = crate::bench::reject_live_outbound_user_action("suspicious-user decision") {
         crate::log_irc!(warn, "{error}");
         super::chat::publish_command_error(&channel, "Suspicious-user action blocked", &error);
         return;
@@ -667,14 +654,16 @@ pub fn insert_event_message(event: &TwitchEvent) {
         None
     };
 
-    crate::backend::irc::add_system_message_with_highlight_flags_id(
-        channel,
-        &text,
-        crate::backend::models::SystemMessageType::Info,
-        highlight_type,
-        flag_overrides,
-        explicit_id,
-    );
+    crate::backend::irc::add_system_row(crate::backend::irc::SystemRow {
+        highlight: highlight_type,
+        flags: flag_overrides,
+        id: explicit_id,
+        ..crate::backend::irc::SystemRow::new(
+            channel,
+            &text,
+            crate::backend::models::SystemMessageType::Info,
+        )
+    });
     crate::backend::components::event_notification::mark_recent_event_chat_visible(event.timestamp);
 }
 
@@ -933,7 +922,7 @@ pub fn poll_ui_actions() -> Vec<UiAction> {
 /// Get performance metrics as JSON
 pub fn get_metrics_json() -> String {
     let metrics_enabled = crate::backend::metrics::is_enabled();
-    let fps_profiler_enabled = crate::fps_profiler::is_enabled();
+    let fps_profiler_enabled = crate::diagnostics::fps_profiler::is_enabled();
     let summary = crate::backend::metrics::get_summary();
     let memory = crate::backend::metrics::get_memory_stats();
     let cache = crate::cache::loader::stats().diagnostic_snapshot();

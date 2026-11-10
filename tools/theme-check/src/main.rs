@@ -1,13 +1,12 @@
-#![allow(dead_code)]
+//! Contract: theme-file parsing in `src/backend/theme_files.rs` (nested themes,
+//! nested fallbacks, Echo flat themes) and the Echo theme export round trip.
 
 #[path = "../../../src/backend/theme_files.rs"]
+#[allow(dead_code)] // `parse_theme_file` reads from disk; the check parses strings
 mod theme_files;
 
-use std::hint::black_box;
-use std::time::Instant;
+use check_support::{FIXTURE_HEADER, assert_fixture, bool_text};
 use theme_files::{ThemeFilePalette, export_echo_theme_json, parse_theme_file_json};
-
-const ITERS: usize = 100_000;
 
 fn main() {
     let nested = sample_nested_theme();
@@ -40,7 +39,7 @@ fn main() {
     assert_eq!(round_trip, echo_parsed);
     assert!(exported.contains(r#""$schema": "https://echo.local/EchoTheme.schema.json""#));
 
-    println!("kind,name,units,ns_per_unit,units_per_second,checksum");
+    println!("{FIXTURE_HEADER}");
     print_smoke_rows(
         &nested_parsed,
         &fallback_parsed,
@@ -48,38 +47,6 @@ fn main() {
         &exported,
         &round_trip,
     );
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let parsed = parse_theme_file_json(black_box(nested)).unwrap();
-        checksum += parsed.bg_surface.len() + parsed.text_primary.len();
-    }
-    print_measurement("parse", "nested_theme", ITERS, start, checksum);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let parsed = parse_theme_file_json(black_box(nested_fallback)).unwrap();
-        checksum += parsed.bg_plate.len() + parsed.border_strong.len();
-    }
-    print_measurement("parse", "nested_fallback_theme", ITERS, start, checksum);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let parsed = parse_theme_file_json(black_box(echo)).unwrap();
-        checksum += parsed.bg_surface.len() + parsed.text_primary.len();
-    }
-    print_measurement("parse", "echo_flat_theme", ITERS, start, checksum);
-
-    let start = Instant::now();
-    let mut checksum = 0usize;
-    for _ in 0..ITERS {
-        let exported = export_echo_theme_json(black_box(&echo_parsed)).unwrap();
-        checksum += exported.len();
-    }
-    print_measurement("export", "echo_flat_theme", ITERS, start, checksum);
 }
 
 fn print_smoke_rows(
@@ -89,83 +56,67 @@ fn print_smoke_rows(
     exported: &str,
     round_trip: &ThemeFilePalette,
 ) {
-    print_fixture(
+    assert_fixture(
         "theme_nested_argb_accent",
         nested.accent.as_deref().unwrap_or("none"),
         "#7f86ff",
     );
-    print_fixture("theme_nested_bg_void", &nested.bg_void, "#050505");
-    print_fixture("theme_nested_bg_surface", &nested.bg_surface, "#101010");
-    print_fixture("theme_nested_text_primary", &nested.text_primary, "#eeeeee");
-    print_fixture(
+    assert_fixture("theme_nested_bg_void", &nested.bg_void, "#050505");
+    assert_fixture("theme_nested_bg_surface", &nested.bg_surface, "#101010");
+    assert_fixture("theme_nested_text_primary", &nested.text_primary, "#eeeeee");
+    assert_fixture(
         "theme_nested_border_strong",
         &nested.border_strong,
         "#7f86ff",
     );
-    print_fixture(
+    assert_fixture(
         "theme_nested_fallback_no_accent",
         bool_text(fallback.accent.is_none()),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "theme_nested_fallback_bg_plate",
         &fallback.bg_plate,
         "#222222",
     );
-    print_fixture(
+    assert_fixture(
         "theme_nested_fallback_bg_hover",
         &fallback.bg_hover,
         "#112233",
     );
-    print_fixture(
+    assert_fixture(
         "theme_nested_fallback_named_text",
         &fallback.text_primary,
         "#ffffff",
     );
-    print_fixture(
+    assert_fixture(
         "theme_nested_fallback_muted_text",
         &fallback.text_muted,
         "#808080",
     );
-    print_fixture("theme_nested_fallback_border", &fallback.border, "#444444");
-    print_fixture(
+    assert_fixture("theme_nested_fallback_border", &fallback.border, "#444444");
+    assert_fixture(
         "theme_nested_fallback_border_strong",
         &fallback.border_strong,
         "#335577",
     );
-    print_fixture(
+    assert_fixture(
         "theme_echo_name",
         echo.name.as_deref().unwrap_or("none"),
         "Echo Flat",
     );
-    print_fixture("theme_echo_bg_hover", &echo.bg_hover, "#202020");
-    print_fixture("theme_echo_text_muted", &echo.text_muted, "#777777");
-    print_fixture(
+    assert_fixture("theme_echo_bg_hover", &echo.bg_hover, "#202020");
+    assert_fixture("theme_echo_text_muted", &echo.text_muted, "#777777");
+    assert_fixture(
         "theme_export_schema_present",
         bool_text(exported.contains(r#""$schema": "https://echo.local/EchoTheme.schema.json""#)),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "theme_export_round_trip",
         bool_text(round_trip == echo),
         "true",
     );
-}
-
-fn print_fixture(name: &str, actual: &str, expected: &str) {
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},1,0.00,0,{}", actual.len());
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
-fn print_measurement(kind: &str, name: &str, units: usize, start: Instant, checksum: usize) {
-    let elapsed = start.elapsed();
-    let nanos_per_unit = elapsed.as_nanos() as f64 / units as f64;
-    let units_per_second = units as f64 / elapsed.as_secs_f64();
-    println!("{kind},{name},{units},{nanos_per_unit:.2},{units_per_second:.0},{checksum}");
 }
 
 fn sample_echo_theme() -> &'static str {

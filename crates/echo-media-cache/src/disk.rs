@@ -1,38 +1,36 @@
-//! Persistent disk cache layer with zstd compression
+//! Persistent media cache on disk.
 //!
-//! Provides persistent storage for:
-//! - Static images (PNG, non-animated WebP) with zstd compression
-//! - Animated frame metadata/index entries
-//!
-//! # File Format (compatible with existing cache)
-
-#![allow(clippy::redundant_closure)] // Some closures are for clarity/future flexibility
+//! Two stores share one directory and one byte budget:
+//! - the URL index and `images/`: zstd-compressed static images keyed by URL;
+//! - the source index and `blobs/`: original provider bytes keyed by media
+//!   identity, content-addressed so several URLs or identities can share one
+//!   blob.
 //!
 //! ```text
-//! ~/.config/echo/cache/
-//! ├── index.postcard.zst   # URL -> entry mapping
-//! ├── images/              # Static images
-//! │   └── {hash}.zst       # zstd compressed raw bytes
-//! └── frames/              # Animated images
-//!     └── {hash}/          # Decoded animation frames
+//! <cache root>/
+//! ├── index.postcard.zst          # URL -> CacheEntry
+//! ├── images/{hash}.zst           # compressed static image bytes
+//! ├── source_index.postcard.zst   # identity and URL aliases -> SourceBlobEntry
+//! ├── blobs/{hash[0..2]}/{hash}.* # source bytes, raw or zstd
+//! └── frames/{hash}/              # animated entries of older caches; only
+//!                                 # evicted and cleaned up, never written
 //! ```
 //!
-//! # Integration
-//!
-//! Uses unified budget manager and stats instead of standalone tracking.
+//! Sizes are charged to the shared [`BudgetManager`] and counted in
+//! [`CacheStats`]; eviction runs when the total passes
+//! [`EVICTION_THRESHOLD`] of [`MAX_DISK_CACHE_BYTES`].
 
 use std::collections::HashSet;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bincode::Decode;
-#[cfg(test)]
-use bincode::Encode;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::persist;
 use echo_cache_policy::{BudgetManager, CacheStats};
 
 // ============================================================================
@@ -88,7 +86,6 @@ const SOURCE_ZSTD_MIN_SAVINGS_DENOMINATOR: usize = 100;
 /// Only try zstd for unknown formats to avoid spending startup CPU proving
 /// PNG/WebP/GIF/JPEG media cannot be compressed meaningfully.
 const SOURCE_ZSTD_UNKNOWN_FORMAT_MAX_BYTES: usize = 256 * 1024;
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
 // Types
@@ -103,282 +100,8 @@ use echo_cache_policy::disk_model::{
     SerializableIndex, SerializableSourceIndex, current_timestamp,
 };
 
-// Frozen Bincode-v1 mirrors. Keep these separate from the current Serde/
-// Postcard models so current schema evolution cannot silently redefine legacy
-// cache bytes. These types exist only to decode and test one-way migration.
-#[derive(Debug, Decode)]
-#[cfg_attr(test, derive(Encode))]
-struct LegacySerializableIndex {
-    version: u32,
-    entries: Vec<(String, LegacyCacheEntry)>,
-    total_size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Decode)]
-#[cfg_attr(test, derive(Encode))]
-struct LegacyCacheEntry {
-    hash: String,
-    entry_type: LegacyEntryType,
-    size_bytes: u64,
-    last_accessed: u64,
-    access_count: u32,
-    width: u32,
-    height: u32,
-    frame_count: u16,
-    total_duration_ms: u32,
-}
-
-#[derive(Debug, Clone, Copy, Decode)]
-#[cfg_attr(test, derive(Encode))]
-enum LegacyEntryType {
-    Static,
-    Animated,
-}
-
-#[derive(Debug, Decode)]
-#[cfg_attr(test, derive(Encode))]
-struct LegacySerializableSourceIndex {
-    version: u32,
-    identity_aliases: Vec<(String, LegacySourceAlias)>,
-    url_aliases: Vec<(String, LegacySourceAlias)>,
-    blobs: Vec<(String, LegacySourceBlobEntry)>,
-    total_size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Decode)]
-#[cfg_attr(test, derive(Encode))]
-struct LegacySourceAlias {
-    blob_hash: String,
-    last_accessed: u64,
-    access_count: u32,
-}
-
-#[derive(Debug, Clone, Decode)]
-#[cfg_attr(test, derive(Encode))]
-struct LegacySourceBlobEntry {
-    hash: String,
-    encoding: LegacySourceBlobEncoding,
-    size_bytes: u64,
-    original_size_bytes: u64,
-    last_accessed: u64,
-    access_count: u32,
-    width: u32,
-    height: u32,
-    frame_count: u16,
-    total_duration_ms: u32,
-}
-
-#[derive(Debug, Clone, Copy, Decode)]
-#[cfg_attr(test, derive(Encode))]
-enum LegacySourceBlobEncoding {
-    Raw,
-    Zstd,
-}
-
-impl From<LegacyEntryType> for EntryType {
-    fn from(value: LegacyEntryType) -> Self {
-        match value {
-            LegacyEntryType::Static => Self::Static,
-            LegacyEntryType::Animated => Self::Animated,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<EntryType> for LegacyEntryType {
-    fn from(value: EntryType) -> Self {
-        match value {
-            EntryType::Static => Self::Static,
-            EntryType::Animated => Self::Animated,
-        }
-    }
-}
-
-impl From<LegacyCacheEntry> for CacheEntry {
-    fn from(value: LegacyCacheEntry) -> Self {
-        Self {
-            hash: value.hash,
-            entry_type: value.entry_type.into(),
-            size_bytes: value.size_bytes,
-            last_accessed: value.last_accessed,
-            access_count: value.access_count,
-            width: value.width,
-            height: value.height,
-            frame_count: value.frame_count,
-            total_duration_ms: value.total_duration_ms,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<CacheEntry> for LegacyCacheEntry {
-    fn from(value: CacheEntry) -> Self {
-        Self {
-            hash: value.hash,
-            entry_type: value.entry_type.into(),
-            size_bytes: value.size_bytes,
-            last_accessed: value.last_accessed,
-            access_count: value.access_count,
-            width: value.width,
-            height: value.height,
-            frame_count: value.frame_count,
-            total_duration_ms: value.total_duration_ms,
-        }
-    }
-}
-
-impl From<LegacySerializableIndex> for SerializableIndex {
-    fn from(value: LegacySerializableIndex) -> Self {
-        Self {
-            version: value.version,
-            entries: value
-                .entries
-                .into_iter()
-                .map(|(url, entry)| (url, entry.into()))
-                .collect(),
-            total_size_bytes: value.total_size_bytes,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<SerializableIndex> for LegacySerializableIndex {
-    fn from(value: SerializableIndex) -> Self {
-        Self {
-            version: value.version,
-            entries: value
-                .entries
-                .into_iter()
-                .map(|(url, entry)| (url, entry.into()))
-                .collect(),
-            total_size_bytes: value.total_size_bytes,
-        }
-    }
-}
-
-impl From<LegacySourceBlobEncoding> for SourceBlobEncoding {
-    fn from(value: LegacySourceBlobEncoding) -> Self {
-        match value {
-            LegacySourceBlobEncoding::Raw => Self::Raw,
-            LegacySourceBlobEncoding::Zstd => Self::Zstd,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<SourceBlobEncoding> for LegacySourceBlobEncoding {
-    fn from(value: SourceBlobEncoding) -> Self {
-        match value {
-            SourceBlobEncoding::Raw => Self::Raw,
-            SourceBlobEncoding::Zstd => Self::Zstd,
-        }
-    }
-}
-
-impl From<LegacySourceAlias> for SourceAlias {
-    fn from(value: LegacySourceAlias) -> Self {
-        Self {
-            blob_hash: value.blob_hash,
-            last_accessed: value.last_accessed,
-            access_count: value.access_count,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<SourceAlias> for LegacySourceAlias {
-    fn from(value: SourceAlias) -> Self {
-        Self {
-            blob_hash: value.blob_hash,
-            last_accessed: value.last_accessed,
-            access_count: value.access_count,
-        }
-    }
-}
-
-impl From<LegacySourceBlobEntry> for SourceBlobEntry {
-    fn from(value: LegacySourceBlobEntry) -> Self {
-        Self {
-            hash: value.hash,
-            encoding: value.encoding.into(),
-            size_bytes: value.size_bytes,
-            original_size_bytes: value.original_size_bytes,
-            last_accessed: value.last_accessed,
-            access_count: value.access_count,
-            width: value.width,
-            height: value.height,
-            frame_count: value.frame_count,
-            total_duration_ms: value.total_duration_ms,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<SourceBlobEntry> for LegacySourceBlobEntry {
-    fn from(value: SourceBlobEntry) -> Self {
-        Self {
-            hash: value.hash,
-            encoding: value.encoding.into(),
-            size_bytes: value.size_bytes,
-            original_size_bytes: value.original_size_bytes,
-            last_accessed: value.last_accessed,
-            access_count: value.access_count,
-            width: value.width,
-            height: value.height,
-            frame_count: value.frame_count,
-            total_duration_ms: value.total_duration_ms,
-        }
-    }
-}
-
-impl From<LegacySerializableSourceIndex> for SerializableSourceIndex {
-    fn from(value: LegacySerializableSourceIndex) -> Self {
-        Self {
-            version: value.version,
-            identity_aliases: value
-                .identity_aliases
-                .into_iter()
-                .map(|(key, alias)| (key, alias.into()))
-                .collect(),
-            url_aliases: value
-                .url_aliases
-                .into_iter()
-                .map(|(url, alias)| (url, alias.into()))
-                .collect(),
-            blobs: value
-                .blobs
-                .into_iter()
-                .map(|(hash, entry)| (hash, entry.into()))
-                .collect(),
-            total_size_bytes: value.total_size_bytes,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<SerializableSourceIndex> for LegacySerializableSourceIndex {
-    fn from(value: SerializableSourceIndex) -> Self {
-        Self {
-            version: value.version,
-            identity_aliases: value
-                .identity_aliases
-                .into_iter()
-                .map(|(key, alias)| (key, alias.into()))
-                .collect(),
-            url_aliases: value
-                .url_aliases
-                .into_iter()
-                .map(|(url, alias)| (url, alias.into()))
-                .collect(),
-            blobs: value
-                .blobs
-                .into_iter()
-                .map(|(hash, entry)| (hash, entry.into()))
-                .collect(),
-            total_size_bytes: value.total_size_bytes,
-        }
-    }
-}
+mod legacy;
+use legacy::{LegacySerializableIndex, LegacySerializableSourceIndex};
 
 // ============================================================================
 // Disk Layer
@@ -416,10 +139,7 @@ pub struct DiskLayer {
     _budget: Arc<BudgetManager>,
     /// Statistics
     stats: Arc<CacheStats>,
-    replace_file: ReplaceFileFn,
 }
-
-type ReplaceFileFn = fn(&Path, &Path) -> std::io::Result<()>;
 
 /// Clears the in-flight `saving_sources` marker on drop so a panic or
 /// future-cancellation during the blocking save can't strand the key, which
@@ -451,12 +171,7 @@ impl DiskLayer {
     }
 
     /// Create a new disk layer
-    pub fn new(
-        base_path: PathBuf,
-        replace_file: fn(&Path, &Path) -> std::io::Result<()>,
-        budget: Arc<BudgetManager>,
-        stats: Arc<CacheStats>,
-    ) -> Self {
+    pub fn new(base_path: PathBuf, budget: Arc<BudgetManager>, stats: Arc<CacheStats>) -> Self {
         Self {
             base_path,
             index: Arc::new(RwLock::new(DiskCacheIndex::new())),
@@ -473,7 +188,6 @@ impl DiskLayer {
             source_index_save_lock: Mutex::new(()),
             _budget: budget,
             stats,
-            replace_file,
         }
     }
 
@@ -536,7 +250,7 @@ impl DiskLayer {
         // Unlisted legacy files are only swept when the loaded index is what
         // is on disk; after a failed load it may still list them.
         let mut legacy_index_read = true;
-        match load_index(&index_path, &legacy_index_path, self.replace_file).await {
+        match load_index(&index_path, &legacy_index_path).await {
             Ok(loaded_index) => {
                 crate::log_cache!(
                     info,
@@ -569,13 +283,7 @@ impl DiskLayer {
         let mut source_index = SourceCacheIndex::new();
         let source_index_path = self.source_index_path();
         let legacy_source_index_path = self.legacy_source_index_path();
-        match load_source_index(
-            &source_index_path,
-            &legacy_source_index_path,
-            self.replace_file,
-        )
-        .await
-        {
+        match load_source_index(&source_index_path, &legacy_source_index_path).await {
             Ok(loaded_source_index) => {
                 crate::log_cache!(
                     info,
@@ -1040,12 +748,7 @@ impl DiskLayer {
     pub async fn save_index_result(&self) -> Result<(), std::io::Error> {
         let _save_guard = self.index_save_lock.lock().await;
 
-        save_index_snapshot(
-            &self.index_path(),
-            Arc::clone(&self.index),
-            self.replace_file,
-        )
-        .await?;
+        save_index_snapshot(&self.index_path(), Arc::clone(&self.index)).await?;
         self.index_dirty_writes.store(0, Ordering::Relaxed);
         self.last_index_save_ts
             .store(current_timestamp(), Ordering::Relaxed);
@@ -1062,12 +765,8 @@ impl DiskLayer {
     async fn save_source_index_result(&self) -> Result<(), std::io::Error> {
         let _save_guard = self.source_index_save_lock.lock().await;
 
-        save_source_index_snapshot(
-            &self.source_index_path(),
-            Arc::clone(&self.source_index),
-            self.replace_file,
-        )
-        .await?;
+        save_source_index_snapshot(&self.source_index_path(), Arc::clone(&self.source_index))
+            .await?;
         self.source_index_dirty_writes.store(0, Ordering::Relaxed);
         self.last_source_index_save_ts
             .store(current_timestamp(), Ordering::Relaxed);
@@ -1388,7 +1087,7 @@ fn save_source_blob_sync(
         return Ok((hash, encoding, size, bytes.len() as u64));
     }
 
-    let temp_path = temp_path_for(&path);
+    let temp_path = persist::temp_path_for(&path);
     {
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(payload)?;
@@ -1455,7 +1154,6 @@ const LEGACY_BINCODE_CONFIG: bincode::config::Configuration<
 async fn load_index(
     current_path: &Path,
     legacy_path: &Path,
-    replace_file: ReplaceFileFn,
 ) -> Result<DiskCacheIndex, std::io::Error> {
     let current_path = current_path.to_path_buf();
     let legacy_path = legacy_path.to_path_buf();
@@ -1467,7 +1165,6 @@ async fn load_index(
             if let Err(error) = save_index_bytes_sync(
                 &current_path,
                 &encode_index_bytes(SerializableIndex::from(&index))?,
-                replace_file,
             ) {
                 crate::log_cache!(
                     warn,
@@ -1492,7 +1189,6 @@ async fn load_index(
 async fn load_source_index(
     current_path: &Path,
     legacy_path: &Path,
-    replace_file: ReplaceFileFn,
 ) -> Result<SourceCacheIndex, std::io::Error> {
     let current_path = current_path.to_path_buf();
     let legacy_path = legacy_path.to_path_buf();
@@ -1505,7 +1201,6 @@ async fn load_source_index(
                 if let Err(error) = save_index_bytes_sync(
                     &current_path,
                     &encode_source_index_bytes(SerializableSourceIndex::from(&index))?,
-                    replace_file,
                 ) {
                     crate::log_cache!(
                         warn,
@@ -1571,50 +1266,12 @@ fn load_legacy_source_index_sync(path: &Path) -> Result<SourceCacheIndex, std::i
 }
 
 fn read_zstd_limited(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    // File metadata is mutable between inspection and read. Capture at most
-    // limit + 1 bytes before decoding so a concurrent grow cannot bypass the
-    // compressed-input cap.
-    let compressed = read_compressed_bytes_limited(
-        std::fs::File::open(path)?,
+    persist::read_zstd_bounded(
+        path,
         MAX_INDEX_COMPRESSED_BYTES as usize,
+        MAX_INDEX_DECOMPRESSED_BYTES,
         "cache index",
-    )?;
-    let mut decoder = zstd::Decoder::new(Cursor::new(compressed))?;
-    decoder.window_log_max(25)?;
-    let mut data = Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_INDEX_DECOMPRESSED_BYTES as u64 + 1)
-        .read_to_end(&mut data)?;
-    if data.len() > MAX_INDEX_DECOMPRESSED_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "decompressed cache index exceeds {} byte limit",
-                MAX_INDEX_DECOMPRESSED_BYTES
-            ),
-        ));
-    }
-    Ok(data)
-}
-
-fn read_compressed_bytes_limited(
-    mut reader: impl Read,
-    limit: usize,
-    label: &str,
-) -> Result<Vec<u8>, std::io::Error> {
-    let mut compressed = Vec::new();
-    reader
-        .by_ref()
-        .take(limit as u64 + 1)
-        .read_to_end(&mut compressed)?;
-    if compressed.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("compressed {label} exceeds {limit} byte limit"),
-        ));
-    }
-    Ok(compressed)
+    )
 }
 
 fn decode_postcard_exact<T>(data: &[u8], label: &str) -> Result<T, std::io::Error>
@@ -2043,7 +1700,6 @@ fn encode_source_index_bytes(
 async fn save_index_snapshot(
     path: &Path,
     index: Arc<RwLock<DiskCacheIndex>>,
-    replace_file: ReplaceFileFn,
 ) -> Result<(), std::io::Error> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -2052,16 +1708,15 @@ async fn save_index_snapshot(
             SerializableIndex::from(&*index)
         };
         let data = encode_index_bytes(serializable)?;
-        save_index_bytes_sync(&path, &data, replace_file)
+        save_index_bytes_sync(&path, &data)
     })
     .await
-    .map_err(|e| std::io::Error::other(e))?
+    .map_err(std::io::Error::other)?
 }
 
 async fn save_source_index_snapshot(
     path: &Path,
     index: Arc<RwLock<SourceCacheIndex>>,
-    replace_file: ReplaceFileFn,
 ) -> Result<(), std::io::Error> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -2070,35 +1725,23 @@ async fn save_source_index_snapshot(
             SerializableSourceIndex::from(&*index)
         };
         let data = encode_source_index_bytes(serializable)?;
-        save_index_bytes_sync(&path, &data, replace_file)
+        save_index_bytes_sync(&path, &data)
     })
     .await
-    .map_err(|e| std::io::Error::other(e))?
+    .map_err(std::io::Error::other)?
 }
 
 /// Save pre-encoded index bytes to disk.
-fn save_index_bytes_sync(
-    path: &Path,
-    data: &[u8],
-    replace_file: ReplaceFileFn,
-) -> Result<(), std::io::Error> {
+fn save_index_bytes_sync(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let temp_path = temp_path_for(path);
-    let write_result = (|| {
-        let file = std::fs::File::create(&temp_path)?;
+    persist::write_atomically(path, |file| {
         let mut encoder = zstd::Encoder::new(file, 6)?;
         encoder.write_all(data)?;
-        encoder.finish()?;
-        replace_file(&temp_path, path)
-    })();
-
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
-    }
+        encoder.finish().map(drop)
+    })?;
 
     crate::log_cache!(debug, path = %path.display(), "Saved disk cache index");
     Ok(())
@@ -2117,19 +1760,6 @@ fn is_entry_expired_at(entry: &CacheEntry, now: u64) -> bool {
     now.saturating_sub(entry.last_accessed) > MAX_DISK_CACHE_ENTRY_AGE_SECS
 }
 
-/// Build a unique temp path next to the destination so atomic rename stays on
-/// the same filesystem while concurrent writers do not share one `.tmp` file.
-fn temp_path_for(path: &Path) -> PathBuf {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let process_id = std::process::id();
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| format!("{ext}.tmp-{process_id}-{counter}"))
-        .unwrap_or_else(|| format!("tmp-{process_id}-{counter}"));
-    path.with_extension(extension)
-}
-
 fn source_blob_path_for(blobs_dir: &Path, hash: &str, encoding: SourceBlobEncoding) -> PathBuf {
     let prefix = hash.get(0..2).unwrap_or("00");
     blobs_dir
@@ -2137,36 +1767,9 @@ fn source_blob_path_for(blobs_dir: &Path, hash: &str, encoding: SourceBlobEncodi
         .join(format!("{}.{}", hash, encoding.extension()))
 }
 
-/// Hash a URL for use as filename
-#[inline]
-pub fn url_hash(url: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = ahash::AHasher::default();
-    url.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn replace_file(replacement: &Path, destination: &Path) -> std::io::Result<()> {
-        std::fs::rename(replacement, destination)
-    }
-
-    #[test]
-    fn test_url_hash() {
-        let hash1 = url_hash("https://cdn.7tv.app/emote/123/1x.webp");
-        let hash2 = url_hash("https://cdn.7tv.app/emote/456/1x.webp");
-
-        assert_eq!(hash1.len(), 16);
-        assert_eq!(hash2.len(), 16);
-        assert_ne!(hash1, hash2);
-
-        // Same URL = same hash
-        let hash1_again = url_hash("https://cdn.7tv.app/emote/123/1x.webp");
-        assert_eq!(hash1, hash1_again);
-    }
 
     #[test]
     fn test_expired_entry_detection() {
@@ -2219,36 +1822,12 @@ mod tests {
     }
 
     #[test]
-    fn test_temp_paths_are_unique_and_adjacent() {
-        let path = PathBuf::from("cache/images/example.zst");
-        let temp_a = temp_path_for(&path);
-        let temp_b = temp_path_for(&path);
-
-        assert_ne!(temp_a, path);
-        assert_ne!(temp_b, path);
-        assert_ne!(temp_a, temp_b);
-        assert_eq!(temp_a.parent(), path.parent());
-        assert_eq!(temp_b.parent(), path.parent());
-        assert!(
-            temp_a
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(".zst.tmp-"))
-        );
-    }
-
-    #[test]
     fn postcard_index_payload_rejects_trailing_bytes() {
         let encoded = encode_index_bytes(SerializableIndex::from(&DiskCacheIndex::new())).unwrap();
         let mut with_trailing_byte = encoded;
         with_trailing_byte.push(0);
 
         assert!(decode_postcard_exact::<SerializableIndex>(&with_trailing_byte, "test").is_err());
-    }
-
-    #[test]
-    fn compressed_index_capture_rejects_over_limit_input() {
-        assert!(read_compressed_bytes_limited(Cursor::new([1, 2, 3]), 2, "test").is_err());
     }
 
     #[tokio::test]
@@ -2272,9 +1851,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_index(&current_path, &legacy_path, replace_file)
-            .await
-            .unwrap();
+        let loaded = load_index(&current_path, &legacy_path).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(current_path.exists());
 
@@ -2283,11 +1860,7 @@ mod tests {
             zstd::encode_all(&b"not a postcard"[..], 3).unwrap(),
         )
         .unwrap();
-        assert!(
-            load_index(&current_path, &legacy_path, replace_file)
-                .await
-                .is_err()
-        );
+        assert!(load_index(&current_path, &legacy_path).await.is_err());
     }
 
     #[tokio::test]
@@ -2320,7 +1893,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_source_index(&current_path, &legacy_path, replace_file)
+        let loaded = load_source_index(&current_path, &legacy_path)
             .await
             .unwrap();
         assert_eq!(loaded.len(), 1);
@@ -2334,7 +1907,6 @@ mod tests {
         let stats = Arc::new(CacheStats::new());
         let layer = DiskLayer::new(
             temp.path().join("cache"),
-            replace_file,
             Arc::new(BudgetManager::new()),
             stats.clone(),
         );

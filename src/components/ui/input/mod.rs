@@ -1,12 +1,14 @@
-//! Echo Input Component - A focused text input for chat messages
+//! The app-wide single-line text input (settings fields, search boxes,
+//! dialogs and popouts).
 //!
-//! Provides a single-line text input with:
+//! Provides:
 //! - Text editing (cursor, selection, clipboard)
 //! - Key bindings (arrows, home/end, backspace, delete)
 //! - Event emission (Change, PressEnter, Focus, Blur)
 //! - Spell check support
 //! - IME support
 
+mod bidi_probe;
 mod caret;
 mod chrome;
 mod element;

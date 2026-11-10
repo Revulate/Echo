@@ -227,13 +227,67 @@ pub fn cancel_pending_drag() {
 static MAIN_WINDOW_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(target_os = "windows")]
-fn remember_main_window_handle(window: &Window) {
+fn window_hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    if let Ok(handle) = HasWindowHandle::window_handle(window)
-        && let RawWindowHandle::Win32(win32) = handle.as_raw()
-    {
-        MAIN_WINDOW_HWND.store(win32.hwnd.get() as usize, Ordering::Relaxed);
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(windows::Win32::Foundation::HWND(
+            win32.hwnd.get() as *mut core::ffi::c_void
+        )),
+        _ => None,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn remember_main_window_handle(window: &Window) {
+    if let Some(hwnd) = window_hwnd(window) {
+        MAIN_WINDOW_HWND.store(hwnd.0 as usize, Ordering::Relaxed);
+    }
+}
+
+/// Keep `window` above other windows, or release it. Returns whether the
+/// platform applied the change.
+#[cfg(target_os = "windows")]
+pub(crate) fn apply_main_window_always_on_top(window: &Window, enabled: bool) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+
+    let Some(hwnd) = window_hwnd(window) else {
+        return false;
+    };
+
+    let insert_after = if enabled {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+
+    // SAFETY: `hwnd` is this process's live main window handle, and SetWindowPos only changes its z-order flags.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(insert_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+        )
+        .is_ok()
+    }
+}
+
+/// Neither Wayland nor GPUI can keep a window above others; KWin can.
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_main_window_always_on_top(_window: &Window, enabled: bool) -> bool {
+    crate::utils::kwin::set_main_window_keep_above(enabled);
+    true
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub(crate) fn apply_main_window_always_on_top(_window: &Window, _enabled: bool) -> bool {
+    false
 }
 
 #[cfg(not(target_os = "windows"))]

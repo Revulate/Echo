@@ -9,11 +9,13 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-echo-core = { path = "../echo-core" }
-lru = "0.19"
-smallvec = "1.13"
-tracing = "0.1"
+echo-core.workspace = true
+lru.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
 unicode-bidi = "0.3"
 
+# The `echo_core::log_*!` macros expand to `tracing::...` at the call site, so
+# this crate needs `tracing` as a direct dependency without naming it itself.
 [package.metadata.cargo-machete]
 ignored = ["tracing"]

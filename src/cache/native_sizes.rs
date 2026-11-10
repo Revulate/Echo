@@ -53,7 +53,7 @@ fn stable_url_key(url: &str) -> u64 {
 }
 
 fn path() -> PathBuf {
-    crate::benchmark_profile::config_root_or_current_dir()
+    crate::storage_roots::config_root_or_current_dir()
         .join("cache")
         .join(FILE_NAME)
 }
@@ -172,14 +172,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("bin.tmp");
-    let written = std::fs::File::create(&temporary)
-        .and_then(|mut file| file.write_all(bytes))
-        .and_then(|()| crate::utils::replace_file(&temporary, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
+    echo_media_cache::persist::write_atomically(path, |file| file.write_all(bytes))
 }
 
 #[cfg(test)]

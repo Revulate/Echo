@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use twitch_irc::message::IRCMessage;
 use twitch_irc::transport::Transport;
 
-type BaseTransport = super::super::proxy_transport::ProxySecureTCPTransport;
+type BaseTransport = super::proxy_transport::ProxySecureTCPTransport;
 
 const JOIN_WINDOW: Duration = Duration::from_secs(10);
 const JOIN_WINDOW_LIMIT: usize = 15;
@@ -47,7 +47,8 @@ impl ChannelIntent {
     fn is_current(&self, endpoint: &Endpoint) -> bool {
         self.active.load(Ordering::Acquire)
             && self.latest_owner.load(Ordering::Acquire) == endpoint.owner
-            && endpoint.generation == super::CONNECTION_GENERATION.load(Ordering::Acquire)
+            && endpoint.generation
+                == super::connection::CONNECTION_GENERATION.load(Ordering::Acquire)
     }
 }
 
@@ -84,14 +85,16 @@ pub(super) fn close_channel_intent(channel: &str) {
         .is_some_and(|member| Arc::ptr_eq(&member.intent, &intent))
     {
         memberships.remove(channel);
-        super::SELF_JOINED_CHANNELS.write().remove(channel);
+        super::connection::SELF_JOINED_CHANNELS
+            .write()
+            .remove(channel);
     }
 }
 
 pub(super) fn reset_confirmed_memberships() {
     let mut memberships = CONFIRMED_MEMBERSHIPS.lock();
     memberships.clear();
-    super::SELF_JOINED_CHANNELS.write().clear();
+    super::connection::SELF_JOINED_CHANNELS.write().clear();
 }
 
 pub(super) fn commit_self_join(channel: &str) -> Option<bool> {
@@ -103,7 +106,7 @@ pub(super) fn commit_self_join(channel: &str) -> Option<bool> {
     }
     member.committed = true;
     Some(
-        super::SELF_JOINED_CHANNELS
+        super::connection::SELF_JOINED_CHANNELS
             .write()
             .insert(channel.to_owned()),
     )
@@ -115,7 +118,9 @@ pub(super) fn is_join_confirmed(channel: &str) -> bool {
         member.endpoint.upgrade().is_some_and(|endpoint| {
             endpoint.is_alive()
                 && member.intent.is_current(&endpoint)
-                && super::SELF_JOINED_CHANNELS.read().contains(channel)
+                && super::connection::SELF_JOINED_CHANNELS
+                    .read()
+                    .contains(channel)
         })
     })
 }
@@ -145,7 +150,7 @@ impl Transport for JoinTransport {
     async fn new() -> Result<Self, Self::ConnectError> {
         // Keep this fence before the await: a connection created after a
         // supervisor restart must never dispatch that retired generation's JOINs.
-        let generation = super::CONNECTION_GENERATION.load(Ordering::Acquire);
+        let generation = super::connection::CONNECTION_GENERATION.load(Ordering::Acquire);
         let transport = BaseTransport::new().await?;
         let (incoming, outgoing) = transport.split();
         let (writer_tx, writer_rx) = mpsc::unbounded_channel();
@@ -234,7 +239,8 @@ impl Endpoint {
         channel: String,
     ) -> io::Result<()> {
         if !endpoint.is_alive()
-            || endpoint.generation != super::CONNECTION_GENERATION.load(Ordering::Acquire)
+            || endpoint.generation
+                != super::connection::CONNECTION_GENERATION.load(Ordering::Acquire)
         {
             return Err(disconnected_error());
         }
@@ -289,7 +295,9 @@ impl Endpoint {
             member.owner == self.owner && member.generation == self.generation
         }) {
             memberships.remove(channel);
-            super::SELF_JOINED_CHANNELS.write().remove(channel);
+            super::connection::SELF_JOINED_CHANNELS
+                .write()
+                .remove(channel);
         }
     }
 
@@ -342,7 +350,7 @@ impl Endpoint {
 
     fn incoming_ended(&self) {
         if self.incoming_closed.swap(true, Ordering::AcqRel)
-            || super::CONNECTION_GENERATION.load(Ordering::Acquire) != self.generation
+            || super::connection::CONNECTION_GENERATION.load(Ordering::Acquire) != self.generation
         {
             return;
         }
@@ -353,11 +361,12 @@ impl Endpoint {
         }
         {
             let mut memberships = CONFIRMED_MEMBERSHIPS.lock();
-            let mut self_joined = super::SELF_JOINED_CHANNELS.write();
+            let mut self_joined = super::connection::SELF_JOINED_CHANNELS.write();
             let disconnected: Vec<_> = owned
                 .into_iter()
                 .filter_map(|(channel, intent)| {
-                    if super::CONNECTION_GENERATION.load(Ordering::Acquire) != self.generation
+                    if super::connection::CONNECTION_GENERATION.load(Ordering::Acquire)
+                        != self.generation
                         || !memberships.get(&channel).is_some_and(|member| {
                             member.owner == self.owner && member.generation == self.generation
                         })
@@ -372,7 +381,7 @@ impl Endpoint {
             drop(self_joined);
             // Establish the gap before a replacement's self-JOIN can commit.
             for channel in disconnected {
-                super::record_channel_disconnect(&channel);
+                super::connection::record_channel_disconnect(&channel);
             }
         }
     }
@@ -675,7 +684,8 @@ async fn run_join_scheduler(mut receiver: mpsc::Receiver<JoinRequest>) {
             continue;
         };
         if endpoint.generation != request.generation
-            || super::CONNECTION_GENERATION.load(Ordering::Acquire) != request.generation
+            || super::connection::CONNECTION_GENERATION.load(Ordering::Acquire)
+                != request.generation
             || !request.intent.is_current(&endpoint)
             || !endpoint.is_alive()
         {
@@ -746,7 +756,8 @@ fn next_pending_join(
         .filter(|(_, request)| {
             request.endpoint.upgrade().is_some_and(|endpoint| {
                 endpoint.generation == request.generation
-                    && super::CONNECTION_GENERATION.load(Ordering::Acquire) == request.generation
+                    && super::connection::CONNECTION_GENERATION.load(Ordering::Acquire)
+                        == request.generation
                     && request.intent.is_current(&endpoint)
                     && endpoint.is_alive()
             })
@@ -794,7 +805,7 @@ fn channel_priorities() -> HashMap<String, u8> {
 
 fn read_persisted_priorities() -> HashMap<String, u8> {
     let mut priorities = HashMap::new();
-    let Some(config_root) = crate::benchmark_profile::config_root() else {
+    let Some(config_root) = crate::storage_roots::config_root() else {
         return priorities;
     };
     let tabs_path = config_root.join("layouts").join("tabs.json");
@@ -811,7 +822,7 @@ fn read_persisted_priorities() -> HashMap<String, u8> {
         let channels = tab.layout.channels();
         let active = tab
             .layout
-            .get_channel_at_path(&tab.active_split_path)
+            .channel_at_path(&tab.active_split_path)
             .or_else(|| channels.first().cloned());
         for channel in channels {
             let is_active = active.as_ref() == Some(&channel);

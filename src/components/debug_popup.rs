@@ -1,25 +1,21 @@
 //! Standalone debug popup window.
 
-use crate::backend::lock_utils::MutexExt;
 use crate::components::settings::render_debug_section_live;
+use crate::components::ui::{Retarget, SingletonWindow};
 use crate::theme::colors;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 const DEBUG_POPUP_ACTIVE_REFRESH_MS: u64 = 400;
 /// Cadence used while the popup window is not the active window.
 const DEBUG_POPUP_INACTIVE_REFRESH_MS: u64 = 2_000;
 
-static DEBUG_POPUP_OPEN: AtomicBool = AtomicBool::new(false);
-static DEBUG_POPUP_HANDLE: LazyLock<Mutex<Option<AnyWindowHandle>>> =
-    LazyLock::new(|| Mutex::new(None));
-static PENDING_DEBUG_CONTEXT: Mutex<Option<String>> = Mutex::new(None);
+/// Pending payload: the context label to show next.
+static DEBUG_POPUP: SingletonWindow<String> = SingletonWindow::new();
 
 pub fn toggle_debug_popup(context_label: String, cx: &mut App) {
-    if DEBUG_POPUP_OPEN.load(Ordering::SeqCst) {
+    if DEBUG_POPUP.is_open() {
         close_debug_popup(cx);
     } else {
         open_debug_popup(context_label, cx);
@@ -27,18 +23,14 @@ pub fn toggle_debug_popup(context_label: String, cx: &mut App) {
 }
 
 pub fn open_debug_popup(context_label: String, cx: &mut App) {
-    if DEBUG_POPUP_OPEN.load(Ordering::SeqCst) {
-        *PENDING_DEBUG_CONTEXT.lock_or_recover() = Some(context_label);
-        let handle = *DEBUG_POPUP_HANDLE.lock_or_recover();
-        if let Some(handle) = handle {
-            let _ = handle.update(cx, |_, window, cx| {
-                cx.activate(true);
-                window.activate_window();
-                window.refresh();
-            });
+    let context_label = match DEBUG_POPUP.retarget(context_label, cx) {
+        Retarget::Retargeted => return,
+        Retarget::NotOpen(context_label) => context_label,
+        Retarget::Stale(context_label) => {
+            DEBUG_POPUP.mark_closed();
+            context_label
         }
-        return;
-    }
+    };
 
     let (width, height) = crate::backend::settings::get_debug_popup_window_size();
     let (bounds, display_id) = crate::utils::popup_window_placement(
@@ -72,8 +64,8 @@ pub fn open_debug_popup(context_label: String, cx: &mut App) {
             ..Default::default()
         },
         move |window, cx| {
-            *DEBUG_POPUP_HANDLE.lock_or_recover() = Some(window.window_handle());
-            DEBUG_POPUP_OPEN.store(true, Ordering::SeqCst);
+            DEBUG_POPUP.set_handle(window.window_handle());
+            DEBUG_POPUP.mark_open();
             cx.new(|cx| DebugPopup::new(context_label.clone(), window, cx))
         },
     )
@@ -81,25 +73,7 @@ pub fn open_debug_popup(context_label: String, cx: &mut App) {
 }
 
 pub fn close_debug_popup(cx: &mut App) {
-    let handle = *DEBUG_POPUP_HANDLE.lock_or_recover();
-    if let Some(handle) = handle {
-        if handle
-            .update(cx, |_, window, _| {
-                window.remove_window();
-            })
-            .is_err()
-        {
-            mark_debug_popup_closed();
-        }
-    } else {
-        mark_debug_popup_closed();
-    }
-}
-
-fn mark_debug_popup_closed() {
-    DEBUG_POPUP_OPEN.store(false, Ordering::SeqCst);
-    *DEBUG_POPUP_HANDLE.lock_or_recover() = None;
-    *PENDING_DEBUG_CONTEXT.lock_or_recover() = None;
+    DEBUG_POPUP.close(cx);
 }
 
 pub struct DebugPopup {
@@ -159,7 +133,7 @@ impl DebugPopup {
 
                 let next_interval = this
                     .update(cx, |popup, cx| {
-                        if !DEBUG_POPUP_OPEN.load(Ordering::SeqCst) {
+                        if !DEBUG_POPUP.is_open() {
                             popup.refresh_waker_running = false;
                             return None;
                         }
@@ -182,14 +156,14 @@ impl DebugPopup {
 
 impl Drop for DebugPopup {
     fn drop(&mut self) {
-        mark_debug_popup_closed();
+        DEBUG_POPUP.mark_closed();
     }
 }
 
 impl Render for DebugPopup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         colors::begin_secondary_window_frame();
-        if let Some(context) = PENDING_DEBUG_CONTEXT.lock_or_recover().take()
+        if let Some(context) = DEBUG_POPUP.take_pending()
             && context != self.context_label
         {
             self.context_label = context;

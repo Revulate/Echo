@@ -1,8 +1,27 @@
 //! GPUI-free domain logic shared by Echo and its verification tools.
+//!
+//! # Ports
+//!
+//! A few behaviours need state that only the running application owns. The
+//! crate asks for it through process-global hooks; each is set once (first
+//! call wins), and every one is optional: without it the crate falls back to
+//! the standalone behaviour named below, which is what tests and tools get.
+//!
+//! | Hook | Fallback when not installed |
+//! | --- | --- |
+//! | [`install_log_category_enabled`] | every `log_*!` category is enabled |
+//! | [`channel_identity::install_current_watching_channel`] | no channel is being watched |
+//! | [`channel_lifecycle::install_whispers_channel_predicate`] | no channel is the whispers channel |
+//! | [`emote_preferences::install_emote_preferences_ports`] | preferences are not persisted |
+//! | [`message_buffer::install_message_buffer_ports`] | default capacity, no layout-cache or embed bookkeeping |
+//! | [`slot_resolver::install_twitch_emote_lookup`] | Twitch emotes resolve by id only |
+//! | [`slot_resolver::install_emoji_style`] | the default emoji style |
+//! | [`slot_resolver::install_emote_trace_enabled`] | emote tracing is off |
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+pub mod badge_key;
 pub mod channel_identity;
 pub mod channel_lifecycle;
 pub mod chat_snapshot;
@@ -11,6 +30,7 @@ pub mod commands;
 pub mod deduplicator;
 pub mod emote_display_rules;
 pub mod emote_preferences;
+pub mod env;
 pub mod file_replace;
 pub mod filter_expression;
 pub mod followed_live;
@@ -25,6 +45,7 @@ pub mod notification_text;
 pub mod oauth_token;
 pub mod observers;
 pub mod overlay_state;
+pub mod quick_switch;
 pub mod reveal_pacer;
 pub mod search;
 pub mod settings_event;
@@ -39,13 +60,11 @@ pub mod twitch_gif;
 pub mod version_registry;
 pub mod workspace;
 
-pub use fuzzy::fuzzy_score;
+// The root re-exports only the crate's central types; functions are reached
+// through their module. `SplitId` lives only here.
 pub use message::ChatMessage;
 pub use split_id::SplitId;
-pub use workspace::{
-    AddSplitDirection, DragDropState, DropZone, SplitNode, SplitOrientation, is_placeholder,
-    new_placeholder,
-};
+pub use workspace::{AddSplitDirection, DragDropState, DropZone, SplitNode, SplitOrientation};
 
 static LOG_CATEGORY_ENABLED: OnceLock<fn(&str) -> bool> = OnceLock::new();
 
@@ -65,82 +84,45 @@ pub fn log_category_enabled(category: &str) -> bool {
         .is_none_or(|callback| callback(category))
 }
 
+/// Shared body of the `log_*!` macros: trace/debug/info are gated on the
+/// category predicate, warn/error always pass through to the tracing filter.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __echo_core_log {
+    ($cat:literal, $target:literal, warn, $($arg:tt)*) => {{
+        tracing::warn!(target: $target, $($arg)*)
+    }};
+    ($cat:literal, $target:literal, error, $($arg:tt)*) => {{
+        tracing::error!(target: $target, $($arg)*)
+    }};
+    ($cat:literal, $target:literal, $level:ident, $($arg:tt)*) => {{
+        if $crate::log_category_enabled($cat) {
+            tracing::$level!(target: $target, $($arg)*)
+        }
+    }};
+}
+
 /// IRC logging (connection, watchdog, lifecycle, supervisor)
 #[macro_export]
 macro_rules! log_irc {
-    (trace, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("irc") {
-            tracing::trace!(target: "echo::irc", $($arg)*)
-        }
-    }};
-    (debug, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("irc") {
-            tracing::debug!(target: "echo::irc", $($arg)*)
-        }
-    }};
-    (info, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("irc") {
-            tracing::info!(target: "echo::irc", $($arg)*)
-        }
-    }};
-    (warn, $($arg:tt)*) => {{
-        tracing::warn!(target: "echo::irc", $($arg)*)
-    }};
-    (error, $($arg:tt)*) => {{
-        tracing::error!(target: "echo::irc", $($arg)*)
-    }};
+    ($($arg:tt)*) => { $crate::__echo_core_log!("irc", "echo::irc", $($arg)*) };
 }
 
 /// UI logging (app events, overlays, input)
 #[macro_export]
 macro_rules! log_ui {
-    (trace, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("ui") {
-            tracing::trace!(target: "echo::ui", $($arg)*)
-        }
-    }};
-    (debug, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("ui") {
-            tracing::debug!(target: "echo::ui", $($arg)*)
-        }
-    }};
-    (info, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("ui") {
-            tracing::info!(target: "echo::ui", $($arg)*)
-        }
-    }};
-    (warn, $($arg:tt)*) => {{
-        tracing::warn!(target: "echo::ui", $($arg)*)
-    }};
-    (error, $($arg:tt)*) => {{
-        tracing::error!(target: "echo::ui", $($arg)*)
-    }};
+    ($($arg:tt)*) => { $crate::__echo_core_log!("ui", "echo::ui", $($arg)*) };
 }
 
 /// Emote-provider logging
 #[macro_export]
 macro_rules! log_emotes {
-    (trace, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("emotes") {
-            tracing::trace!(target: "echo::emotes", $($arg)*)
-        }
-    }};
-    (debug, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("emotes") {
-            tracing::debug!(target: "echo::emotes", $($arg)*)
-        }
-    }};
-    (info, $($arg:tt)*) => {{
-        if $crate::log_category_enabled("emotes") {
-            tracing::info!(target: "echo::emotes", $($arg)*)
-        }
-    }};
-    (warn, $($arg:tt)*) => {{
-        tracing::warn!(target: "echo::emotes", $($arg)*)
-    }};
-    (error, $($arg:tt)*) => {{
-        tracing::error!(target: "echo::emotes", $($arg)*)
-    }};
+    ($($arg:tt)*) => { $crate::__echo_core_log!("emotes", "echo::emotes", $($arg)*) };
+}
+
+/// Serde default for persisted flags that start enabled.
+pub(crate) fn default_true() -> bool {
+    true
 }
 
 /// Milliseconds since the Unix epoch, or 0 if the clock is before it.

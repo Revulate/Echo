@@ -41,6 +41,14 @@ pub struct CacheEntry {
     pub total_duration_ms: u32,
 }
 
+/// LRU-LFU score shared by every disk index entry: frequent and recently used
+/// entries score higher and are kept longer.
+fn disk_eviction_score(access_count: u32, last_accessed: u64) -> f64 {
+    let recency_secs = current_timestamp().saturating_sub(last_accessed) as f64;
+    let frequency = (access_count as f64).ln().max(1.0);
+    frequency / (recency_secs / 3600.0 + 1.0)
+}
+
 impl CacheEntry {
     /// Create a new static image entry
     pub fn new_static(hash: String, size_bytes: u64, width: u32, height: u32) -> Self {
@@ -59,12 +67,7 @@ impl CacheEntry {
 
     /// Calculate eviction score (lower = evict first)
     pub fn eviction_score(&self) -> f64 {
-        let now = current_timestamp();
-        let recency_secs = now.saturating_sub(self.last_accessed) as f64;
-        let frequency = (self.access_count as f64).ln().max(1.0);
-
-        // Higher frequency and lower recency = higher score = keep longer
-        frequency / (recency_secs / 3600.0 + 1.0)
+        disk_eviction_score(self.access_count, self.last_accessed)
     }
 
     /// Touch the entry (update access time and count)
@@ -95,7 +98,9 @@ impl MediaSourceId {
         }
     }
 
-    pub fn new_shared_labels(provider: &str, id: Arc<str>, variant: MediaVariant) -> Self {
+    /// An identity whose provider label is one of the process-wide shared
+    /// `Arc`s, so the many identities of one provider do not each allocate it.
+    pub fn with_interned_provider(provider: &str, id: Arc<str>, variant: MediaVariant) -> Self {
         Self {
             provider: shared_media_label(provider),
             id,
@@ -295,10 +300,7 @@ impl SourceBlobEntry {
     }
 
     pub fn eviction_score(&self) -> f64 {
-        let now = current_timestamp();
-        let recency_secs = now.saturating_sub(self.last_accessed) as f64;
-        let frequency = (self.access_count as f64).ln().max(1.0);
-        frequency / (recency_secs / 3600.0 + 1.0)
+        disk_eviction_score(self.access_count, self.last_accessed)
     }
 
     pub fn as_cache_entry(&self) -> CacheEntry {

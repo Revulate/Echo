@@ -51,7 +51,7 @@ fn keyring_available() -> bool {
 }
 
 fn keyring_entry(key: &str) -> Option<keyring_core::Entry> {
-    if crate::benchmark_profile::is_enabled() {
+    if crate::storage_roots::is_isolated() {
         return None;
     }
     if !keyring_available() {
@@ -67,7 +67,7 @@ fn keyring_entry(key: &str) -> Option<keyring_core::Entry> {
 }
 
 fn token_store_path() -> PathBuf {
-    crate::benchmark_profile::config_root_or_current_dir().join(TOKEN_STORE_FILE)
+    crate::storage_roots::config_root_or_current_dir().join(TOKEN_STORE_FILE)
 }
 
 /// Serializes every read → (migrate) → write of the fallback token store, so
@@ -439,7 +439,7 @@ pub(super) fn has_plaintext_runtime_tokens(settings: &AppSettings) -> bool {
 }
 
 pub(super) fn hydrate_tokens_from_keyring(settings: &mut AppSettings) {
-    if crate::benchmark_profile::is_enabled() {
+    if crate::storage_roots::is_isolated() {
         return;
     }
     if let Some(token) = keyring_get_secret(KEY_ACTIVE_TOKEN) {

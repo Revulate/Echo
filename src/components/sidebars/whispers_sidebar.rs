@@ -1,5 +1,6 @@
 //! Activity Whispers content renderer.
 
+use crate::backend::bridge::{CommandAuthBlock, WhisperComposeBlock};
 use crate::backend::{self, WhisperThread};
 use crate::components::ui::{ButtonExt, PressToClick};
 use crate::theme::colors;
@@ -24,11 +25,11 @@ pub fn render_whispers_activity_content<T: 'static, F: Fn(&mut Context<T>) + 'st
         .flex()
         .flex_col()
         .child(render_whispers_toolbar(&threads, on_mark_read, cx))
-        .when_some(compose_block_reason.as_deref(), |el, reason| {
+        .when_some(compose_block_reason.as_ref(), |el, reason| {
             el.child(render_whispers_compose_status(reason))
         })
         .child(if threads.is_empty() {
-            render_whispers_empty_state(compose_block_reason.as_deref()).into_any_element()
+            render_whispers_empty_state(compose_block_reason.as_ref()).into_any_element()
         } else {
             render_whispers_list(threads, compose_block_reason.is_none()).into_any_element()
         })
@@ -128,24 +129,23 @@ fn render_whispers_toolbar<T: 'static, F: Fn(&mut Context<T>) + 'static>(
         )
 }
 
-fn compact_whisper_compose_reason(reason: &str) -> String {
-    let lower = reason.to_ascii_lowercase();
-    if lower.contains("anonymously") {
-        "Whispers are unavailable in anonymous mode".to_string()
-    } else if lower.contains("re-authenticated") || lower.contains("chat token") {
-        "Whispers require a re-authenticated Twitch account".to_string()
-    } else if lower.contains("active twitch account") {
-        "Log in to a Twitch account to use whispers".to_string()
-    } else if lower.contains("connecting") || lower.contains("reconnecting") {
-        "Whispers will be available once Twitch IRC reconnects".to_string()
-    } else if lower.contains("disconnected") || lower.contains("connection is ready") {
-        "Whispers will be available once Twitch IRC is ready".to_string()
-    } else {
-        "Whispers are temporarily unavailable".to_string()
+fn compact_whisper_compose_reason(reason: &WhisperComposeBlock) -> &'static str {
+    match reason {
+        WhisperComposeBlock::Auth(CommandAuthBlock::Anonymous) => {
+            "Whispers are unavailable in anonymous mode"
+        }
+        WhisperComposeBlock::Auth(CommandAuthBlock::NeedsReauth) => {
+            "Whispers require a re-authenticated Twitch account"
+        }
+        WhisperComposeBlock::Auth(CommandAuthBlock::NoAccount)
+        | WhisperComposeBlock::IdentityLoading => "Log in to a Twitch account to use whispers",
+        WhisperComposeBlock::Auth(CommandAuthBlock::NoToken { .. }) => {
+            "Whispers are temporarily unavailable"
+        }
     }
 }
 
-fn render_whispers_compose_status(reason: &str) -> impl IntoElement + use<> {
+fn render_whispers_compose_status(reason: &WhisperComposeBlock) -> impl IntoElement + use<> {
     div()
         .mx_3()
         .mt_2()
@@ -176,11 +176,13 @@ fn render_whispers_compose_status(reason: &str) -> impl IntoElement + use<> {
         )
 }
 
-fn render_whispers_empty_state(compose_block_reason: Option<&str>) -> impl IntoElement + use<> {
+fn render_whispers_empty_state(
+    compose_block_reason: Option<&WhisperComposeBlock>,
+) -> impl IntoElement + use<> {
     let (icon, message) = if let Some(reason) = compose_block_reason {
         ("🔒", compact_whisper_compose_reason(reason))
     } else {
-        ("💬", "No whispers yet".to_string())
+        ("💬", "No whispers yet")
     };
 
     div()

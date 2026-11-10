@@ -23,6 +23,8 @@
 //! changed, and the only asynchronous work is a one-shot, revision-fenced task
 //! that publishes the search-count announcement after it settles.
 
+mod benchmark_hooks;
+
 use crate::components::auth::LoginModalState;
 use crate::components::settings::sections::{self, UploaderEditorInputs};
 use crate::components::settings::settings_navigation::{
@@ -175,9 +177,9 @@ fn settings_content_width(chrome: SettingsChrome, window: &Window) -> f32 {
 
 /// What a host should show when it opens.
 ///
-/// Replaces the bare pending section id: navigation now addresses a page *and*
-/// an anchor, and the modal hands its live query to the popout so "Open in
-/// window" does not silently drop the user's search.
+/// Navigation addresses a page *and* an anchor, and the modal hands its live
+/// query to the popout so "Open in window" does not silently drop the user's
+/// search.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SettingsOpenRequest {
     /// Explicit destination, or `None` to restore the remembered location.
@@ -415,12 +417,7 @@ struct SearchRestore {
 
 impl Drop for SettingsSurface {
     fn drop(&mut self) {
-        sections::release_general_settings_inputs_for_host(self.host_id);
-        sections::release_proxy_inputs_for_host(self.host_id);
-        sections::forget_logging_viewer_state_for_host(self.host_id);
-        sections::release_command_editor_inputs_for_host(self.host_id);
-        sections::forget_hotkey_editor_host(self.host_id);
-        sections::clear_uploader_status(self.host_id.as_u64());
+        sections::release_host_editor_state(self.host_id);
     }
 }
 
@@ -616,11 +613,6 @@ impl SettingsSurface {
             .map(|descriptor| descriptor.id)
     }
 
-    /// Public navigation entry point for hosts and automation.
-    pub fn navigate(&mut self, location: SettingsLocation) -> bool {
-        self.jump_to(location, true)
-    }
-
     pub fn navigate_setting(&mut self, id: &str) -> bool {
         let Some(target) = setting_target_by_id(id) else {
             return false;
@@ -712,15 +704,10 @@ impl SettingsSurface {
     /// Session teardown on close. Scroll positions stay: they are cheap, and a
     /// reopened surface should land where the user left it.
     pub fn reset_session(&mut self) -> bool {
-        sections::release_general_settings_inputs_for_host(self.host_id);
-        sections::release_proxy_inputs_for_host(self.host_id);
-        sections::forget_logging_viewer_state_for_host(self.host_id);
+        sections::release_host_editor_state(self.host_id);
         self._diagnostics_refresh_task = None;
         self.last_rendered_section = None;
-        sections::release_command_editor_inputs_for_host(self.host_id);
-        sections::forget_hotkey_editor_host(self.host_id);
         self.uploader_inputs = None;
-        sections::clear_uploader_status(self.host_id.as_u64());
         self.anchor_reveal = None;
         self.pending_disclosure_handoff = None;
         let mut changed = self.set_query("");
@@ -846,8 +833,7 @@ impl SettingsSurface {
     }
 
     /// Keep the selection inside the result set. Uses the *ranked* order, so an
-    /// exact page-name hit wins over a looser keyword hit in an earlier
-    /// category.
+    /// exact page-name hit wins over a looser keyword hit on an earlier page.
     fn resync_selection(&mut self) -> bool {
         if !self.is_searching() {
             return false;
@@ -894,7 +880,7 @@ impl SettingsSurface {
     /// the query the user already typed immediately answers their question.
     ///
     /// Search reveal is session-only and never changes developer_mode.
-    fn reveal_hidden_developer(&mut self, _persist: bool) -> bool {
+    fn reveal_hidden_developer(&mut self) -> bool {
         let target = self.search.model().hidden_developer_location();
         self.developer_override = Some(true);
         self.search_developer_revealed = true;
@@ -1006,7 +992,6 @@ impl SettingsSurface {
     fn activate_node(&mut self, node: SettingsTreeNode) -> bool {
         let mut changed = self.focused != node;
         match node {
-            SettingsTreeNode::Category(_) => self.focused = node,
             SettingsTreeNode::Page(section) => {
                 self.focused = node;
                 changed |= self.jump_to(SettingsLocation::page(section), true);
@@ -1133,189 +1118,6 @@ impl SettingsSurface {
             None => false,
         }
     }
-
-    #[doc(hidden)]
-    pub fn benchmark_focus_search(&mut self) {
-        self.search_active = true;
-        self.developer_override = Some(false);
-        self.search.sync(&self.query, false);
-        if self.location.is_developer_only() {
-            let location = restore_location(&navigation_prefs(), false);
-            self.go_to(location, false);
-        }
-        self.resync_selection();
-    }
-
-    #[doc(hidden)]
-    pub fn benchmark_focus_region(&self, window: &Window, cx: &App) -> &'static str {
-        if self.search_is_focused(window, cx) {
-            "search"
-        } else if self.tree_focus.is_focused(window) {
-            "navigation"
-        } else if self.content_focus.contains_focused(window, cx) {
-            "content"
-        } else {
-            "outside"
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn benchmark_content_bounds(&self) -> Option<Bounds<Pixels>> {
-        self.page_scroll
-            .get(&self.location.section)
-            .map(|scroll| scroll.handle().bounds())
-    }
-
-    #[doc(hidden)]
-    pub fn benchmark_set_query(&mut self, query: &str) {
-        self.set_query(query);
-    }
-
-    /// Run the production hidden-developer recovery without writing the user's
-    /// developer-mode preference.
-    #[doc(hidden)]
-    pub fn benchmark_reveal_advanced(&mut self) {
-        self.reveal_hidden_developer(false);
-    }
-
-    #[doc(hidden)]
-    pub fn benchmark_developer_revealed(&self) -> bool {
-        self.developer_override == Some(true)
-    }
-
-    #[doc(hidden)]
-    pub fn benchmark_result_count(&self) -> usize {
-        self.search.model().ordered_ids().len()
-    }
-
-    /// Press a key on the tree through the *production* key handler.
-    ///
-    /// The harness synthesizes the keystroke rather than the outcome, so the
-    /// acceptance run exercises the same `handle_tree_key` the `on_key_down`
-    /// listener calls — a regression in the key model fails the run instead of
-    /// being papered over by a parallel test-only navigation path.
-    #[doc(hidden)]
-    pub fn benchmark_press_tree_key(
-        &mut self,
-        key: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        let event = KeyDownEvent {
-            keystroke: Keystroke {
-                modifiers: Modifiers::default(),
-                key: key.to_string(),
-                key_char: (key.chars().count() == 1).then(|| key.to_string()),
-            },
-            is_held: false,
-            prefer_character_input: false,
-        };
-        self.handle_tree_key(&event, window, cx).handled
-    }
-
-    /// Current destination as the slug pair that is persisted and logged.
-    #[doc(hidden)]
-    pub fn benchmark_location_slugs(&self) -> (&'static str, Option<&'static str>) {
-        (
-            section_slug(self.location.section),
-            self.location
-                .subsection
-                .and_then(|id| {
-                    crate::components::settings::settings_navigation::subsection_descriptor(
-                        self.location.section,
-                        id,
-                    )
-                })
-                .map(|descriptor| descriptor.slug),
-        )
-    }
-
-    /// Visible tree rows flattened to `level:label` for log assertions.
-    #[doc(hidden)]
-    pub fn benchmark_tree_labels(&self) -> Vec<String> {
-        self.visible_rows()
-            .iter()
-            .map(|row| format!("{}:{}", row.level, row.label))
-            .collect()
-    }
-
-    /// Label of the row the tree keyboard model currently focuses.
-    #[doc(hidden)]
-    pub fn benchmark_focused_label(&self) -> Option<&'static str> {
-        let focused = self.focused;
-        self.visible_rows()
-            .into_iter()
-            .find(|row| row.node == focused)
-            .map(|row| row.label)
-    }
-
-    /// Search-only secondary line on the row for `location`, e.g.
-    /// `"Streamlink path · +3"`.
-    #[doc(hidden)]
-    pub fn benchmark_secondary_for(&self, location: SettingsLocation) -> Option<String> {
-        let target = node_for_location(location);
-        self.visible_rows()
-            .into_iter()
-            .find(|row| row.node == target)
-            .and_then(|row| row.secondary)
-    }
-
-    /// Live-region text the status node would settle on, without waiting out the
-    /// announcement delay.
-    #[doc(hidden)]
-    pub fn benchmark_status_announcement(&self) -> Option<String> {
-        self.search.model().status_announcement()
-    }
-
-    /// `(settings, subsections, pages)` matching only behind the disclosure.
-    #[doc(hidden)]
-    pub fn benchmark_hidden_developer_counts(&self) -> (usize, usize, usize) {
-        let counts = self.search.model().hidden_developer_counts();
-        (counts.settings, counts.subsections, counts.pages)
-    }
-
-    /// Block index the current page's scroll-spy reports as active.
-    ///
-    /// This is the value a laid-out frame settles on, so comparing it with
-    /// [`Self::benchmark_target_block`] after a render proves the anchor jump
-    /// reached the block it addressed rather than merely updating the label.
-    #[doc(hidden)]
-    pub fn benchmark_active_block(&self) -> usize {
-        self.page_scroll
-            .get(&self.location.section)
-            .map_or(0, SettingsPageScroll::active)
-    }
-
-    /// Block index the current destination *should* occupy, taken from the
-    /// descriptor the tree and breadcrumb index against.
-    #[doc(hidden)]
-    pub fn benchmark_target_block(&self) -> usize {
-        let Some(subsection) = self.location.subsection else {
-            return 0;
-        };
-        section_descriptor(self.location.section)
-            .and_then(|section| {
-                section
-                    .subsections
-                    .iter()
-                    .position(|descriptor| descriptor.id == subsection)
-            })
-            .unwrap_or(usize::MAX)
-    }
-
-    /// Whether an anchor jump is still waiting for a laid-out frame.
-    #[doc(hidden)]
-    pub fn benchmark_anchor_pending(&self) -> bool {
-        self.pending_anchor.is_some()
-    }
-
-    #[doc(hidden)]
-    pub fn benchmark_disclosure_expanded(&self, id: &str) -> bool {
-        self.page_ui
-            .get(&self.location.section)
-            .and_then(|ui| ui.disclosures.get(id))
-            .is_some_and(SettingsDisclosureState::is_expanded)
-    }
 }
 
 /// Result of a key handler: whether it consumed the key, and whether visible
@@ -1345,15 +1147,14 @@ impl KeyOutcome {
 
 /// First result in *rank* order, resolved to its first matching anchor.
 ///
-/// [`SettingsSearchModel::first_location`] walks the tree in declaration order,
-/// which would prefer an early category's loose keyword hit over an exact page
+/// [`SettingsSearchModel::first_location`] walks the tree in sidebar order,
+/// which would prefer an earlier page's loose keyword hit over an exact page
 /// name match further down.
 pub fn first_ranked_location(model: &SettingsSearchModel) -> Option<SettingsLocation> {
     let id = *model.ordered_ids().first()?;
     model
         .tree()
         .iter()
-        .flat_map(|category| category.sections.iter())
         .find(|section| section.descriptor.id == id)
         .map(|section| section.location())
         .or_else(|| Some(SettingsLocation::page(id)))
@@ -2400,25 +2201,12 @@ fn render_page<T: SettingsSurfaceHost>(
 ) -> AnyElement {
     let section = host.surface().location.section;
     let previous_section = host.surface_mut().last_rendered_section.replace(section);
-    if previous_section == Some(SettingsSectionId::Advanced)
-        && section != SettingsSectionId::Advanced
-    {
-        let host_id = host.surface().host_id;
-        sections::release_proxy_inputs_for_host(host_id);
-        sections::release_logging_inputs_for_host(host_id);
-    }
-    if section != SettingsSectionId::Hotkeys {
-        let host_id = host.surface().host_id;
-        sections::release_command_editor_inputs_for_host(host_id);
-        sections::release_hotkey_editor_inputs_for_host(host_id);
-    }
+    sections::release_hidden_page_inputs(host.surface().host_id, previous_section, section);
     let login_modal = host.surface().login_modal.clone();
     let uploader_inputs = if section == SettingsSectionId::Connections {
         Some(ensure_uploader_inputs(host, window, cx))
     } else {
-        let host_id = host.surface().host_id;
         host.surface_mut().uploader_inputs = None;
-        sections::release_general_settings_inputs_for_host(host_id);
         None
     };
     let handle = host.surface_mut().page_scroll_mut(section).handle().clone();
@@ -2586,7 +2374,6 @@ fn search_match_labels(surface: &SettingsSurface, section: SettingsSectionId) ->
         .model()
         .tree()
         .iter()
-        .flat_map(|category| category.sections.iter())
         .filter(|found| found.id() == section)
         .flat_map(|found| {
             found
@@ -2773,7 +2560,7 @@ fn render_hidden_developer_state<T: SettingsSurfaceHost>(
 /// Reveal the developer disclosure and land on the first hidden match, so the
 /// same query immediately answers the question the user asked.
 fn reveal_hidden_developer_matches<T: SettingsSurfaceHost>(host: &mut T) {
-    host.surface_mut().reveal_hidden_developer(true);
+    host.surface_mut().reveal_hidden_developer();
 }
 
 #[cfg(test)]

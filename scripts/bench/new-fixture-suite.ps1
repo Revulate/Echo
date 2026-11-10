@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Create and validate a deterministic chat/render fixture suite.
+new-fixture-suite.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet("normal", "high-volume", "burst", "reconnect")]
@@ -21,80 +26,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "value"
-    }
-
-    return $slug
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Invoke-CheckedScript {
     param(
@@ -163,17 +95,17 @@ $fixtureIndex = 0
 foreach ($scenario in $ChatScenarios) {
     $fixtureSeed = $Seed + $fixtureIndex
     $fixtureIndex += 1
-    $args = @{
+    $fixtureArgs = @{
         ReplayScenario = $scenario
         OutputRoot = $fixtureOutputRoot
         BenchmarkScenario = "chat replay fixture suite $scenario"
         Seed = $fixtureSeed
     }
     if ($ChatMessageCount -gt 0) {
-        $args.MessageCount = $ChatMessageCount
+        $fixtureArgs.MessageCount = $ChatMessageCount
     }
 
-    $manifestPath = Invoke-CheckedScript -ScriptPath $chatFixtureScript -Arguments $args
+    $manifestPath = Invoke-CheckedScript -ScriptPath $chatFixtureScript -Arguments $fixtureArgs
     $fixtureRunDir = Split-Path -Parent $manifestPath
     $validationArgs = @{
         RunDir = $fixtureRunDir
@@ -197,17 +129,17 @@ foreach ($scenario in $ChatScenarios) {
 foreach ($kind in $RenderKinds) {
     $fixtureSeed = $Seed + $fixtureIndex
     $fixtureIndex += 1
-    $args = @{
+    $fixtureArgs = @{
         FixtureKind = $kind
         OutputRoot = $fixtureOutputRoot
         BenchmarkScenario = "render fixture suite $kind"
         Seed = $fixtureSeed
     }
     if ($RenderMessageCount -gt 0) {
-        $args.MessageCount = $RenderMessageCount
+        $fixtureArgs.MessageCount = $RenderMessageCount
     }
 
-    $manifestPath = Invoke-CheckedScript -ScriptPath $renderFixtureScript -Arguments $args
+    $manifestPath = Invoke-CheckedScript -ScriptPath $renderFixtureScript -Arguments $fixtureArgs
     $fixtureRunDir = Split-Path -Parent $manifestPath
     $validationArgs = @{
         RunDir = $fixtureRunDir

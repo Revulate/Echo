@@ -143,7 +143,7 @@ pub fn provider_from_key(key: &str) -> Option<EmoteProvider> {
 
 /// Lowercase login without `#` or surrounding whitespace.
 pub fn normalize_channel(channel: &str) -> String {
-    channel.trim().trim_start_matches('#').to_ascii_lowercase()
+    crate::channel_identity::normalize_channel_key(channel.trim())
 }
 
 #[inline]

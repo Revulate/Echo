@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Create deterministic chat replay fixture artifacts.
+new-chat-replay-fixture.py is the Python twin.
+#>
 [CmdletBinding()]
 param(
     [ValidateSet("normal", "high-volume", "burst", "reconnect")]
@@ -31,113 +36,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function ConvertTo-Slug {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $slug = $Value.ToLowerInvariant() -replace "[^a-z0-9._-]+", "-"
-    $slug = $slug.Trim("-")
-    if ([string]::IsNullOrWhiteSpace($slug)) {
-        return "value"
-    }
-
-    return $slug
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $args = @{
-        Scenario = $BenchmarkScenario
-        FixtureName = "chat-replay-$ReplayScenario"
-        Notes = "Deterministic chat replay fixture for '$ReplayScenario'. This is input data, not performance evidence."
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-        $args.OutputRoot = $OutputRoot
-    }
-
-    $output = & $initializer @args
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
-
-function Get-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return $property.Value
-}
-
-function Set-JsonProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [object]$Value
-    )
-
-    $property = $Object.PSObject.Properties.Match($Name) | Select-Object -First 1
-    if ($null -ne $property) {
-        $property.Value = $Value
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
-    }
-}
-
-function Ensure-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [psobject]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    $value = Get-JsonProperty -Object $Object -Name $Name
-    if ($null -eq $value) {
-        $value = [pscustomobject]@{}
-        Set-JsonProperty -Object $Object -Name $Name -Value $value
-    }
-
-    return $value
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Get-DefaultMessageCount {
     param(
@@ -304,7 +203,12 @@ function New-MessageEvent {
 }
 
 $repoRoot = Resolve-RepoRoot
-$scenarioDir = Initialize-RunDirectory -RepoRoot $repoRoot
+$scenarioDir = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $BenchmarkScenario
+    OutputRoot = $OutputRoot
+    FixtureName = "chat-replay-$ReplayScenario"
+    Notes = "Deterministic chat replay fixture for '$ReplayScenario'. This is input data, not performance evidence."
+}
 $normalizedChannel = if ($Channel.StartsWith("#")) { $Channel } else { "#$Channel" }
 $durationMs = $DurationSeconds * 1000
 $resolvedMessageCount = if ($MessageCount -gt 0) { $MessageCount } else { Get-DefaultMessageCount -Scenario $ReplayScenario }

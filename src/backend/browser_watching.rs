@@ -254,7 +254,7 @@ pub fn current_channel() -> Option<String> {
 /// Watching split. Ordinary sessions cannot enter this path.
 #[doc(hidden)]
 pub fn set_current_channel_for_benchmark(channel: &str) -> Option<WatchingBenchmarkRestore> {
-    if !crate::benchmark_ui_fixture::is_enabled() {
+    if !crate::bench::ui_fixture::is_enabled() {
         return None;
     }
     let mut state = WATCHING_STATE.write_or_recover();
@@ -268,7 +268,7 @@ pub fn set_current_channel_for_benchmark(channel: &str) -> Option<WatchingBenchm
 /// Restore the Watching state captured by `set_current_channel_for_benchmark`.
 #[doc(hidden)]
 pub fn restore_current_channel_after_benchmark(restore: WatchingBenchmarkRestore) -> bool {
-    if !crate::benchmark_ui_fixture::is_enabled() {
+    if !crate::bench::ui_fixture::is_enabled() {
         return false;
     }
     let mut state = WATCHING_STATE.write_or_recover();
@@ -307,7 +307,7 @@ pub fn integration_error() -> Option<String> {
 pub fn initialize() {
     #[cfg(target_os = "windows")]
     {
-        if crate::benchmark_profile::is_enabled() {
+        if crate::storage_roots::is_isolated() {
             crate::log_ui!(
                 info,
                 "Browser Watching registry integration and pipe are disabled in benchmark profiles"
@@ -335,7 +335,7 @@ pub fn shutdown() {
     #[cfg(target_os = "windows")]
     {
         REGISTRATION_STOPPED.store(true, std::sync::atomic::Ordering::Release);
-        if crate::benchmark_profile::is_enabled() {
+        if crate::storage_roots::is_isolated() {
             return;
         }
         if let Err(error) = restore_upstream_native_messaging_registration() {
@@ -477,7 +477,7 @@ fn start_gui_lifetime_monitor() -> bool {
 
 #[cfg(target_os = "windows")]
 fn normalize_channel_login(channel: &str) -> Option<String> {
-    let channel = channel.trim().trim_start_matches('#').to_ascii_lowercase();
+    let channel = echo_core::channel_identity::normalize_channel_key(channel.trim());
     if channel.is_empty()
         || channel.len() > 25
         || !channel
@@ -1118,7 +1118,7 @@ fn registration_paths() -> Result<&'static RegistrationPaths, String> {
         .get_or_init(|| {
             let executable = std::env::current_exe()
                 .map_err(|error| format!("Could not resolve Echo's executable: {error}"))?;
-            let directory = crate::benchmark_profile::config_root()
+            let directory = crate::storage_roots::config_root()
                 .ok_or_else(|| "Windows did not provide a configuration directory".to_string())?
                 .join("native-messaging");
             Ok(RegistrationPaths {
@@ -1411,7 +1411,7 @@ fn write_upstream_native_messaging_manifests(
 
 #[cfg(target_os = "windows")]
 fn load_native_host_bridge_config() -> Result<NativeHostBridgeConfig, String> {
-    let path = crate::benchmark_profile::config_root()
+    let path = crate::storage_roots::config_root()
         .ok_or_else(|| "Windows did not provide a configuration directory".to_string())?
         .join("native-messaging")
         .join("upstream-host.json");

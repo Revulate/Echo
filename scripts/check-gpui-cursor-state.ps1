@@ -1,3 +1,13 @@
+<#
+.SYNOPSIS
+Compile the GPUI fork's Windows cursor handlers (handle_cursor_changed,
+handle_set_cursor) against stubbed Win32 boundaries and check cursor
+persistence, non-owner isolation, hidden-cursor restoration and resize deferral.
+
+.DESCRIPTION
+Guards gpui-windows-cursor-stability.patch (docs/GPUI_FORK.md). It reads the
+reconstructed fork at -ForkPath (default ../zed-gpui-fork) and opens no window.
+#>
 param([string]$ForkPath = (Join-Path $PSScriptRoot '..\..\zed-gpui-fork'))
 
 $ErrorActionPreference = 'Stop'

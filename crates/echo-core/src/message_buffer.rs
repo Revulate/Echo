@@ -5,6 +5,7 @@
 //!
 use crate::message::ChatMessage;
 use rustc_hash::FxHashMap;
+use std::borrow::Borrow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
@@ -67,6 +68,100 @@ fn prune_message_id(id: &str) {
     }
 }
 
+/// How [`merge_history_by_timestamp`] combined the two row lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryMergeStrategy {
+    /// Every incoming row was already held; `rows` is `existing` unchanged.
+    NoNewRows,
+    /// The batch is entirely older than the held rows and went in front.
+    Prepend,
+    /// The batch is entirely newer than the held rows and went behind.
+    Append,
+    /// The timestamp ranges overlap; the rows were interleaved by timestamp.
+    Interleave,
+}
+
+pub(crate) struct HistoryMerge<T> {
+    pub rows: Vec<T>,
+    pub strategy: HistoryMergeStrategy,
+    /// Incoming rows that were neither already held nor repeated in the batch.
+    pub new_unique: usize,
+}
+
+/// Merge a history batch into rows already held, oldest first.
+///
+/// Incoming rows whose id is already held, or repeats an earlier incoming
+/// row, are dropped. The ordering decision uses the timestamp range of the
+/// whole batch, duplicates included: a batch strictly older than every held
+/// row is prepended, one strictly newer is appended, and anything else is
+/// interleaved by timestamp with held rows winning ties, so `existing` keeps
+/// its own order. The result is not truncated; callers apply their capacity.
+///
+/// `existing` is shared by [`MessageBuffer`] (owned rows) and the chat
+/// snapshot (`Arc` rows); `into_row` converts a kept incoming row into the
+/// caller's row type.
+pub(crate) fn merge_history_by_timestamp<T, U>(
+    existing: Vec<T>,
+    incoming: Vec<U>,
+    into_row: impl FnMut(U) -> T,
+) -> HistoryMerge<T>
+where
+    T: Borrow<ChatMessage>,
+    U: Borrow<ChatMessage>,
+{
+    let existing_earliest = existing.first().map_or(i64::MAX, |m| m.borrow().timestamp);
+    let existing_latest = existing.last().map_or(i64::MIN, |m| m.borrow().timestamp);
+    let incoming_timestamps = || incoming.iter().map(|m| m.borrow().timestamp);
+    let incoming_earliest = incoming_timestamps().min().unwrap_or(i64::MAX);
+    let incoming_latest = incoming_timestamps().max().unwrap_or(i64::MIN);
+
+    let existing_ids: HashSet<&str> = existing.iter().map(|m| m.borrow().id.as_ref()).collect();
+    let mut seen_incoming_ids: HashSet<Arc<str>> = HashSet::new();
+    let mut new_incoming: Vec<T> = incoming
+        .into_iter()
+        .filter(|m| {
+            let id = &m.borrow().id;
+            !existing_ids.contains(id.as_ref()) && seen_incoming_ids.insert(Arc::clone(id))
+        })
+        .map(into_row)
+        .collect();
+    let new_unique = new_incoming.len();
+
+    let (rows, strategy) = if new_incoming.is_empty() {
+        (existing, HistoryMergeStrategy::NoNewRows)
+    } else if incoming_latest < existing_earliest {
+        new_incoming.extend(existing);
+        (new_incoming, HistoryMergeStrategy::Prepend)
+    } else if incoming_earliest > existing_latest {
+        let mut merged = existing;
+        merged.extend(new_incoming);
+        (merged, HistoryMergeStrategy::Append)
+    } else {
+        // Filtering keeps the batch's order, but the API does not promise one.
+        new_incoming.sort_by_key(|m| m.borrow().timestamp);
+        let mut merged = Vec::with_capacity(existing.len() + new_incoming.len());
+        let mut existing = existing.into_iter().peekable();
+        let mut new_incoming = new_incoming.into_iter().peekable();
+        while let (Some(held), Some(added)) = (existing.peek(), new_incoming.peek()) {
+            let next = if held.borrow().timestamp <= added.borrow().timestamp {
+                existing.next()
+            } else {
+                new_incoming.next()
+            };
+            merged.extend(next);
+        }
+        merged.extend(existing);
+        merged.extend(new_incoming);
+        (merged, HistoryMergeStrategy::Interleave)
+    };
+
+    HistoryMerge {
+        rows,
+        strategy,
+        new_unique,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageReconcileAction {
     Keep,
@@ -92,7 +187,7 @@ pub struct MessageBuffer {
     version: u64,
     /// Cached observer snapshot, valid while `version` matches.
     ///
-    /// PERF: observer events (history load, gap fill, retokenize) each need
+    /// Observer events (history load, gap fill, retokenize) each need
     /// a snapshot; the cached `Arc` makes repeat snapshots of an unchanged
     /// buffer free instead of deep-cloning up to 10k `ChatMessage`s per
     /// event. The extra retention is negligible because observers hold the
@@ -104,7 +199,7 @@ pub struct MessageBuffer {
     next_alternate: bool,
     /// How many buffered rows carry each id.
     ///
-    /// PERF: every live PRIVMSG asks whether its id is already buffered (a
+    /// Every live PRIVMSG asks whether its id is already buffered (a
     /// history merge can land the same row first). Without the index that
     /// question walks every resident row and misses almost always. Counts
     /// rather than a set because nothing forbids a caller from pushing the
@@ -241,12 +336,10 @@ impl MessageBuffer {
         self.messages.reserve_exact(target - self.messages.len());
     }
 
-    /// Replace all messages (used when syncing from backend)
-    ///
-    /// PERF: Uses atomic swap instead of clear-then-rebuild to avoid race
-    /// conditions where renders could see an empty buffer mid-replacement.
+    /// Replace all messages (used when syncing from backend), keeping the
+    /// newest `capacity` rows. Ids that drop out are queued for layout-cache
+    /// reclaim.
     pub fn replace_all(&mut self, messages: Vec<ChatMessage>) {
-        // Build new VecDeque first, then swap atomically (no observable empty state)
         let start = if messages.len() > self.capacity {
             messages.len() - self.capacity
         } else {
@@ -267,22 +360,17 @@ impl MessageBuffer {
                 .collect(),
         );
 
-        // Atomic swap - messages is never empty between states
         self.messages = new_messages;
         self.rebuild_id_index();
         self.reassign_alternate_rows();
         self.invalidate_cache();
     }
 
-    /// Merge incoming messages with existing buffer, deduplicating by ID
-    /// This is safer than replace_all when history may race with new messages.
+    /// Merge a history batch into the buffer, deduplicating by id.
     ///
-    /// PERF: Uses O(N) two-pointer merge when possible, falling back to O(N log N)
-    /// sort only when history overlaps with existing messages.
-    ///
-    /// IMPORTANT: We drain FIRST, then build the dedup set. This ensures the dedup set
-    /// matches exactly what we drained, avoiding race conditions where messages could
-    /// arrive between building the ID set and draining.
+    /// Unlike [`Self::replace_all`], rows that arrived live after the history
+    /// request was issued survive the merge. See [`merge_history_by_timestamp`]
+    /// for the ordering rules.
     pub fn merge_history(&mut self, incoming: Vec<ChatMessage>) {
         if incoming.is_empty() {
             return;
@@ -292,15 +380,10 @@ impl MessageBuffer {
     }
 
     fn merge_history_rows(&mut self, incoming: Vec<ChatMessage>) {
-        use std::collections::HashSet;
-
         let incoming_count = incoming.len();
-
-        // Step 1: Drain existing messages FIRST
         let existing: Vec<ChatMessage> = self.messages.drain(..).collect();
         let existing_count = existing.len();
 
-        // Early return: if no existing messages, just use incoming
         if existing.is_empty() {
             let start = incoming_count.saturating_sub(self.capacity);
             self.messages = incoming.into_iter().skip(start).collect();
@@ -314,38 +397,9 @@ impl MessageBuffer {
             return;
         }
 
-        // Get timestamp bounds for fast-path detection
-        let existing_earliest = existing.first().map(|m| m.timestamp).unwrap_or(i64::MAX);
-        let existing_latest = existing.last().map(|m| m.timestamp).unwrap_or(i64::MIN);
-        let incoming_earliest = incoming
-            .iter()
-            .map(|m| m.timestamp)
-            .min()
-            .unwrap_or(i64::MAX);
-        let incoming_latest = incoming
-            .iter()
-            .map(|m| m.timestamp)
-            .max()
-            .unwrap_or(i64::MIN);
-
-        // Build dedup set from existing
-        let existing_ids: HashSet<&str> = existing.iter().map(|m| m.id.as_ref()).collect();
-
-        // Filter incoming to only new messages, also dropping duplicate IDs that
-        // appear more than once within the same incoming payload (Arc<str> clone
-        // is a cheap refcount bump, not an allocation).
-        let mut seen_incoming_ids: HashSet<Arc<str>> = HashSet::new();
-        let new_incoming: Vec<ChatMessage> = incoming
-            .into_iter()
-            .filter(|m| {
-                !existing_ids.contains(m.id.as_ref()) && seen_incoming_ids.insert(m.id.clone())
-            })
-            .collect();
-        let new_from_incoming = new_incoming.len();
-
-        if new_incoming.is_empty() {
-            // All incoming were duplicates, restore existing
-            self.messages = existing.into_iter().collect();
+        let merge = merge_history_by_timestamp(existing, incoming, |message| message);
+        if merge.strategy == HistoryMergeStrategy::NoNewRows {
+            self.messages = merge.rows.into();
             self.invalidate_cache();
             crate::log_irc!(
                 debug,
@@ -356,89 +410,17 @@ impl MessageBuffer {
             return;
         }
 
-        // FAST PATH: History is purely older than existing (most common case)
-        // This is O(N) - just prepend history to existing
-        if incoming_latest < existing_earliest {
-            let mut merged = new_incoming;
-            merged.extend(existing);
-            // Truncate from front to respect capacity
-            let start = merged.len().saturating_sub(self.capacity);
-            self.messages = merged.into_iter().skip(start).collect();
-            self.reassign_alternate_rows();
-            self.invalidate_cache();
-            crate::log_irc!(
-                debug,
-                "merge_history (fast-path prepend): existing={}, new_unique={}, final={}",
-                existing_count,
-                new_from_incoming,
-                self.messages.len()
-            );
-            return;
-        }
-
-        // FAST PATH: History is purely newer than existing (rare but possible)
-        // This is O(N) - just append history to existing
-        if incoming_earliest > existing_latest {
-            let mut merged = existing;
-            merged.extend(new_incoming);
-            // Truncate from front to respect capacity
-            let start = merged.len().saturating_sub(self.capacity);
-            self.messages = merged.into_iter().skip(start).collect();
-            self.reassign_alternate_rows();
-            self.invalidate_cache();
-            crate::log_irc!(
-                debug,
-                "merge_history (fast-path append): existing={}, new_unique={}, final={}",
-                existing_count,
-                new_from_incoming,
-                self.messages.len()
-            );
-            return;
-        }
-
-        // SLOW PATH: Overlapping timestamps - need O(N) two-pointer merge
-        // Both existing and incoming should be mostly sorted, but we sort incoming
-        // to guarantee it (API returns in order, but we filter which may not preserve order)
-        let mut sorted_incoming = new_incoming;
-        sorted_incoming.sort_by_key(|m| m.timestamp);
-
-        // O(N) two-pointer merge
-        let mut merged = Vec::with_capacity(existing.len() + sorted_incoming.len());
-        let mut i = 0; // existing index
-        let mut j = 0; // incoming index
-
-        while i < existing.len() && j < sorted_incoming.len() {
-            if existing[i].timestamp <= sorted_incoming[j].timestamp {
-                merged.push(existing[i].clone());
-                i += 1;
-            } else {
-                merged.push(sorted_incoming[j].clone());
-                j += 1;
-            }
-        }
-
-        // Append remaining from whichever has leftovers
-        while i < existing.len() {
-            merged.push(existing[i].clone());
-            i += 1;
-        }
-        while j < sorted_incoming.len() {
-            merged.push(sorted_incoming[j].clone());
-            j += 1;
-        }
-
-        // Truncate from front to respect capacity
-        let start = merged.len().saturating_sub(self.capacity);
-        self.messages = merged.into_iter().skip(start).collect();
+        let start = merge.rows.len().saturating_sub(self.capacity);
+        self.messages = merge.rows.into_iter().skip(start).collect();
         self.reassign_alternate_rows();
         self.invalidate_cache();
-
         crate::log_irc!(
             debug,
-            "merge_history (two-pointer merge): existing={}, incoming={}, new_unique={}, final={}",
+            "merge_history ({:?}): existing={}, incoming={}, new_unique={}, final={}",
+            merge.strategy,
             existing_count,
             incoming_count,
-            new_from_incoming,
+            merge.new_unique,
             self.messages.len()
         );
     }
@@ -473,7 +455,7 @@ impl MessageBuffer {
 
     /// Get index of message by ID, scanning from the newest end.
     ///
-    /// PERF: Live messages sit at the tail of a buffer that can hold 10k
+    /// Live messages sit at the tail of a buffer that can hold 10k
     /// entries, so the per-live-message retokenize lookup should not walk the
     /// whole history first.
     pub fn rindex_of(&self, id: &str) -> Option<usize> {

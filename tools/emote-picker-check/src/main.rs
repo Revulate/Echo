@@ -1,5 +1,8 @@
-#![allow(dead_code, unused_variables)]
+//! Contract: the emote-picker model in `src/components/overlays/emote_picker/`: tab
+//! sets, page capacity and load-more rows, search ranking and emoji alias
+//! boundaries, favorite/recent/collapsed sections and stability telemetry.
 
+use check_support::{FIXTURE_HEADER, assert_fixture};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -13,12 +16,13 @@ macro_rules! log_perf {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Hsla;
 
+// The picker only stores display strings in this type; the check never reads them.
 #[derive(Clone, Debug, Default)]
-pub struct SharedString(String);
+pub struct SharedString;
 
 impl From<String> for SharedString {
-    fn from(value: String) -> Self {
-        Self(value)
+    fn from(_: String) -> Self {
+        Self
     }
 }
 
@@ -88,8 +92,6 @@ mod backend {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum EmojiStyle {
             Twemoji,
-            Noto,
-            Native,
         }
 
         pub fn get_emoji_style() -> EmojiStyle {
@@ -405,18 +407,19 @@ mod theme {
 }
 
 mod utils {
-    pub use echo_core::fuzzy;
-    pub use echo_core::fuzzy_score;
+    pub use echo_core::fuzzy::fuzzy_score;
 
     pub fn emote_provider_color(_provider: &str) -> crate::Hsla {
         crate::Hsla
     }
 }
 
-#[path = "../../../src/components/overlays/emote_picker_core.rs"]
+#[path = "../../../src/components/overlays/emote_picker/core.rs"]
+#[allow(dead_code)] // the check drives the picker model, not its view helpers
 mod emote_picker_core;
 
-#[path = "../../../src/components/overlays/emote_picker_stability.rs"]
+#[path = "../../../src/components/overlays/emote_picker/stability.rs"]
+#[allow(dead_code)] // only part of the stability telemetry is asserted here
 mod emote_picker_stability;
 
 use backend::{Emote, EmoteProvider};
@@ -440,14 +443,14 @@ enum CapacityRow {
 }
 
 fn main() {
-    println!("kind,name,value,checksum");
+    println!("{FIXTURE_HEADER}");
 
-    print_fixture(
+    assert_fixture(
         "picker_inline_tabs",
         tab_labels(EmoteTab::inline_tabs()),
         "Favorites|Recent|Subs|Channel|Global|Emoji",
     );
-    print_fixture(
+    assert_fixture(
         "picker_popout_tabs",
         tab_labels(EmoteTab::popout_tabs()),
         "Favorites|Recent|Subs|Channel|Global|Emoji",
@@ -457,45 +460,45 @@ fn main() {
 
     let mut picker = EmotePickerCore::new("forsen".to_string());
     picker.load_emotes();
-    print_fixture(
+    assert_fixture(
         "picker_channel_sections",
         header_names(&picker),
         "7TV|BetterTTV|FrankerFaceZ|7TV Personal",
     );
-    print_fixture(
+    assert_fixture(
         "picker_channel_order",
         emote_names(&picker),
         "OMEGALUL|FeelsOkayMan|CatJAM|PersonalWow",
     );
 
     picker.select_tab(EmoteTab::Subs);
-    print_fixture("picker_sub_sections", header_names(&picker), "forsen");
-    print_fixture(
+    assert_fixture("picker_sub_sections", header_names(&picker), "forsen");
+    assert_fixture(
         "picker_sub_excludes_global_like",
         emote_names(&picker),
         "SubWave",
     );
 
     picker.select_tab(EmoteTab::Global);
-    print_fixture(
+    assert_fixture(
         "picker_global_sections",
         header_names(&picker),
         "Twitch|7TV|BetterTTV|FrankerFaceZ|Twitch Prime",
     );
-    print_fixture(
+    assert_fixture(
         "picker_global_includes_event_sub",
         emote_names(&picker),
         "Kappa|PrideWave|GlobalSeven|GlobalBTTV|GlobalFFZ|PrimeSmile",
     );
 
     picker.set_search("omegalul searchable".to_string());
-    print_fixture(
+    assert_fixture(
         "picker_search_original_name",
         emote_names(&picker),
         "OMEGALUL",
     );
     picker.set_search("OMEGA".to_string());
-    print_fixture(
+    assert_fixture(
         "picker_search_dedup",
         picker
             .flat_emotes
@@ -522,12 +525,12 @@ fn main() {
         height: Some(100),
     };
     let (cell_w, cell_h, image_w, image_h) = calculate_emote_dimensions(&wide);
-    print_fixture(
+    assert_fixture(
         "picker_display_url_matches_native_density",
         picker_display_url(&wide),
         "https://cdn/wide/1x",
     );
-    print_fixture(
+    assert_fixture(
         "picker_wide_preview_preserves_ratio",
         format!("{cell_w:.0}x{cell_h:.0}:{image_w:.0}x{image_h:.0}"),
         "194x56:184x18",
@@ -538,12 +541,12 @@ fn main() {
         height: Some(14),
         ..wide.clone()
     };
-    print_fixture(
+    assert_fixture(
         "picker_respects_explicit_2x_ceiling",
         picker_display_url(&small_native),
         "https://cdn/wide/2x",
     );
-    print_fixture(
+    assert_fixture(
         "picker_tooltip_scope",
         picker_tooltip_text(&wide),
         "Wide - 7TV - Channel forsen",
@@ -553,7 +556,7 @@ fn main() {
         original_name: Some("Wide".into()),
         ..wide.clone()
     };
-    print_fixture(
+    assert_fixture(
         "picker_tooltip_uses_channel_alias",
         picker_tooltip_text(&aliased),
         "ChannelWide - 7TV - Channel forsen",
@@ -563,7 +566,7 @@ fn main() {
         channel: Some("other_channel".into()),
         ..aliased.clone()
     };
-    print_fixture(
+    assert_fixture(
         "picker_tooltip_keeps_same_emote_channel_names_distinct",
         picker_tooltip_text(&other_channel_alias),
         "OtherWide - 7TV - Channel other_channel",
@@ -603,8 +606,8 @@ fn main() {
         |_, _| (),
         |_, _| (),
     );
-    print_fixture("picker_packed_navigation_shown", shown.to_string(), "5");
-    print_fixture(
+    assert_fixture("picker_packed_navigation_shown", shown.to_string(), "5");
+    assert_fixture(
         "picker_packed_navigation_visual_down",
         navigation
             .vertical_neighbor(1, 1)
@@ -612,7 +615,7 @@ fn main() {
             .to_string(),
         "3",
     );
-    print_fixture(
+    assert_fixture(
         "picker_packed_navigation_virtual_row",
         navigation
             .virtual_row_for_index(3)
@@ -625,7 +628,7 @@ fn main() {
     refreshed_fallback.id = Arc::from("");
     let fallback_identity = emote_selection_identity_key(&refreshed_fallback);
     refreshed_fallback.url = Arc::from("https://cdn/wide/refreshed");
-    print_fixture(
+    assert_fixture(
         "picker_selection_identity_survives_url_refresh",
         (fallback_identity == emote_selection_identity_key(&refreshed_fallback)).to_string(),
         "true",
@@ -641,29 +644,29 @@ fn main() {
         .clone();
     prefs_picker.toggle_favorite(&omega);
     prefs_picker.select_tab(EmoteTab::Favorites);
-    print_fixture(
+    assert_fixture(
         "picker_favorites_section",
         header_names(&prefs_picker),
         "Favorites",
     );
-    print_fixture(
+    assert_fixture(
         "picker_favorites_toggle",
         emote_names(&prefs_picker),
         "OMEGALUL",
     );
-    print_fixture(
+    assert_fixture(
         "picker_favorite_cache",
         prefs_picker.is_favorite(&omega).to_string(),
         "true",
     );
 
     prefs_picker.select_tab(EmoteTab::Recent);
-    print_fixture(
+    assert_fixture(
         "picker_recent_section",
         header_names(&prefs_picker),
         "Recently Used",
     );
-    print_fixture(
+    assert_fixture(
         "picker_recent_provider_match",
         emote_names(&prefs_picker),
         "OMEGALUL",
@@ -671,7 +674,7 @@ fn main() {
 
     prefs_picker.select_tab(EmoteTab::Channel);
     prefs_picker.toggle_category("SevenTV-channel");
-    print_fixture(
+    assert_fixture(
         "picker_collapsed_channel_section",
         emote_names(&prefs_picker),
         "FeelsOkayMan|CatJAM|PersonalWow",
@@ -679,11 +682,12 @@ fn main() {
 }
 
 fn check_emoji_search_alias_boundaries() {
-    // This is the pre-fix aggregate alias for 🤟. Fuzzy matching can form
-    // "revu" only by crossing from its display name to its shortcode.
+    // Joined into one string, the display name and shortcode of 🤟 fuzzy-match
+    // "revu" only across the alias boundary; the index must score each alias
+    // on its own.
     assert!(
         utils::fuzzy_score("revu", "love-you gesture love_you_gesture").is_some(),
-        "the regression fixture must reproduce the old cross-alias fuzzy match"
+        "the joined aliases must fuzzy-match across the boundary for this fixture to mean anything"
     );
     let emoji = Arc::new(Emote {
         id: "emoji:love_you_gesture:🤟".into(),
@@ -701,12 +705,12 @@ fn check_emoji_search_alias_boundaries() {
     });
     let index = EmoteSearchIndex::new("", [emoji]);
 
-    print_fixture(
+    assert_fixture(
         "picker_emoji_alias_boundary_rejects_cross_alias_fuzzy_match",
         index.rank("revu").is_empty().to_string(),
         "true",
     );
-    print_fixture(
+    assert_fixture(
         "picker_emoji_shortcode_search",
         index
             .rank("love_you")
@@ -715,7 +719,7 @@ fn check_emoji_search_alias_boundaries() {
             .unwrap_or_default(),
         "🤟",
     );
-    print_fixture(
+    assert_fixture(
         "picker_emoji_shortcode_is_inline_tab_prefix_match",
         index
             .rank("love_you")
@@ -743,7 +747,7 @@ fn check_picker_stability_telemetry() {
         record_animated_frame(1, 2 + (pass % 2) as u16);
     }
     let stable = finish_stationary_window().expect("stable picker telemetry window");
-    print_fixture(
+    assert_fixture(
         "picker_stationary_render_stability",
         format!(
             "stable={}:ranges={}:cells={}/{}:animations={}/{}:transitions={}:regressions={}:post_rendered_placeholders={}",
@@ -785,7 +789,7 @@ fn check_picker_stability_telemetry() {
     record_animated_frame(0, 1);
     record_animated_frame(1, 2);
     let churn = finish_stationary_window().expect("churning picker telemetry window");
-    print_fixture(
+    assert_fixture(
         "picker_stationary_churn_rejected",
         format!(
             "stable={}:regressions={}:post_rendered_placeholders={}",
@@ -809,7 +813,7 @@ fn check_picker_stability_telemetry() {
         record_animated_frame(1, 2 + (pass % 2) as u16);
     }
     let moved = finish_stationary_window().expect("moving picker telemetry window");
-    print_fixture(
+    assert_fixture(
         "picker_stationary_range_change_rejected",
         format!(
             "stable={}:range_changes={}",
@@ -828,7 +832,7 @@ fn check_picker_stability_telemetry() {
         record_animated_frame(1, 2 + (pass % 2) as u16);
     }
     let incomplete = finish_stationary_window().expect("incomplete picker telemetry window");
-    print_fixture(
+    assert_fixture(
         "picker_stationary_incomplete_viewport_rejected",
         format!(
             "stable={}:cells={}/{}",
@@ -849,7 +853,7 @@ fn check_picker_stability_telemetry() {
         record_animated_frame(1, 0);
     }
     let frozen = finish_stationary_window().expect("frozen picker animation telemetry window");
-    print_fixture(
+    assert_fixture(
         "picker_stationary_frozen_animation_rejected",
         format!(
             "stable={}:animations={}/{}:transitions={}",
@@ -881,7 +885,7 @@ fn check_picker_stability_telemetry() {
     }
     let source_switch =
         finish_stationary_window().expect("source-switching picker telemetry window");
-    print_fixture(
+    assert_fixture(
         "picker_stationary_source_switch_rejected",
         format!(
             "continuous={}:switches={}:min_transitions={}",
@@ -899,13 +903,13 @@ fn check_picker_capacity() {
 
     let original_limit = std::env::var_os("ECHO_PICKER_PAGE_EMOTE_LIMIT");
     set_picker_page_emote_limit_for_check(None);
-    print_fixture(
+    assert_fixture(
         "picker_default_page_capacity",
         picker_page_emote_limit().to_string(),
         "10000",
     );
     set_picker_page_emote_limit_for_check(Some(std::ffi::OsStr::new("999999")));
-    print_fixture(
+    assert_fixture(
         "picker_page_capacity_override_clamped",
         picker_page_emote_limit().to_string(),
         "50000",
@@ -930,12 +934,12 @@ fn check_picker_capacity() {
         .iter()
         .filter(|row| matches!(row, CapacityRow::LoadMore { .. }))
         .count();
-    print_fixture(
+    assert_fixture(
         "picker_large_catalog_catalog_fully_visible",
         format!("{large_shown}/{large_total}:load_more={large_load_more_rows}"),
         "4500/4500:load_more=0",
     );
-    print_fixture(
+    assert_fixture(
         "picker_large_catalog_last_emote_navigable",
         large_navigation
             .virtual_row_for_index(LARGE_CATALOG_EMOTE_COUNT - 1)
@@ -963,7 +967,7 @@ fn check_picker_capacity() {
             CapacityRow::Section | CapacityRow::Emotes => None,
         })
         .collect::<Vec<_>>();
-    print_fixture(
+    assert_fixture(
         "picker_exceptional_catalog_retains_load_more",
         format!("{over_limit_shown}/{over_limit_total}:load_more={load_more_rows:?}"),
         "10000/10137:load_more=[(10000, 10137)]",
@@ -1047,14 +1051,4 @@ fn emote_names(picker: &EmotePickerCore) -> String {
         .map(|emote| emote.name.as_ref())
         .collect::<Vec<_>>()
         .join("|")
-}
-
-fn print_fixture(name: &str, actual: impl AsRef<str>, expected: &str) {
-    let actual = actual.as_ref();
-    assert_eq!(actual, expected, "fixture mismatch for {name}");
-    println!("fixture,{name},{actual},{}", checksum(actual));
-}
-
-fn checksum(value: &str) -> usize {
-    value.bytes().map(usize::from).sum()
 }

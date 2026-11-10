@@ -370,18 +370,19 @@ fn render_feed_item(index: usize, item: ActivityFeedItem, can_compose_whisper: b
             let jump_channel = channel.clone();
             let dismiss_channel = channel.clone();
             let dismiss_message_id = message_id.clone();
-            feed_row(
-                format!("activity-all-mention-{index}"),
-                "Mention",
-                colors::mention_border(),
-                sender,
-                sender_color,
-                visible_channel,
+            FeedRow {
+                id: format!("activity-all-mention-{index}"),
+                source: "Mention",
+                source_color: colors::mention_border(),
+                title: sender,
+                title_color: sender_color,
+                context: visible_channel,
                 preview,
                 timestamp,
-                None,
+                status: None,
                 copy_text,
-            )
+            }
+            .render()
             .on_activate(move |_event, _window, _cx| {
                 backend::push_ui_action(backend::UiAction::JumpToMessage {
                     channel: jump_channel.clone(),
@@ -417,18 +418,19 @@ fn render_feed_item(index: usize, item: ActivityFeedItem, can_compose_whisper: b
             let username_for_action = username.clone();
             let username_for_mark_read = username.clone();
             let unread_label = (unread > 0).then(|| format!("{unread} unread"));
-            feed_row(
-                format!("activity-all-whisper-{index}"),
-                "Whisper",
-                colors::whisper_border(),
-                visible_username,
-                colors::text_primary(),
-                "Direct message".to_string(),
+            FeedRow {
+                id: format!("activity-all-whisper-{index}"),
+                source: "Whisper",
+                source_color: colors::whisper_border(),
+                title: visible_username,
+                title_color: colors::text_primary(),
+                context: "Direct message".to_string(),
                 preview,
                 timestamp,
-                unread_label,
+                status: unread_label,
                 copy_text,
-            )
+            }
+            .render()
             .on_activate(move |_event, _window, _cx| {
                 if can_compose_whisper {
                     backend::push_ui_action(backend::UiAction::ComposeWhisper {
@@ -438,7 +440,8 @@ fn render_feed_item(index: usize, item: ActivityFeedItem, can_compose_whisper: b
                 } else {
                     backend::push_ui_action(backend::UiAction::ShowWarningToast {
                         message: "Whisper reply unavailable".to_string(),
-                        detail: backend::bridge::get_whisper_compose_block_reason(),
+                        detail: backend::bridge::get_whisper_compose_block_reason()
+                            .map(|block| block.to_string()),
                     });
                 }
             })
@@ -464,18 +467,19 @@ fn render_feed_item(index: usize, item: ActivityFeedItem, can_compose_whisper: b
         } => {
             let copy_text = super::format_activity_copy_text("Event", &title, &channel, &preview);
             let event_timestamp = timestamp;
-            feed_row(
-                format!("activity-all-event-{index}"),
-                "Event",
-                colors::info(),
+            FeedRow {
+                id: format!("activity-all-event-{index}"),
+                source: "Event",
+                source_color: colors::info(),
                 title,
-                colors::text_primary(),
-                channel,
+                title_color: colors::text_primary(),
+                context: channel,
                 preview,
                 timestamp,
-                None,
+                status: None,
                 copy_text,
-            )
+            }
+            .render()
             .on_activate(move |_event, _window, _cx| {
                 backend::push_ui_action(backend::UiAction::OpenNotifications {
                     filter: backend::ui_actions::NotificationFilter::All,
@@ -495,8 +499,10 @@ fn render_feed_item(index: usize, item: ActivityFeedItem, can_compose_whisper: b
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn feed_row(
+/// One row of the combined activity feed: a source pill and title, a
+/// timestamp, a context line with an optional status pill, a preview and a
+/// copy action.
+struct FeedRow {
     id: String,
     source: &'static str,
     source_color: Hsla,
@@ -507,118 +513,134 @@ fn feed_row(
     timestamp: i64,
     status: Option<String>,
     copy_text: String,
-) -> Stateful<Div> {
-    let timestamp = format_sidebar_timestamp(timestamp);
-    let copy_action_id = format!("{id}-copy");
+}
 
-    div()
-        .id(SharedString::from(id))
-        .relative()
-        .w_full()
-        .px_3()
-        .py_2()
-        .pr(px(Spacing::XXXL + Spacing::XS))
-        .cursor_pointer()
-        .border_b_1()
-        .border_color(colors::border())
-        .hover(|style| style.bg(colors::bg_hover()))
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .min_w_0()
-                                .child(
+impl FeedRow {
+    fn render(self) -> Stateful<Div> {
+        let FeedRow {
+            id,
+            source,
+            source_color,
+            title,
+            title_color,
+            context,
+            preview,
+            timestamp,
+            status,
+            copy_text,
+        } = self;
+        let timestamp = format_sidebar_timestamp(timestamp);
+        let copy_action_id = format!("{id}-copy");
+
+        div()
+            .id(SharedString::from(id))
+            .relative()
+            .w_full()
+            .px_3()
+            .py_2()
+            .pr(px(Spacing::XXXL + Spacing::XS))
+            .cursor_pointer()
+            .border_b_1()
+            .border_color(colors::border())
+            .hover(|style| style.bg(colors::bg_hover()))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1p5()
+                                            .h(px(18.0))
+                                            .rounded(Radii::sm())
+                                            .bg(source_color.opacity(0.12))
+                                            .flex()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_size(px(FontSize::XS))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(source_color)
+                                                    .child(source),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(title_color)
+                                            .child(title),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(colors::text_muted())
+                                    .child(timestamp),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(colors::text_muted())
+                                    .child(context),
+                            )
+                            .when_some(status, |row, status| {
+                                row.child(
                                     div()
                                         .flex_shrink_0()
                                         .px_1p5()
-                                        .h(px(18.0))
-                                        .rounded(Radii::sm())
-                                        .bg(source_color.opacity(0.12))
-                                        .flex()
-                                        .items_center()
+                                        .rounded(Radii::full())
+                                        .bg(colors::accent().opacity(0.14))
                                         .child(
                                             div()
                                                 .text_size(px(FontSize::XS))
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(source_color)
-                                                .child(source),
+                                                .text_color(colors::accent_text())
+                                                .child(status),
                                         ),
                                 )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(title_color)
-                                        .child(title),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(colors::text_muted())
-                                .child(timestamp),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(colors::text_muted())
-                                .child(context),
-                        )
-                        .when_some(status, |row, status| {
-                            row.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .px_1p5()
-                                    .rounded(Radii::full())
-                                    .bg(colors::accent().opacity(0.14))
-                                    .child(
-                                        div()
-                                            .text_size(px(FontSize::XS))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(colors::accent_text())
-                                            .child(status),
-                                    ),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .text_sm()
-                        .text_color(colors::text_secondary())
-                        .child(preview),
-                )
-                .child(div().pt_1().child(super::render_activity_copy_action(
-                    copy_action_id,
-                    copy_text,
-                ))),
-        )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_sm()
+                            .text_color(colors::text_secondary())
+                            .child(preview),
+                    )
+                    .child(div().pt_1().child(super::render_activity_copy_action(
+                        copy_action_id,
+                        copy_text,
+                    ))),
+            )
+    }
 }
 
 fn dismiss_button(

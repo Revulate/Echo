@@ -1,7 +1,7 @@
-//! App-owned cache service facade.
+//! Startup and shutdown of the media cache runtime.
 //!
-//! The loader still exposes compatibility functions for hot-path callers, but lifecycle,
-//! metrics, reset, and shutdown entry points are centralized here.
+//! The GPUI entity loads persisted warming priorities and native sizes, then
+//! initializes the loader; everything else goes through `cache::loader`.
 
 use gpui::{Context, Task};
 

@@ -1,11 +1,10 @@
 //! Settings navigation hierarchy.
 //!
-//! Single source of truth for the three-level settings tree:
+//! Single source of truth for the two-level settings tree:
 //!
 //! ```text
-//! Category
-//! └── Page (SettingsSectionId)
-//!     └── Subsection scroll anchor (SettingsSubsectionId)
+//! Page (SettingsSectionId): seven pages plus Advanced, in sidebar order
+//! └── Subsection scroll anchor (SettingsSubsectionId)
 //! ```
 //!
 //! Individual settings are flat search results; browsing retains the tree.
@@ -49,11 +48,11 @@ use crate::backend::settings::{PersistedSettingsLocation, SettingsNavigationPref
 
 /// Page identifiers.
 ///
-/// NOTE: variants are stable IDs (state stores the selected page by ID, not
-/// index). Several older standalone pages (Embeds, Uploader, Proxy, Logging,
-/// Debug, Similarity) were merged into Links & Media / Developer Tools /
-/// Filters and no longer have their own destination; their old slugs survive
-/// in [`LEGACY_SLUGS`].
+/// Eight variants are pages (see [`canonical_section`]); `Sounds`, `Updates`,
+/// `Emotes`, `Filters`, `Nicknames`, `Commands` and `Privacy` name retired
+/// pages that callers may still request and that always resolve to the page
+/// that now holds their controls. Persistence is slug-keyed, so variant names
+/// never reach disk; retired slugs live in [`LEGACY_SLUGS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum SettingsSectionId {
     #[default]
@@ -72,17 +71,6 @@ pub enum SettingsSectionId {
     Connections,
     Privacy,
     Advanced,
-}
-
-/// Top-level tree categories. Categories are expansion containers, never
-/// content destinations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SettingsCategoryId {
-    General,
-    Chat,
-    Tools,
-    MediaPrivacy,
-    Developer,
 }
 
 /// Stable subsection (scroll anchor) identifiers.
@@ -152,29 +140,6 @@ pub enum SettingsSubsectionId {
     Configuration,
 }
 
-/// Disclosure rule for a category.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub enum SettingsVisibility {
-    /// Always part of the tree.
-    #[default]
-    Always,
-    /// Only present while developer mode (or the benchmark override) is on.
-    DeveloperOnly,
-}
-
-impl SettingsVisibility {
-    pub const fn is_visible(self, developer_visible: bool) -> bool {
-        match self {
-            Self::Always => true,
-            Self::DeveloperOnly => developer_visible,
-        }
-    }
-
-    pub const fn is_developer_only(self) -> bool {
-        matches!(self, Self::DeveloperOnly)
-    }
-}
-
 /// A resolved content destination: a page plus an optional scroll anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SettingsLocation {
@@ -220,9 +185,7 @@ impl SettingsLocation {
     }
 
     pub fn is_visible(self, developer_visible: bool) -> bool {
-        let location = canonical_location(self);
-        section_visibility(location.section).is_visible(developer_visible)
-            && (developer_visible || !location.is_developer_only())
+        developer_visible || !canonical_location(self).is_developer_only()
     }
 
     /// Slug pair written to disk. Locations are persisted by slug so renaming a
@@ -253,9 +216,8 @@ impl SettingsLocation {
     }
 }
 
-/// Stable destinations used by the flat settings sidebar. Older section IDs
-/// remain part of the public enum because locations are persisted and callers
-/// still use them, but always resolve to one of these eight pages.
+/// The page that owns `id`: itself for the eight sidebar pages, the merged
+/// destination for a retired page id.
 pub const fn canonical_section(id: SettingsSectionId) -> SettingsSectionId {
     match id {
         SettingsSectionId::General
@@ -274,9 +236,9 @@ pub const fn canonical_section(id: SettingsSectionId) -> SettingsSectionId {
     }
 }
 
-/// Canonicalize legacy page IDs and resolve every anchor by its global owner.
-/// This makes persisted page/anchor pairs and explicit open requests survive
-/// the flat-page migration even when the old pair no longer belongs together.
+/// Canonicalize retired page IDs and resolve every anchor by its global owner,
+/// so persisted page/anchor pairs and explicit open requests still land even
+/// when the requested pair no longer belongs together.
 pub fn canonical_location(location: SettingsLocation) -> SettingsLocation {
     let subsection = location
         .subsection
@@ -318,6 +280,10 @@ const fn canonical_subsection(id: SettingsSubsectionId) -> SettingsSubsectionId 
     }
 }
 
+/// Where an open request for a retired page id lands: the anchor that page
+/// opened on before it was merged. Compare [`LEGACY_PAGE_DEFAULT_ANCHORS`],
+/// which answers a different question (which current anchor inherits the
+/// retired page's search keywords) and so may name a different anchor.
 const fn legacy_default_subsection(section: SettingsSectionId) -> Option<SettingsSubsectionId> {
     match section {
         SettingsSectionId::Sounds => Some(SettingsSubsectionId::Sounds),
@@ -331,9 +297,9 @@ const fn legacy_default_subsection(section: SettingsSectionId) -> Option<Setting
     }
 }
 
-/// The original anchor requested by a caller before the flat page migration
-/// maps it to a visible block. Its disclosure chain is needed for legacy page
-/// requests such as `Nicknames`, whose default is now a summary row.
+/// The anchor a caller asked for, before [`canonical_location`] maps it to the
+/// visible block. Its disclosure chain is needed for retired page requests such
+/// as `Nicknames`, whose default is now a summary row.
 pub fn requested_anchor(location: SettingsLocation) -> Option<SettingsLocation> {
     match location.subsection {
         Some(_) => Some(location),
@@ -454,27 +420,6 @@ impl SettingsSectionDescriptor {
     }
 }
 
-/// One tree category. Categories carry no content of their own.
-#[derive(Clone, Copy, Debug)]
-pub struct SettingsCategoryDescriptor {
-    pub id: SettingsCategoryId,
-    pub slug: &'static str,
-    pub label: &'static str,
-    pub sections: &'static [SettingsSectionId],
-    pub visibility: SettingsVisibility,
-}
-
-impl SettingsCategoryDescriptor {
-    /// Page descriptors in declaration order.
-    pub fn section_descriptors(
-        &self,
-    ) -> impl Iterator<Item = &'static SettingsSectionDescriptor> + '_ {
-        self.sections
-            .iter()
-            .filter_map(|id| section_descriptor(*id))
-    }
-}
-
 /// Legacy slug -> location mapping for slugs that target a specific anchor.
 #[derive(Clone, Copy, Debug)]
 pub struct LegacySlugMapping {
@@ -483,28 +428,244 @@ pub struct LegacySlugMapping {
     pub subsection: Option<SettingsSubsectionId>,
 }
 
-/// Back-compat aliases so existing call sites keep compiling while the tree
-/// shell is built out. `SettingsSection` was the flat pre-tree descriptor and
-/// has the same `id`/`label`/`icon`/`keywords` shape.
-pub type SettingsSection = SettingsSectionDescriptor;
+// Search keywords shared by a current anchor and the retired-layout anchor
+// it replaced. Naming them keeps the two tables in step: reordering a legacy
+// table cannot change what the current anchor matches.
 
-const APPEARANCE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const THEME_COLORS_KEYWORDS: &[&str] = &[
+    "live preview",
+    "theme",
+    "accent color",
+    "dark",
+    "light",
+    "midnight",
+    "oled",
+    "custom theme",
+    "theme file",
+    "palette",
+];
+
+const TABS_SIZING_KEYWORDS: &[&str] = &[
+    "tab style",
+    "tab overflow",
+    "unread indicator",
+    "sizing",
+    "font scale",
+    "text size",
+    "emote size",
+    "image quality",
+    "density",
+];
+
+const WINDOWS_OVERLAY_KEYWORDS: &[&str] = &[
+    "settings window",
+    "popout",
+    "window",
+    "always on top",
+    "transparent",
+    "overlay",
+    "click through",
+    "ghost mode",
+    "opacity",
+    "idle fade",
+];
+
+const INPUT_COMPOSING_KEYWORDS: &[&str] = &[
+    "input",
+    "send button",
+    "character counter",
+    "tab completion",
+    "username completion",
+    "mention comma",
+    "unified input",
+    "spell check",
+];
+
+const SLASH_COMMANDS_KEYWORDS: &[&str] = &[
+    "slash command",
+    "autocomplete",
+    "description",
+    "built in command",
+];
+
+const CUSTOM_COMMANDS_KEYWORDS: &[&str] = &[
+    "custom command",
+    "trigger",
+    "alias",
+    "placeholder",
+    "response",
+    "import",
+    "export",
+];
+
+const NETWORK_PROXY_KEYWORDS: &[&str] = &[
+    "proxy",
+    "proxy mode",
+    "manual proxy url",
+    "network",
+    "http",
+    "socks",
+];
+
+const CHAT_LOGGING_KEYWORDS: &[&str] = &[
+    "log content",
+    "readable channel logs",
+    "deleted message display",
+    "deleted message limit",
+    "logging",
+    "log file",
+];
+
+const HISTORY_CLEANUP_KEYWORDS: &[&str] = &[
+    "message history",
+    "cleanup",
+    "retention",
+    "latest history file",
+    "directory",
+];
+
+const DIAGNOSTICS_KEYWORDS: &[&str] = &[
+    "diagnostics",
+    "debug",
+    "frame rate",
+    "runtime liveness",
+    "7tv eventapi",
+    "message performance",
+    "emote loading",
+    "memory usage",
+    "metrics",
+];
+
+const CONFIGURATION_KEYWORDS: &[&str] = &[
+    "configuration",
+    "settings file",
+    "import",
+    "export",
+    "reset",
+    "backup",
+];
+
+const EMOTES_DISPLAY_KEYWORDS: &[&str] = &[
+    "emoji style",
+    "twemoji",
+    "noto",
+    "native emoji",
+    "emote spacing",
+    "zero width",
+    "overlay emote",
+];
+
+const FILTER_RULES_KEYWORDS: &[&str] =
+    &["filter", "rule", "expression", "regex", "hide", "replace"];
+
+const BLOCKED_USERS_KEYWORDS: &[&str] = &["block", "blocked user", "unblock", "allow"];
+
+const SIMILAR_MESSAGES_KEYWORDS: &[&str] = &[
+    "chat",
+    "spam",
+    "duplicate",
+    "similar",
+    "similarity",
+    "threshold",
+    "repeated",
+    "detection",
+];
+
+const HIGHLIGHTS_PREVIEW_COLORS_KEYWORDS: &[&str] = &[
+    "live preview",
+    "message highlights",
+    "quick presets",
+    "color",
+    "mention color",
+    "whisper color",
+    "subscription color",
+    "first message",
+];
+
+const HIGHLIGHTS_BEHAVIOR_KEYWORDS: &[&str] = &[
+    "self messages",
+    "own messages",
+    "elevated",
+    "hype chat",
+    "reply thread",
+    "mention behavior",
+    "flash",
+    "title",
+];
+
+const HIGHLIGHTS_CUSTOM_RULES_KEYWORDS: &[&str] = &[
+    "custom highlight",
+    "phrase",
+    "regex",
+    "ignored users",
+    "blacklist",
+    "badge highlight",
+    "test highlights",
+];
+
+const USER_CARD_KEYWORDS: &[&str] = &[
+    "user card",
+    "usercard",
+    "pronouns",
+    "follow date",
+    "follower count",
+    "fields",
+];
+
+const MODERATION_BUTTONS_KEYWORDS: &[&str] = &[
+    "moderation button",
+    "timeout",
+    "ban",
+    "delete",
+    "destructive",
+];
+
+const SOUNDS_KEYWORDS: &[&str] = &[
+    "sound events",
+    "audio",
+    "volume",
+    "highlight sound",
+    "ping",
+    "custom sound",
+];
+
+const DESKTOP_NOTIFICATIONS_KEYWORDS: &[&str] =
+    &["desktop notification", "toast", "system notification"];
+
+const MUTED_CHANNELS_KEYWORDS: &[&str] = &["mute", "muted channel", "silence", "highlight sound"];
+
+const DATA_MANAGEMENT_KEYWORDS: &[&str] =
+    &["data", "cache", "clear message cache", "reset", "storage"];
+
+const ACCOUNT_KEYWORDS: &[&str] = &[
+    "account",
+    "login",
+    "logout",
+    "anonymous",
+    "profile",
+    "twitch",
+    "switch account",
+    "remove account",
+    "reauthenticate",
+    "current account",
+    "all accounts",
+];
+
+// Subsection tables of the retired page layout, one per former page.
+//
+// They are aliases, not destinations: `resolve_slug_path` resolves persisted
+// `page/anchor` slug pairs through them, search ranks their labels and keywords
+// for the anchor that now owns them (`subsection_search_rank`), and
+// `search_reveal_location` uses their ids to open the disclosure that now holds
+// a former anchor's controls. Tests pin that every keyword here still reaches
+// its current anchor.
+
+const LEGACY_APPEARANCE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ThemeColors,
         slug: "theme-colors",
         label: "Theme & colors",
-        keywords: &[
-            "live preview",
-            "theme",
-            "accent color",
-            "dark",
-            "light",
-            "midnight",
-            "oled",
-            "custom theme",
-            "theme file",
-            "palette",
-        ],
+        keywords: THEME_COLORS_KEYWORDS,
         settings: APPEARANCE_THEME_COLORS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -529,59 +690,31 @@ const APPEARANCE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::TabsSizing,
         slug: "tabs-sizing",
         label: "Tabs & sizing",
-        keywords: &[
-            "tab style",
-            "tab overflow",
-            "unread indicator",
-            "sizing",
-            "font scale",
-            "text size",
-            "emote size",
-            "image quality",
-            "density",
-        ],
+        keywords: TABS_SIZING_KEYWORDS,
         settings: APPEARANCE_TABS_SIZING_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::WindowsOverlay,
         slug: "windows-overlay",
         label: "Windows & overlay",
-        keywords: &[
-            "settings window",
-            "popout",
-            "window",
-            "always on top",
-            "transparent",
-            "overlay",
-            "click through",
-            "ghost mode",
-            "opacity",
-            "idle fade",
-        ],
+        keywords: WINDOWS_OVERLAY_KEYWORDS,
         settings: APPEARANCE_WINDOWS_OVERLAY_SETTINGS,
     },
 ];
 
-const NOTIFICATIONS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_NOTIFICATIONS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::Sounds,
         slug: "sounds",
         label: "Sounds",
-        keywords: &[
-            "sound events",
-            "audio",
-            "volume",
-            "highlight sound",
-            "ping",
-            "custom sound",
-        ],
+        keywords: SOUNDS_KEYWORDS,
         settings: NOTIFICATIONS_SOUNDS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::DesktopNotifications,
         slug: "desktop-notifications",
         label: "Desktop notifications",
-        keywords: &["desktop notification", "toast", "system notification"],
+        keywords: DESKTOP_NOTIFICATIONS_KEYWORDS,
         settings: NOTIFICATIONS_DESKTOP_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -601,12 +734,12 @@ const NOTIFICATIONS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::MutedChannels,
         slug: "muted-channels",
         label: "Muted channels",
-        keywords: &["mute", "muted channel", "silence", "highlight sound"],
+        keywords: MUTED_CHANNELS_KEYWORDS,
         settings: NOTIFICATIONS_MUTED_SETTINGS,
     },
 ];
 
-const UPDATES_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_UPDATES_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::UpdateChecks,
         slug: "update-checks",
@@ -632,21 +765,12 @@ const UPDATES_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::InputComposing,
         slug: "input-composing",
         label: "Input & composing",
-        keywords: &[
-            "input",
-            "send button",
-            "character counter",
-            "tab completion",
-            "username completion",
-            "mention comma",
-            "unified input",
-            "spell check",
-        ],
+        keywords: INPUT_COMPOSING_KEYWORDS,
         settings: CHAT_INPUT_COMPOSING_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -687,20 +811,12 @@ const CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const EMOTES_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_EMOTES_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::EmotesDisplay,
         slug: "display",
         label: "Display",
-        keywords: &[
-            "emoji style",
-            "twemoji",
-            "noto",
-            "native emoji",
-            "emote spacing",
-            "zero width",
-            "overlay emote",
-        ],
+        keywords: EMOTES_DISPLAY_KEYWORDS,
         settings: EMOTES_DISPLAY_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -733,145 +849,84 @@ const EMOTES_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const HIGHLIGHTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_HIGHLIGHTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HighlightsPreviewColors,
         slug: "preview-colors",
         label: "Preview & colors",
-        keywords: &[
-            "live preview",
-            "message highlights",
-            "quick presets",
-            "color",
-            "mention color",
-            "whisper color",
-            "subscription color",
-            "first message",
-        ],
+        keywords: HIGHLIGHTS_PREVIEW_COLORS_KEYWORDS,
         settings: HIGHLIGHTS_PREVIEW_COLORS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HighlightsBehavior,
         slug: "behavior",
         label: "Behavior",
-        keywords: &[
-            "self messages",
-            "own messages",
-            "elevated",
-            "hype chat",
-            "reply thread",
-            "mention behavior",
-            "flash",
-            "title",
-        ],
+        keywords: HIGHLIGHTS_BEHAVIOR_KEYWORDS,
         settings: HIGHLIGHTS_BEHAVIOR_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HighlightsCustomRules,
         slug: "custom-rules",
         label: "Custom rules",
-        keywords: &[
-            "custom highlight",
-            "phrase",
-            "regex",
-            "ignored users",
-            "blacklist",
-            "badge highlight",
-            "test highlights",
-        ],
+        keywords: HIGHLIGHTS_CUSTOM_RULES_KEYWORDS,
         settings: HIGHLIGHTS_CUSTOM_RULES_SETTINGS,
     },
 ];
 
-const FILTERS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_FILTERS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::FilterRules,
         slug: "filter-rules",
         label: "Filter rules",
-        keywords: &["filter", "rule", "expression", "regex", "hide", "replace"],
+        keywords: FILTER_RULES_KEYWORDS,
         settings: FILTERS_RULES_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::BlockedUsers,
         slug: "blocked-users",
         label: "Blocked users",
-        keywords: &["block", "blocked user", "unblock", "allow"],
+        keywords: BLOCKED_USERS_KEYWORDS,
         settings: FILTERS_BLOCKED_USERS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::SimilarMessages,
         slug: "similar-messages",
         label: "Similar messages",
-        keywords: &[
-            "chat",
-            "spam",
-            "duplicate",
-            "similar",
-            "similarity",
-            "threshold",
-            "repeated",
-            "detection",
-        ],
+        keywords: SIMILAR_MESSAGES_KEYWORDS,
         settings: FILTERS_SIMILAR_MESSAGES_SETTINGS,
     },
 ];
 
-const COMMANDS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_COMMANDS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::SlashCommands,
         slug: "slash-commands",
         label: "Slash commands",
-        keywords: &[
-            "slash command",
-            "autocomplete",
-            "description",
-            "built in command",
-        ],
+        keywords: SLASH_COMMANDS_KEYWORDS,
         settings: COMMANDS_SLASH_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::CustomCommands,
         slug: "custom-commands",
         label: "Custom commands",
-        keywords: &[
-            "custom command",
-            "trigger",
-            "alias",
-            "placeholder",
-            "response",
-            "import",
-            "export",
-        ],
+        keywords: CUSTOM_COMMANDS_KEYWORDS,
         settings: COMMANDS_CUSTOM_SETTINGS,
     },
 ];
 
-const MODERATION_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_MODERATION_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::UserCard,
         slug: "user-card",
         label: "User card",
-        keywords: &[
-            "user card",
-            "usercard",
-            "pronouns",
-            "follow date",
-            "follower count",
-            "fields",
-        ],
+        keywords: USER_CARD_KEYWORDS,
         settings: MODERATION_USER_CARD_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ModerationButtons,
         slug: "moderation-buttons",
         label: "Moderation buttons",
-        keywords: &[
-            "moderation button",
-            "timeout",
-            "ban",
-            "delete",
-            "destructive",
-        ],
+        keywords: MODERATION_BUTTONS_KEYWORDS,
         settings: MODERATION_BUTTONS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -883,7 +938,7 @@ const MODERATION_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const HOTKEYS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_HOTKEYS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HotkeysNavigation,
         slug: "navigation",
@@ -998,7 +1053,7 @@ const LINKS_MEDIA_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const STREAMER_MODE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_STREAMER_MODE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::StreamerPrivacy,
         slug: "privacy",
@@ -1033,100 +1088,63 @@ const STREAMER_MODE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::DataManagement,
         slug: "data-management",
         label: "Data management",
-        keywords: &["data", "cache", "clear message cache", "reset", "storage"],
+        keywords: DATA_MANAGEMENT_KEYWORDS,
         settings: STREAMER_MODE_DATA_SETTINGS,
     },
 ];
 
-const DEVELOPER_TOOLS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const LEGACY_DEVELOPER_TOOLS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::NetworkProxy,
         slug: "network-proxy",
         label: "Network proxy",
-        keywords: &[
-            "proxy",
-            "proxy mode",
-            "manual proxy url",
-            "network",
-            "http",
-            "socks",
-        ],
+        keywords: NETWORK_PROXY_KEYWORDS,
         settings: DEVELOPER_NETWORK_PROXY_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ChatLogging,
         slug: "chat-logging",
         label: "Chat logging",
-        keywords: &[
-            "log content",
-            "readable channel logs",
-            "deleted message display",
-            "deleted message limit",
-            "logging",
-            "log file",
-        ],
+        keywords: CHAT_LOGGING_KEYWORDS,
         settings: DEVELOPER_CHAT_LOGGING_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HistoryCleanup,
         slug: "history-cleanup",
         label: "History & cleanup",
-        keywords: &[
-            "message history",
-            "cleanup",
-            "retention",
-            "latest history file",
-            "directory",
-        ],
+        keywords: HISTORY_CLEANUP_KEYWORDS,
         settings: DEVELOPER_HISTORY_CLEANUP_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::Diagnostics,
         slug: "diagnostics",
         label: "Diagnostics",
-        keywords: &[
-            "diagnostics",
-            "debug",
-            "frame rate",
-            "runtime liveness",
-            "7tv eventapi",
-            "message performance",
-            "emote loading",
-            "memory usage",
-            "metrics",
-        ],
+        keywords: DIAGNOSTICS_KEYWORDS,
         settings: DEVELOPER_DIAGNOSTICS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::Configuration,
         slug: "configuration",
         label: "Configuration",
-        keywords: &[
-            "configuration",
-            "settings file",
-            "import",
-            "export",
-            "reset",
-            "backup",
-        ],
+        keywords: CONFIGURATION_KEYWORDS,
         settings: DEVELOPER_CONFIGURATION_SETTINGS,
     },
 ];
 
 const LEGACY_SUBSECTION_TABLES: &[&[SettingsSubsectionDescriptor]] = &[
-    APPEARANCE_SUBSECTIONS,
-    NOTIFICATIONS_SUBSECTIONS,
-    UPDATES_SUBSECTIONS,
-    CHAT_SUBSECTIONS,
-    EMOTES_SUBSECTIONS,
-    HIGHLIGHTS_SUBSECTIONS,
-    FILTERS_SUBSECTIONS,
-    COMMANDS_SUBSECTIONS,
-    MODERATION_SUBSECTIONS,
-    HOTKEYS_SUBSECTIONS,
+    LEGACY_APPEARANCE_SUBSECTIONS,
+    LEGACY_NOTIFICATIONS_SUBSECTIONS,
+    LEGACY_UPDATES_SUBSECTIONS,
+    LEGACY_CHAT_SUBSECTIONS,
+    LEGACY_EMOTES_SUBSECTIONS,
+    LEGACY_HIGHLIGHTS_SUBSECTIONS,
+    LEGACY_FILTERS_SUBSECTIONS,
+    LEGACY_COMMANDS_SUBSECTIONS,
+    LEGACY_MODERATION_SUBSECTIONS,
+    LEGACY_HOTKEYS_SUBSECTIONS,
     LINKS_MEDIA_SUBSECTIONS,
-    STREAMER_MODE_SUBSECTIONS,
-    DEVELOPER_TOOLS_SUBSECTIONS,
+    LEGACY_STREAMER_MODE_SUBSECTIONS,
+    LEGACY_DEVELOPER_TOOLS_SUBSECTIONS,
 ];
 
 fn legacy_subsection_by_slug(
@@ -1134,20 +1152,20 @@ fn legacy_subsection_by_slug(
     subsection_slug: &str,
 ) -> Option<&'static SettingsSubsectionDescriptor> {
     let subsections = match page_slug.trim().to_ascii_lowercase().as_str() {
-        "appearance" | "theme" => APPEARANCE_SUBSECTIONS,
-        "notifications" | "sounds" => NOTIFICATIONS_SUBSECTIONS,
-        "updates" => UPDATES_SUBSECTIONS,
-        "chat" | "chat-behavior" => CHAT_SUBSECTIONS,
-        "emotes" => EMOTES_SUBSECTIONS,
-        "highlights" => HIGHLIGHTS_SUBSECTIONS,
-        "filters" | "similarity" => FILTERS_SUBSECTIONS,
-        "commands" => COMMANDS_SUBSECTIONS,
-        "moderation" => MODERATION_SUBSECTIONS,
-        "hotkeys" => HOTKEYS_SUBSECTIONS,
+        "appearance" | "theme" => LEGACY_APPEARANCE_SUBSECTIONS,
+        "notifications" | "sounds" => LEGACY_NOTIFICATIONS_SUBSECTIONS,
+        "updates" => LEGACY_UPDATES_SUBSECTIONS,
+        "chat" | "chat-behavior" => LEGACY_CHAT_SUBSECTIONS,
+        "emotes" => LEGACY_EMOTES_SUBSECTIONS,
+        "highlights" => LEGACY_HIGHLIGHTS_SUBSECTIONS,
+        "filters" | "similarity" => LEGACY_FILTERS_SUBSECTIONS,
+        "commands" => LEGACY_COMMANDS_SUBSECTIONS,
+        "moderation" => LEGACY_MODERATION_SUBSECTIONS,
+        "hotkeys" => LEGACY_HOTKEYS_SUBSECTIONS,
         "links-media" | "connections" | "uploader" | "embeds" => LINKS_MEDIA_SUBSECTIONS,
-        "streamer-mode" | "privacy" => STREAMER_MODE_SUBSECTIONS,
+        "streamer-mode" | "privacy" => LEGACY_STREAMER_MODE_SUBSECTIONS,
         "advanced" | "developer-tools" | "proxy" | "logging" | "debug" => {
-            DEVELOPER_TOOLS_SUBSECTIONS
+            LEGACY_DEVELOPER_TOOLS_SUBSECTIONS
         }
         _ => return None,
     };
@@ -1220,7 +1238,7 @@ const GENERAL_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::Account,
         slug: "account",
         label: "Account",
-        keywords: LEGACY_PAGE_KEYWORDS[0].1,
+        keywords: ACCOUNT_KEYWORDS,
         settings: ACCOUNT_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -1241,17 +1259,17 @@ const GENERAL_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::SettingsWindow,
         slug: "settings-window",
         label: "Window & startup",
-        keywords: APPEARANCE_SUBSECTIONS[3].keywords,
+        keywords: WINDOWS_OVERLAY_KEYWORDS,
         settings: GENERAL_SETTINGS_WINDOW_SETTINGS,
     },
 ];
 
-const FLAT_APPEARANCE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const APPEARANCE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ThemeColors,
         slug: "theme-colors",
         label: "Theme & colors",
-        keywords: APPEARANCE_SUBSECTIONS[0].keywords,
+        keywords: THEME_COLORS_KEYWORDS,
         settings: APPEARANCE_THEME_PRIMARY_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -1265,19 +1283,19 @@ const FLAT_APPEARANCE_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::TabsSizing,
         slug: "tabs-sizing",
         label: "Tabs & sizing",
-        keywords: APPEARANCE_SUBSECTIONS[2].keywords,
+        keywords: TABS_SIZING_KEYWORDS,
         settings: APPEARANCE_TABS_PRIMARY_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::AppearanceOptions,
         slug: "appearance-options",
         label: "More appearance options",
-        keywords: APPEARANCE_SUBSECTIONS[3].keywords,
+        keywords: WINDOWS_OVERLAY_KEYWORDS,
         settings: APPEARANCE_OPTIONS_SETTINGS,
     },
 ];
 
-const FLAT_CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ChatReading,
         slug: "reading",
@@ -1289,14 +1307,14 @@ const FLAT_CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::ChatComposing,
         slug: "composing",
         label: "Composing",
-        keywords: CHAT_SUBSECTIONS[0].keywords,
+        keywords: INPUT_COMPOSING_KEYWORDS,
         settings: CHAT_COMPOSING_ALL_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::EmotesDisplay,
         slug: "emotes",
         label: "Emotes",
-        keywords: EMOTES_SUBSECTIONS[0].keywords,
+        keywords: EMOTES_DISPLAY_KEYWORDS,
         settings: CHAT_EMOTES_ALL_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -1314,64 +1332,64 @@ const FLAT_CHAT_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const FLAT_HIGHLIGHTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const HIGHLIGHTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HighlightsBehavior,
         slug: "behavior",
         label: "Attention",
-        keywords: HIGHLIGHTS_SUBSECTIONS[1].keywords,
+        keywords: HIGHLIGHTS_BEHAVIOR_KEYWORDS,
         settings: HIGHLIGHTS_BEHAVIOR_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HighlightsCustomRules,
         slug: "custom-rules",
         label: "Highlight rules",
-        keywords: HIGHLIGHTS_SUBSECTIONS[2].keywords,
+        keywords: HIGHLIGHTS_CUSTOM_RULES_KEYWORDS,
         settings: HIGHLIGHTS_CUSTOM_RULES_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HighlightsPreviewColors,
         slug: "preview-colors",
         label: "Palette",
-        keywords: HIGHLIGHTS_SUBSECTIONS[0].keywords,
+        keywords: HIGHLIGHTS_PREVIEW_COLORS_KEYWORDS,
         settings: HIGHLIGHTS_PREVIEW_COLORS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::Sounds,
         slug: "sounds",
         label: "Sounds",
-        keywords: NOTIFICATIONS_SUBSECTIONS[0].keywords,
+        keywords: SOUNDS_KEYWORDS,
         settings: NOTIFICATIONS_SOUNDS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::DesktopNotifications,
         slug: "desktop-notifications",
         label: "Notifications",
-        keywords: NOTIFICATIONS_SUBSECTIONS[1].keywords,
+        keywords: DESKTOP_NOTIFICATIONS_KEYWORDS,
         settings: NOTIFICATIONS_PRIMARY_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::MutedChannels,
         slug: "muted-channels",
         label: "Muted channels",
-        keywords: NOTIFICATIONS_SUBSECTIONS[3].keywords,
+        keywords: MUTED_CHANNELS_KEYWORDS,
         settings: NOTIFICATIONS_MUTED_SETTINGS,
     },
 ];
 
-const FLAT_MODERATION_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const MODERATION_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::UserCard,
         slug: "user-card",
         label: "User cards",
-        keywords: MODERATION_SUBSECTIONS[0].keywords,
+        keywords: USER_CARD_KEYWORDS,
         settings: MODERATION_USER_CARD_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ModerationButtons,
         slug: "moderation-buttons",
         label: "Moderation buttons",
-        keywords: MODERATION_SUBSECTIONS[1].keywords,
+        keywords: MODERATION_BUTTONS_KEYWORDS,
         settings: MODERATION_BUTTONS_ALL_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -1385,38 +1403,38 @@ const FLAT_MODERATION_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::FilterRules,
         slug: "filter-rules",
         label: "Filter rules",
-        keywords: FILTERS_SUBSECTIONS[0].keywords,
+        keywords: FILTER_RULES_KEYWORDS,
         settings: FILTERS_RULES_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::BlockedUsers,
         slug: "blocked-users",
         label: "Blocked users",
-        keywords: FILTERS_SUBSECTIONS[1].keywords,
+        keywords: BLOCKED_USERS_KEYWORDS,
         settings: FILTERS_BLOCKED_USERS_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::SimilarMessages,
         slug: "similar-messages",
         label: "Similar messages",
-        keywords: FILTERS_SUBSECTIONS[2].keywords,
+        keywords: SIMILAR_MESSAGES_KEYWORDS,
         settings: FILTERS_SIMILAR_MESSAGES_SETTINGS,
     },
 ];
 
-const FLAT_SHORTCUTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const SHORTCUTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::SlashCommands,
         slug: "slash-commands",
         label: "Commands",
-        keywords: COMMANDS_SUBSECTIONS[0].keywords,
+        keywords: SLASH_COMMANDS_KEYWORDS,
         settings: COMMANDS_SLASH_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::CustomCommands,
         slug: "custom-commands",
         label: "Custom commands",
-        keywords: COMMANDS_SUBSECTIONS[1].keywords,
+        keywords: CUSTOM_COMMANDS_KEYWORDS,
         settings: COMMANDS_CUSTOM_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -1455,40 +1473,40 @@ const FLAT_SHORTCUTS_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     },
 ];
 
-const FLAT_ADVANCED_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
+const ADVANCED_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::ChatLogging,
         slug: "chat-logging",
         label: "History & logs",
-        keywords: DEVELOPER_TOOLS_SUBSECTIONS[1].keywords,
+        keywords: CHAT_LOGGING_KEYWORDS,
         settings: DEVELOPER_CHAT_LOGGING_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::HistoryCleanup,
         slug: "history-cleanup",
         label: "History files",
-        keywords: DEVELOPER_TOOLS_SUBSECTIONS[2].keywords,
+        keywords: HISTORY_CLEANUP_KEYWORDS,
         settings: DEVELOPER_HISTORY_CLEANUP_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::NetworkProxy,
         slug: "network-proxy",
         label: "Network proxy",
-        keywords: DEVELOPER_TOOLS_SUBSECTIONS[0].keywords,
+        keywords: NETWORK_PROXY_KEYWORDS,
         settings: DEVELOPER_NETWORK_PROXY_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::Configuration,
         slug: "configuration",
         label: "Configuration",
-        keywords: DEVELOPER_TOOLS_SUBSECTIONS[4].keywords,
+        keywords: CONFIGURATION_KEYWORDS,
         settings: DEVELOPER_CONFIGURATION_SETTINGS,
     },
     SettingsSubsectionDescriptor {
         id: SettingsSubsectionId::DataManagement,
         slug: "data-management",
         label: "Data management",
-        keywords: STREAMER_MODE_SUBSECTIONS[2].keywords,
+        keywords: DATA_MANAGEMENT_KEYWORDS,
         settings: STREAMER_MODE_DATA_SETTINGS,
     },
     SettingsSubsectionDescriptor {
@@ -1502,28 +1520,15 @@ const FLAT_ADVANCED_SUBSECTIONS: &[SettingsSubsectionDescriptor] = &[
         id: SettingsSubsectionId::Diagnostics,
         slug: "diagnostics",
         label: "Developer diagnostics",
-        keywords: DEVELOPER_TOOLS_SUBSECTIONS[3].keywords,
+        keywords: DIAGNOSTICS_KEYWORDS,
         settings: DEVELOPER_DIAGNOSTICS_SETTINGS,
     },
 ];
 
+/// Search keywords of every retired page, credited to the anchor named for it
+/// in [`LEGACY_PAGE_DEFAULT_ANCHORS`].
 const LEGACY_PAGE_KEYWORDS: &[(SettingsSectionId, &[&str])] = &[
-    (
-        SettingsSectionId::General,
-        &[
-            "account",
-            "login",
-            "logout",
-            "anonymous",
-            "profile",
-            "twitch",
-            "switch account",
-            "remove account",
-            "reauthenticate",
-            "current account",
-            "all accounts",
-        ],
-    ),
+    (SettingsSectionId::General, ACCOUNT_KEYWORDS),
     (
         SettingsSectionId::Theme,
         &[
@@ -1831,6 +1836,13 @@ const LEGACY_PAGE_KEYWORDS: &[(SettingsSectionId, &[&str])] = &[
     ),
 ];
 
+/// The current anchor that inherits each retired page's search keywords.
+///
+/// Independent of where an open request for the retired page lands
+/// ([`legacy_default_subsection`]), and the two differ for Filters (keywords
+/// credited to Similar messages, requests land on Filter rules). Both anchors
+/// sit on the same page, so the keywords still surface the right page; the
+/// tests pin this table as it is.
 const LEGACY_PAGE_DEFAULT_ANCHORS: &[(SettingsSectionId, SettingsSubsectionId)] = &[
     (SettingsSectionId::General, SettingsSubsectionId::Account),
     (SettingsSectionId::Theme, SettingsSubsectionId::ThemeColors),
@@ -1950,7 +1962,7 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
             "popout",
         ],
         default_subsection: Some(SettingsSubsectionId::ThemeColors),
-        subsections: FLAT_APPEARANCE_SUBSECTIONS,
+        subsections: APPEARANCE_SUBSECTIONS,
         settings: &[],
     },
     SettingsSectionDescriptor {
@@ -1998,7 +2010,7 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
             "timestamp",
         ],
         default_subsection: Some(SettingsSubsectionId::ChatReading),
-        subsections: FLAT_CHAT_SUBSECTIONS,
+        subsections: CHAT_SUBSECTIONS,
         settings: &[],
     },
     SettingsSectionDescriptor {
@@ -2031,7 +2043,7 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
             "blacklist",
         ],
         default_subsection: Some(SettingsSubsectionId::HighlightsBehavior),
-        subsections: FLAT_HIGHLIGHTS_SUBSECTIONS,
+        subsections: HIGHLIGHTS_SUBSECTIONS,
         settings: &[],
     },
     SettingsSectionDescriptor {
@@ -2055,7 +2067,7 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
             "message variables",
         ],
         default_subsection: Some(SettingsSubsectionId::UserCard),
-        subsections: FLAT_MODERATION_SUBSECTIONS,
+        subsections: MODERATION_SUBSECTIONS,
         settings: &[],
     },
     SettingsSectionDescriptor {
@@ -2076,7 +2088,7 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
             "reset defaults",
         ],
         default_subsection: Some(SettingsSubsectionId::SlashCommands),
-        subsections: FLAT_SHORTCUTS_SUBSECTIONS,
+        subsections: SHORTCUTS_SUBSECTIONS,
         settings: &[],
     },
     SettingsSectionDescriptor {
@@ -2141,12 +2153,13 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
             "configuration",
         ],
         default_subsection: Some(SettingsSubsectionId::ChatLogging),
-        subsections: FLAT_ADVANCED_SUBSECTIONS,
+        subsections: ADVANCED_SUBSECTIONS,
         settings: &[],
     },
 ];
 
-const SETTINGS_CATEGORY_SECTIONS: &[SettingsSectionId] = &[
+/// Pages in sidebar order. Every page in [`SECTIONS`] appears exactly once.
+const PAGE_ORDER: &[SettingsSectionId] = &[
     SettingsSectionId::General,
     SettingsSectionId::Theme,
     SettingsSectionId::ChatBehavior,
@@ -2156,20 +2169,6 @@ const SETTINGS_CATEGORY_SECTIONS: &[SettingsSectionId] = &[
     SettingsSectionId::Hotkeys,
     SettingsSectionId::Advanced,
 ];
-
-/// Every category in tree order. The developer disclosure only appends the last
-/// entry, so both shapes are sub-slices of one table rather than two copies.
-const CATEGORIES: &[SettingsCategoryDescriptor] = &[SettingsCategoryDescriptor {
-    id: SettingsCategoryId::General,
-    slug: "settings",
-    label: "Settings",
-    sections: SETTINGS_CATEGORY_SECTIONS,
-    visibility: SettingsVisibility::Always,
-}];
-
-/// Number of leading categories that are always disclosed. Keeping the
-/// developer category last lets both shapes share one table.
-const STANDARD_CATEGORY_COUNT: usize = 1;
 
 /// Slugs from earlier layouts, including the ones that merged into a specific
 /// anchor of a surviving page.
@@ -2341,12 +2340,12 @@ pub const LEGACY_SLUGS: &[LegacySlugMapping] = &[
     },
 ];
 
-/// Categories in tree order, honouring the developer disclosure.
+/// Page descriptors in sidebar order.
 ///
 /// Also the single place the debug descriptor-integrity check runs, so a broken
 /// table trips on the first settings render of a debug build instead of silently
 /// corrupting navigation state.
-pub fn build_categories(include_advanced: bool) -> &'static [SettingsCategoryDescriptor] {
+pub fn pages() -> impl Iterator<Item = &'static SettingsSectionDescriptor> {
     #[cfg(debug_assertions)]
     {
         use std::sync::Once;
@@ -2361,15 +2360,7 @@ pub fn build_categories(include_advanced: bool) -> &'static [SettingsCategoryDes
         });
     }
 
-    if include_advanced {
-        CATEGORIES
-    } else {
-        &CATEGORIES[..STANDARD_CATEGORY_COUNT]
-    }
-}
-
-pub fn category_descriptor(id: SettingsCategoryId) -> Option<&'static SettingsCategoryDescriptor> {
-    CATEGORIES.iter().find(|category| category.id == id)
+    PAGE_ORDER.iter().filter_map(|id| section_descriptor(*id))
 }
 
 pub fn section_descriptor(id: SettingsSectionId) -> Option<&'static SettingsSectionDescriptor> {
@@ -2399,39 +2390,17 @@ pub const fn subsection_is_developer_only(subsection: SettingsSubsectionId) -> b
     matches!(subsection, SettingsSubsectionId::Diagnostics)
 }
 
-/// The category that owns a page. Descriptor validation guarantees exactly one.
-pub fn category_of_section(id: SettingsSectionId) -> Option<&'static SettingsCategoryDescriptor> {
-    let id = canonical_section(id);
-    CATEGORIES
-        .iter()
-        .find(|category| category.sections.contains(&id))
-}
-
-pub fn section_visibility(id: SettingsSectionId) -> SettingsVisibility {
-    category_of_section(id)
-        .map(|category| category.visibility)
-        .unwrap_or_default()
-}
-
-pub fn is_section_visible(id: SettingsSectionId, developer_visible: bool) -> bool {
-    section_visibility(id).is_visible(developer_visible)
-}
-
 pub fn section_slug(id: SettingsSectionId) -> &'static str {
     section_descriptor(id)
         .map(|section| section.slug)
         .unwrap_or("account")
 }
 
-/// Label of a destination, or `"Settings"` when the id is not currently
-/// disclosed. Pointer-cheap lookup over the static table.
-pub fn section_label(selected: SettingsSectionId, include_advanced: bool) -> &'static str {
-    build_categories(include_advanced)
-        .iter()
-        .flat_map(|category| category.section_descriptors())
-        .find(|section| section.id == canonical_section(selected))
+/// Label of a destination, or [`SETTINGS_ROOT_LABEL`] for an unknown id.
+pub fn section_label(selected: SettingsSectionId) -> &'static str {
+    section_descriptor(selected)
         .map(|section| section.label)
-        .unwrap_or("Settings")
+        .unwrap_or(SETTINGS_ROOT_LABEL)
 }
 
 pub fn subsection_label(
@@ -2441,14 +2410,15 @@ pub fn subsection_label(
     subsection_descriptor(section, subsection).map(|descriptor| descriptor.label)
 }
 
-/// `Category › Page › Anchor` breadcrumb parts. The category is included even
-/// when the header omits it visually, because the accessible label needs it.
+/// Name of the tree root, the first breadcrumb part.
+pub const SETTINGS_ROOT_LABEL: &str = "Settings";
+
+/// `Settings › Page › Anchor` breadcrumb parts. The root is included even when
+/// the header omits it visually, because the accessible label needs it.
 pub fn location_breadcrumb(location: SettingsLocation) -> Vec<&'static str> {
     let location = canonical_location(location);
     let mut parts = Vec::with_capacity(3);
-    if let Some(category) = category_of_section(location.section) {
-        parts.push(category.label);
-    }
+    parts.push(SETTINGS_ROOT_LABEL);
     if let Some(section) = section_descriptor(location.section) {
         parts.push(section.label);
     }
@@ -2514,7 +2484,7 @@ fn legacy_slug_location(slug: &str) -> Option<SettingsLocation> {
 /// Resolve a persisted slug pair with the spec's fallback rules:
 ///
 /// - unknown subsection on a known page -> that page's default anchor
-/// - page hidden by the developer disclosure -> `None`
+/// - developer-only anchor while the disclosure is off -> Advanced › Developer mode
 /// - unknown page -> `None` (caller falls back to the last valid location, then
 ///   Account)
 pub fn resolve_slug_path(
@@ -2523,10 +2493,6 @@ pub fn resolve_slug_path(
     developer_visible: bool,
 ) -> Option<SettingsLocation> {
     let resolved = resolve_section_slug(section_slug)?;
-    if !is_section_visible(resolved.section, developer_visible) {
-        return None;
-    }
-
     let section = section_descriptor(resolved.section)?;
     let subsection = match subsection_slug {
         Some(slug) => legacy_subsection_by_slug(section_slug, slug)
@@ -2642,7 +2608,7 @@ pub fn coerce_visible_location(
 /// would make "default tree state" depend on whatever the developer last
 /// expanded, so the fixture sees the first-open defaults instead.
 pub fn navigation_prefs() -> SettingsNavigationPrefs {
-    if crate::benchmark_ui_fixture::should_suppress_persistence() {
+    if crate::bench::ui_fixture::should_suppress_persistence() {
         return SettingsNavigationPrefs::default();
     }
     crate::backend::settings::get_settings_navigation_prefs()
@@ -2841,7 +2807,7 @@ pub fn search_reveal_location(location: SettingsLocation, query: &str) -> Settin
 /// so turning the disclosure off restores the last standard page instead.
 /// Returns whether anything changed.
 pub fn persist_location(location: SettingsLocation) -> bool {
-    if crate::benchmark_ui_fixture::should_suppress_persistence() {
+    if crate::bench::ui_fixture::should_suppress_persistence() {
         return false;
     }
     let persisted = location.to_persisted();
@@ -2852,39 +2818,11 @@ pub fn persist_location(location: SettingsLocation) -> bool {
     }
 }
 
-/// Validate the static tables: unique ids/slugs, every page in exactly one
-/// category, resolvable defaults, and a legacy table that agrees with the page
-/// descriptors. Runs once per process in debug builds via [`build_categories`].
+/// Validate the static tables: unique ids/slugs, every page in the sidebar
+/// order exactly once, resolvable defaults, and a legacy table that agrees with
+/// the page descriptors. Runs once per process in debug builds via [`pages`].
 pub fn validate_navigation_descriptors() -> Result<(), Vec<String>> {
     let mut issues = Vec::new();
-
-    for (index, category) in CATEGORIES.iter().enumerate() {
-        if CATEGORIES[..index]
-            .iter()
-            .any(|other| other.id == category.id)
-        {
-            issues.push(format!("duplicate category id {:?}", category.id));
-        }
-        if CATEGORIES[..index]
-            .iter()
-            .any(|other| other.slug == category.slug)
-        {
-            issues.push(format!("duplicate category slug '{}'", category.slug));
-        }
-        if category.sections.is_empty() {
-            issues.push(format!("category '{}' has no pages", category.slug));
-        }
-    }
-
-    for (index, category) in CATEGORIES.iter().enumerate() {
-        let hidden = category.visibility.is_developer_only();
-        if hidden != (index >= STANDARD_CATEGORY_COUNT) {
-            issues.push(format!(
-                "category '{}' visibility does not match STANDARD_CATEGORY_COUNT",
-                category.slug
-            ));
-        }
-    }
 
     for (index, section) in SECTIONS.iter().enumerate() {
         if SECTIONS[..index].iter().any(|other| other.id == section.id) {
@@ -2897,13 +2835,10 @@ pub fn validate_navigation_descriptors() -> Result<(), Vec<String>> {
             issues.push(format!("duplicate page slug '{}'", section.slug));
         }
 
-        let owners = CATEGORIES
-            .iter()
-            .filter(|category| category.sections.contains(&section.id))
-            .count();
-        if owners != 1 {
+        let placements = PAGE_ORDER.iter().filter(|id| **id == section.id).count();
+        if placements != 1 {
             issues.push(format!(
-                "page '{}' appears in {owners} categories (expected exactly 1)",
+                "page '{}' appears {placements} times in the sidebar order (expected exactly 1)",
                 section.slug
             ));
         }
@@ -3102,8 +3037,7 @@ fn text_rank(label: &str, keywords: &[&str], query_lower: &str) -> Option<u8> {
         .then_some(3)
 }
 
-/// Rank a destination against a query. Kept as a free function because the
-/// legacy flat sidebar orders results by this rank.
+/// Rank a destination against a query; search results are ordered by it.
 fn section_search_rank(section: &SettingsSectionDescriptor, query_lower: &str) -> Option<u8> {
     text_rank(section.label, section.keywords, query_lower)
 }
@@ -3247,32 +3181,20 @@ impl SettingsSearchSection {
     }
 }
 
-/// A retained category in the filtered tree.
-#[derive(Clone, Debug)]
-pub struct SettingsSearchCategory {
-    pub descriptor: &'static SettingsCategoryDescriptor,
-    pub matched: bool,
-    pub sections: Vec<SettingsSearchSection>,
-    pub counts: SettingsSearchCounts,
-}
-
 /// One filtered view of the static navigation tables.
 ///
 /// Built once per query revision (see [`SettingsSearchState`]) and shared by the
-/// tree, the legacy flat sidebar, the "no matching settings" state, the count
-/// announcement, and the selected-label lookup, so a keystroke ranks the
-/// hierarchy once instead of two or three times.
+/// tree, the "no matching settings" state, the count announcement, and the
+/// selected-label lookup, so a keystroke ranks the hierarchy once instead of
+/// two or three times.
 #[derive(Clone, Debug)]
 pub struct SettingsSearchModel {
-    /// Sidebar groups in render order. Normal browsing keeps one group per
-    /// category. An active search collapses them into one relevance-ordered
-    /// result list so an exact page-name hit is never buried below a looser
-    /// keyword match in an earlier category.
-    groups: Vec<(&'static str, Vec<&'static SettingsSection>)>,
-    /// Relevance-ordered ids of every matching destination.
+    /// Ids of every matching destination: sidebar order while browsing,
+    /// relevance order while searching, so an exact page-name hit is never
+    /// buried below a looser keyword match on an earlier page.
     ordered_ids: Vec<SettingsSectionId>,
-    /// Ancestor-retaining tree for the three-level navigation surface.
-    tree: Vec<SettingsSearchCategory>,
+    /// Ancestor-retaining page tree for the navigation surface, in sidebar order.
+    tree: Vec<SettingsSearchSection>,
     targets: Vec<SettingTarget>,
     counts: SettingsSearchCounts,
     first_location: Option<SettingsLocation>,
@@ -3287,48 +3209,31 @@ pub struct SettingsSearchModel {
 impl SettingsSearchModel {
     pub fn compute(query: &str, include_advanced: bool) -> Self {
         let query_lower = query.trim().to_lowercase();
-        let categories = build_categories(include_advanced);
 
         if query_lower.is_empty() {
-            let tree: Vec<SettingsSearchCategory> = categories
-                .iter()
-                .map(|category| SettingsSearchCategory {
-                    descriptor: category,
+            let tree: Vec<SettingsSearchSection> = pages()
+                .map(|section| SettingsSearchSection {
+                    descriptor: section,
                     matched: false,
-                    sections: category
-                        .section_descriptors()
-                        .map(|section| SettingsSearchSection {
-                            descriptor: section,
+                    rank: 0,
+                    subsections: section
+                        .subsections
+                        .iter()
+                        .map(|subsection| SettingsSearchSubsection {
+                            section: section.id,
+                            descriptor: subsection,
                             matched: false,
-                            rank: 0,
-                            subsections: section
-                                .subsections
-                                .iter()
-                                .map(|subsection| SettingsSearchSubsection {
-                                    section: section.id,
-                                    descriptor: subsection,
-                                    matched: false,
-                                    settings: Vec::new(),
-                                    counts: SettingsSearchCounts::default(),
-                                })
-                                .collect(),
                             settings: Vec::new(),
                             counts: SettingsSearchCounts::default(),
                         })
                         .collect(),
+                    settings: Vec::new(),
                     counts: SettingsSearchCounts::default(),
                 })
                 .collect();
 
             return Self {
-                groups: categories
-                    .iter()
-                    .map(|category| (category.label, category.section_descriptors().collect()))
-                    .collect(),
-                ordered_ids: categories
-                    .iter()
-                    .flat_map(|category| category.sections.iter().copied())
-                    .collect(),
+                ordered_ids: tree.iter().map(SettingsSearchSection::id).collect(),
                 tree,
                 targets: Vec::new(),
                 counts: SettingsSearchCounts::default(),
@@ -3340,26 +3245,15 @@ impl SettingsSearchModel {
             };
         }
 
-        let (tree, counts, first_location) =
-            Self::filter(categories, &query_lower, include_advanced);
+        let (tree, counts, first_location) = Self::filter(&query_lower, include_advanced);
         let targets = Self::collect_targets(&tree, &query_lower);
 
-        let mut matches: Vec<(u8, &'static SettingsSectionDescriptor)> = tree
+        let mut matches: Vec<(u8, SettingsSectionId)> = tree
             .iter()
-            .flat_map(|category| category.sections.iter())
-            .map(|section| (section.rank, section.descriptor))
+            .map(|section| (section.rank, section.id()))
             .collect();
         matches.sort_by_key(|(rank, _)| *rank);
-
-        let ordered_ids = matches.iter().map(|(_, section)| section.id).collect();
-        let groups = if matches.is_empty() {
-            Vec::new()
-        } else {
-            vec![(
-                "Results",
-                matches.into_iter().map(|(_, section)| section).collect(),
-            )]
-        };
+        let ordered_ids = matches.into_iter().map(|(_, id)| id).collect();
 
         let hidden_developer_targets = if include_advanced {
             Vec::new()
@@ -3380,7 +3274,6 @@ impl SettingsSearchModel {
             .map(|target| target.location);
 
         Self {
-            groups,
             ordered_ids,
             tree,
             targets,
@@ -3393,9 +3286,9 @@ impl SettingsSearchModel {
         }
     }
 
-    fn collect_targets(tree: &[SettingsSearchCategory], query: &str) -> Vec<SettingTarget> {
+    fn collect_targets(tree: &[SettingsSearchSection], query: &str) -> Vec<SettingTarget> {
         let mut targets = Vec::new();
-        for section in tree.iter().flat_map(|category| &category.sections) {
+        for section in tree {
             targets.extend(section.settings.iter().map(|setting| SettingTarget {
                 location: canonical_location(SettingsLocation::page(section.id())),
                 setting: **setting,
@@ -3459,11 +3352,10 @@ impl SettingsSearchModel {
     /// Ancestor-retaining filter pass. A node that matches keeps its whole
     /// subtree; a node that only contains matches keeps just the matching path.
     fn filter(
-        categories: &'static [SettingsCategoryDescriptor],
         query_lower: &str,
         include_developer: bool,
     ) -> (
-        Vec<SettingsSearchCategory>,
+        Vec<SettingsSearchSection>,
         SettingsSearchCounts,
         Option<SettingsLocation>,
     ) {
@@ -3471,99 +3363,76 @@ impl SettingsSearchModel {
         let mut totals = SettingsSearchCounts::default();
         let mut first_location = None;
 
-        for category in categories {
-            let mut sections = Vec::new();
-            let mut category_counts = SettingsSearchCounts::default();
+        for section in pages() {
+            let rank = section_search_rank(section, query_lower);
+            let section_matched = rank.is_some();
+            let retain_all = section_matched;
 
-            for section in category.section_descriptors() {
-                let rank = section_search_rank(section, query_lower);
-                let section_matched = rank.is_some();
-                let retain_all = section_matched;
+            let mut subsections = Vec::new();
+            let mut section_counts = SettingsSearchCounts::default();
 
-                let mut subsections = Vec::new();
-                let mut section_counts = SettingsSearchCounts::default();
-
-                for subsection in section.subsections {
-                    if subsection_is_developer_only(subsection.id) && !include_developer {
-                        continue;
-                    }
-                    let subsection_matched =
-                        subsection_search_rank(subsection, query_lower).is_some();
-                    let matched_settings: Vec<&'static SettingDescriptor> = subsection
-                        .settings
-                        .iter()
-                        .filter(|setting| setting_matches(setting, query_lower))
-                        .collect();
-                    let counted = subsection_matched || !matched_settings.is_empty();
-
-                    if !counted && !retain_all {
-                        continue;
-                    }
-
-                    let counts = SettingsSearchCounts {
-                        settings: matched_settings.len(),
-                        subsections: usize::from(counted),
-                        pages: 0,
-                    };
-                    section_counts.merge(counts);
-                    subsections.push(SettingsSearchSubsection {
-                        section: section.id,
-                        descriptor: subsection,
-                        matched: subsection_matched,
-                        settings: matched_settings,
-                        counts,
-                    });
+            for subsection in section.subsections {
+                if subsection_is_developer_only(subsection.id) && !include_developer {
+                    continue;
                 }
-
-                let matched_page_settings: Vec<&'static SettingDescriptor> = section
+                let subsection_matched = subsection_search_rank(subsection, query_lower).is_some();
+                let matched_settings: Vec<&'static SettingDescriptor> = subsection
                     .settings
                     .iter()
                     .filter(|setting| setting_matches(setting, query_lower))
                     .collect();
-                section_counts.settings += matched_page_settings.len();
+                let counted = subsection_matched || !matched_settings.is_empty();
 
-                let has_descendant_match =
-                    section_counts.subsections > 0 || !matched_page_settings.is_empty();
-                if !section_matched && !has_descendant_match {
+                if !counted && !retain_all {
                     continue;
                 }
 
-                section_counts.pages = 1;
-                category_counts.merge(section_counts);
-
-                let entry = SettingsSearchSection {
-                    descriptor: section,
-                    matched: section_matched,
-                    rank: rank.unwrap_or(4),
-                    subsections,
-                    settings: matched_page_settings,
-                    counts: section_counts,
+                let counts = SettingsSearchCounts {
+                    settings: matched_settings.len(),
+                    subsections: usize::from(counted),
+                    pages: 0,
                 };
-                if first_location.is_none() {
-                    first_location = Some(entry.location());
-                }
-                sections.push(entry);
+                section_counts.merge(counts);
+                subsections.push(SettingsSearchSubsection {
+                    section: section.id,
+                    descriptor: subsection,
+                    matched: subsection_matched,
+                    settings: matched_settings,
+                    counts,
+                });
             }
 
-            if sections.is_empty() {
+            let matched_page_settings: Vec<&'static SettingDescriptor> = section
+                .settings
+                .iter()
+                .filter(|setting| setting_matches(setting, query_lower))
+                .collect();
+            section_counts.settings += matched_page_settings.len();
+
+            let has_descendant_match =
+                section_counts.subsections > 0 || !matched_page_settings.is_empty();
+            if !section_matched && !has_descendant_match {
                 continue;
             }
 
-            totals.merge(category_counts);
-            tree.push(SettingsSearchCategory {
-                descriptor: category,
-                matched: false,
-                sections,
-                counts: category_counts,
-            });
+            section_counts.pages = 1;
+            totals.merge(section_counts);
+
+            let entry = SettingsSearchSection {
+                descriptor: section,
+                matched: section_matched,
+                rank: rank.unwrap_or(4),
+                subsections,
+                settings: matched_page_settings,
+                counts: section_counts,
+            };
+            if first_location.is_none() {
+                first_location = Some(entry.location());
+            }
+            tree.push(entry);
         }
 
         (tree, totals, first_location)
-    }
-
-    /// Legacy flat sidebar groups (`(header, sections)`).
-    pub fn groups(&self) -> &[(&'static str, Vec<&'static SettingsSection>)] {
-        &self.groups
     }
 
     /// Relevance-ordered ids of every matching destination.
@@ -3571,8 +3440,8 @@ impl SettingsSearchModel {
         &self.ordered_ids
     }
 
-    /// Ancestor-retaining tree for the navigation surface.
-    pub fn tree(&self) -> &[SettingsSearchCategory] {
+    /// Ancestor-retaining page tree for the navigation surface.
+    pub fn tree(&self) -> &[SettingsSearchSection] {
         &self.tree
     }
 
@@ -3604,7 +3473,6 @@ impl SettingsSearchModel {
     pub fn contains_location(&self, location: SettingsLocation) -> bool {
         self.tree
             .iter()
-            .flat_map(|category| category.sections.iter())
             .filter(|section| section.descriptor.id == location.section)
             .any(|section| match location.subsection {
                 None => true,
@@ -4267,7 +4135,6 @@ mod exact_target_tests {
                     model
                         .tree()
                         .iter()
-                        .flat_map(|category| &category.sections)
                         .flat_map(|section| &section.subsections)
                         .any(|current| {
                             current.descriptor.id == expected_anchor && current.matched
@@ -4293,7 +4160,6 @@ mod exact_target_tests {
                     model
                         .tree()
                         .iter()
-                        .flat_map(|category| &category.sections)
                         .flat_map(|section| &section.subsections)
                         .any(|current| {
                             current.descriptor.id == *expected_anchor && current.matched
@@ -4308,12 +4174,10 @@ mod exact_target_tests {
     fn synthetic_category_never_retains_the_flat_sidebar() {
         for query in ["settings", "set", "in"] {
             let model = SettingsSearchModel::compute(query, false);
-            assert!(model.tree().iter().all(|category| !category.matched));
             assert!(
                 model
                     .tree()
                     .iter()
-                    .flat_map(|category| &category.sections)
                     .map(|section| section.subsections.len())
                     .sum::<usize>()
                     < 48,
@@ -5058,9 +4922,9 @@ mod exact_target_tests {
                     SettingsLocation::anchor(SettingsSectionId::Highlights, expected)
                 );
                 if let Some(disclosure) = disclosure {
-                    let raw = NOTIFICATIONS_SUBSECTIONS
+                    let raw = LEGACY_NOTIFICATIONS_SUBSECTIONS
                         .iter()
-                        .chain(HIGHLIGHTS_SUBSECTIONS.iter())
+                        .chain(LEGACY_HIGHLIGHTS_SUBSECTIONS.iter())
                         .find(|anchor| anchor.slug == slug)
                         .unwrap();
                     assert_eq!(
@@ -5085,8 +4949,7 @@ mod exact_target_tests {
                 .sum::<usize>(),
             38,
         );
-        assert_eq!(CATEGORIES.len(), 1);
-        assert_eq!(CATEGORIES[0].sections.len(), 8);
+        assert_eq!(PAGE_ORDER.len(), 8);
         let expected_setting_count = 366 + usize::from(cfg!(target_os = "windows")) * 2;
         assert_eq!(setting_targets().count(), expected_setting_count);
     }
@@ -5097,33 +4960,53 @@ mod exact_target_tests {
             (
                 "appearance",
                 SettingsSectionId::Theme,
-                APPEARANCE_SUBSECTIONS,
+                LEGACY_APPEARANCE_SUBSECTIONS,
             ),
             (
                 "notifications",
                 SettingsSectionId::Sounds,
-                NOTIFICATIONS_SUBSECTIONS,
+                LEGACY_NOTIFICATIONS_SUBSECTIONS,
             ),
-            ("updates", SettingsSectionId::Updates, UPDATES_SUBSECTIONS),
-            ("chat", SettingsSectionId::ChatBehavior, CHAT_SUBSECTIONS),
-            ("emotes", SettingsSectionId::Emotes, EMOTES_SUBSECTIONS),
+            (
+                "updates",
+                SettingsSectionId::Updates,
+                LEGACY_UPDATES_SUBSECTIONS,
+            ),
+            (
+                "chat",
+                SettingsSectionId::ChatBehavior,
+                LEGACY_CHAT_SUBSECTIONS,
+            ),
+            (
+                "emotes",
+                SettingsSectionId::Emotes,
+                LEGACY_EMOTES_SUBSECTIONS,
+            ),
             (
                 "highlights",
                 SettingsSectionId::Highlights,
-                HIGHLIGHTS_SUBSECTIONS,
+                LEGACY_HIGHLIGHTS_SUBSECTIONS,
             ),
-            ("filters", SettingsSectionId::Filters, FILTERS_SUBSECTIONS),
+            (
+                "filters",
+                SettingsSectionId::Filters,
+                LEGACY_FILTERS_SUBSECTIONS,
+            ),
             (
                 "commands",
                 SettingsSectionId::Commands,
-                COMMANDS_SUBSECTIONS,
+                LEGACY_COMMANDS_SUBSECTIONS,
             ),
             (
                 "moderation",
                 SettingsSectionId::Moderation,
-                MODERATION_SUBSECTIONS,
+                LEGACY_MODERATION_SUBSECTIONS,
             ),
-            ("hotkeys", SettingsSectionId::Hotkeys, HOTKEYS_SUBSECTIONS),
+            (
+                "hotkeys",
+                SettingsSectionId::Hotkeys,
+                LEGACY_HOTKEYS_SUBSECTIONS,
+            ),
             (
                 "links-media",
                 SettingsSectionId::Connections,
@@ -5132,12 +5015,12 @@ mod exact_target_tests {
             (
                 "streamer-mode",
                 SettingsSectionId::Privacy,
-                STREAMER_MODE_SUBSECTIONS,
+                LEGACY_STREAMER_MODE_SUBSECTIONS,
             ),
             (
                 "developer-tools",
                 SettingsSectionId::Advanced,
-                DEVELOPER_TOOLS_SUBSECTIONS,
+                LEGACY_DEVELOPER_TOOLS_SUBSECTIONS,
             ),
         ];
         for (slug, section, anchors) in legacy_pages {

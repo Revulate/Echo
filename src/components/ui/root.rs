@@ -1,10 +1,8 @@
-//! Root component - minimal window wrapper for Echo
+//! Root view of the main window.
 //!
-//! This is a simplified replacement for gpui_component::Root.
-//! It provides:
-//! - A wrapper view for the main application
-//! - Tab/Shift-Tab focus navigation
-//! - Basic window setup
+//! Wraps the application view in the `EchoRoot` key context, which binds
+//! Tab/Shift-Tab to focus traversal between tab stops, and samples renderer
+//! statistics on every main-window draw.
 
 use gpui::{
     AnyView, App, Context, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _,
@@ -67,7 +65,7 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::fps_profiler::record_main_window_renderer_statistics(window);
+        crate::diagnostics::fps_profiler::record_main_window_renderer_statistics(window);
         div()
             .id("root")
             .key_context(CONTEXT)

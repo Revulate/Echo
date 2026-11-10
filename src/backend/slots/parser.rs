@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use echo_core::channel_identity::normalize_channel_key;
 use echo_core::slot::MessageSlot;
 use echo_core::slot_parser::{SlotEmoteResolver, TwitchEmoteMap};
 
 use crate::backend::emotes::{
     Emote, EmoteLookupSnapshot, EmoteSender, get_emote_fast_case_sensitive_from_snapshot,
-    normalize_channel_key, schedule_channel_refresh_on_unresolved, snapshot_emote_lookups,
+    schedule_channel_refresh_on_unresolved, snapshot_emote_lookups,
     snapshot_emote_lookups_for_sender,
 };
 

@@ -7,41 +7,14 @@ plain pinned Zed revision.
   `-ForkPath` for the PowerShell script or the first argument of the shell
   script)
 - Branch: `echo-paint-fork`
-- Base revision: `9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3` (the same rev pinned in
-  `Cargo.toml` for `gpui`, `gpui_platform`, and `reqwest_client`)
-- Expected source tree: `7a802743da3a4ba05833b47153b01f2cf567904f`
-- Fork commits: 29 commits in 28 patch files, applied in the order listed by
-  `scripts/gpui-fork-patches.txt`: the two-commit `patches/gpui-paint-fork.patch`,
-  then
-  `patches/gpui-image-features.patch`,
-  `patches/gpui-gpu-timestamps.patch`,
-  `patches/gpui-image-transport-retry.patch`,
-  `patches/gpui-image-response-bounds.patch`,
-  `patches/gpui-image-decode-bounds.patch`,
-  `patches/gpui-svg-rendered-bounds.patch`,
-  `patches/gpui-reqwest-runtime-bound-body.patch`,
-  `patches/gpui-image-decode-budget.patch`,
-  `patches/gpui-windows-window-teardown.patch`,
-  `patches/gpui-windows-cursor-stability.patch`,
-  `patches/gpui-asset-source-diagnostics.patch`,
-  `patches/gpui-bidi-text-geometry.patch`,
-  `patches/gpui-windows-atlas-retirement-stability.patch`,
-  `patches/gpui-windows-device-lost-retry.patch`,
-  `patches/gpui-windows-hardware-adapter-preference.patch`,
-  `patches/gpui-windows-lazy-path-msaa.patch`,
-  `patches/gpui-skip-transparent-glyphs.patch`,
-  `patches/gpui-animated-image-patching.patch`,
-  `patches/gpui-windows-minimize-vsync-recovery-fixes.patch`,
-  `patches/gpui-shaped-line-inline-decorations.patch`,
-  `patches/gpui-releasable-images-painted-text.patch`,
-  `patches/gpui-windows-mouse-leave-exit.patch`,
-  `patches/gpui-windows-ime-caret-active-end.patch`,
-  `patches/gpui-text-wrap-measure-cache.patch`,
-  `patches/gpui-atlas-drop-scoped-refresh.patch`,
-  `patches/gpui-linux-activation-token.patch`,
-  and `patches/gpui-a11y-reuse-cached-view-nodes.patch`,
-  so the fork is reconstructible from this repository plus the pinned upstream
-  revision. The patch files are the source of record.
+- Base revision: the `rev` that the root `Cargo.toml` pins for `gpui`,
+  `gpui_platform` and `reqwest_client` in `[workspace.dependencies]`; every
+  workspace member inherits those three dependencies from there.
+- Patch series and expected source tree: `scripts/gpui-fork-patches.txt` lists
+  the patch files in `patches/` in application order and records the
+  `fork-tree` the series must produce. The patch files are the source of
+  record, so the fork is reconstructible from this repository plus the pinned
+  upstream revision. The sections below describe each patch.
 - Wiring: the `[patch."https://github.com/zed-industries/zed"]` section at the bottom
   of `Cargo.toml` redirects `gpui`, `gpui_platform`, and `reqwest_client` to relative
   path dependencies inside that sibling checkout. The setup script verifies the
@@ -73,7 +46,7 @@ file.
 ```
 
 ```pwsh
-./scripts/setup-gpui-fork.ps1
+pwsh -NoProfile -File scripts/setup-gpui-fork.ps1
 ```
 
 The script clones Zed (blob-filtered) into `../zed-gpui-fork`, checks out the pinned
@@ -468,8 +441,8 @@ on the correct side.
 cached size only for the same wrap width, like the existing guard for truncated
 layouts. Otherwise a `MinContent` or `MaxContent` probe after a constrained measure
 got the wrapped size (one word per line for a wrap width of 0), so the intrinsic
-size of a `white-space: normal` text element depended on measure order. An affected
-probe now reshapes, which is a line-layout-cache lookup when the text was already
+size of a `white-space: normal` text element depended on measure order. With the
+patch an affected probe reshapes, which is a line-layout-cache lookup when the text was already
 shaped this frame or the previous one. Chat messages are shaped by the canvas
 renderer and do not use this element.
 
@@ -491,11 +464,11 @@ and the dispatch subtree of a reused cached view, and `A11y::begin_frame` clears
 the accessibility tree every frame. Without this patch, a reused cached view's
 whole subtree (for Echo: the chat list, its row nodes and the live region) dropped
 out of the tree sent to screen readers on any frame where another view
-re-rendered. The finished nodes of each frame are now kept, and
+re-rendered. The patch keeps the finished nodes of each frame, and
 `PrepaintStateIndex` records a node range that `reuse_prepaint` replays under the
 current parent, together with node bounds, focus registrations and (moved) action
 listeners. Nothing changes while accessibility is inactive. Upstream Zed has the
-same behavior, so this patch is a candidate to upstream.
+same bug, so this patch is a candidate to upstream.
 
 ### Upstream features Echo relies on
 
@@ -508,7 +481,8 @@ observer (`observe_window_visibility`) and the `on_system_sleep` hook.
 
 ## Updating the pinned GPUI rev
 
-1. Update the `rev = ...` pins in `Cargo.toml`.
+1. Update the three `rev = ...` pins in the root `Cargo.toml`'s
+   `[workspace.dependencies]` (`gpui`, `gpui_platform`, `reqwest_client`).
 2. In the fork, fetch the new revision and rebase the series onto it:
    `git fetch origin <new-rev>` and
    `git rebase --onto <new-rev> <old-rev> echo-paint-fork`. Resolve conflicts
@@ -520,6 +494,9 @@ observer (`observe_window_visibility`) and the `on_system_sleep` hook.
    (`gpui-paint-fork.patch` holds two commits:
    `git format-patch <new-rev>..<second-commit> --stdout`). Update
    `scripts/gpui-fork-patches.txt` if the series layout changes.
-4. Update the pinned revision and expected tree in `scripts/setup-gpui-fork.ps1`,
-   `scripts/setup-gpui-fork.sh` and this document, then confirm that both setup
-   scripts reconstruct that tree from a clean checkout.
+4. Set `fork-tree` in `scripts/gpui-fork-patches.txt` to the rebased fork's
+   `git rev-parse 'HEAD^{tree}'`, and update the `$PinnedRev` and
+   `$ExpectedForkTree` literals in `scripts/setup-gpui-fork.ps1` (the release
+   verification reads them; the script fails if they disagree with Cargo.toml
+   or the manifest). Then confirm that both setup scripts reconstruct that tree
+   from a clean checkout.

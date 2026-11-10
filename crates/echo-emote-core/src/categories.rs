@@ -1,23 +1,11 @@
-use crate::{Emote, EmoteProvider};
+use crate::{Emote, EmoteProvider, EmoteScope, emote_scope};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Category of emotes for picker UI
-/// Uses Arc<Emote> to avoid cloning emote data when building categories
+/// One section of the emote picker. Shares the emotes rather than cloning them.
 #[derive(Clone, Debug)]
 pub struct EmoteCategory {
     pub emotes: Vec<Arc<Emote>>,
-}
-
-impl EmoteCategory {
-    pub fn new(_id: &str, _name: &str, _provider: Option<EmoteProvider>) -> Self {
-        Self { emotes: Vec::new() }
-    }
-
-    pub fn with_emotes(mut self, emotes: Vec<Arc<Emote>>) -> Self {
-        self.emotes = emotes;
-        self
-    }
 }
 
 /// Group emotes into categories for the emote picker
@@ -71,21 +59,16 @@ pub fn group_emotes_into_categories(
     }
 
     for emote in emotes {
-        match &emote.channel {
-            Some(ch) if ch.starts_with("sub:") => {
-                // Subscription emote (Twitch)
-                let channel_name = ch.strip_prefix("sub:").unwrap_or(ch);
-                if let Some(existing) = sub_emotes.get_mut(channel_name) {
-                    existing.push(emote);
-                } else {
-                    let channel_name = channel_name.to_string();
-                    sub_emotes.insert(channel_name, vec![emote]);
-                }
+        // A shared handle on the scope string, so the arms can move `emote`.
+        let channel = emote.channel.clone();
+        match emote_scope(channel.as_deref()) {
+            EmoteScope::Subscription(owner) => {
+                push_subscription_emote(&mut sub_emotes, owner, emote);
             }
-            Some(ch) if ch.as_ref() == "personal:7tv" => {
+            EmoteScope::Personal => {
                 personal_7tv.push(emote);
             }
-            Some(ch) if ch.eq_ignore_ascii_case(channel_login) => {
+            EmoteScope::Channel(ch) if ch.eq_ignore_ascii_case(channel_login) => {
                 // Channel-specific emote
                 match emote.provider {
                     EmoteProvider::SevenTV => channel_7tv.push(emote),
@@ -98,7 +81,7 @@ pub fn group_emotes_into_categories(
                     EmoteProvider::Emoji => {} // Emojis don't belong to channels
                 }
             }
-            None => {
+            EmoteScope::Global => {
                 // Global emote
                 match emote.provider {
                     EmoteProvider::SevenTV => global_7tv.push(emote),
@@ -108,7 +91,7 @@ pub fn group_emotes_into_categories(
                     EmoteProvider::Emoji => {} // Emojis are handled separately
                 }
             }
-            Some(_) => {
+            EmoteScope::Channel(_) => {
                 // Other channel emotes (shouldn't happen normally)
                 match emote.provider {
                     EmoteProvider::SevenTV => channel_7tv.push(emote),

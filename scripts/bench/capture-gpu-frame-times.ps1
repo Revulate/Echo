@@ -1,3 +1,8 @@
+<#
+.SYNOPSIS
+Launch an executable under PresentMon and record its per-frame present timing
+(optionally with CPU samples) into a benchmark run directory.
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -37,66 +42,7 @@ param(
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
-
-function Resolve-RepoRoot {
-    $scriptRoot = Split-Path -Parent $PSCommandPath
-    return (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
-}
-
-function Resolve-ExecutablePath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    if (Test-Path $Path) {
-        return (Resolve-Path $Path).Path
-    }
-
-    $command = Get-Command $Path -ErrorAction SilentlyContinue
-    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-        return $command.Source
-    }
-
-    throw "Executable '$Path' was not found as a file or command."
-}
-
-function Initialize-RunDirectory {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($RunDir)) {
-        return (New-Item -ItemType Directory -Force -Path $RunDir).FullName
-    }
-
-    $initializer = Join-Path $RepoRoot "scripts\bench\new-benchmark-run.ps1"
-    if (-not (Test-Path $initializer)) {
-        throw "Benchmark run initializer not found: $initializer"
-    }
-
-    $args = @{
-        Scenario = $Scenario
-        EchoPath = $LaunchPath
-        EchoBuildType = $EchoBuildType
-        CacheState = $CacheState
-        NetworkState = $NetworkState
-        FixtureName = $FixtureName
-        Notes = $Notes
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-        $args.OutputRoot = $OutputRoot
-    }
-
-    $output = & $initializer @args
-    $path = (($output | Select-Object -Last 1) | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-        throw "Benchmark run initializer did not return an existing path."
-    }
-
-    return (Resolve-Path $path).Path
-}
+Import-Module (Join-Path $PSScriptRoot 'BenchLib.psm1') -Force -DisableNameChecking
 
 function Stop-LaunchedProcess {
     param(
@@ -144,7 +90,16 @@ function Stop-PresentMonProcess {
 $repoRoot = Resolve-RepoRoot
 $presentMon = Resolve-ExecutablePath -Path $PresentMonPath
 $launch = Resolve-ExecutablePath -Path $LaunchPath
-$runPath = Initialize-RunDirectory -RepoRoot $repoRoot
+$runPath = Initialize-BenchRunDirectory -RepoRoot $repoRoot -RunDir $RunDir -Metadata @{
+    Scenario = $Scenario
+    OutputRoot = $OutputRoot
+    EchoPath = $LaunchPath
+    EchoBuildType = $EchoBuildType
+    CacheState = $CacheState
+    NetworkState = $NetworkState
+    FixtureName = $FixtureName
+    Notes = $Notes
+}
 
 $rawTrace = Join-Path $runPath "gpu-presentmon-trace.csv"
 $summaryPath = Join-Path $runPath "gpu-presentmon-summary.json"

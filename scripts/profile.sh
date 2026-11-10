@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Echo Profiling & Analysis Scripts
+# Echo profiling wrappers (Linux): perf, flamegraph, heaptrack, Valgrind,
+# sanitizers and strace around a locally built Echo.
 # =============================================================================
-# Usage: ./scripts/profile.sh [command]
+# Usage: ./scripts/profile.sh [command]   (see cmd_help below, or `make help`)
 #
-# Commands:
-#   flame       - Generate flamegraph (CPU profiling)
-#   perf        - Run with perf stat (CPU counters)
-#   perf-record - Record with perf for detailed analysis
-#   heap        - Memory profiling with heaptrack
-#   cache       - Cache analysis with Valgrind/Cachegrind
-#   memcheck    - Memory error detection with Valgrind
-#   asan        - AddressSanitizer build
-#   tsan        - ThreadSanitizer build
-#   strace      - System call tracing
-#   install     - Install required tools
+# Every run uses an isolated Echo profile (ECHO_BENCH_PROFILE_ROOT, default
+# target/profile/echo-profile, kept between runs so you can sign in once) and
+# writes its artifacts to target/profile/. Nothing runs as root: perf needs
+# kernel.perf_event_paranoid <= 2 for user-space sampling (`install` explains).
 # =============================================================================
 
 set -euo pipefail
@@ -23,7 +17,16 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 PROFILE="${PROFILE:-release-with-debug}"
-BINARY="./target/${PROFILE}/echo"
+# Cargo writes the dev profile to target/debug; every other profile uses its name.
+if [[ "$PROFILE" == "dev" ]]; then
+    PROFILE_DIR="debug"
+else
+    PROFILE_DIR="$PROFILE"
+fi
+BINARY="$PROJECT_ROOT/target/${PROFILE_DIR}/echo"
+OUT_DIR="$PROJECT_ROOT/target/profile"
+export ECHO_BENCH_PROFILE_ROOT="${ECHO_BENCH_PROFILE_ROOT:-$OUT_DIR/echo-profile}"
+mkdir -p "$OUT_DIR"
 
 # Colors for output
 RED='\033[0;31m'
@@ -37,13 +40,11 @@ success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
-# Build with debug symbols
 build_profile() {
     info "Building with profile: $PROFILE"
-    cargo build --profile "$PROFILE"
+    cargo build --locked --profile "$PROFILE" --bin echo
 }
 
-# Check if tool is installed
 require_tool() {
     if ! command -v "$1" &> /dev/null; then
         error "$1 is not installed. Run: $2"
@@ -58,18 +59,14 @@ require_tool() {
 cmd_flame() {
     require_tool "flamegraph" "cargo install flamegraph"
     require_tool "perf" "sudo pacman -S perf (or linux-tools on Ubuntu)"
-
-    info "Generating flamegraph..."
     build_profile
 
-    # Flamegraph needs root for perf events
-    cargo flamegraph --profile "$PROFILE" --root -o flamegraph.svg
+    info "Generating flamegraph..."
+    (cd "$OUT_DIR" && flamegraph -o flamegraph.svg -- "$BINARY")
+    success "Flamegraph saved to: $OUT_DIR/flamegraph.svg"
 
-    success "Flamegraph saved to: flamegraph.svg"
-
-    # Try to open in browser
     if command -v xdg-open &> /dev/null; then
-        xdg-open flamegraph.svg 2>/dev/null &
+        xdg-open "$OUT_DIR/flamegraph.svg" 2>/dev/null &
     fi
 }
 
@@ -78,7 +75,7 @@ cmd_perf() {
     build_profile
 
     info "Running perf stat..."
-    sudo perf stat -d "$BINARY"
+    perf stat -d "$BINARY"
 }
 
 cmd_perf_record() {
@@ -86,13 +83,13 @@ cmd_perf_record() {
     build_profile
 
     info "Recording with perf (Ctrl+C to stop)..."
-    sudo perf record -g --call-graph dwarf "$BINARY"
+    perf record -g --call-graph dwarf -o "$OUT_DIR/perf.data" "$BINARY"
 
     info "Generating report..."
-    sudo perf report --stdio > perf-report.txt
+    perf report -i "$OUT_DIR/perf.data" --stdio > "$OUT_DIR/perf-report.txt"
 
-    success "Report saved to: perf-report.txt"
-    info "Interactive: sudo perf report"
+    success "Report saved to: $OUT_DIR/perf-report.txt"
+    info "Interactive: perf report -i $OUT_DIR/perf.data"
 }
 
 cmd_heap() {
@@ -100,10 +97,9 @@ cmd_heap() {
     build_profile
 
     info "Running heaptrack memory profiler..."
-    heaptrack "$BINARY"
+    heaptrack -o "$OUT_DIR/heaptrack.echo" "$BINARY"
 
-    # Find the latest heaptrack output
-    LATEST=$(ls -t heaptrack.echo.*.zst 2>/dev/null | head -1)
+    LATEST=$(ls -t "$OUT_DIR"/heaptrack.echo*.zst 2>/dev/null | head -1)
     if [[ -n "$LATEST" ]]; then
         success "Heap trace saved to: $LATEST"
         info "Analyze with: heaptrack_gui $LATEST"
@@ -119,9 +115,9 @@ cmd_cache() {
     build_profile
 
     info "Running Cachegrind cache analysis..."
-    valgrind --tool=cachegrind "$BINARY"
+    valgrind --tool=cachegrind --cachegrind-out-file="$OUT_DIR/cachegrind.out.%p" "$BINARY"
 
-    LATEST=$(ls -t cachegrind.out.* 2>/dev/null | head -1)
+    LATEST=$(ls -t "$OUT_DIR"/cachegrind.out.* 2>/dev/null | head -1)
     if [[ -n "$LATEST" ]]; then
         success "Cache analysis saved to: $LATEST"
         info "Analyze with: cg_annotate $LATEST"
@@ -134,35 +130,31 @@ cmd_memcheck() {
 
     info "Running Valgrind memcheck..."
     valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
-        --log-file=valgrind.log "$BINARY"
+        --log-file="$OUT_DIR/valgrind.log" "$BINARY"
 
-    success "Memory check log saved to: valgrind.log"
+    success "Memory check log saved to: $OUT_DIR/valgrind.log"
+}
+
+# Sanitizer builds need nightly and their own target directory layout, so they
+# ignore PROFILE and always use the `sanitize` profile.
+run_sanitized() {
+    local sanitizer="$1"
+    local options="$2"
+    info "Building with -Zsanitizer=$sanitizer (requires nightly)..."
+    RUSTFLAGS="-Zsanitizer=$sanitizer" \
+        cargo +nightly build --profile sanitize --bin echo \
+        -Zbuild-std --target x86_64-unknown-linux-gnu
+
+    success "Sanitizer build complete"
+    env "$options" ./target/x86_64-unknown-linux-gnu/sanitize/echo
 }
 
 cmd_asan() {
-    info "Building with AddressSanitizer (requires nightly)..."
-
-    RUSTFLAGS="-Zsanitizer=address" \
-    cargo +nightly build --profile sanitize \
-        -Zbuild-std --target x86_64-unknown-linux-gnu
-
-    success "ASAN build complete"
-    info "Run: ./target/x86_64-unknown-linux-gnu/sanitize/echo"
-
-    # Run it
-    ASAN_OPTIONS="detect_leaks=1" \
-    ./target/x86_64-unknown-linux-gnu/sanitize/echo
+    run_sanitized address "ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1}"
 }
 
 cmd_tsan() {
-    info "Building with ThreadSanitizer (requires nightly)..."
-
-    RUSTFLAGS="-Zsanitizer=thread" \
-    cargo +nightly build --profile sanitize \
-        -Zbuild-std --target x86_64-unknown-linux-gnu
-
-    success "TSAN build complete"
-    ./target/x86_64-unknown-linux-gnu/sanitize/echo
+    run_sanitized thread "TSAN_OPTIONS=${TSAN_OPTIONS:-}"
 }
 
 cmd_strace() {
@@ -170,23 +162,20 @@ cmd_strace() {
     build_profile
 
     info "Tracing system calls..."
-    strace -c -f "$BINARY" 2>&1 | tee strace-summary.txt
+    strace -c -f -o "$OUT_DIR/strace-summary.txt" "$BINARY"
 
-    success "Summary saved to: strace-summary.txt"
+    success "Summary saved to: $OUT_DIR/strace-summary.txt"
 }
 
 cmd_install() {
     info "Installing profiling tools..."
 
     if command -v pacman &> /dev/null; then
-        # Arch Linux
         sudo pacman -S --needed perf valgrind heaptrack strace
     elif command -v apt &> /dev/null; then
-        # Ubuntu/Debian
         sudo apt install -y linux-tools-common linux-tools-generic valgrind \
             heaptrack heaptrack-gui strace
     elif command -v dnf &> /dev/null; then
-        # Fedora
         sudo dnf install -y perf valgrind heaptrack strace
     else
         warn "Unknown package manager. Install manually:"
@@ -199,14 +188,12 @@ cmd_install() {
     info "Installing Rust tools..."
     cargo install flamegraph
 
-    # Check perf permissions
     if [[ -f /proc/sys/kernel/perf_event_paranoid ]]; then
         PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid)
-        if [[ "$PARANOID" -gt 1 ]]; then
-            warn "perf_event_paranoid is $PARANOID (restrictive)"
-            info "For user-space profiling without root:"
-            echo "  sudo sysctl kernel.perf_event_paranoid=1"
-            echo "  # Or permanently: add to /etc/sysctl.d/99-perf.conf"
+        if [[ "$PARANOID" -gt 2 ]]; then
+            warn "perf_event_paranoid is $PARANOID; perf cannot sample user-space as a normal user"
+            info "Allow it for this boot (or persist it under /etc/sysctl.d/):"
+            echo "  sudo sysctl kernel.perf_event_paranoid=2"
         fi
     fi
 
@@ -225,13 +212,16 @@ cmd_help() {
     echo "  heap         Memory profiling (heaptrack)"
     echo "  cache        Cache analysis (Cachegrind)"
     echo "  memcheck     Memory error check (Valgrind)"
-    echo "  asan         Build with AddressSanitizer"
-    echo "  tsan         Build with ThreadSanitizer"
+    echo "  asan         Build and run with AddressSanitizer (nightly)"
+    echo "  tsan         Build and run with ThreadSanitizer (nightly)"
     echo "  strace       System call tracing"
     echo "  install      Install required tools"
     echo ""
     echo "Environment:"
-    echo "  PROFILE      Build profile (default: release-with-debug)"
+    echo "  PROFILE                  Cargo profile (default: release-with-debug; dev maps to target/debug)"
+    echo "  ECHO_BENCH_PROFILE_ROOT  Echo profile to run under (default: target/profile/echo-profile)"
+    echo ""
+    echo "Artifacts are written to target/profile/."
     echo ""
     echo "Examples:"
     echo "  $0 flame                  # CPU flamegraph"

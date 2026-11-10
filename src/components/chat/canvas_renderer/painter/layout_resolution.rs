@@ -95,7 +95,7 @@ impl CanvasMessageList {
                 window,
                 allow_sync_layout,
             ),
-            LayoutStatus::Failed(_) => self.resolve_failed_layout_height(
+            LayoutStatus::Failed => self.resolve_failed_layout_height(
                 msg,
                 cache_key,
                 mode,
@@ -120,10 +120,13 @@ impl CanvasMessageList {
             .async_layout_manager
             .get_layout_width(
                 &msg.id,
-                self.show_timestamp,
-                message_content_fingerprint(msg),
-                current_emote_version,
-                current_channel_emote_version,
+                &async_layout::LayoutVersions {
+                    show_timestamp: self.show_timestamp,
+                    content_fingerprint: message_content_fingerprint(msg),
+                    layout_settings_version: settings::get_layout_settings_version(),
+                    emote_resolution_version: current_emote_version,
+                    channel_emote_version: current_channel_emote_version,
+                },
             )
             .unwrap_or_else(|| layout::quantize_width(self.container_width));
 
