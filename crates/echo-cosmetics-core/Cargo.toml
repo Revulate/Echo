@@ -1,0 +1,13 @@
+[package]
+name = "echo-cosmetics-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-free 7TV cosmetics parsing and resolution for Echo"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

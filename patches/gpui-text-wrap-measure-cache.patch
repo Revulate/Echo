@@ -1,0 +1,44 @@
+From deaf55fe2311405aad7362a7034184fa663d0029 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 16:43:20 -0700
+Subject: [PATCH] fix(gpui): don't answer unconstrained text probes with a
+ wrapped size
+
+TextLayout's measure cache returned the cached size whenever a request had
+no wrap width, even when that size came from wrapping at an earlier,
+narrower width. A MinContent or MaxContent probe after a constrained
+measure then reported the wrapped size (one word per line for a wrap width
+of 0), so a white-space:normal text element's intrinsic size depended on
+which measure pass happened to run first. The cache is now reused only for
+an identical wrap width, matching the existing guard for truncated layouts.
+---
+ crates/gpui/src/elements/text.rs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/elements/text.rs b/crates/gpui/src/elements/text.rs
+index ed643841f7..6025d2a3ca 100644
+--- a/crates/gpui/src/elements/text.rs
++++ b/crates/gpui/src/elements/text.rs
+@@ -685,7 +685,9 @@ impl TextLayout {
+ 
+                 // Only use cached layout if:
+                 // 1. We have a cached size
+-                // 2. wrap_width matches (or both are None)
++                // 2. wrap_width matches exactly (a layout wrapped at some width answers an
++                //    unconstrained probe with the wrapped size, which poisons intrinsic sizing
++                //    the same way as 4)
+                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
+                 //    because the previous layout may have been computed without truncation)
+                 // 4. the cached layout was not truncated (a truncated layout answers an
+@@ -693,7 +695,7 @@ impl TextLayout {
+                 //    sizing with whatever width some earlier measure pass happened to use)
+                 if let Some(text_layout) = element_state.0.borrow().as_ref()
+                     && let Some(size) = text_layout.size
+-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
++                    && wrap_width == text_layout.wrap_width
+                     && truncate_width.is_none()
+                     && text_layout.truncate_width.is_none()
+                 {
+-- 
+2.55.0.windows.5
+

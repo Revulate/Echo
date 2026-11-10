@@ -1,0 +1,121 @@
+name: Linux test and build
+
+on:
+  push:
+    branches: [main, master, 2026-rewrite]
+  pull_request:
+  schedule:
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "268435456"
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  verify:
+    name: Test, smoke, and verify Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Echo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils \
+            build-essential \
+            file \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            mesa-vulkan-drivers \
+            xauth \
+            xvfb \
+            pkg-config
+
+      - name: Install exact Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install nextest
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: nextest@0.9.143
+          fallback: none
+
+      - name: Reconstruct pinned GPUI fork
+        run: ./scripts/setup-gpui-fork.sh
+
+      - name: Check canonical formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Linux pull-request suite
+        run: ./scripts/test-linux.sh quick-nextest
+
+      - name: Run Clippy
+        run: cargo clippy --locked -p echo_gpui -p echo-autocomplete-core -p echo-cache-policy -p echo-chat-render -p echo-core -p echo-cosmetics-core -p echo-emote-core -p echo-link-core -p echo-media-cache -p echo-render-core -p echo-text-core --lib -- -D clippy::correctness -D clippy::suspicious
+
+      - name: Verify Linux build and artifacts
+        run: ./scripts/verify-linux-build.sh
+
+      - name: Run real GPUI startup smoke under Xvfb
+        run: |
+          cargo build --release --locked -p profile-log-check
+          smoke_root="${RUNNER_TEMP}/echo-linux-smoke"
+          ECHO_BENCH_PROFILE_ROOT="${smoke_root}/profile" \
+            xvfb-run --auto-servernum python3 scripts/bench/run-echo-profile.py \
+              --output-root "${smoke_root}/artifacts" \
+              --scenario "Linux CI dist startup smoke" \
+              --launch-path target/dist/echo \
+              --duration-seconds 8 \
+              --exit-wait-seconds 5 \
+              --stop-mode close-main-window \
+              --profile-log-check-path target/release/profile-log-check \
+              --echo-build-type dist \
+              --cache-state isolated \
+              --fixture-name linux-ci-startup
+
+      - name: Upload test and smoke reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: echo-linux-test-reports-${{ github.sha }}
+          path: |
+            target/nextest/ci/junit.xml
+            target/linux-tool-checks
+            target/linux-test-stages
+            ${{ runner.temp }}/echo-linux-smoke/artifacts
+            ${{ runner.temp }}/echo-linux-smoke/profile/logs/echo.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: echo-linux-x64-${{ github.sha }}
+          path: |
+            target/dist/echo
+            target/dist/echo-version
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

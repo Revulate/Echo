@@ -1,0 +1,40 @@
+From ac30534d325f459674ee2dfda8b2d985066eff18 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:12:20 -0700
+Subject: [PATCH] fix(gpui_windows): place the IME window at the selection's
+ active end
+
+retrieve_caret_position asked for the bounds of the whole selected range,
+whose origin is its left edge, so with a forward selection (or any input
+that reports range bounds from one fixed end) the candidate window opened
+at the wrong side of the selection. It now asks for the collapsed caret at
+the active end: the start of a reversed selection, otherwise its end.
+---
+ crates/gpui_windows/src/events.rs | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index 5e2444d381..f751f97d10 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -697,8 +697,15 @@ impl WindowsWindowInner {
+ 
+     fn retrieve_caret_position(&self) -> Option<POINT> {
+         self.with_input_handler_and_scale_factor(|input_handler, scale_factor| {
+-            let caret_range = input_handler.selected_text_range(false)?;
+-            let caret_position = input_handler.bounds_for_range(caret_range.range)?;
++            let selection = input_handler.selected_text_range(false)?;
++            // The IME window belongs at the caret, which is the selection's
++            // active end: the start of a reversed selection, else its end.
++            let caret = if selection.reversed {
++                selection.range.start
++            } else {
++                selection.range.end
++            };
++            let caret_position = input_handler.bounds_for_range(caret..caret)?;
+             Some(POINT {
+                 // logical to physical
+                 x: (caret_position.origin.x.as_f32() * scale_factor) as i32,
+-- 
+2.55.0.windows.5
+

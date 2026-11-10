@@ -1,0 +1,8 @@
+[package]
+name = "echo-emote-quality-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+echo-emote-core = { path = "../../crates/echo-emote-core" }

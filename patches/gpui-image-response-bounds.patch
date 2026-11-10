@@ -1,0 +1,168 @@
+From 05d3b1455e9712fcaf1933829c5adea51eb3b3ea Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 12:48:44 -0700
+Subject: [PATCH] Bound image URI response bodies
+
+---
+ crates/gpui/src/elements/img.rs | 107 +++++++++++++++++++++++++-------
+ 1 file changed, 86 insertions(+), 21 deletions(-)
+
+diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
+index 0956d0c6c8..9a090dde05 100644
+--- a/crates/gpui/src/elements/img.rs
++++ b/crates/gpui/src/elements/img.rs
+@@ -5,7 +5,7 @@ use crate::{
+     SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
+     decode_static_image, decode_webp_image, px,
+ };
+-use anyhow::Result;
++use anyhow::{Result, anyhow};
+ 
+ use futures::Future;
+ use gpui_util::ResultExt;
+@@ -31,6 +31,19 @@ pub const LOADING_DELAY: Duration = Duration::from_millis(200);
+ // does not permanently poison every image asset that shared it. HTTP statuses
+ // and image/SVG decode failures stay terminal and never enter this loop.
+ const IMAGE_URI_MAX_ATTEMPTS: u8 = 3;
++// Bound the compressed transport body before any image decoder sees it. Echo's
++// own media path uses a stricter source budget; this framework boundary also
++// protects generic/user-provided URI images and non-success response bodies.
++const IMAGE_URI_MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
++// Reqwest's configured body-read timeout is idle based. A peer that keeps
++// sending small chunks can avoid it, so each complete attempt also has a wall
++// clock deadline independent of the byte cap and idle deadline.
++const IMAGE_URI_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
++
++enum ImageUriAttemptFailure {
++    Retryable(anyhow::Error),
++    Terminal(anyhow::Error),
++}
+ 
+ fn image_uri_retry_delay(uri: &SharedUri, failed_attempt: u8) -> Duration {
+     let exponential_ms = 100u64.saturating_mul(1u64 << failed_attempt.saturating_sub(1));
+@@ -641,50 +654,102 @@ impl Asset for ImageAssetLoader {
+             let bytes = match source.clone() {
+                 Resource::Path(uri) => fs::read(uri.as_ref())?,
+                 Resource::Uri(uri) => {
++                    use crate::FutureExt as _;
+                     use futures::AsyncReadExt as _;
+ 
+                     let mut attempt = 1u8;
+                     loop {
+-                        let mut response = match client.get(uri.as_ref(), ().into(), true).await {
+-                            Ok(response) => response,
+-                            Err(error) if attempt < IMAGE_URI_MAX_ATTEMPTS => {
++                        let fetch_attempt = async {
++                            let mut response = client
++                                .get(uri.as_ref(), ().into(), true)
++                                .await
++                                .map_err(ImageUriAttemptFailure::Retryable)?;
++                            let status = response.status();
++                            let declared_len = response
++                                .headers()
++                                .get(http_client::http::header::CONTENT_LENGTH)
++                                .and_then(|value| value.to_str().ok())
++                                .and_then(|value| value.parse::<u64>().ok());
++                            if declared_len.is_some_and(|len| len > IMAGE_URI_MAX_BODY_BYTES) {
++                                return Err(ImageUriAttemptFailure::Terminal(anyhow!(
++                                    "image asset URI {uri} declares a {declared_len:?}-byte body; \
++                                     limit is {IMAGE_URI_MAX_BODY_BYTES} bytes"
++                                )));
++                            }
++
++                            let mut body = Vec::new();
++                            let read_result = response
++                                .body_mut()
++                                .take(IMAGE_URI_MAX_BODY_BYTES + 1)
++                                .read_to_end(&mut body)
++                                .await;
++                            if let Err(error) = read_result {
++                                let error = anyhow!(error).context(format!(
++                                    "reading image asset response body from {uri:?}"
++                                ));
++                                return Err(if status.is_success() {
++                                    ImageUriAttemptFailure::Retryable(error)
++                                } else {
++                                    ImageUriAttemptFailure::Terminal(error)
++                                });
++                            }
++                            if body.len() as u64 > IMAGE_URI_MAX_BODY_BYTES {
++                                return Err(ImageUriAttemptFailure::Terminal(anyhow!(
++                                    "image asset URI {uri} exceeded the \
++                                     {IMAGE_URI_MAX_BODY_BYTES}-byte response limit"
++                                )));
++                            }
++
++                            Ok((status, body))
++                        }
++                        .with_timeout(IMAGE_URI_ATTEMPT_TIMEOUT, &background_executor)
++                        .await;
++
++                        let (status, body) = match fetch_attempt {
++                            Ok(Ok(result)) => result,
++                            Ok(Err(ImageUriAttemptFailure::Retryable(error)))
++                                if attempt < IMAGE_URI_MAX_ATTEMPTS =>
++                            {
+                                 let delay = image_uri_retry_delay(&uri, attempt);
+                                 log::debug!(
+-                                    "Retrying image asset URI {uri} after request transport failure \
+-                                     (attempt {attempt}/{IMAGE_URI_MAX_ATTEMPTS}, delay={}ms): {error}",
++                                    "Retrying image asset URI {uri} after transport failure \
++                                     (attempt {attempt}/{IMAGE_URI_MAX_ATTEMPTS}, \
++                                     delay={}ms): {error}",
+                                     delay.as_millis()
+                                 );
+                                 background_executor.timer(delay).await;
+                                 attempt += 1;
+                                 continue;
+                             }
+-                            Err(error) => {
++                            Ok(Err(ImageUriAttemptFailure::Retryable(error))) => {
+                                 return Err(error
+                                     .context(format!("loading image asset from {uri:?}"))
+                                     .into());
+                             }
+-                        };
+-
+-                        let status = response.status();
+-                        let mut body = Vec::new();
+-                        match response.body_mut().read_to_end(&mut body).await {
+-                            Ok(_) => {}
+-                            Err(error)
+-                                if status.is_success() && attempt < IMAGE_URI_MAX_ATTEMPTS =>
+-                            {
++                            Ok(Err(ImageUriAttemptFailure::Terminal(error))) => {
++                                return Err(error.into());
++                            }
++                            Err(_timeout) if attempt < IMAGE_URI_MAX_ATTEMPTS => {
+                                 let delay = image_uri_retry_delay(&uri, attempt);
+                                 log::debug!(
+-                                    "Retrying image asset URI {uri} after response-body transport \
+-                                     failure (attempt {attempt}/{IMAGE_URI_MAX_ATTEMPTS}, \
+-                                     delay={}ms): {error}",
++                                    "Retrying image asset URI {uri} after {}s attempt timeout \
++                                     (attempt {attempt}/{IMAGE_URI_MAX_ATTEMPTS}, delay={}ms)",
++                                    IMAGE_URI_ATTEMPT_TIMEOUT.as_secs(),
+                                     delay.as_millis()
+                                 );
+                                 background_executor.timer(delay).await;
+                                 attempt += 1;
+                                 continue;
+                             }
+-                            Err(error) => return Err(error.into()),
+-                        }
++                            Err(timeout) => {
++                                return Err(anyhow!(timeout)
++                                    .context(format!(
++                                        "image asset URI {uri:?} did not complete within {}s",
++                                        IMAGE_URI_ATTEMPT_TIMEOUT.as_secs()
++                                    ))
++                                    .into());
++                            }
++                        };
+ 
+                         if !status.is_success() {
+                             let mut body = String::from_utf8_lossy(&body).into_owned();
+-- 
+2.55.0.windows.5
+

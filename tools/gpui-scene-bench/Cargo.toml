@@ -1,0 +1,22 @@
+[package]
+name = "gpui-scene-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+echo_gpui = { path = "../..", features = ["gpui-bench"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3", features = ["bench"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3", features = ["bench-support", "test-support", "wayland", "x11"] }
+smallvec = "1.13"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "gpui_chat_scene_bench"
+harness = false
+
+[package.metadata.cargo-machete]
+ignored = ["gpui_platform"]

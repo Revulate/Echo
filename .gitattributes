@@ -1,0 +1,13 @@
+# Auto-detect text files and normalize line endings to LF in repo
+* text=auto
+
+# Format-patch files encode diff syntax where added blank lines and the standard
+# `-- ` mail signature separator intentionally end in spaces. Do not report
+# those payload lines as repository whitespace errors.
+*.patch whitespace=-blank-at-eof,-blank-at-eol
+
+# Keep docs, scripts and benchmark fixtures LF in every checkout. Shell scripts
+# must stay LF to run on Linux.
+docs/*.md text eol=lf
+scripts/** text=auto eol=lf
+benchmarks/** text=auto eol=lf

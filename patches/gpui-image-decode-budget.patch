@@ -1,0 +1,29 @@
+From ad99f030ad765d7f23da04d86f68da1df656f3d4 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 14:44:14 -0700
+Subject: [PATCH] gpui: align URI cumulative decode budget
+
+---
+ crates/gpui/src/elements/img.rs | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
+index 2956c1c3c9..da2a301432 100644
+--- a/crates/gpui/src/elements/img.rs
++++ b/crates/gpui/src/elements/img.rs
+@@ -49,7 +49,11 @@ enum ImageUriAttemptFailure {
+ // framework's decoded raster allocation bounded as well as its transport body.
+ const IMAGE_URI_MAX_DIMENSION: u32 = 8192;
+ const IMAGE_URI_MAX_FRAME_RGBA_BYTES: u64 = 64 * 1024 * 1024;
+-const IMAGE_URI_MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
++// Keep the cumulative animation allocation aligned with the one-frame ceiling.
++// Echo's bounded generic URI cache admits at most this much decoded data per
++// resource, so allowing four times that amount would create avoidable transient
++// pressure only to reject the completed image afterward.
++const IMAGE_URI_MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+ const IMAGE_URI_MAX_DECODED_FRAMES: usize = 1024;
+ 
+ const IMAGE_URI_DECODE_LIMITS: ImageDecodeLimits = ImageDecodeLimits {
+-- 
+2.55.0.windows.5
+

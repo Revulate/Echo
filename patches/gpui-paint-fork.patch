@@ -1,0 +1,430 @@
+From 6ca6b086a13051003d18e5625c36c87136840d42 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Tue, 9 Jun 2026 20:59:16 -0700
+Subject: [PATCH 1/2] gpui: add Window::rasterize_shaped_line_mask for Echo
+ exact 7TV paints
+
+Expose a position-independent grayscale glyph-coverage mask for (a byte
+subrange of) a ShapedLine. Echo composites exact 7TV name-paint fills
+(linear/radial/repeating gradients, image textures) and gaussian-blurred
+glyph-shaped shadows on the CPU, caches the flattened result, and paints
+it as a regular image sprite.
+
+Rasterization has to live inside GPUI because raster_bounds/
+rasterize_glyph and RenderGlyphParams are pub(crate).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ crates/gpui/src/window.rs | 177 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 177 insertions(+)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 4e2e1a798c..bc28904619 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5146,6 +5146,164 @@ impl Window {
+         Ok(())
+     }
+ 
++    /// Rasterize the grayscale glyph-coverage mask for `line` at the window's current
++    /// scale factor.
++    ///
++    /// This is a local Echo extension (branch `echo-paint-fork`) used for exact 7TV
++    /// name-paint rendering: the caller generates its own gradient/image fill and
++    /// blurred shadow layers on the CPU, masks them with this coverage buffer, caches
++    /// the flattened result as a [`RenderImage`], and paints it via
++    /// [`Window::paint_image`]. Only coverage extraction lives in GPUI because glyph
++    /// rasterization requires `pub(crate)` text-system internals.
++    ///
++    /// `byte_range` optionally restricts the mask to glyphs whose source byte index
++    /// falls inside the range (e.g. a username inside a larger shaped line).
++    ///
++    /// Glyph origins are quantized to whole device pixels (no subpixel variants), so
++    /// the mask is position-independent and can be cached and repainted at any origin.
++    /// Returns `Ok(None)` when no rasterizable glyph coverage exists.
++    pub fn rasterize_shaped_line_mask(
++        &mut self,
++        line: &crate::ShapedLine,
++        line_height: Pixels,
++        byte_range: Option<std::ops::Range<usize>>,
++    ) -> Result<Option<ShapedLineRasterMask>> {
++        struct GlyphCoverage {
++            dst_x0: i32,
++            dst_y0: i32,
++            width: usize,
++            height: usize,
++            channels: usize,
++            bytes: Vec<u8>,
++        }
++
++        let scale_factor = self.scale_factor();
++        let layout = &line.layout;
++        let padding_top = (line_height - layout.ascent - layout.descent) / 2.0;
++        let baseline_y = padding_top + layout.ascent;
++
++        let mut glyph_masks: Vec<GlyphCoverage> = Vec::with_capacity(layout.len.max(8));
++        let mut min_x = i32::MAX;
++        let mut min_y = i32::MAX;
++        let mut max_x = i32::MIN;
++        let mut max_y = i32::MIN;
++
++        for run in &layout.runs {
++            for glyph in &run.glyphs {
++                if let Some(range) = byte_range.as_ref() {
++                    if !range.contains(&glyph.index) {
++                        continue;
++                    }
++                }
++
++                let logical_origin = point(glyph.position.x, baseline_y + glyph.position.y);
++                let origin_scaled = logical_origin.scale(scale_factor);
++
++                // Quantize to whole device pixels so the mask does not depend on the
++                // eventual paint origin and can be cached across frames/positions.
++                let params = RenderGlyphParams {
++                    font_id: run.font_id,
++                    glyph_id: glyph.id,
++                    font_size: layout.font_size,
++                    subpixel_variant: Point::new(0, 0),
++                    scale_factor,
++                    is_emoji: false,
++                    subpixel_rendering: false,
++                    dilation: 0,
++                };
++
++                let raster_bounds = self.text_system().raster_bounds(&params)?;
++                if raster_bounds.is_zero() {
++                    continue;
++                }
++
++                let (mask_size, bytes) = self.text_system().rasterize_glyph(&params)?;
++                let width = mask_size.width.0.max(0) as usize;
++                let height = mask_size.height.0.max(0) as usize;
++                if width == 0 || height == 0 {
++                    continue;
++                }
++                let pixel_count = width * height;
++                if bytes.len() < pixel_count {
++                    continue;
++                }
++                let channels = bytes.len() / pixel_count;
++
++                let dst_x0 = origin_scaled.x.0.floor() as i32 + raster_bounds.origin.x.0;
++                let dst_y0 = origin_scaled.y.0.floor() as i32 + raster_bounds.origin.y.0;
++
++                min_x = min_x.min(dst_x0);
++                min_y = min_y.min(dst_y0);
++                max_x = max_x.max(dst_x0 + width as i32);
++                max_y = max_y.max(dst_y0 + height as i32);
++
++                glyph_masks.push(GlyphCoverage {
++                    dst_x0,
++                    dst_y0,
++                    width,
++                    height,
++                    channels,
++                    bytes,
++                });
++            }
++        }
++
++        if glyph_masks.is_empty() || min_x >= max_x || min_y >= max_y {
++            return Ok(None);
++        }
++
++        let mask_w = (max_x - min_x) as usize;
++        let mask_h = (max_y - min_y) as usize;
++        let mut coverage = vec![0u8; mask_w * mask_h];
++
++        for glyph in &glyph_masks {
++            for y in 0..glyph.height {
++                let src_row = y * glyph.width;
++                let dst_y = (glyph.dst_y0 - min_y) as usize + y;
++                let dst_row = dst_y * mask_w;
++                for x in 0..glyph.width {
++                    let pixel_i = src_row + x;
++                    let alpha = match glyph.channels {
++                        1 => glyph.bytes[pixel_i],
++                        3 => {
++                            let i = pixel_i * 3;
++                            glyph.bytes[i].max(glyph.bytes[i + 1]).max(glyph.bytes[i + 2])
++                        }
++                        channels => {
++                            let i = pixel_i * channels;
++                            let a = glyph.bytes.get(i + 3).copied().unwrap_or(0);
++                            if a > 0 {
++                                a
++                            } else {
++                                let r = glyph.bytes.get(i).copied().unwrap_or(0);
++                                let g = glyph.bytes.get(i + 1).copied().unwrap_or(0);
++                                let b = glyph.bytes.get(i + 2).copied().unwrap_or(0);
++                                r.max(g).max(b)
++                            }
++                        }
++                    };
++                    if alpha == 0 {
++                        continue;
++                    }
++
++                    let dst_x = (glyph.dst_x0 - min_x) as usize + x;
++                    let out = &mut coverage[dst_row + dst_x];
++                    *out = (*out).max(alpha);
++                }
++            }
++        }
++
++        Ok(Some(ShapedLineRasterMask {
++            coverage,
++            size: size(DevicePixels(mask_w as i32), DevicePixels(mask_h as i32)),
++            origin_offset: point(
++                Pixels(min_x as f32 / scale_factor),
++                Pixels(min_y as f32 / scale_factor),
++            ),
++            scale_factor,
++        }))
++    }
++
+     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
+             return false;
+@@ -8163,6 +8321,25 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
+     }
+ }
+ 
++/// A rasterized grayscale glyph-coverage mask for (a subrange of) a
++/// [`ShapedLine`](crate::ShapedLine), produced by
++/// [`Window::rasterize_shaped_line_mask`].
++///
++/// Local Echo extension (branch `echo-paint-fork`); see that method for details.
++#[derive(Clone, Debug)]
++pub struct ShapedLineRasterMask {
++    /// One coverage byte per pixel, row-major, `size.width * size.height` entries.
++    pub coverage: Vec<u8>,
++    /// Mask dimensions in device pixels.
++    pub size: Size<DevicePixels>,
++    /// Offset from the line's logical paint origin (top-left of the line box) to the
++    /// mask's top-left corner, in logical pixels. May be negative for overhanging
++    /// glyphs.
++    pub origin_offset: Point<Pixels>,
++    /// The window scale factor the mask was rasterized at.
++    pub scale_factor: f32,
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::{
+-- 
+2.55.0.windows.5
+
+
+From 817d57f28c8a5dd4dfbbaf25d38b09c1714f16d2 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Thu, 11 Jun 2026 18:59:31 -0700
+Subject: [PATCH 2/2] gpui: add Window::present_statistics for Echo metrics
+ overlay
+
+Expose swap-chain present timing so Echo's in-app metrics overlay can show
+real present (vsync) latency instead of a stubbed "n/a".
+
+On Windows, DirectXRenderer::present_statistics maps
+IDXGISwapChain::GetFrameStatistics (the swap chain is flip-model:
+DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) plus the high-resolution performance
+counter into a small PresentStatistics { present_count, present_latency_ms }.
+present_latency_ms is the age of the most recently scanned-out frame
+(now QPC - SyncQPCTime). Returns None when statistics are unavailable, when
+DXGI reports them transiently disjoint, or before the first vsync-aligned
+present -- never fabricated. The PlatformWindow trait method defaults to None,
+so macOS/Linux/test backends are unaffected. GPU timestamp queries remain out
+of scope (no query-heap pipeline).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ crates/gpui/src/gpui.rs                     | 17 +++++++
+ crates/gpui/src/platform.rs                 | 11 +++-
+ crates/gpui/src/window.rs                   | 18 ++++++-
+ crates/gpui_windows/src/directx_renderer.rs | 56 +++++++++++++++++++++
+ crates/gpui_windows/src/window.rs           |  4 ++
+ 5 files changed, 103 insertions(+), 3 deletions(-)
+
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index 5b31a3557f..f0defe0d04 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -351,3 +351,20 @@ pub struct GpuSpecs {
+     /// Further information about the driver, as reported by Vulkan.
+     pub driver_info: String,
+ }
++
++/// Present/swap-chain timing for the most recently scanned-out frame.
++///
++/// This is a local Echo extension (branch `echo-paint-fork`) used by the in-app
++/// metrics overlay. On Windows it maps `IDXGISwapChain::GetFrameStatistics` (a
++/// flip-model swap chain is required); other platforms return `None`. Values come
++/// straight from DXGI/QPC and are never fabricated: when statistics are unavailable
++/// or transiently disjoint, [`Window::present_statistics`] returns `None`.
++#[derive(Debug, Clone, Copy)]
++pub struct PresentStatistics {
++    /// Running count of frames the swap chain has presented (DXGI `PresentCount`).
++    pub present_count: u32,
++    /// Age, in milliseconds, of the most recently presented frame: the elapsed time
++    /// between that frame's vsync scan-out (`SyncQPCTime`) and the moment this call
++    /// sampled the high-resolution counter. Approximates present-pipeline latency.
++    pub present_latency_ms: f64,
++}
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index b84bcc5c09..5a2dd16443 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -40,7 +40,8 @@ use crate::{
+     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds, Corners,
+     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
+     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
+-    LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
++    LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, PresentStatistics,
++    Priority,
+     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
+     ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
+     hash, point, px, size,
+@@ -1401,6 +1402,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn set_client_corner_radii(&self, _radii: Corners<Pixels>) {}
+     fn gpu_specs(&self) -> Option<GpuSpecs>;
+ 
++    /// Present/swap-chain timing for the most recently scanned-out frame, if the
++    /// platform renderer can report it. Local Echo extension (`echo-paint-fork`);
++    /// only the Windows DirectX backend implements it. Returns `None` everywhere else
++    /// and whenever statistics are unavailable or transiently disjoint.
++    fn present_statistics(&self) -> Option<PresentStatistics> {
++        None
++    }
++
+     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
+ 
+     // Mobile platform methods.
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index bc28904619..66a9873346 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -16,7 +16,8 @@ use crate::{
+     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
++    PolychromeSprite, PresentStatistics, Priority, PromptButton, PromptLevel, Quad, Render,
++    RenderGlyphParams,
+     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+     StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+@@ -5267,7 +5268,9 @@ impl Window {
+                         1 => glyph.bytes[pixel_i],
+                         3 => {
+                             let i = pixel_i * 3;
+-                            glyph.bytes[i].max(glyph.bytes[i + 1]).max(glyph.bytes[i + 2])
++                            glyph.bytes[i]
++                                .max(glyph.bytes[i + 1])
++                                .max(glyph.bytes[i + 2])
+                         }
+                         channels => {
+                             let i = pixel_i * channels;
+@@ -7377,6 +7380,17 @@ impl Window {
+         self.platform_window.gpu_specs()
+     }
+ 
++    /// Present/swap-chain timing for the most recently scanned-out frame.
++    ///
++    /// Local Echo extension (branch `echo-paint-fork`) for the in-app metrics overlay.
++    /// Implemented only on the Windows DirectX backend (maps
++    /// `IDXGISwapChain::GetFrameStatistics`, which requires a flip-model swap chain);
++    /// returns `None` on other platforms and whenever DXGI statistics are unavailable
++    /// or transiently disjoint. Never fabricates values.
++    pub fn present_statistics(&self) -> Option<PresentStatistics> {
++        self.platform_window.present_statistics()
++    }
++
+     /// Perform titlebar double-click action.
+     /// This is macOS specific.
+     pub fn titlebar_double_click(&self) {
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index 4cce3e06cd..5fdf58357c 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -850,6 +850,62 @@ impl DirectXRenderer {
+         })
+     }
+ 
++    /// Present/swap-chain timing for the most recently scanned-out frame, mapped from
++    /// `IDXGISwapChain::GetFrameStatistics` and the high-resolution performance counter.
++    ///
++    /// Local Echo extension (branch `echo-paint-fork`) for the in-app metrics overlay.
++    /// `GetFrameStatistics` is meaningful only on flip-model swap chains (this backend
++    /// uses `DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL`). Returns `None` when no statistics are
++    /// available yet, when DXGI reports the data is transiently disjoint, or when the
++    /// performance counter is unusable. Never fabricates values.
++    pub(crate) fn present_statistics(&self) -> Option<PresentStatistics> {
++        use windows::Win32::System::Performance::{
++            QueryPerformanceCounter, QueryPerformanceFrequency,
++        };
++
++        let resources = self.resources.as_ref()?;
++        let mut stats = DXGI_FRAME_STATISTICS::default();
++        // SAFETY: `stats` is a valid, fully-owned out-param for the duration of the call.
++        // GetFrameStatistics returns an HRESULT; any failure (most notably
++        // DXGI_ERROR_FRAME_STATISTICS_DISJOINT, which means the data is momentarily
++        // inconsistent, e.g. just after a mode change) is treated as "not available right
++        // now" rather than an error.
++        let hr = unsafe { resources.swap_chain.GetFrameStatistics(&mut stats) };
++        if hr.is_err() {
++            return None;
++        }
++
++        // SyncQPCTime is the QPC value at the vsync that scanned out the last present.
++        // Zero means the swap chain has not produced a vsync-aligned present yet
++        // (common right after startup, or when presenting with sync interval 0 before
++        // the compositor has sampled a frame): no honest latency can be derived.
++        let sync_qpc = stats.SyncQPCTime;
++        if sync_qpc == 0 {
++            return None;
++        }
++
++        let mut now_qpc: i64 = 0;
++        let mut freq: i64 = 0;
++        // SAFETY: both out-params are valid local i64 storage.
++        unsafe {
++            QueryPerformanceCounter(&mut now_qpc).ok()?;
++            QueryPerformanceFrequency(&mut freq).ok()?;
++        }
++        if freq <= 0 {
++            return None;
++        }
++
++        // Age of the most recently presented frame, in milliseconds. Clamp to >= 0 in
++        // case the swap chain reports a SyncQPCTime fractionally ahead of `now`.
++        let delta_ticks = (now_qpc - sync_qpc).max(0);
++        let present_latency_ms = (delta_ticks as f64) * 1000.0 / (freq as f64);
++
++        Some(PresentStatistics {
++            present_count: stats.PresentCount,
++            present_latency_ms,
++        })
++    }
++
+     pub(crate) fn get_font_info() -> &'static FontInfo {
+         static CACHED_FONT_INFO: OnceLock<FontInfo> = OnceLock::new();
+         CACHED_FONT_INFO.get_or_init(|| unsafe {
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index 5d8415af72..e8ffa413b1 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -1063,6 +1063,10 @@ impl PlatformWindow for WindowsWindow {
+         self.state.renderer.borrow().gpu_specs().log_err()
+     }
+ 
++    fn present_statistics(&self) -> Option<PresentStatistics> {
++        self.state.renderer.borrow().present_statistics()
++    }
++
+     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+         let scale_factor = self.state.scale_factor.get();
+         let caret_position = POINT {
+-- 
+2.55.0.windows.5
+

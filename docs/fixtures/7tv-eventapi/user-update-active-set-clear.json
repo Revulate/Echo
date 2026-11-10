@@ -1,0 +1,31 @@
+{
+  "op": 0,
+  "d": {
+    "type": "user.update",
+    "body": {
+      "id": "example_7tv_user_id",
+      "actor": {
+        "display_name": "Echo Fixture"
+      },
+      "updated": [
+        {
+          "key": "connections",
+          "index": 0,
+          "value": [
+            {
+              "key": "emote_set",
+              "old_value": {
+                "id": "old_example_set_id",
+                "name": "Old Echo Set"
+              },
+              "value": {
+                "id": "",
+                "name": ""
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

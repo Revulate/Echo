@@ -1,0 +1,86 @@
+From dac8a261ba7a7f8ae5dc94eecaed8256ef921846 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 17:53:36 -0700
+Subject: [PATCH] feat(gpui): activate a window with a token from another
+ process
+
+A single-instance app forwards a second launch's XDG_ACTIVATION_TOKEN to
+the running instance, which must activate its window with that token for
+the compositor's focus-stealing prevention to honor the launch.
+Window::activate_window only requests a fresh token from the window's own
+last input serial, which KWin refuses for a background window and answers
+with an attention hint instead.
+
+Window::activate_window_with_token and PlatformWindow::activate_with_token
+activate with a handed-over token on Wayland; other platforms, and
+compositors without xdg_activation_v1, activate normally.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/platform.rs                   |  8 ++++++++
+ crates/gpui/src/window.rs                     |  8 ++++++++
+ crates/gpui_linux/src/linux/wayland/window.rs | 10 ++++++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 938313fef3..cf0f2e5ede 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1291,6 +1291,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+         answers: &[PromptButton],
+     ) -> Option<oneshot::Receiver<usize>>;
+     fn activate(&self);
++    /// Activate the window with an activation token another process handed
++    /// over (Wayland `xdg_activation_v1`), so the compositor's
++    /// focus-stealing prevention can honor that process's user launch.
++    /// Local Echo extension (`echo-paint-fork`); platforms without token
++    /// activation activate normally.
++    fn activate_with_token(&self, _token: &str) {
++        self.activate();
++    }
+     /// Requests that the operating system draw attention to this window.
+     fn request_attention(&self) {}
+     fn is_active(&self) -> bool;
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 52aca034d0..f95fa474d8 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -7455,6 +7455,14 @@ impl Window {
+         self.platform_window.activate();
+     }
+ 
++    /// Focus the current window with an activation token handed over by
++    /// another process, such as a second launch forwarding its
++    /// `XDG_ACTIVATION_TOKEN`. Local Echo extension (`echo-paint-fork`);
++    /// platforms without token activation behave like `activate_window`.
++    pub fn activate_window_with_token(&self, token: &str) {
++        self.platform_window.activate_with_token(token);
++    }
++
+     /// Requests that the operating system draw attention to this window.
+     pub fn request_attention(&self) {
+         self.platform_window.request_attention();
+diff --git a/crates/gpui_linux/src/linux/wayland/window.rs b/crates/gpui_linux/src/linux/wayland/window.rs
+index 6647a8ef7f..8f6b2465a1 100644
+--- a/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -1886,6 +1886,16 @@ impl PlatformWindow for WaylandWindow {
+         }
+     }
+ 
++    fn activate_with_token(&self, token: &str) {
++        let state = self.borrow();
++        if let Some(activation) = state.globals.activation.as_ref() {
++            activation.activate(token.to_owned(), &state.surface);
++        } else {
++            drop(state);
++            self.activate();
++        }
++    }
++
+     fn request_attention(&self) {}
+ 
+     fn is_active(&self) -> bool {
+-- 
+2.55.0.windows.5
+

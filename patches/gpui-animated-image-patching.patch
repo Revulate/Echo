@@ -1,0 +1,967 @@
+From d54eca1a8c3e38cc0a0dd6d8ee24d58ac4ddef6f Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 05:33:55 -0700
+Subject: [PATCH] perf(gpui): patch animated image frames into the presented
+ scene
+
+Animated content that changes only its frame no longer needs a window
+redraw. `Window::paint_animated_image` paints an image as a keyed slot;
+cached views carry their slots when replayed, and each slot is resolved
+to its sprite once the scene is sorted. `Window::patch_animated_image`
+then swaps that sprite's atlas tile in the presented scene and in the
+paint operation cached views replay, records the sprite's bounds as
+damage and requests a present-only frame. It refuses (returns false)
+when the key was not painted, was painted twice, or a draw is running.
+
+The Direct3D 11 renderer presents patch-only frames with
+`IDXGISwapChain1::Present1` dirty rectangles. Every frame still redraws
+the whole back buffer; the rectangles only let the compositor update
+less. The first present after resize or device recovery is full.
+
+`Window::frame_stage_statistics` reports cumulative CPU time per frame
+stage (layout, prepaint, paint, scene ordering, renderer upload, encode
+and the swap-chain present call), views rendered and reused, presents,
+partial presents, patches and patch refusals by reason.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/gpui.rs                     |  65 ++++
+ crates/gpui/src/platform.rs                 |  19 +-
+ crates/gpui/src/scene.rs                    |   9 +-
+ crates/gpui/src/view.rs                     |   3 +
+ crates/gpui/src/window.rs                   | 385 +++++++++++++++++---
+ crates/gpui_windows/src/directx_renderer.rs | 112 +++++-
+ crates/gpui_windows/src/window.rs           |   8 +
+ 7 files changed, 535 insertions(+), 66 deletions(-)
+
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index a3739ac886..60a63e0a43 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -382,3 +382,68 @@ pub struct GpuFrameStatistics {
+     /// Running count of successfully resolved, non-disjoint timestamp samples.
+     pub sample_count: u64,
+ }
++
++/// Cumulative CPU time a window has spent in each stage of its frame pipeline.
++///
++/// This is a local Echo extension (branch `echo-paint-fork`). Every field only
++/// grows for the lifetime of the window, so a consumer diffs two snapshots taken
++/// at different times to get per-interval costs. Timing costs a handful of
++/// monotonic clock reads per frame and never changes pacing.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct FrameStageStatistics {
++    /// Number of completed `Window::draw` calls.
++    pub frames_drawn: u64,
++    /// Number of frames handed to the platform renderer.
++    pub frames_presented: u64,
++    /// Total time inside `Window::draw`.
++    pub draw_nanos: u64,
++    /// Time spent laying out, prepainting and painting the element trees.
++    pub layout_paint_nanos: u64,
++    /// Part of `layout_paint_nanos` spent rendering views and requesting layout.
++    pub request_layout_nanos: u64,
++    /// Part of `layout_paint_nanos` spent computing layout and prepainting.
++    pub prepaint_nanos: u64,
++    /// Part of `layout_paint_nanos` spent painting.
++    pub paint_nanos: u64,
++    /// Views whose `render` ran.
++    pub views_rendered: u64,
++    /// Cached views replayed from the previous frame.
++    pub views_reused: u64,
++    /// Time spent ordering the finished scene's primitives.
++    pub scene_finish_nanos: u64,
++    /// Time inside the platform renderer for a frame: buffer upload, command
++    /// encoding and the swap-chain present call.
++    pub present_nanos: u64,
++    /// Primitives in finished scenes.
++    pub primitives: u64,
++    /// Primitives copied from the previous frame by cached views.
++    pub replayed_primitives: u64,
++    /// Presents that sent only damaged regions to the platform.
++    pub partial_presents: u64,
++    /// Animated image sprites retargeted by `Window::patch_animated_image`.
++    pub animated_image_patches: u64,
++    /// `Window::patch_animated_image` calls refused, by reason: key not painted
++    /// in the presented frame, key painted more than once, sprite not found
++    /// after sorting, atlas or frame data unavailable, draw in progress.
++    pub animated_image_patch_rejections: [u64; 5],
++    /// Renderer-side split of `present_nanos`, when the backend reports one.
++    pub renderer: Option<RendererCpuStatistics>,
++}
++
++/// Cumulative CPU time a window's platform renderer spent per frame stage.
++///
++/// This is a local Echo extension (branch `echo-paint-fork`). Values only grow.
++/// The Windows Direct3D 11 renderer reports these; other backends return `None`.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct RendererCpuStatistics {
++    /// Frames the renderer drew.
++    pub frames: u64,
++    /// Time copying primitive instance data into GPU buffers.
++    pub upload_nanos: u64,
++    /// Time clearing the target and encoding draw calls.
++    pub encode_nanos: u64,
++    /// Time inside the swap-chain present call.
++    pub present_call_nanos: u64,
++    /// Bytes of instance data copied into GPU buffers.
++    pub upload_bytes: u64,
++}
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index d5d08f8239..d2ba1b3f22 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -42,8 +42,9 @@ use crate::{
+     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuFrameStatistics, GpuSpecs, Hsla,
+     ImageSource, Keymap, LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput,
+     Point, PresentStatistics, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+-    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
+-    SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
++    RenderSvgParams, RendererCpuStatistics, ScaledPixels, Scene, ShapedGlyph, ShapedRun,
++    SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point,
++    px, size,
+ };
+ #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+ use anyhow::bail;
+@@ -1424,6 +1425,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+         None
+     }
+ 
++    /// Regions of the window that changed since the previous present, for the
++    /// next `draw`. `None` means the whole window changed.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). Renderers may use this to
++    /// present only the damaged regions; the default ignores it.
++    fn set_present_damage(&self, _regions: Option<&[Bounds<ScaledPixels>]>) {}
++
++    /// Cumulative CPU time the renderer spent per frame stage.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). The default returns `None`.
++    fn renderer_cpu_statistics(&self) -> Option<RendererCpuStatistics> {
++        None
++    }
++
+     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
+ 
+     // Mobile platform methods.
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index a4116aa525..a0397ccf5b 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -50,11 +50,15 @@ pub struct Scene {
+     pub subpixel_sprites: Vec<SubpixelSprite>,
+     pub polychrome_sprites: Vec<PolychromeSprite>,
+     pub surfaces: Vec<PaintSurface>,
++    /// Primitives copied from a previous scene by [`Scene::replay`] since the
++    /// last [`Scene::clear`]. Echo frame-stage diagnostics.
++    pub(crate) replayed_primitives: usize,
+ }
+ 
+ #[expect(missing_docs)]
+ impl Scene {
+     pub fn clear(&mut self) {
++        self.replayed_primitives = 0;
+         self.paint_operations.clear();
+         self.primitive_bounds.clear();
+         self.layer_stack.clear();
+@@ -141,7 +145,10 @@ impl Scene {
+     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+         for operation in &prev_scene.paint_operations[range] {
+             match operation {
+-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
++                PaintOperation::Primitive(primitive) => {
++                    self.replayed_primitives += 1;
++                    self.insert_primitive(primitive.clone())
++                }
+                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                 PaintOperation::EndLayer => self.pop_layer(),
+             }
+diff --git a/crates/gpui/src/view.rs b/crates/gpui/src/view.rs
+index 37418510d9..b47fada966 100644
+--- a/crates/gpui/src/view.rs
++++ b/crates/gpui/src/view.rs
+@@ -501,6 +501,7 @@ fn request_layout_view(
+                 (layout_id, None)
+             }
+             _ => {
++                window.frame_stage_statistics.views_rendered += 1;
+                 let mut element = render(window, cx);
+                 let layout_id = element.request_layout(window, cx);
+                 (layout_id, Some(element))
+@@ -557,6 +558,7 @@ fn prepaint_view(
+                     && !window.dirty_views.contains(&entity_id)
+                     && !window.refreshing
+                 {
++                    window.frame_stage_statistics.views_reused += 1;
+                     let prepaint_start = window.prepaint_index();
+                     window.reuse_prepaint(element_state.prepaint_range.clone());
+                     cx.entities
+@@ -567,6 +569,7 @@ fn prepaint_view(
+                     return (None, element_state);
+                 }
+ 
++                window.frame_stage_statistics.views_rendered += 1;
+                 let refreshing = mem::replace(&mut window.refreshing, true);
+                 let prepaint_start = window.prepaint_index();
+                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 9969390511..701879068a 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -11,25 +11,25 @@ use crate::{
+     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+-    GpuFrameStatistics, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
++    EntityId, EventEmitter, FileDropEvent, FontId, FrameStageStatistics, Global, GlobalElementId,
++    GlyphId, GpuFrameStatistics, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
+     KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
+     Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+     MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+     PlatformWindow, Point, PolychromeSprite, PresentStatistics, Priority, PromptButton, PromptLevel,
+-    Quad, Render, RenderGlyphParams,
+-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+-    StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+-    SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
+-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
++    Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay,
++    ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels,
++    Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, Subscription,
++    SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
++    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
++    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
++    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
++    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+ };
+ 
+ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+ use crate::interactive::TouchEvent;
++use crate::scene::{PaintOperation, Primitive};
+ use anyhow::{Context as _, Result, anyhow};
+ use collections::{FxHashMap, FxHashSet};
+ use derive_more::{Deref, DerefMut};
+@@ -1062,6 +1062,46 @@ pub(crate) struct Frame {
+     #[cfg(any(feature = "inspector", debug_assertions))]
+     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
+     pub(crate) tab_stops: TabStopMap,
++    /// Animated images painted with [`Window::paint_animated_image`], in paint
++    /// order. Local Echo extension (`echo-paint-fork`).
++    animated_image_slots: Vec<AnimatedImageSlot>,
++    /// Where each slot's sprite landed once the scene was sorted.
++    animated_image_sprites: FxHashMap<u64, AnimatedImageSlotResolution>,
++}
++
++/// An animated image sprite that [`Window::patch_animated_image`] can retarget
++/// to another frame without redrawing the window.
++#[derive(Clone, Copy)]
++struct AnimatedImageSlot {
++    key: u64,
++    /// Index of the sprite's operation in the scene's paint operations.
++    op_index: usize,
++    visible_bounds: Bounds<Pixels>,
++    image_bounds: Bounds<Pixels>,
++}
++
++#[derive(Clone, Copy)]
++enum AnimatedImageSlotResolution {
++    Resolved(ResolvedAnimatedImageSlot),
++    /// The key was painted more than once, so no single sprite can be patched.
++    Ambiguous,
++    /// The sprite could not be found in the sorted scene.
++    Unresolved,
++}
++
++#[derive(Clone, Copy)]
++struct ResolvedAnimatedImageSlot {
++    slot: AnimatedImageSlot,
++    /// Index of the sprite in the sorted `Scene::polychrome_sprites`.
++    sprite_index: usize,
++}
++
++/// Window regions that changed since the last present.
++enum PresentDamage {
++    /// The whole window was redrawn.
++    Full,
++    /// Only these regions changed (animated image patches).
++    Regions(SmallVec<[Bounds<ScaledPixels>; 8]>),
+ }
+ 
+ #[derive(Clone, Default)]
+@@ -1121,10 +1161,14 @@ impl Frame {
+             #[cfg(any(feature = "inspector", debug_assertions))]
+             inspector_hitboxes: FxHashMap::default(),
+             tab_stops: TabStopMap::default(),
++            animated_image_slots: Vec::new(),
++            animated_image_sprites: FxHashMap::default(),
+         }
+     }
+ 
+     pub(crate) fn clear(&mut self) {
++        self.animated_image_slots.clear();
++        self.animated_image_sprites.clear();
+         self.element_states.clear();
+         self.accessed_element_states.clear();
+         self.mouse_listeners.clear();
+@@ -1197,7 +1241,8 @@ impl Frame {
+             .unwrap_or_default()
+     }
+ 
+-    pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
++    /// Returns the time spent ordering the scene's primitives.
++    pub(crate) fn finish(&mut self, prev_frame: &mut Self) -> std::time::Duration {
+         for element_state_key in &self.accessed_element_states {
+             if let Some((element_state_key, element_state)) =
+                 prev_frame.element_states.remove_entry(element_state_key)
+@@ -1206,7 +1251,43 @@ impl Frame {
+             }
+         }
+ 
++        let scene_finish_started = std::time::Instant::now();
+         self.scene.finish();
++        let scene_finish = scene_finish_started.elapsed();
++        self.resolve_animated_image_slots();
++        scene_finish
++    }
++
++    /// Find each animated image slot's sprite in the sorted scene.
++    fn resolve_animated_image_slots(&mut self) {
++        let sprites = &self.scene.polychrome_sprites;
++        for slot in &self.animated_image_slots {
++            let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
++                self.scene.paint_operations.get(slot.op_index)
++            else {
++                continue;
++            };
++            let key = (painted.order, painted.tile.tile_id);
++            let start = sprites.partition_point(|sprite| (sprite.order, sprite.tile.tile_id) < key);
++            let sprite_index = sprites[start..]
++                .iter()
++                .take_while(|sprite| (sprite.order, sprite.tile.tile_id) == key)
++                .position(|sprite| sprite.bounds == painted.bounds)
++                .map(|offset| start + offset);
++            let resolution = match sprite_index {
++                Some(sprite_index) => {
++                    AnimatedImageSlotResolution::Resolved(ResolvedAnimatedImageSlot {
++                        slot: *slot,
++                        sprite_index,
++                    })
++                }
++                None => AnimatedImageSlotResolution::Unresolved,
++            };
++            self.animated_image_sprites
++                .entry(slot.key)
++                .and_modify(|existing| *existing = AnimatedImageSlotResolution::Ambiguous)
++                .or_insert(resolution);
++        }
+     }
+ }
+ 
+@@ -1283,6 +1364,8 @@ pub struct Window {
+     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+     #[cfg(feature = "profiler")]
+     pub(crate) window_profiler: profiler::WindowProfiler,
++    pub(crate) frame_stage_statistics: FrameStageStatistics,
++    present_damage: PresentDamage,
+     last_input_modality: InputModality,
+     touch_gestures: TouchGestureRecognizer,
+     touch_prediction_enabled: bool,
+@@ -2403,6 +2486,8 @@ impl Window {
+             input_rate_tracker,
+             #[cfg(feature = "profiler")]
+             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
++            frame_stage_statistics: FrameStageStatistics::default(),
++            present_damage: PresentDamage::Full,
+             last_input_modality: InputModality::Mouse,
+             touch_gestures: TouchGestureRecognizer::new(
+                 cx.platform
+@@ -3665,6 +3750,7 @@ impl Window {
+         let frame_dirty = self.invalidator.take_frame_dirty();
+         #[cfg(feature = "profiler")]
+         self.window_profiler.begin_draw();
++        let draw_started = std::time::Instant::now();
+ 
+         // Set up the per-App arena for element allocation during this draw.
+         // This ensures that multiple test Apps have isolated arenas.
+@@ -3697,7 +3783,10 @@ impl Window {
+             }
+         }
+         if !cx.mode.skip_drawing() {
++            let layout_paint_started = std::time::Instant::now();
+             self.draw_roots(cx);
++            self.frame_stage_statistics.layout_paint_nanos +=
++                duration_nanos(layout_paint_started.elapsed());
+             #[cfg(feature = "profiler")]
+             {
+                 let viewport_size = self.viewport_size;
+@@ -3743,7 +3832,11 @@ impl Window {
+ 
+         self.layout_engine.as_mut().unwrap().clear();
+         self.text_system().finish_frame();
+-        self.next_frame.finish(&mut self.rendered_frame);
++        let scene_finish = self.next_frame.finish(&mut self.rendered_frame);
++        let scene = &self.next_frame.scene;
++        self.frame_stage_statistics.scene_finish_nanos += duration_nanos(scene_finish);
++        self.frame_stage_statistics.primitives += scene.len() as u64;
++        self.frame_stage_statistics.replayed_primitives += scene.replayed_primitives as u64;
+ 
+         self.invalidator.set_phase(DrawPhase::Focus);
+         let previous_focus_path = self.rendered_frame.focus_path();
+@@ -3800,6 +3893,9 @@ impl Window {
+             self.refresh();
+         }
+         self.needs_present.set(true);
++        self.present_damage = PresentDamage::Full;
++        self.frame_stage_statistics.frames_drawn += 1;
++        self.frame_stage_statistics.draw_nanos += duration_nanos(draw_started.elapsed());
+ 
+         #[cfg(feature = "profiler")]
+         {
+@@ -3842,7 +3938,21 @@ impl Window {
+         let _foreground_turn = profiler::journal::foreground_turn();
+         #[cfg(feature = "profiler")]
+         let present_start = Instant::now();
++        let platform_draw_started = std::time::Instant::now();
++        match mem::replace(
++            &mut self.present_damage,
++            PresentDamage::Regions(SmallVec::new()),
++        ) {
++            PresentDamage::Regions(regions) if !regions.is_empty() => {
++                self.frame_stage_statistics.partial_presents += 1;
++                self.platform_window.set_present_damage(Some(&regions));
++            }
++            _ => self.platform_window.set_present_damage(None),
++        }
+         self.platform_window.draw(&self.rendered_frame.scene);
++        self.frame_stage_statistics.frames_presented += 1;
++        self.frame_stage_statistics.present_nanos +=
++            duration_nanos(platform_draw_started.elapsed());
+         #[cfg(feature = "profiler")]
+         self.window_profiler.record_present(
+             present_start,
+@@ -3935,6 +4045,7 @@ impl Window {
+         let scale_factor = self.scale_factor();
+         #[cfg(feature = "profiler")]
+         let request_layout_start = Instant::now();
++        let request_layout_started = std::time::Instant::now();
+         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
+         let root_layout_id = root_element.request_layout(self, cx);
+         #[cfg(feature = "profiler")]
+@@ -3943,6 +4054,9 @@ impl Window {
+             .as_mut()
+             .unwrap()
+             .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
++        let prepaint_started = std::time::Instant::now();
++        self.frame_stage_statistics.request_layout_nanos +=
++            duration_nanos(prepaint_started - request_layout_started);
+         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+ 
+         #[cfg(any(feature = "inspector", debug_assertions))]
+@@ -3978,6 +4092,9 @@ impl Window {
+         // Now actually paint the elements.
+         #[cfg(feature = "profiler")]
+         let paint_start = Instant::now();
++        let paint_started = std::time::Instant::now();
++        self.frame_stage_statistics.prepaint_nanos +=
++            duration_nanos(paint_started - prepaint_started);
+         self.invalidator.set_phase(DrawPhase::Paint);
+         root_element.paint(self, cx);
+ 
+@@ -3996,6 +4113,7 @@ impl Window {
+ 
+         #[cfg(any(feature = "inspector", debug_assertions))]
+         self.paint_inspector_hitbox(cx);
++        self.frame_stage_statistics.paint_nanos += duration_nanos(paint_started.elapsed());
+ 
+         #[cfg(feature = "profiler")]
+         self.window_profiler
+@@ -4348,10 +4466,24 @@ impl Window {
+ 
+         self.text_system
+             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
++        let replayed_scene_start = self.next_frame.scene.len();
+         self.next_frame.scene.replay(
+             range.start.scene_index..range.end.scene_index,
+             &self.rendered_frame.scene,
+         );
++        let slots = &self.rendered_frame.animated_image_slots;
++        let first = slots.partition_point(|slot| slot.op_index < range.start.scene_index);
++        for slot in slots[first..]
++            .iter()
++            .take_while(|slot| slot.op_index < range.end.scene_index)
++        {
++            self.next_frame
++                .animated_image_slots
++                .push(AnimatedImageSlot {
++                    op_index: replayed_scene_start + (slot.op_index - range.start.scene_index),
++                    ..*slot
++                });
++        }
+     }
+ 
+     /// Push a text style onto the stack, and call a function with that style active.
+@@ -5505,46 +5637,7 @@ impl Window {
+             .expect("Callback above only returns Some");
+ 
+         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+-
+-        let sub_tile = if visible_bounds == image_bounds {
+-            tile
+-        } else {
+-            let x_offset_ratio =
+-                (visible_bounds.origin.x - image_bounds.origin.x) / image_bounds.size.width;
+-            let y_offset_ratio =
+-                (visible_bounds.origin.y - image_bounds.origin.y) / image_bounds.size.height;
+-            let width_ratio = visible_bounds.size.width / image_bounds.size.width;
+-            let height_ratio = visible_bounds.size.height / image_bounds.size.height;
+-
+-            let tile_origin_x = tile.bounds.origin.x.0;
+-            let tile_origin_y = tile.bounds.origin.y.0;
+-            let tile_width = tile.bounds.size.width.0;
+-            let tile_height = tile.bounds.size.height.0;
+-
+-            let sub_origin_x = tile_origin_x + (x_offset_ratio * tile_width as f32).round() as i32;
+-            let sub_origin_y = tile_origin_y + (y_offset_ratio * tile_height as f32).round() as i32;
+-            let sub_width = (width_ratio * tile_width as f32).round() as i32;
+-            let sub_height = (height_ratio * tile_height as f32).round() as i32;
+-
+-            let max_x = tile_origin_x + tile_width;
+-            let max_y = tile_origin_y + tile_height;
+-
+-            let clamped_origin_x = sub_origin_x.clamp(tile_origin_x, max_x);
+-            let clamped_origin_y = sub_origin_y.clamp(tile_origin_y, max_y);
+-            let clamped_width = sub_width.min(max_x - clamped_origin_x).max(0);
+-            let clamped_height = sub_height.min(max_y - clamped_origin_y).max(0);
+-
+-            AtlasTile {
+-                bounds: Bounds {
+-                    origin: point(
+-                        DevicePixels(clamped_origin_x),
+-                        DevicePixels(clamped_origin_y),
+-                    ),
+-                    size: size(DevicePixels(clamped_width), DevicePixels(clamped_height)),
+-                },
+-                ..tile
+-            }
+-        };
++        let sub_tile = visible_image_tile(tile, visible_bounds, image_bounds);
+ 
+         let content_mask = self.snapped_content_mask();
+         let corner_radii = corner_radii
+@@ -5565,6 +5658,131 @@ impl Window {
+         Ok(())
+     }
+ 
++    /// Paint an animated image frame that [`Self::patch_animated_image`] can later
++    /// swap for another frame without redrawing the window.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). `key` identifies this painted
++    /// instance within the window; painting one key twice in a frame makes it
++    /// unpatchable for that frame. Cached views carry their slots when replayed.
++    /// Returns whether a slot was recorded: nothing is painted, and no slot
++    /// exists, when the image lies entirely outside the content mask.
++    pub fn paint_animated_image(
++        &mut self,
++        key: u64,
++        bounds: Bounds<Pixels>,
++        image_bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        data: Arc<RenderImage>,
++        frame_index: usize,
++        grayscale: bool,
++    ) -> Result<bool> {
++        let op_index = self.next_frame.scene.len();
++        self.paint_image(
++            bounds,
++            image_bounds,
++            corner_radii,
++            data,
++            frame_index,
++            grayscale,
++        )?;
++        let painted = self.next_frame.scene.len() > op_index;
++        if painted {
++            self.next_frame
++                .animated_image_slots
++                .push(AnimatedImageSlot {
++                    key,
++                    op_index,
++                    visible_bounds: bounds.intersect(&image_bounds),
++                    image_bounds,
++                });
++        }
++        Ok(painted)
++    }
++
++    /// Show another frame of an image painted with [`Self::paint_animated_image`]
++    /// in the presented frame, without drawing a new frame.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). The sprite's atlas tile is
++    /// replaced in the presented scene and in the operation cached views replay,
++    /// and the window presents again with only that sprite's region damaged.
++    /// Returns `false`, changing nothing, when the presented frame has no
++    /// unambiguous sprite for `key` or a draw is in progress; the caller must
++    /// then redraw instead.
++    pub fn patch_animated_image(
++        &mut self,
++        key: u64,
++        data: &Arc<RenderImage>,
++        frame_index: usize,
++    ) -> bool {
++        if !self.invalidator.not_drawing() {
++            self.frame_stage_statistics.animated_image_patch_rejections[4] += 1;
++            return false;
++        }
++        let resolved = match self
++            .rendered_frame
++            .animated_image_sprites
++            .get(&key)
++            .copied()
++        {
++            Some(AnimatedImageSlotResolution::Resolved(resolved)) => resolved,
++            resolution => {
++                let reason = match resolution {
++                    None => 0,
++                    Some(AnimatedImageSlotResolution::Ambiguous) => 1,
++                    _ => 2,
++                };
++                self.frame_stage_statistics.animated_image_patch_rejections[reason] += 1;
++                return false;
++            }
++        };
++        let Some(frame_bytes) = data.as_bytes(frame_index) else {
++            self.frame_stage_statistics.animated_image_patch_rejections[3] += 1;
++            return false;
++        };
++        let params = RenderImageParams {
++            image_id: data.id,
++            frame_index,
++        };
++        let Ok(Some(tile)) = self
++            .sprite_atlas
++            .get_or_insert_with(params.into(), &mut || {
++                Ok(Some((data.size(frame_index), Cow::Borrowed(frame_bytes))))
++            })
++        else {
++            self.frame_stage_statistics.animated_image_patch_rejections[3] += 1;
++            return false;
++        };
++        let tile = visible_image_tile(
++            tile,
++            resolved.slot.visible_bounds,
++            resolved.slot.image_bounds,
++        );
++
++        let scene = &mut self.rendered_frame.scene;
++        let Some(sprite) = scene.polychrome_sprites.get_mut(resolved.sprite_index) else {
++            return false;
++        };
++        if sprite.tile == tile {
++            return true;
++        }
++        sprite.tile = tile;
++        let damage = sprite.bounds.intersect(&sprite.content_mask.bounds);
++        if let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
++            scene.paint_operations.get_mut(resolved.slot.op_index)
++        {
++            painted.tile = tile;
++        }
++
++        if let PresentDamage::Regions(regions) = &mut self.present_damage {
++            regions.push(damage);
++        }
++        self.frame_stage_statistics.animated_image_patches += 1;
++        self.needs_present.set(true);
++        self.platform_window.schedule_frame();
++        self.invalidator.wake_platform();
++        true
++    }
++
+     /// Paint a surface into the scene for the next frame at the current z-index.
+     ///
+     /// This method should only be called as part of the paint phase of element drawing.
+@@ -7423,6 +7641,17 @@ impl Window {
+         self.platform_window.gpu_frame_statistics()
+     }
+ 
++    /// Cumulative CPU time this window has spent per frame-pipeline stage.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). Diff two snapshots to get the
++    /// cost of the frames drawn between them.
++    pub fn frame_stage_statistics(&self) -> FrameStageStatistics {
++        FrameStageStatistics {
++            renderer: self.platform_window.renderer_cpu_statistics(),
++            ..self.frame_stage_statistics
++        }
++    }
++
+     /// Perform titlebar double-click action.
+     /// This is macOS specific.
+     pub fn titlebar_double_click(&self) {
+@@ -10901,3 +11130,53 @@ mod inspector_tests {
+         .expect("closed inspector has no bookkeeping and no style overrides");
+     }
+ }
++
++fn duration_nanos(duration: std::time::Duration) -> u64 {
++    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
++}
++
++/// The part of `tile` that shows `visible_bounds` of an image drawn at `image_bounds`.
++fn visible_image_tile(
++    tile: AtlasTile,
++    visible_bounds: Bounds<Pixels>,
++    image_bounds: Bounds<Pixels>,
++) -> AtlasTile {
++    if visible_bounds == image_bounds {
++        return tile;
++    }
++    let x_offset_ratio =
++        (visible_bounds.origin.x - image_bounds.origin.x) / image_bounds.size.width;
++    let y_offset_ratio =
++        (visible_bounds.origin.y - image_bounds.origin.y) / image_bounds.size.height;
++    let width_ratio = visible_bounds.size.width / image_bounds.size.width;
++    let height_ratio = visible_bounds.size.height / image_bounds.size.height;
++
++    let tile_origin_x = tile.bounds.origin.x.0;
++    let tile_origin_y = tile.bounds.origin.y.0;
++    let tile_width = tile.bounds.size.width.0;
++    let tile_height = tile.bounds.size.height.0;
++
++    let sub_origin_x = tile_origin_x + (x_offset_ratio * tile_width as f32).round() as i32;
++    let sub_origin_y = tile_origin_y + (y_offset_ratio * tile_height as f32).round() as i32;
++    let sub_width = (width_ratio * tile_width as f32).round() as i32;
++    let sub_height = (height_ratio * tile_height as f32).round() as i32;
++
++    let max_x = tile_origin_x + tile_width;
++    let max_y = tile_origin_y + tile_height;
++
++    let clamped_origin_x = sub_origin_x.clamp(tile_origin_x, max_x);
++    let clamped_origin_y = sub_origin_y.clamp(tile_origin_y, max_y);
++    let clamped_width = sub_width.min(max_x - clamped_origin_x).max(0);
++    let clamped_height = sub_height.min(max_y - clamped_origin_y).max(0);
++
++    AtlasTile {
++        bounds: Bounds {
++            origin: point(
++                DevicePixels(clamped_origin_x),
++                DevicePixels(clamped_origin_y),
++            ),
++            size: size(DevicePixels(clamped_width), DevicePixels(clamped_height)),
++        },
++        ..tile
++    }
++}
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index 93a5bceb12..a226149f9f 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
+ use gpui_util::ResultExt;
+ use windows::{
+     Win32::{
+-        Foundation::HWND,
++        Foundation::{HWND, RECT},
+         Graphics::{
+             Direct3D::*,
+             Direct3D11::*,
+@@ -54,6 +54,16 @@ pub(crate) struct DirectXRenderer {
+     gpu_timing_enabled: bool,
+     gpu_timing_unavailable: bool,
+     gpu_frame_timer: Option<GpuFrameTimer>,
++    cpu_statistics: RendererCpuStatistics,
++    /// Upload time of the frame being drawn, so `draw` can attribute the rest
++    /// of `render` to encoding.
++    frame_upload_nanos: u64,
++    /// Regions that changed since the previous present, in back-buffer pixels.
++    /// `None` presents the whole buffer.
++    present_dirty_rects: Option<Vec<RECT>>,
++    /// Set when the back buffers were (re)created; their first present must
++    /// cover the whole window.
++    force_full_present: bool,
+ 
+     width: u32,
+     height: u32,
+@@ -396,6 +406,10 @@ impl DirectXRenderer {
+             gpu_timing_enabled: false,
+             gpu_timing_unavailable: false,
+             gpu_frame_timer: None,
++            cpu_statistics: RendererCpuStatistics::default(),
++            frame_upload_nanos: 0,
++            present_dirty_rects: None,
++            force_full_present: true,
+             width: 1,
+             height: 1,
+             skip_draws: false,
+@@ -446,16 +460,44 @@ impl DirectXRenderer {
+         Ok(())
+     }
+ 
++    /// Record which regions changed for the next present (local Echo extension).
++    ///
++    /// Every frame still redraws the whole back buffer, so the regions are only a
++    /// hint that lets the compositor update less of the screen. They must cover
++    /// every pixel that differs from the previously presented frame.
++    pub(crate) fn set_present_damage(&mut self, regions: Option<&[Bounds<ScaledPixels>]>) {
++        self.present_dirty_rects = regions.map(|regions| {
++            regions
++                .iter()
++                .filter_map(|region| device_rect(region, self.width, self.height))
++                .collect()
++        });
++    }
++
+     #[inline]
+     fn present(&mut self) -> Result<()> {
+-        let result = unsafe {
+-            self.resources
+-                .as_ref()
+-                .context("resources missing")?
+-                .swap_chain
+-                .Present(0, DXGI_PRESENT(0))
++        let dirty_rects = self.present_dirty_rects.take();
++        let swap_chain = &self
++            .resources
++            .as_ref()
++            .context("resources missing")?
++            .swap_chain;
++        let result = match dirty_rects {
++            Some(mut rects) if !rects.is_empty() && !self.force_full_present => {
++                let parameters = DXGI_PRESENT_PARAMETERS {
++                    DirtyRectsCount: rects.len() as u32,
++                    pDirtyRects: rects.as_mut_ptr(),
++                    pScrollRect: std::ptr::null_mut(),
++                    pScrollOffset: std::ptr::null_mut(),
++                };
++                // SAFETY: `parameters` points at `rects`, which outlives the call;
++                // every rect lies within the back buffer (`device_rect`).
++                unsafe { swap_chain.Present1(0, DXGI_PRESENT(0), &parameters) }
++            }
++            _ => unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) },
+         };
+         result.ok().context("Presenting swap chain failed")?;
++        self.force_full_present = false;
+         SUCCESSFUL_PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         Ok(())
+     }
+@@ -541,6 +583,7 @@ impl DirectXRenderer {
+         }
+         self.devices = Some(devices);
+         self.resources = Some(resources);
++        self.force_full_present = true;
+         self.globals = globals;
+         self.pipelines = pipelines;
+         self.direct_composition = direct_composition;
+@@ -558,15 +601,29 @@ impl DirectXRenderer {
+             // and likely lack the textures it needs, or recovery is still pending
+             return Ok(());
+         }
+-        if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref()) {
++        if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref())
++        {
+             timer.begin_frame(&devices.device_context);
+         }
++        let render_started = std::time::Instant::now();
+         let draw_result = self.render(scene, background_appearance);
+-        if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref()) {
++        if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref())
++        {
+             timer.end_frame(&devices.device_context);
+         }
++        let render_nanos = duration_nanos(render_started.elapsed());
++        self.cpu_statistics.frames += 1;
++        self.cpu_statistics.encode_nanos += render_nanos.saturating_sub(self.frame_upload_nanos);
+         draw_result?;
+-        self.present()
++        let present_started = std::time::Instant::now();
++        let present_result = self.present();
++        self.cpu_statistics.present_call_nanos += duration_nanos(present_started.elapsed());
++        present_result
++    }
++
++    /// Cumulative CPU time per frame stage (local Echo extension).
++    pub(crate) fn renderer_cpu_statistics(&self) -> RendererCpuStatistics {
++        self.cpu_statistics
+     }
+ 
+     /// Clear the render target for `background_appearance` and encode every
+@@ -583,7 +640,11 @@ impl DirectXRenderer {
+             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+             _ => [0.0f32; 4],
+         })?;
++        let upload_started = std::time::Instant::now();
+         self.upload_scene_buffers(scene)?;
++        self.frame_upload_nanos = duration_nanos(upload_started.elapsed());
++        self.cpu_statistics.upload_nanos += self.frame_upload_nanos;
++        self.cpu_statistics.upload_bytes += scene_instance_bytes(scene);
+ 
+         let annotation = self
+             .devices
+@@ -718,6 +779,7 @@ impl DirectXRenderer {
+         }
+         self.width = width;
+         self.height = height;
++        self.force_full_present = true;
+ 
+         // Clear the render target before resizing
+         let devices = self.devices.as_ref().context("devices missing")?;
+@@ -2358,3 +2420,33 @@ mod dxgi {
+         ))
+     }
+ }
++
++fn duration_nanos(duration: std::time::Duration) -> u64 {
++    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
++}
++
++/// Bytes of per-primitive instance data `upload_scene_buffers` copies for `scene`.
++fn scene_instance_bytes(scene: &Scene) -> u64 {
++    use std::mem::size_of_val;
++    (size_of_val(scene.shadows.as_slice())
++        + size_of_val(scene.quads.as_slice())
++        + size_of_val(scene.underlines.as_slice())
++        + size_of_val(scene.monochrome_sprites.as_slice())
++        + size_of_val(scene.subpixel_sprites.as_slice())
++        + size_of_val(scene.polychrome_sprites.as_slice())) as u64
++}
++
++/// `region` as a back-buffer rectangle, grown to whole pixels and clipped to
++/// the buffer; `None` when nothing of it is inside.
++fn device_rect(region: &Bounds<ScaledPixels>, width: u32, height: u32) -> Option<RECT> {
++    let left = (region.origin.x.0.floor() as i32).max(0);
++    let top = (region.origin.y.0.floor() as i32).max(0);
++    let right = ((region.origin.x.0 + region.size.width.0).ceil() as i32).min(width as i32);
++    let bottom = ((region.origin.y.0 + region.size.height.0).ceil() as i32).min(height as i32);
++    (left < right && top < bottom).then_some(RECT {
++        left,
++        top,
++        right,
++        bottom,
++    })
++}
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index 07f3d1e96c..d5b6ebc6ff 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -1086,6 +1086,14 @@ impl PlatformWindow for WindowsWindow {
+         self.state.renderer.borrow().gpu_frame_statistics()
+     }
+ 
++    fn set_present_damage(&self, regions: Option<&[Bounds<ScaledPixels>]>) {
++        self.state.renderer.borrow_mut().set_present_damage(regions);
++    }
++
++    fn renderer_cpu_statistics(&self) -> Option<RendererCpuStatistics> {
++        Some(self.state.renderer.borrow().renderer_cpu_statistics())
++    }
++
+     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+         let scale_factor = self.state.scale_factor.get();
+         let caret_position = POINT {
+-- 
+2.55.0.windows.5
+

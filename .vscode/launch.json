@@ -1,0 +1,58 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Echo (dev)",
+      "cargo": {
+        "args": ["build", "--bin=echo"],
+        "filter": { "name": "echo", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug",
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Echo (dev, IRC tracing + log file)",
+      "cargo": {
+        "args": ["build", "--bin=echo"],
+        "filter": { "name": "echo", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "warn,echo_gpui=info,echo_gpui::backend::irc=debug",
+        "RUST_BACKTRACE": "1",
+        "ECHO_LOG_FILE": "1"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Echo (release-with-debug)",
+      "cargo": {
+        "args": ["build", "--profile=release-with-debug", "--bin=echo"],
+        "filter": { "name": "echo", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "info",
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "attach",
+      "name": "Attach to running Echo",
+      "program": "${workspaceFolder}/target/debug/echo",
+      "waitFor": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[package]
+name = "emoji-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+echo-core = { path = "../../crates/echo-core" }
+echo-text-core = { path = "../../crates/echo-text-core" }
+emojis.workspace = true

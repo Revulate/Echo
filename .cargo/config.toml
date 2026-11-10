@@ -1,0 +1,68 @@
+# Target CPU and linker flags intentionally do not live in repository-wide Cargo
+# configuration. Release builds select a portable CPU baseline, while
+# developers may opt into host-specific flags through their environment.
+# This keeps clean-clone artifacts runnable on machines other than the builder and
+# avoids requiring `mold` merely to check the workspace on Linux.
+
+# -----------------------------------------------------------------------------
+# Common aliases for development workflows
+# -----------------------------------------------------------------------------
+[alias]
+# Quick check without building
+c = "check"
+
+# Run with info-level logging
+r = "run"
+# Explicit diagnostic/benchmark opt-ins below may create additional artifacts.
+rr = "run --release"
+
+# Fast dev build with nightly (use with RUSTFLAGS for parallel frontend)
+# Note: Cranelift doesn't work with aws-lc-rs native deps
+# Usage: RUSTFLAGS="-Zthreads=8" cargo fast
+fast = "+nightly run"
+fast-build = "+nightly build"
+fast-check = "+nightly check"
+
+# Profiling builds
+prof = "build --release --features profiling"
+prof-run = "run --release --features profiling"
+
+# Flamegraph (requires: cargo install flamegraph)
+flame = "flamegraph --root -- "
+
+# Run tests with output
+t = "test -- --nocapture"
+
+# Clippy with all warnings
+lint = "clippy -- -W clippy::all -W clippy::pedantic -W clippy::nursery"
+
+# Build with sanitizers (Linux only, requires nightly)
+# Usage: cargo +nightly asan
+asan = "build -Zbuild-std --target x86_64-unknown-linux-gnu"
+tsan = "build -Zbuild-std --target x86_64-unknown-linux-gnu"
+
+# Workspace-cache-safe Echo checks and standalone tool runs. Prefer these over
+# `--manifest-path tools/.../Cargo.toml --target-dir target/...`, which creates
+# a separate dependency cache per tool and bloats target/.
+echo-check = "check --bin echo"
+tool = "run --release --package"
+tool-check = "check --package"
+
+# Optimized release builds. The normal path uses ThinLTO plus parallel codegen;
+# reserve dist-max for measured runtime comparisons that justify fat LTO.
+debug-build = "build --locked --bin echo"
+dist-build = "build --profile dist --locked --bin echo"
+dist-max-build = "build --profile dist-max --locked --bin echo"
+
+# =============================================================================
+# Environment variables for common tasks
+# =============================================================================
+[env]
+# Default log level for development (override with RUST_LOG=... at the shell)
+RUST_LOG = "warn,echo=debug"
+
+# Enable backtraces on panic
+RUST_BACKTRACE = "1"
+
+# Colored cargo output
+CARGO_TERM_COLOR = "always"

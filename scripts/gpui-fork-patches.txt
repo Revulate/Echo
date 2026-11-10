@@ -1,0 +1,30 @@
+# Ordered GPUI fork patch series. Keep this file as the single source of truth
+# for both setup-gpui-fork.ps1 and setup-gpui-fork.sh.
+patches/gpui-paint-fork.patch
+patches/gpui-image-features.patch
+patches/gpui-gpu-timestamps.patch
+patches/gpui-image-transport-retry.patch
+patches/gpui-image-response-bounds.patch
+patches/gpui-image-decode-bounds.patch
+patches/gpui-svg-rendered-bounds.patch
+patches/gpui-reqwest-runtime-bound-body.patch
+patches/gpui-image-decode-budget.patch
+patches/gpui-windows-window-teardown.patch
+patches/gpui-windows-cursor-stability.patch
+patches/gpui-asset-source-diagnostics.patch
+patches/gpui-bidi-text-geometry.patch
+patches/gpui-windows-atlas-retirement-stability.patch
+patches/gpui-windows-device-lost-retry.patch
+patches/gpui-windows-hardware-adapter-preference.patch
+patches/gpui-windows-lazy-path-msaa.patch
+patches/gpui-skip-transparent-glyphs.patch
+patches/gpui-animated-image-patching.patch
+patches/gpui-windows-minimize-vsync-recovery-fixes.patch
+patches/gpui-shaped-line-inline-decorations.patch
+patches/gpui-releasable-images-painted-text.patch
+patches/gpui-windows-mouse-leave-exit.patch
+patches/gpui-windows-ime-caret-active-end.patch
+patches/gpui-text-wrap-measure-cache.patch
+patches/gpui-atlas-drop-scoped-refresh.patch
+patches/gpui-linux-activation-token.patch
+patches/gpui-a11y-reuse-cached-view-nodes.patch

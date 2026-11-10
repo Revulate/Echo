@@ -1,0 +1,23 @@
+<svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="leftLarge" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="leftMed" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#C4B5FD"/>
+    </linearGradient>
+    <linearGradient id="rightWave" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#A78BFA"/>
+      <stop offset="100%" stop-color="#C4B5FD"/>
+    </linearGradient>
+  </defs>
+  <g stroke-width="10" stroke-linecap="round" fill="none">
+    <path d="M 56.76 94.49 A 45 45 0 1 1 56.76 5.51" stroke="url(#leftLarge)"/>
+    <path d="M 52.85 79.86 A 30 30 0 1 1 52.85 20.14" stroke="url(#leftMed)"/>
+    <path d="M 85.15 21.90 A 45 45 0 0 1 85.15 78.10" stroke="url(#rightWave)"/>
+    <path d="M 74.44 32.60 A 30 30 0 0 1 74.44 67.40" stroke="url(#rightWave)"/>
+    <path d="M 63.49 43.45 A 15 15 0 0 1 63.49 56.55" stroke="url(#rightWave)"/>
+  </g>
+</svg>

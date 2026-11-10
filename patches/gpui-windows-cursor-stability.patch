@@ -1,0 +1,95 @@
+From a14a3372cc295f20a7646bd659bb33dede5dbc37 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 23:15:15 -0700
+Subject: [PATCH] fix(gpui_windows): verify native cursor ownership and retain
+ per-window cursor styles
+
+GPUI broadcasts cursor-style changes to every native window. Each window
+used to call SetCursor whenever its cached style flipped between some and
+none, so a window whose cached hover state outlived the real topmost
+relationship (another native window covering it) could overwrite the
+cursor the user actually sees.
+
+`handle_cursor_changed` now always stores the received style in the
+window's cache, because WM_SETCURSOR and hide-until-typing restoration
+read it, but only publishes it with SetCursor when this window is the
+Win32 capture owner or the window under the pointer (or one of their
+children). A hidden cursor stays hidden.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui_windows/src/events.rs | 43 ++++++++++++++++++++++++-------
+ 1 file changed, 34 insertions(+), 9 deletions(-)
+
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index f18c070370..ec6e410702 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -1174,22 +1174,47 @@ impl WindowsWindowInner {
+         None
+     }
+ 
+-    fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
+-        let had_cursor = self.state.current_cursor.get().is_some();
+-
+-        self.state.current_cursor.set(if lparam.0 == 0 {
++    fn handle_cursor_changed(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
++        let cursor = if lparam.0 == 0 {
+             None
+         } else {
+             Some(HCURSOR(lparam.0 as _))
+-        });
+-
+-        if had_cursor != self.state.current_cursor.get().is_some() {
+-            unsafe { SetCursor(self.state.current_cursor.get()) };
++        };
++        // WM_SETCURSOR and hide-until-typing restoration read the window cache.
++        // Retain the style even when another window currently owns the pointer.
++        self.state.current_cursor.set(cursor);
++
++        // `SetCursor` is a shared resource. Cached hover state can outlive the
++        // real topmost relationship when another native window covers this
++        // one, so verify the Win32 pointer or capture owner before publishing.
++        if Self::owns_cursor(handle) {
++            let cursor = if self.state.cursor_visible.load(Ordering::Relaxed) {
++                cursor
++            } else {
++                None
++            };
++            unsafe { SetCursor(cursor) };
+         }
+ 
+         Some(0)
+     }
+ 
++    fn owns_cursor(handle: HWND) -> bool {
++        let capture = unsafe { GetCapture() };
++        if !capture.is_invalid() {
++            return capture == handle || unsafe { IsChild(handle, capture).as_bool() };
++        }
++
++        let mut cursor_position = POINT::default();
++        if unsafe { GetCursorPos(&mut cursor_position) }.is_err() {
++            return false;
++        }
++
++        let cursor_window = unsafe { WindowFromPoint(cursor_position) };
++        cursor_window == handle
++            || (!cursor_window.is_invalid() && unsafe { IsChild(handle, cursor_window).as_bool() })
++    }
++
+     fn handle_set_cursor(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+         if unsafe { !IsWindowEnabled(handle).as_bool() }
+             || matches!(
+@@ -1322,7 +1347,7 @@ impl WindowsWindowInner {
+             return None;
+         }
+         match message {
+-            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
++            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(handle, lparam),
+             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
+             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+             _ => unreachable!(),
+-- 
+2.55.0.windows.5
+

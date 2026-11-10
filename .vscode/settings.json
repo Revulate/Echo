@@ -1,0 +1,10 @@
+{
+  // Keep rust-analyzer's builds out of ./target so it does not hold the cargo
+  // build lock while `cargo run` / the debugger are building.
+  "rust-analyzer.cargo.targetDir": true,
+  // Mirror `make lint`, which uses clippy as the project's lint pass.
+  "rust-analyzer.check.command": "clippy",
+  // `cargo test` crashes rustc on this codebase (known stack-overflow bug),
+  // so rust-analyzer must not build test targets.
+  "rust-analyzer.check.allTargets": false
+}

@@ -1,0 +1,9 @@
+[package]
+name = "helix-command-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = "1"
+urlencoding = "2"

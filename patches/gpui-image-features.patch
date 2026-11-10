@@ -1,0 +1,48 @@
+From 9246c5d779846377a629080c15e536265a337692 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 20:15:00 -0700
+Subject: [PATCH] gpui: restrict image codecs to referenced formats
+
+Echo only exercises the formats named by GPUI's image and clipboard paths.
+Avoid compiling unrelated image encoders/decoders and image's Rayon feature,
+including the AVIF encoder that pulls ravif and paste into the release graph.
+---
+ Cargo.toml | 21 ++++++---------------
+ 1 file changed, 6 insertions(+), 15 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index b612bdf874..a02d13716e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -656,22 +656,13 @@ idna = "1.0"
+ ignore = "0.4.22"
+ # image's default features minus "avif", which only adds an encoder (rav1e);
+ # decoding AVIF would additionally need the non-default "avif-native" feature.
++#
++# Echo narrows this further to the formats its GPUI and clipboard paths actually
++# reference, and drops image's Rayon feature: the extra decoders (dds, exr, ff,
++# hdr, qoi, tga) and the rayon thread pool are dead weight in Echo's release
++# graph.
+ image = { version = "0.25.1", default-features = false, features = [
+-    "bmp",
+-    "dds",
+-    "exr",
+-    "ff",
+-    "gif",
+-    "hdr",
+-    "ico",
+-    "jpeg",
+-    "png",
+-    "pnm",
+-    "qoi",
+-    "rayon",
+-    "tga",
+-    "tiff",
+-    "webp",
++    "bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp",
+ ] }
+ imara-diff = { version = "0.2", default-features = false }
+ indexmap = { version = "2.7.0", features = ["serde"] }
+-- 
+2.55.0.windows.5
+

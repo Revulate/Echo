@@ -1,0 +1,62 @@
+From ecdd8c2bae41c4298767e2978111e195b44b5488 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 14:44:00 -0700
+Subject: [PATCH] reqwest_client: bind response body polls to runtime
+
+---
+ crates/reqwest_client/src/reqwest_client.rs | 32 ++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reqwest_client/src/reqwest_client.rs b/crates/reqwest_client/src/reqwest_client.rs
+index 436ec60fe1..0129e9be2e 100644
+--- a/crates/reqwest_client/src/reqwest_client.rs
++++ b/crates/reqwest_client/src/reqwest_client.rs
+@@ -155,6 +155,35 @@ struct StreamReader {
+     capacity: usize,
+ }
+ 
++/// Keeps response-body polling inside the Tokio runtime that owns reqwest's
++/// connection and timeout machinery, even when a caller consumes the returned
++/// `AsyncBody` from GPUI's independent background executor.
++struct RuntimeBoundReader<R> {
++    handle: tokio::runtime::Handle,
++    inner: Pin<Box<R>>,
++}
++
++impl<R> RuntimeBoundReader<R> {
++    fn new(handle: tokio::runtime::Handle, inner: R) -> Self {
++        Self {
++            handle,
++            inner: Box::pin(inner),
++        }
++    }
++}
++
++impl<R: AsyncRead> AsyncRead for RuntimeBoundReader<R> {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++        buf: &mut [u8],
++    ) -> Poll<std::io::Result<usize>> {
++        let this = self.get_mut();
++        let _runtime = this.handle.enter();
++        this.inner.as_mut().poll_read(cx, buf)
++    }
++}
++
+ impl StreamReader {
+     fn new(reader: Pin<Box<dyn futures::AsyncRead + Send + Sync>>) -> Self {
+         Self {
+@@ -312,7 +341,8 @@ impl http_client::HttpClient for ReqwestClient {
+                 .bytes_stream()
+                 .map_err(futures::io::Error::other)
+                 .into_async_read();
+-            let body = http_client::AsyncBody::from_reader(bytes);
++            let body =
++                http_client::AsyncBody::from_reader(RuntimeBoundReader::new(handle.clone(), bytes));
+ 
+             builder.body(body).map_err(|e| anyhow!(e))
+         }
+-- 
+2.55.0.windows.5
+

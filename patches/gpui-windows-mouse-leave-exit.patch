@@ -1,0 +1,107 @@
+From 5f9284aa7e96f1250d0aae6f4c525f79b1171de0 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 21:27:06 -0700
+Subject: [PATCH] fix(gpui_windows): dispatch MouseExited when the pointer
+ leaves a window
+
+WM_MOUSELEAVE only cleared the hovered flag, so on_hover(false) listeners
+never ran and later frames re-hovered from the last in-window point,
+latching tooltips and hover states after the pointer left the window.
+A leave that is not a move into this window's own non-client area now
+dispatches MouseExited with a position outside the window, and the window
+records that position for subsequent hit tests.
+---
+ crates/gpui/src/window.rs         |  1 +
+ crates/gpui_windows/src/events.rs | 47 +++++++++++++++++++++++++++++--
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 4dee654e19..12a5215092 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -6423,6 +6423,7 @@ impl Window {
+                 PlatformInput::MousePressure(mouse_pressure)
+             }
+             PlatformInput::MouseExited(mouse_exited) => {
++                self.mouse_position = mouse_exited.position;
+                 self.modifiers = mouse_exited.modifiers;
+                 PlatformInput::MouseExited(mouse_exited)
+             }
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index de7e80292a..5e2444d381 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -109,7 +109,7 @@ impl WindowsWindowInner {
+             WM_CLOSE => self.handle_close_msg(),
+             WM_DESTROY => self.handle_destroy_msg(handle),
+             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
+-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
++            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
+             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
+             // Treat double click as a second single click, since we track the double clicks ourselves.
+             // If you don't interact with any elements, this will fall through to the windows default
+@@ -402,7 +402,7 @@ impl WindowsWindowInner {
+         if handled { Some(0) } else { Some(1) }
+     }
+ 
+-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
++    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
+         self.state.hovered.set(false);
+         // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
+         // the flag for tight `is_cursor_visible()` semantics.
+@@ -415,9 +415,52 @@ impl WindowsWindowInner {
+                 .set(Some(callback));
+         }
+ 
++        // Moving between the client and non-client areas of this window also
++        // posts a leave; the following move re-establishes hover there. Only a
++        // real departure (or a window covering the pointer) is an exit, and it
++        // must carry a position outside this window so later frames don't
++        // re-hover from the last in-window point.
++        if !Self::owns_cursor(handle) {
++            if let Some(mut func) = self.state.callbacks.input.take() {
++                let input = PlatformInput::MouseExited(MouseExitEvent {
++                    position: self.cursor_position_outside(handle),
++                    pressed_button: None,
++                    modifiers: current_modifiers(),
++                });
++                func(input);
++                self.state.callbacks.input.set(Some(func));
++            }
++        }
++
+         Some(0)
+     }
+ 
++    fn cursor_position_outside(&self, handle: HWND) -> Point<Pixels> {
++        let outside = point(px(-1.0), px(-1.0));
++        let mut cursor = POINT::default();
++        if unsafe { GetCursorPos(&mut cursor) }.is_err()
++            || !unsafe { ScreenToClient(handle, &mut cursor) }.as_bool()
++        {
++            return outside;
++        }
++        let mut client = RECT::default();
++        if unsafe { GetClientRect(handle, &mut client) }.is_err() {
++            return outside;
++        }
++        let inside = cursor.x >= client.left
++            && cursor.x < client.right
++            && cursor.y >= client.top
++            && cursor.y < client.bottom;
++        if inside {
++            return outside;
++        }
++        logical_point(
++            cursor.x as f32,
++            cursor.y as f32,
++            self.state.scale_factor.get(),
++        )
++    }
++
+     fn handle_syskeyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+         let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
+             PlatformInput::KeyUp(KeyUpEvent { keystroke })
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,210 @@
+From 9240e8cacb98081bb72713b4814fe7f05461c5b1 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 19:13:40 -0700
+Subject: [PATCH] fix(gpui_windows): retry GPU device-lost recovery instead of
+ panicking
+
+A driver reset (TDR), driver update or GPU switch can take several seconds.
+The VSync thread now retries recovery with 0.5-5 s backoff for up to 60 s and
+only panics after that; a window renderer that fails to recover requests
+another attempt instead of panicking, and draws are skipped while its
+devices or resources are missing.
+
+A window's failed recovery counts as a failed attempt (backoff and the 60 s
+cap apply even when the shared devices were recreated), and the episode only
+ends once a swap chain presents again or the device stays healthy for the
+full window. The renderer remembers whether it was created without
+DirectComposition, so a retry after a partial teardown rebuilds the same
+swap chain kind.
+---
+ crates/gpui_windows/src/directx_renderer.rs | 25 ++++++----
+ crates/gpui_windows/src/events.rs           |  6 ++-
+ crates/gpui_windows/src/platform.rs         | 52 +++++++++++++++++++--
+ 3 files changed, 71 insertions(+), 12 deletions(-)
+
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index c64a94534b..4f6260e05f 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -36,6 +36,11 @@ pub(crate) struct FontInfo {
+     pub is_bgr: bool,
+ }
+ 
++/// Swap chain presents that succeeded in any window, so device-lost recovery
++/// can tell when a recovered device is actually drawing again.
++pub(crate) static SUCCESSFUL_PRESENTS: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(0);
++
+ pub(crate) struct DirectXRenderer {
+     hwnd: HWND,
+     atlas: Arc<DirectXAtlas>,
+@@ -44,6 +49,7 @@ pub(crate) struct DirectXRenderer {
+     globals: DirectXGlobalElements,
+     pipelines: DirectXRenderPipelines,
+     direct_composition: Option<DirectComposition>,
++    disable_direct_composition: bool,
+     font_info: &'static FontInfo,
+     gpu_timing_enabled: bool,
+     gpu_timing_unavailable: bool,
+@@ -366,6 +372,7 @@ impl DirectXRenderer {
+             globals,
+             pipelines,
+             direct_composition,
++            disable_direct_composition,
+             font_info: Self::get_font_info(),
+             gpu_timing_enabled: false,
+             gpu_timing_unavailable: false,
+@@ -381,11 +388,11 @@ impl DirectXRenderer {
+     }
+ 
+     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+-        let resources = self.resources.as_ref().expect("resources missing");
++        let resources = self.resources.as_ref().context("resources missing")?;
+         let device_context = &self
+             .devices
+             .as_ref()
+-            .expect("devices missing")
++            .context("devices missing")?
+             .device_context;
+         update_buffer(
+             device_context,
+@@ -425,11 +432,13 @@ impl DirectXRenderer {
+         let result = unsafe {
+             self.resources
+                 .as_ref()
+-                .expect("resources missing")
++                .context("resources missing")?
+                 .swap_chain
+                 .Present(0, DXGI_PRESENT(0))
+         };
+-        result.ok().context("Presenting swap chain failed")
++        result.ok().context("Presenting swap chain failed")?;
++        SUCCESSFUL_PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        Ok(())
+     }
+ 
+     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+@@ -440,7 +449,7 @@ impl DirectXRenderer {
+     }
+ 
+     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+-        let disable_direct_composition = self.direct_composition.is_none();
++        let disable_direct_composition = self.disable_direct_composition;
+ 
+         self.gpu_frame_timer.take();
+         self.gpu_timing_unavailable = false;
+@@ -525,9 +534,9 @@ impl DirectXRenderer {
+         scene: &Scene,
+         background_appearance: WindowBackgroundAppearance,
+     ) -> Result<()> {
+-        if self.skip_draws {
+-            // skip drawing this frame, we just recovered from a device lost event
+-            // and so likely do not have the textures anymore that are required for drawing
++        if self.skip_draws || self.resources.is_none() || self.devices.is_none() {
++            // skip drawing this frame: we just recovered from a device lost event
++            // and likely lack the textures it needs, or recovery is still pending
+             return Ok(());
+         }
+         if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref()) {
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index ec6e410702..aa55a8e6fc 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -1366,7 +1366,11 @@ impl WindowsWindowInner {
+             .borrow_mut()
+             .handle_device_lost(&devices)
+         {
+-            panic!("Device lost: {err}");
++            log::error!("Window renderer did not recover from a lost device, retrying: {err:#}");
++            self.state
++                .invalidate_devices
++                .store(true, std::sync::atomic::Ordering::Release);
++            return Some(0);
+         }
+         // Make sure the first `draw_window` after recovery (whether it comes
+         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
+diff --git a/crates/gpui_windows/src/platform.rs b/crates/gpui_windows/src/platform.rs
+index 4cf4b6be35..b15df45081 100644
+--- a/crates/gpui_windows/src/platform.rs
++++ b/crates/gpui_windows/src/platform.rs
+@@ -442,6 +442,10 @@ impl WindowsPlatform {
+             .name("VSyncProvider".to_owned())
+             .spawn(move || {
+                 let vsync_provider = VSyncProvider::new();
++                let mut device_lost_since: Option<std::time::Instant> = None;
++                let mut last_recovery_at = std::time::Instant::now();
++                let mut presents_at_recovery = 0u64;
++                let mut recovery_attempts = 0u32;
+                 loop {
+                     let signal_source = vsync_provider.wait_for_vsync();
+                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
+@@ -451,14 +455,45 @@ impl WindowsPlatform {
+                     if check_device_lost(&directx_device.device)
+                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
+                     {
+-                        if let Err(err) = handle_gpu_device_lost(
++                        let lost_since =
++                            *device_lost_since.get_or_insert_with(std::time::Instant::now);
++                        let result = handle_gpu_device_lost(
+                             &mut directx_device,
+                             platform_window.as_raw(),
+                             validation_number,
+                             &all_windows,
+-                        ) {
+-                            panic!("Device lost: {err}");
++                        );
++                        // A window renderer that failed to recover asks for
++                        // another attempt through `invalidate_devices`.
++                        let window_failed = invalidate_devices.swap(false, Ordering::AcqRel);
++                        last_recovery_at = std::time::Instant::now();
++                        presents_at_recovery = SUCCESSFUL_PRESENTS.load(Ordering::Relaxed);
++                        let failure = match result {
++                            Err(err) => Some(err),
++                            Ok(()) if window_failed => {
++                                Some(anyhow!("a window renderer did not recover"))
++                            }
++                            Ok(()) => None,
++                        };
++                        if let Some(err) = failure {
++                            if lost_since.elapsed() >= DEVICE_LOST_RECOVERY_WINDOW {
++                                panic!("Device lost: {err}");
++                            }
++                            let delay = device_lost_retry_delay(recovery_attempts);
++                            recovery_attempts = recovery_attempts.saturating_add(1);
++                            log::warn!(
++                                "GPU device recovery failed (attempt {recovery_attempts}), retrying in {delay:?}: {err:#}"
++                            );
++                            std::thread::sleep(delay);
++                            invalidate_devices.store(true, Ordering::Release);
++                            continue;
+                         }
++                    } else if device_lost_since.is_some()
++                        && (SUCCESSFUL_PRESENTS.load(Ordering::Relaxed) != presents_at_recovery
++                            || last_recovery_at.elapsed() >= DEVICE_LOST_RECOVERY_WINDOW)
++                    {
++                        device_lost_since = None;
++                        recovery_attempts = 0;
+                     }
+                     let Some(all_windows) = all_windows.upgrade() else {
+                         break;
+@@ -1759,6 +1794,17 @@ fn is_window_station_visible() -> bool {
+     result.is_ok() && flags.dwFlags & WSF_VISIBLE as u32 != 0
+ }
+ 
++/// How long a lost GPU device may stay unrecoverable before GPUI gives up.
++/// Driver resets (TDR), driver updates and GPU switches can take several
++/// seconds; the window stays alive with draws skipped meanwhile.
++const DEVICE_LOST_RECOVERY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
++
++fn device_lost_retry_delay(attempt: u32) -> std::time::Duration {
++    std::time::Duration::from_millis(500)
++        .saturating_mul(1 << attempt.min(4))
++        .min(std::time::Duration::from_secs(5))
++}
++
+ fn handle_gpu_device_lost(
+     directx_devices: &mut DirectXDevices,
+     platform_window: HWND,
+-- 
+2.55.0.windows.5
+

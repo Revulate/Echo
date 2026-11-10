@@ -1,0 +1,43 @@
+//! Overlay components (UserCard, EmotePicker, ContextMenu, Autocomplete, SearchModal, ModLog, Toast, ThreadViewer, ConfirmationModal, HotkeyCheatSheet, MetricsOverlay, ChatterList, QuickSwitcher)
+
+mod autocomplete;
+mod chatter_list;
+mod confirmation_modal;
+mod context_menu;
+mod emote_picker;
+mod emote_picker_core;
+mod emote_picker_popout;
+mod emote_picker_prefetch;
+mod emote_picker_shared;
+mod emote_picker_stability;
+mod global_tooltip;
+mod hotkey_cheat_sheet;
+mod media_inspector;
+mod metrics_overlay;
+mod mod_log;
+mod quick_switcher;
+mod search_modal;
+mod thread_viewer;
+mod toast;
+pub mod traits;
+mod user_card;
+mod user_card_popout;
+
+pub use autocomplete::*;
+pub use chatter_list::*;
+pub use confirmation_modal::*;
+pub use context_menu::*;
+pub use emote_picker::*;
+pub(crate) use emote_picker_core::record_emote_usage;
+pub use emote_picker_popout::*;
+pub use global_tooltip::*;
+pub use hotkey_cheat_sheet::*;
+pub use media_inspector::*;
+pub use metrics_overlay::*;
+pub use mod_log::*;
+pub use quick_switcher::*;
+pub use search_modal::*;
+pub use thread_viewer::*;
+pub use toast::*;
+pub use user_card::*;
+pub use user_card_popout::*;

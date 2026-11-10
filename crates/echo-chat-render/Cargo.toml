@@ -1,0 +1,22 @@
+[package]
+name = "echo-chat-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-dependent chat render model and interaction policies for Echo"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dashmap = "6"
+echo-core = { path = "../echo-core" }
+echo-cosmetics-core = { path = "../echo-cosmetics-core" }
+echo-render-core = { path = "../echo-render-core" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
+rustc-hash = "2"
+smallvec = "1.13"
+tracing = "0.1"
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]

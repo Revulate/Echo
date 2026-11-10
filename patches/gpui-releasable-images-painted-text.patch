@@ -1,0 +1,1611 @@
+From 0b904fc648ac4625c7e8e3e77e5b8e1ac8368986 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 19:22:31 -0700
+Subject: [PATCH] perf(gpui): release image pixels after upload; add a
+ painted-text primitive
+
+RenderImage::new_releasable creates a single-frame image whose CPU
+pixels are dropped once a window has uploaded them to its sprite atlas,
+while only one window is open. A later atlas miss (a window opened
+afterwards, or a lost device) rebuilds them through the image's pixel
+source; when that fails the sprite is skipped instead of panicking.
+paint_image and patch_animated_image share the upload path.
+
+PaintedText is a scene primitive that rebuilds a 7TV-style name paint
+per pixel: stroke rings and a gradient or image fill drawn through a
+glyph mask, then drop shadows from precomputed weights. Its mask is an
+8-bit atlas tile (AtlasKey::PaintMask, PaintMask) stacking the coverage
+and one block per shadow; the fill can sample an image frame from the
+polychrome atlas, and patch_animated_image swaps that frame without a
+redraw. Window::paint_painted_text, App/Window::drop_paint_mask and
+PlatformWindow::supports_painted_text expose it. The Direct3D 11
+renderer draws it with a new shader (mask at t0, instances at t1, fill
+at t2); other renderers report no support and skip it.
+---
+ crates/gpui/src/app.rs                      |  11 +
+ crates/gpui/src/assets.rs                   | 162 +++++++++-
+ crates/gpui/src/platform.rs                 |  11 +
+ crates/gpui/src/scene.rs                    | 201 ++++++++++++
+ crates/gpui/src/window.rs                   | 325 ++++++++++++++++----
+ crates/gpui_apple/src/metal_renderer.rs     |   2 +
+ crates/gpui_wgpu/src/wgpu_renderer.rs       |   2 +
+ crates/gpui_windows/build.rs                |   1 +
+ crates/gpui_windows/src/directx_renderer.rs | 105 ++++++-
+ crates/gpui_windows/src/shaders.hlsl        | 292 ++++++++++++++++++
+ crates/gpui_windows/src/window.rs           |   4 +
+ 11 files changed, 1049 insertions(+), 67 deletions(-)
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 75da2eb6e5..01f6ee61af 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -3226,6 +3226,17 @@ impl App {
+         }
+     }
+ 
++    /// Remove a [`crate::PaintMask`] from every window's sprite atlas (local
++    /// Echo extension).
++    pub fn drop_paint_mask(&mut self, mask_id: u64, current_window: Option<&mut Window>) {
++        for window in self.windows.values_mut().flatten() {
++            window.drop_paint_mask(mask_id);
++        }
++        if let Some(window) = current_window {
++            window.drop_paint_mask(mask_id);
++        }
++    }
++
+     /// Sets the renderer for the inspector.
+     #[cfg(any(feature = "inspector", debug_assertions))]
+     pub fn set_inspector_renderer(&mut self, f: crate::InspectorRenderer) {
+diff --git a/crates/gpui/src/assets.rs b/crates/gpui/src/assets.rs
+index cb8b47ed01..48e51f253f 100644
+--- a/crates/gpui/src/assets.rs
++++ b/crates/gpui/src/assets.rs
+@@ -2,11 +2,15 @@ use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
+ use smallvec::SmallVec;
+ 
+ use image::{Delay, Frame};
++use parking_lot::{Mutex, MutexGuard};
+ use std::{
+     borrow::Cow,
+     fmt,
+     hash::Hash,
+-    sync::atomic::{AtomicUsize, Ordering::SeqCst},
++    sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering::SeqCst},
++    },
+ };
+ 
+ /// A source of assets for this app to use.
+@@ -39,6 +43,19 @@ pub struct RenderImageParams {
+     pub frame_index: usize,
+ }
+ 
++/// Rebuilds the BGRA pixels of a released single-frame image.
++///
++/// Local Echo extension (`echo-paint-fork`); see [`RenderImage::new_releasable`].
++pub type RenderImagePixelSource = Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
++
++/// A single frame whose CPU pixels are dropped once it is in a sprite atlas.
++struct ReleasablePixels {
++    size: Size<DevicePixels>,
++    delay: Delay,
++    resident: Mutex<Option<Vec<u8>>>,
++    source: RenderImagePixelSource,
++}
++
+ /// A cached and processed image, in BGRA format
+ pub struct RenderImage {
+     /// The ID associated with this image
+@@ -46,6 +63,7 @@ pub struct RenderImage {
+     /// The scale factor of this image on render.
+     pub(crate) scale_factor: f32,
+     data: SmallVec<[Frame; 1]>,
++    releasable: Option<ReleasablePixels>,
+ }
+ 
+ impl PartialEq for RenderImage {
+@@ -59,24 +77,117 @@ impl Eq for RenderImage {}
+ impl RenderImage {
+     /// Create a new image from the given data.
+     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
+-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+-
+         Self {
+-            id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
++            id: next_image_id(),
+             scale_factor: 1.0,
+             data: data.into(),
++            releasable: None,
++        }
++    }
++
++    /// Create a single-frame image whose CPU pixels are released once a window
++    /// has uploaded them to its sprite atlas.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). Atlases are per window and are
++    /// cleared when the GPU device is lost, so a window that needs the pixels
++    /// after the release calls `source` to rebuild them. `source` may return
++    /// `None` when they can no longer be rebuilt; that window then paints
++    /// nothing for the image.
++    pub fn new_releasable(
++        width: u32,
++        height: u32,
++        delay: Delay,
++        pixels: Vec<u8>,
++        source: RenderImagePixelSource,
++    ) -> Self {
++        Self {
++            id: next_image_id(),
++            scale_factor: 1.0,
++            data: SmallVec::new(),
++            releasable: Some(ReleasablePixels {
++                size: size(width.into(), height.into()),
++                delay,
++                resident: Mutex::new(Some(pixels)),
++                source,
++            }),
+         }
+     }
+ 
+     /// Convert this image into a byte slice.
++    ///
++    /// Always `None` for an image created with [`Self::new_releasable`]; use
++    /// [`Self::with_pixels`] to read those.
+     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
+         self.data
+             .get(frame_index)
+             .map(|frame| frame.buffer().as_raw().as_slice())
+     }
+ 
++    /// Run `f` on a frame's BGRA pixels: borrowed, still resident, or rebuilt
++    /// for a released image. `None` when the frame has no pixels.
++    pub fn with_pixels<R>(&self, frame_index: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
++        if let Some(bytes) = self.as_bytes(frame_index) {
++            return Some(f(bytes));
++        }
++        let releasable = self.releasable.as_ref().filter(|_| frame_index == 0)?;
++        {
++            let resident = releasable.resident.lock();
++            if let Some(bytes) = resident.as_deref() {
++                return Some(f(bytes));
++            }
++        }
++        let bytes = (releasable.source)()?;
++        Some(f(&bytes))
++    }
++
++    /// Size in bytes of a frame's BGRA pixels, whether or not they are resident.
++    pub fn byte_len(&self, frame_index: usize) -> usize {
++        let size = self.size(frame_index);
++        size.width.0.max(0) as usize * size.height.0.max(0) as usize * 4
++    }
++
++    /// Whether this image drops its CPU pixels after an atlas upload.
++    pub fn is_releasable(&self) -> bool {
++        self.releasable.is_some()
++    }
++
++    /// Whether a released image still holds its CPU pixels.
++    pub fn has_resident_pixels(&self) -> bool {
++        self.releasable
++            .as_ref()
++            .is_none_or(|releasable| releasable.resident.lock().is_some())
++    }
++
++    /// Lock a releasable image's resident pixels so an atlas upload can borrow
++    /// them. `None` for other images.
++    pub(crate) fn lock_resident_pixels(&self) -> Option<MutexGuard<'_, Option<Vec<u8>>>> {
++        self.releasable
++            .as_ref()
++            .map(|releasable| releasable.resident.lock())
++    }
++
++    /// Rebuild a released frame's pixels.
++    pub(crate) fn rebuild_pixels(&self, frame_index: usize) -> Option<Vec<u8>> {
++        let releasable = self.releasable.as_ref().filter(|_| frame_index == 0)?;
++        (releasable.source)()
++    }
++
++    /// Drop a releasable image's CPU pixels; a no-op for other images.
++    pub(crate) fn release_pixels(&self) {
++        if let Some(releasable) = &self.releasable {
++            releasable.resident.lock().take();
++        }
++    }
++
+     /// Get the size of this image, in pixels.
+     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
++        if let Some(releasable) = &self.releasable {
++            return if frame_index == 0 {
++                releasable.size
++            } else {
++                Size::default()
++            };
++        }
+         self.data
+             .get(frame_index)
+             .map(|frame| {
+@@ -94,6 +205,9 @@ impl RenderImage {
+ 
+     /// Get the delay of this frame from the previous
+     pub fn delay(&self, frame_index: usize) -> Delay {
++        if let Some(releasable) = self.releasable.as_ref().filter(|_| frame_index == 0) {
++            return releasable.delay;
++        }
+         self.data
+             .get(frame_index)
+             .map(|frame| frame.delay())
+@@ -102,15 +216,25 @@ impl RenderImage {
+ 
+     /// Get the number of frames for this image.
+     pub fn frame_count(&self) -> usize {
+-        self.data.len()
++        if self.releasable.is_some() {
++            1
++        } else {
++            self.data.len()
++        }
+     }
+ }
+ 
++fn next_image_id() -> ImageId {
++    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
++    ImageId(NEXT_ID.fetch_add(1, SeqCst))
++}
++
+ impl fmt::Debug for RenderImage {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.debug_struct("ImageData")
+             .field("id", &self.id)
+-            .field("size", &self.data.first().map(|f| f.buffer().dimensions()))
++            .field("size", &self.size(0))
++            .field("releasable", &self.releasable.is_some())
+             .finish()
+     }
+ }
+@@ -130,4 +254,30 @@ mod tests {
+         assert_eq!(image.delay(0), Delay::from_numer_denom_ms(100, 1));
+         let _ = format!("{image:?}");
+     }
++
++    #[test]
++    fn releasable_image_rebuilds_after_release() {
++        let image = RenderImage::new_releasable(
++            1,
++            1,
++            Delay::from_numer_denom_ms(50, 1),
++            vec![1, 2, 3, 4],
++            Arc::new(|| Some(vec![5, 6, 7, 8])),
++        );
++        assert_eq!(image.frame_count(), 1);
++        assert_eq!(image.size(0), size(1.into(), 1.into()));
++        assert_eq!(image.byte_len(0), 4);
++        assert_eq!(image.as_bytes(0), None);
++        assert_eq!(
++            image.with_pixels(0, |bytes| bytes.to_vec()),
++            Some(vec![1, 2, 3, 4])
++        );
++        image.release_pixels();
++        assert!(!image.has_resident_pixels());
++        assert_eq!(
++            image.with_pixels(0, |bytes| bytes.to_vec()),
++            Some(vec![5, 6, 7, 8])
++        );
++        assert_eq!(image.with_pixels(1, |bytes| bytes.len()), None);
++    }
+ }
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index d2ba1b3f22..b9aa64cf99 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1432,6 +1432,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     /// present only the damaged regions; the default ignores it.
+     fn set_present_damage(&self, _regions: Option<&[Bounds<ScaledPixels>]>) {}
+ 
++    /// Whether the renderer draws [`crate::PaintedText`] primitives.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). Callers must use another way
++    /// to paint when this is false; such renderers skip the primitive.
++    fn supports_painted_text(&self) -> bool {
++        false
++    }
++
+     /// Cumulative CPU time the renderer spent per frame stage.
+     ///
+     /// Local Echo extension (`echo-paint-fork`). The default returns `None`.
+@@ -1798,6 +1806,8 @@ pub enum AtlasKey {
+     Glyph(RenderGlyphParams),
+     Svg(RenderSvgParams),
+     Image(RenderImageParams),
++    /// A [`crate::PaintMask`] (local Echo extension).
++    PaintMask(u64),
+ }
+ 
+ impl AtlasKey {
+@@ -1815,6 +1825,7 @@ impl AtlasKey {
+             }
+             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
+             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
++            AtlasKey::PaintMask(_) => AtlasTextureKind::Monochrome,
+         }
+     }
+ }
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index a0397ccf5b..df133e75fa 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -49,6 +49,7 @@ pub struct Scene {
+     pub monochrome_sprites: Vec<MonochromeSprite>,
+     pub subpixel_sprites: Vec<SubpixelSprite>,
+     pub polychrome_sprites: Vec<PolychromeSprite>,
++    pub painted_texts: Vec<PaintedText>,
+     pub surfaces: Vec<PaintSurface>,
+     /// Primitives copied from a previous scene by [`Scene::replay`] since the
+     /// last [`Scene::clear`]. Echo frame-stage diagnostics.
+@@ -69,6 +70,7 @@ impl Scene {
+         self.monochrome_sprites.clear();
+         self.subpixel_sprites.clear();
+         self.polychrome_sprites.clear();
++        self.painted_texts.clear();
+         self.surfaces.clear();
+     }
+ 
+@@ -133,6 +135,10 @@ impl Scene {
+                 sprite.order = order;
+                 self.polychrome_sprites.push(*sprite);
+             }
++            Primitive::PaintedText(text) => {
++                text.order = order;
++                self.painted_texts.push(**text);
++            }
+             Primitive::Surface(surface) => {
+                 surface.order = order;
+                 self.surfaces.push(surface.clone());
+@@ -166,6 +172,7 @@ impl Scene {
+             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+         self.polychrome_sprites
+             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
++        self.painted_texts.sort_by_key(PaintedText::sort_key);
+         self.surfaces.sort_by_key(|surface| surface.order);
+     }
+ 
+@@ -192,6 +199,8 @@ impl Scene {
+             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
+             polychrome_sprites_start: 0,
+             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
++            painted_texts_start: 0,
++            painted_texts_iter: self.painted_texts.iter().peekable(),
+             surfaces_start: 0,
+             surfaces_iter: self.surfaces.iter().peekable(),
+         }
+@@ -215,6 +224,7 @@ pub(crate) enum PrimitiveKind {
+     MonochromeSprite,
+     SubpixelSprite,
+     PolychromeSprite,
++    PaintedText,
+     Surface,
+ }
+ 
+@@ -234,6 +244,7 @@ pub enum Primitive {
+     MonochromeSprite(MonochromeSprite),
+     SubpixelSprite(SubpixelSprite),
+     PolychromeSprite(PolychromeSprite),
++    PaintedText(Box<PaintedText>),
+     Surface(PaintSurface),
+ }
+ 
+@@ -248,6 +259,7 @@ impl Primitive {
+             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
+             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
+             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
++            Primitive::PaintedText(text) => &text.bounds,
+             Primitive::Surface(surface) => &surface.bounds,
+         }
+     }
+@@ -261,6 +273,7 @@ impl Primitive {
+             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
+             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
+             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
++            Primitive::PaintedText(text) => &text.content_mask,
+             Primitive::Surface(surface) => &surface.content_mask,
+         }
+     }
+@@ -288,6 +301,8 @@ struct BatchIterator<'a> {
+     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
+     polychrome_sprites_start: usize,
+     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
++    painted_texts_start: usize,
++    painted_texts_iter: Peekable<slice::Iter<'a, PaintedText>>,
+     surfaces_start: usize,
+     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+ }
+@@ -319,6 +334,10 @@ impl<'a> Iterator for BatchIterator<'a> {
+                 self.polychrome_sprites_iter.peek().map(|s| s.order),
+                 PrimitiveKind::PolychromeSprite,
+             ),
++            (
++                self.painted_texts_iter.peek().map(|t| t.order),
++                PrimitiveKind::PaintedText,
++            ),
+             (
+                 self.surfaces_iter.peek().map(|s| s.order),
+                 PrimitiveKind::Surface,
+@@ -454,6 +473,28 @@ impl<'a> Iterator for BatchIterator<'a> {
+                     range: sprites_start..sprites_end,
+                 })
+             }
++            PrimitiveKind::PaintedText => {
++                let first = self.painted_texts_iter.peek().unwrap();
++                let textures = first.textures();
++                let texts_start = self.painted_texts_start;
++                let mut texts_end = texts_start + 1;
++                self.painted_texts_iter.next();
++                while self
++                    .painted_texts_iter
++                    .next_if(|text| {
++                        (text.order, batch_kind) < max_order_and_kind && text.textures() == textures
++                    })
++                    .is_some()
++                {
++                    texts_end += 1;
++                }
++                self.painted_texts_start = texts_end;
++                Some(PrimitiveBatch::PaintedTexts {
++                    mask_texture_id: textures.0,
++                    fill_texture_id: textures.1,
++                    range: texts_start..texts_end,
++                })
++            }
+             PrimitiveKind::Surface => {
+                 let surfaces_start = self.surfaces_start;
+                 let mut surfaces_end = surfaces_start + 1;
+@@ -499,6 +540,12 @@ pub enum PrimitiveBatch {
+         texture_id: AtlasTextureId,
+         range: Range<usize>,
+     },
++    /// Local Echo extension; see [`PaintedText`].
++    PaintedTexts {
++        mask_texture_id: AtlasTextureId,
++        fill_texture_id: AtlasTextureId,
++        range: Range<usize>,
++    },
+     Surfaces(Range<usize>),
+ }
+ 
+@@ -531,6 +578,15 @@ impl PrimitiveBatch {
+                     texture_id.index
+                 )
+             }
++            Self::PaintedTexts {
++                mask_texture_id,
++                range,
++                ..
++            } => format!(
++                "painted texts ({}) on atlas {}",
++                range.len(),
++                mask_texture_id.index
++            ),
+             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+         }
+     }
+@@ -770,6 +826,151 @@ impl From<PolychromeSprite> for Primitive {
+     }
+ }
+ 
++/// Most fill layers a [`PaintedText`] carries.
++pub const PAINTED_TEXT_MAX_LAYERS: usize = 4;
++/// Most gradient stops a [`PaintedText`] carries across its layers.
++pub const PAINTED_TEXT_MAX_STOPS: usize = 16;
++/// Most drop shadows a [`PaintedText`] carries.
++pub const PAINTED_TEXT_MAX_SHADOWS: usize = 8;
++/// Most stroke rings a [`PaintedText`] carries.
++pub const PAINTED_TEXT_MAX_RINGS: usize = 8;
++
++/// No fill; the layer is skipped.
++pub const PAINTED_TEXT_LAYER_NONE: u32 = 0;
++/// A solid color, `solid` premultiplied with the layer opacity applied.
++pub const PAINTED_TEXT_LAYER_SOLID: u32 = 1;
++/// A linear gradient; `params` = direction x, direction y, min projection, span.
++pub const PAINTED_TEXT_LAYER_LINEAR: u32 = 2;
++/// A circular radial gradient; `params` = center x, center y, radius.
++pub const PAINTED_TEXT_LAYER_CIRCLE: u32 = 3;
++/// An elliptical radial gradient; `params` = center x, center y, radius x, radius y.
++pub const PAINTED_TEXT_LAYER_ELLIPSE: u32 = 4;
++/// The fill texture stretched over the paint box, over the base color.
++pub const PAINTED_TEXT_LAYER_IMAGE: u32 = 5;
++
++/// One fill layer of a [`PaintedText`].
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++#[repr(C)]
++#[expect(missing_docs)]
++pub struct PaintedTextLayer {
++    pub kind: u32,
++    pub repeat: u32,
++    pub stop_start: u32,
++    pub stop_count: u32,
++    pub opacity: f32,
++    pub params: [f32; 4],
++    pub solid: [f32; 4],
++}
++
++/// A gradient stop: position and straight-alpha color in `0..=255` per channel.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++#[repr(C)]
++#[expect(missing_docs)]
++pub struct PaintedTextStop {
++    pub at: f32,
++    pub color: [f32; 4],
++}
++
++/// Text painted with a 7TV-style name paint (local Echo extension).
++///
++/// The shader rebuilds the CPU compositor's result per pixel of a padded
++/// canvas: stroke rings and the fill drawn source-over through the glyph mask,
++/// then each drop shadow destination-over with its precomputed blurred weight.
++/// The mask tile stacks `1 + shadow_count` blocks of `canvas_height` rows:
++/// block 0 is the glyph coverage, block `k` the weight of shadow `k - 1`.
++/// Colors are premultiplied RGBA in `0..=1` unless noted.
++#[derive(Clone, Copy, Debug)]
++#[repr(C)]
++#[expect(missing_docs)]
++pub struct PaintedText {
++    pub order: DrawOrder,
++    pub layer_count: u32,
++    pub bounds: Bounds<ScaledPixels>,
++    pub content_mask: ContentMask<ScaledPixels>,
++    pub mask_tile: AtlasTile,
++    pub fill_tile: AtlasTile,
++    pub canvas_height: u32,
++    pub shadow_count: u32,
++    pub ring_count: u32,
++    pub has_fill_texture: u32,
++    pub use_fallback: u32,
++    pub opacity: f32,
++    /// Added to a canvas pixel index to get its paint-box position (pixel center).
++    pub fill_origin: [f32; 2],
++    pub box_size: [f32; 2],
++    pub base_color: [f32; 4],
++    pub fallback_color: [f32; 4],
++    pub stroke_color: [f32; 4],
++    pub ring_offsets: [[i32; 2]; PAINTED_TEXT_MAX_RINGS],
++    pub shadow_colors: [[f32; 4]; PAINTED_TEXT_MAX_SHADOWS],
++    pub layers: [PaintedTextLayer; PAINTED_TEXT_MAX_LAYERS],
++    pub stops: [PaintedTextStop; PAINTED_TEXT_MAX_STOPS],
++}
++
++// The HLSL `PaintedText` in gpui_windows/src/shaders.hlsl reads this layout
++// from a structured buffer, field for field with 4-byte packing.
++const _: () = assert!(std::mem::size_of::<PaintedText>() == 912);
++
++impl PaintedText {
++    fn textures(&self) -> (AtlasTextureId, AtlasTextureId) {
++        (self.mask_tile.texture_id, self.fill_tile.texture_id)
++    }
++
++    pub(crate) fn sort_key(&self) -> (DrawOrder, u32, u32, u32, u32) {
++        (
++            self.order,
++            self.mask_tile.texture_id.index,
++            self.fill_tile.texture_id.index,
++            self.fill_tile.texture_id.kind as u32,
++            self.mask_tile.tile_id.0,
++        )
++    }
++}
++
++impl Default for PaintedText {
++    /// An empty instance with opacity 1; the window fills in tiles and bounds.
++    fn default() -> Self {
++        let tile = AtlasTile {
++            texture_id: AtlasTextureId {
++                index: 0,
++                kind: crate::AtlasTextureKind::Monochrome,
++            },
++            tile_id: crate::TileId(0),
++            padding: 0,
++            bounds: Bounds::default(),
++        };
++        Self {
++            order: 0,
++            layer_count: 0,
++            bounds: Bounds::default(),
++            content_mask: ContentMask::default(),
++            mask_tile: tile,
++            fill_tile: tile,
++            canvas_height: 0,
++            shadow_count: 0,
++            ring_count: 0,
++            has_fill_texture: 0,
++            use_fallback: 0,
++            opacity: 1.0,
++            fill_origin: [0.0; 2],
++            box_size: [1.0; 2],
++            base_color: [0.0; 4],
++            fallback_color: [0.0; 4],
++            stroke_color: [0.0; 4],
++            ring_offsets: [[0; 2]; PAINTED_TEXT_MAX_RINGS],
++            shadow_colors: [[0.0; 4]; PAINTED_TEXT_MAX_SHADOWS],
++            layers: [PaintedTextLayer::default(); PAINTED_TEXT_MAX_LAYERS],
++            stops: [PaintedTextStop::default(); PAINTED_TEXT_MAX_STOPS],
++        }
++    }
++}
++
++impl From<PaintedText> for Primitive {
++    fn from(text: PaintedText) -> Self {
++        Primitive::PaintedText(Box::new(text))
++    }
++}
++
+ #[derive(Clone, Debug)]
+ #[allow(missing_docs)]
+ pub struct PaintSurface {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 701879068a..4dee654e19 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -27,9 +27,10 @@ use crate::{
+     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+ };
+ 
++use crate::AtlasKey;
+ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+ use crate::interactive::TouchEvent;
+-use crate::scene::{PaintOperation, Primitive};
++use crate::scene::{PaintOperation, PaintedText, Primitive};
+ use anyhow::{Context as _, Result, anyhow};
+ use collections::{FxHashMap, FxHashSet};
+ use derive_more::{Deref, DerefMut};
+@@ -1078,6 +1079,16 @@ struct AnimatedImageSlot {
+     op_index: usize,
+     visible_bounds: Bounds<Pixels>,
+     image_bounds: Bounds<Pixels>,
++    kind: AnimatedSlotKind,
++}
++
++/// The primitive an [`AnimatedImageSlot`] patches.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum AnimatedSlotKind {
++    /// A polychrome sprite showing the image frame.
++    Sprite,
++    /// A [`PaintedText`] whose fill texture is the image frame.
++    PaintedText,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -1092,7 +1103,8 @@ enum AnimatedImageSlotResolution {
+ #[derive(Clone, Copy)]
+ struct ResolvedAnimatedImageSlot {
+     slot: AnimatedImageSlot,
+-    /// Index of the sprite in the sorted `Scene::polychrome_sprites`.
++    /// Index of the primitive in the sorted `Scene::polychrome_sprites`, or in
++    /// `Scene::painted_texts` for a painted-text slot.
+     sprite_index: usize,
+ }
+ 
+@@ -1261,19 +1273,34 @@ impl Frame {
+     /// Find each animated image slot's sprite in the sorted scene.
+     fn resolve_animated_image_slots(&mut self) {
+         let sprites = &self.scene.polychrome_sprites;
++        let texts = &self.scene.painted_texts;
+         for slot in &self.animated_image_slots {
+-            let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
+-                self.scene.paint_operations.get(slot.op_index)
+-            else {
+-                continue;
++            let sprite_index = match self.scene.paint_operations.get(slot.op_index) {
++                Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted)))
++                    if slot.kind == AnimatedSlotKind::Sprite =>
++                {
++                    let key = (painted.order, painted.tile.tile_id);
++                    let start =
++                        sprites.partition_point(|sprite| (sprite.order, sprite.tile.tile_id) < key);
++                    sprites[start..]
++                        .iter()
++                        .take_while(|sprite| (sprite.order, sprite.tile.tile_id) == key)
++                        .position(|sprite| sprite.bounds == painted.bounds)
++                        .map(|offset| start + offset)
++                }
++                Some(PaintOperation::Primitive(Primitive::PaintedText(painted)))
++                    if slot.kind == AnimatedSlotKind::PaintedText =>
++                {
++                    let key = painted.sort_key();
++                    let start = texts.partition_point(|text| text.sort_key() < key);
++                    texts[start..]
++                        .iter()
++                        .take_while(|text| text.sort_key() == key)
++                        .position(|text| text.bounds == painted.bounds)
++                        .map(|offset| start + offset)
++                }
++                _ => continue,
+             };
+-            let key = (painted.order, painted.tile.tile_id);
+-            let start = sprites.partition_point(|sprite| (sprite.order, sprite.tile.tile_id) < key);
+-            let sprite_index = sprites[start..]
+-                .iter()
+-                .take_while(|sprite| (sprite.order, sprite.tile.tile_id) == key)
+-                .position(|sprite| sprite.bounds == painted.bounds)
+-                .map(|offset| start + offset);
+             let resolution = match sprite_index {
+                 Some(sprite_index) => {
+                     AnimatedImageSlotResolution::Resolved(ResolvedAnimatedImageSlot {
+@@ -1309,6 +1336,7 @@ pub struct Window {
+     is_resizable: bool,
+     is_minimizable: bool,
+     sprite_atlas: Arc<dyn PlatformAtlas>,
++    _open_window_count: OpenWindowCount,
+     text_system: Rc<WindowTextSystem>,
+     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
+     rem_size: Pixels,
+@@ -1718,6 +1746,27 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
+     window_bounds_ctor(Bounds::new(final_origin, base_size))
+ }
+ 
++/// Windows alive in this process. A releasable image keeps its CPU pixels
++/// while another window could still need them, so a second window does not
++/// rebuild every frame it shares with the first.
++static OPEN_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// Counts a constructed window in [`OPEN_WINDOWS`] until it is dropped.
++struct OpenWindowCount;
++
++impl OpenWindowCount {
++    fn new() -> Self {
++        OPEN_WINDOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        Self
++    }
++}
++
++impl Drop for OpenWindowCount {
++    fn drop(&mut self) {
++        OPEN_WINDOWS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
+ impl Window {
+     pub(crate) fn new(
+         handle: AnyWindowHandle,
+@@ -2442,6 +2491,7 @@ impl Window {
+             is_resizable,
+             is_minimizable,
+             sprite_atlas,
++            _open_window_count: OpenWindowCount::new(),
+             text_system,
+             text_rendering_mode: cx.text_rendering_mode.clone(),
+             rem_size: px(16.),
+@@ -5618,24 +5668,11 @@ impl Window {
+             return Ok(());
+         }
+ 
+-        let params = RenderImageParams {
+-            image_id: data.id,
+-            frame_index,
++        let Some(tile) = image_atlas_tile(&*self.sprite_atlas, &data, frame_index)? else {
++            // A released image that can no longer rebuild its pixels.
++            return Ok(());
+         };
+ 
+-        let tile = self
+-            .sprite_atlas
+-            .get_or_insert_with(params.into(), &mut || {
+-                Ok(Some((
+-                    data.size(frame_index),
+-                    Cow::Borrowed(
+-                        data.as_bytes(frame_index)
+-                            .expect("It's the caller's job to pass a valid frame index"),
+-                    ),
+-                )))
+-            })?
+-            .expect("Callback above only returns Some");
+-
+         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+         let sub_tile = visible_image_tile(tile, visible_bounds, image_bounds);
+ 
+@@ -5694,6 +5731,7 @@ impl Window {
+                     op_index,
+                     visible_bounds: bounds.intersect(&image_bounds),
+                     image_bounds,
++                    kind: AnimatedSlotKind::Sprite,
+                 });
+         }
+         Ok(painted)
+@@ -5735,43 +5773,53 @@ impl Window {
+                 return false;
+             }
+         };
+-        let Some(frame_bytes) = data.as_bytes(frame_index) else {
+-            self.frame_stage_statistics.animated_image_patch_rejections[3] += 1;
+-            return false;
+-        };
+-        let params = RenderImageParams {
+-            image_id: data.id,
+-            frame_index,
+-        };
+-        let Ok(Some(tile)) = self
+-            .sprite_atlas
+-            .get_or_insert_with(params.into(), &mut || {
+-                Ok(Some((data.size(frame_index), Cow::Borrowed(frame_bytes))))
+-            })
+-        else {
++        let Ok(Some(tile)) = image_atlas_tile(&*self.sprite_atlas, data, frame_index) else {
+             self.frame_stage_statistics.animated_image_patch_rejections[3] += 1;
+             return false;
+         };
+-        let tile = visible_image_tile(
+-            tile,
+-            resolved.slot.visible_bounds,
+-            resolved.slot.image_bounds,
+-        );
+ 
+         let scene = &mut self.rendered_frame.scene;
+-        let Some(sprite) = scene.polychrome_sprites.get_mut(resolved.sprite_index) else {
+-            return false;
++        let damage = match resolved.slot.kind {
++            AnimatedSlotKind::Sprite => {
++                let tile = visible_image_tile(
++                    tile,
++                    resolved.slot.visible_bounds,
++                    resolved.slot.image_bounds,
++                );
++                let Some(sprite) = scene.polychrome_sprites.get_mut(resolved.sprite_index) else {
++                    return false;
++                };
++                if sprite.tile == tile {
++                    return true;
++                }
++                sprite.tile = tile;
++                let damage = sprite.bounds.intersect(&sprite.content_mask.bounds);
++                if let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
++                    scene.paint_operations.get_mut(resolved.slot.op_index)
++                {
++                    painted.tile = tile;
++                }
++                damage
++            }
++            AnimatedSlotKind::PaintedText => {
++                let Some(text) = scene.painted_texts.get_mut(resolved.sprite_index) else {
++                    return false;
++                };
++                if text.has_fill_texture != 0 && text.fill_tile == tile {
++                    return true;
++                }
++                text.fill_tile = tile;
++                text.has_fill_texture = 1;
++                let damage = text.bounds.intersect(&text.content_mask.bounds);
++                if let Some(PaintOperation::Primitive(Primitive::PaintedText(painted))) =
++                    scene.paint_operations.get_mut(resolved.slot.op_index)
++                {
++                    painted.fill_tile = tile;
++                    painted.has_fill_texture = 1;
++                }
++                damage
++            }
+         };
+-        if sprite.tile == tile {
+-            return true;
+-        }
+-        sprite.tile = tile;
+-        let damage = sprite.bounds.intersect(&sprite.content_mask.bounds);
+-        if let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
+-            scene.paint_operations.get_mut(resolved.slot.op_index)
+-        {
+-            painted.tile = tile;
+-        }
+ 
+         if let PresentDamage::Regions(regions) = &mut self.present_damage {
+             regions.push(damage);
+@@ -5806,6 +5854,81 @@ impl Window {
+         });
+     }
+ 
++    /// Whether this window's renderer draws [`Self::paint_painted_text`]
++    /// (local Echo extension).
++    pub fn supports_painted_text(&self) -> bool {
++        self.platform_window.supports_painted_text()
++    }
++
++    /// Paint text with a 7TV-style name paint rebuilt on the GPU (local Echo
++    /// extension). See [`PaintedText`] for the per-pixel recipe.
++    ///
++    /// `bounds` is the padded canvas the mask covers, in logical pixels. The
++    /// window fills in the primitive's order, bounds, content mask, tiles and
++    /// opacity. `fill` is the texture for an image layer. With `slot_key`, a
++    /// later [`Self::patch_animated_image`] for that key swaps the fill
++    /// texture without redrawing. Returns whether anything was painted.
++    pub fn paint_painted_text(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        mask: &PaintMask,
++        fill: Option<(&Arc<RenderImage>, usize)>,
++        mut text: PaintedText,
++        slot_key: Option<u64>,
++    ) -> Result<bool> {
++        self.invalidator.debug_assert_paint();
++        if bounds.size.width <= Pixels::ZERO || bounds.size.height <= Pixels::ZERO {
++            return Ok(false);
++        }
++        let Some(mask_tile) = self
++            .sprite_atlas
++            .get_or_insert_with(AtlasKey::PaintMask(mask.id), &mut || {
++                Ok(Some((mask.tile_size(), Cow::Borrowed(&mask.data[..]))))
++            })?
++        else {
++            return Ok(false);
++        };
++        let fill_tile = match fill {
++            Some((image, frame_index)) => {
++                image_atlas_tile(&*self.sprite_atlas, image, frame_index)?
++            }
++            None => None,
++        };
++
++        text.order = 0;
++        text.bounds = self.snap_bounds(bounds);
++        text.content_mask = self.snapped_content_mask();
++        text.mask_tile = mask_tile;
++        text.canvas_height = mask.block_height;
++        text.has_fill_texture = fill_tile.is_some() as u32;
++        text.fill_tile = fill_tile.unwrap_or(mask_tile);
++        text.opacity *= self.element_opacity();
++
++        let op_index = self.next_frame.scene.len();
++        self.next_frame.scene.insert_primitive(text);
++        let painted = self.next_frame.scene.len() > op_index;
++        if painted && let Some(key) = slot_key {
++            self.next_frame
++                .animated_image_slots
++                .push(AnimatedImageSlot {
++                    key,
++                    op_index,
++                    visible_bounds: bounds,
++                    image_bounds: bounds,
++                    kind: AnimatedSlotKind::PaintedText,
++                });
++        }
++        Ok(painted)
++    }
++
++    /// Removes a [`PaintMask`] from the sprite atlas (local Echo extension).
++    pub fn drop_paint_mask(&mut self, mask_id: u64) {
++        if self.sprite_atlas.remove(&AtlasKey::PaintMask(mask_id)) {
++            // Cached scenes can still reference the retired tile.
++            self.refresh();
++        }
++    }
++
+     /// Removes an image from the sprite atlas.
+     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+         let mut removed_any = false;
+@@ -11135,6 +11258,88 @@ fn duration_nanos(duration: std::time::Duration) -> u64 {
+     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+ }
+ 
++/// Glyph coverage and drop-shadow weights for [`Window::paint_painted_text`]
++/// (local Echo extension): `blocks` stacked blocks of `width x block_height`
++/// 8-bit values. Block 0 is the glyph coverage over the padded canvas, block
++/// `k` the blurred weight of drop shadow `k - 1`.
++pub struct PaintMask {
++    id: u64,
++    width: u32,
++    block_height: u32,
++    blocks: u32,
++    data: Arc<[u8]>,
++}
++
++impl PaintMask {
++    /// `None` when `data` is not exactly `width * block_height * blocks` bytes.
++    pub fn new(width: u32, block_height: u32, blocks: u32, data: Vec<u8>) -> Option<Self> {
++        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++        let expected = (width as usize)
++            .checked_mul(block_height as usize)?
++            .checked_mul(blocks as usize)?;
++        (expected > 0 && data.len() == expected).then(|| Self {
++            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
++            width,
++            block_height,
++            blocks,
++            data: data.into(),
++        })
++    }
++
++    /// Identity for [`Window::drop_paint_mask`] and [`App::drop_paint_mask`].
++    pub fn id(&self) -> u64 {
++        self.id
++    }
++
++    /// Bytes held for re-uploading the mask.
++    pub fn byte_len(&self) -> usize {
++        self.data.len()
++    }
++
++    fn tile_size(&self) -> Size<DevicePixels> {
++        size(
++            DevicePixels(self.width as i32),
++            DevicePixels((self.block_height * self.blocks) as i32),
++        )
++    }
++}
++
++/// The atlas tile of an image frame, uploading the frame on a miss.
++///
++/// A releasable image ([`RenderImage::new_releasable`]) uploads its resident
++/// pixels, or rebuilds them when a lost device or a window opened later needs
++/// them after the release. It drops its CPU copy once a tile exists, but only
++/// while a single window is open, so windows showing the same image do not
++/// each rebuild it. `Ok(None)` when a released image cannot rebuild its pixels.
++fn image_atlas_tile(
++    atlas: &dyn PlatformAtlas,
++    data: &RenderImage,
++    frame_index: usize,
++) -> Result<Option<AtlasTile>> {
++    let params = RenderImageParams {
++        image_id: data.id,
++        frame_index,
++    };
++    let resident = data.lock_resident_pixels();
++    let tile = atlas.get_or_insert_with(params.into(), &mut || {
++        let bytes = if let Some(bytes) = data.as_bytes(frame_index) {
++            Cow::Borrowed(bytes)
++        } else if let Some(bytes) = resident.as_ref().and_then(|pixels| pixels.as_deref()) {
++            Cow::Borrowed(bytes)
++        } else if let Some(bytes) = data.rebuild_pixels(frame_index) {
++            Cow::Owned(bytes)
++        } else {
++            return Ok(None);
++        };
++        Ok(Some((data.size(frame_index), bytes)))
++    })?;
++    drop(resident);
++    if tile.is_some() && OPEN_WINDOWS.load(std::sync::atomic::Ordering::Relaxed) <= 1 {
++        data.release_pixels();
++    }
++    Ok(tile)
++}
++
+ /// The part of `tile` that shows `visible_bounds` of an image drawn at `image_bounds`.
+ fn visible_image_tile(
+     tile: AtlasTile,
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 9b98a23a41..06b99d5703 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -925,6 +925,8 @@ impl MetalRenderer {
+                         viewport_size,
+                         &command_encoder,
+                     ),
++                // Never emitted: this renderer reports no painted-text support.
++                PrimitiveBatch::PaintedTexts { .. } => {}
+                 PrimitiveBatch::Surfaces(range) => {
+                     if let Err(error) = self.draw_surfaces(
+                         &scene.surfaces[range.clone()],
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index 46f9ffdb98..44da053d5e 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -1636,6 +1636,8 @@ impl WgpuRendererCore {
+                     // Surfaces are macOS-only for video playback and are not
+                     // implemented by the WGPU renderer.
+                     PrimitiveBatch::Surfaces(_surfaces) => {}
++                    // Never emitted: this renderer reports no painted-text support.
++                    PrimitiveBatch::PaintedTexts { .. } => {}
+                 }
+             }
+         }
+diff --git a/crates/gpui_windows/build.rs b/crates/gpui_windows/build.rs
+index a544f6cf90..e201fa0096 100644
+--- a/crates/gpui_windows/build.rs
++++ b/crates/gpui_windows/build.rs
+@@ -40,6 +40,7 @@ mod shader_compilation {
+             "monochrome_sprite",
+             "subpixel_sprite",
+             "polychrome_sprite",
++            "painted_text",
+         ];
+ 
+         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index a226149f9f..563195a9d0 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -302,6 +302,7 @@ struct DirectXRenderPipelines {
+     mono_sprites: PipelineState<MonochromeSprite>,
+     subpixel_sprites: PipelineState<SubpixelSprite>,
+     poly_sprites: PipelineState<PolychromeSprite>,
++    painted_texts: PipelineState<PaintedText>,
+ }
+ 
+ struct DirectXGlobalElements {
+@@ -673,6 +674,16 @@ impl DirectXRenderer {
+                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                 }
++                PrimitiveBatch::PaintedTexts {
++                    mask_texture_id,
++                    fill_texture_id,
++                    range,
++                } => self.draw_painted_texts(
++                    mask_texture_id,
++                    fill_texture_id,
++                    range.start,
++                    range.len(),
++                ),
+                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+             }
+             .with_context(|| {
+@@ -867,6 +878,14 @@ impl DirectXRenderer {
+             )?;
+         }
+ 
++        if !scene.painted_texts.is_empty() {
++            self.pipelines.painted_texts.update_buffer(
++                &devices.device,
++                &devices.device_context,
++                &scene.painted_texts,
++            )?;
++        }
++
+         Ok(())
+     }
+ 
+@@ -1119,6 +1138,38 @@ impl DirectXRenderer {
+         )
+     }
+ 
++    fn draw_painted_texts(
++        &mut self,
++        mask_texture_id: AtlasTextureId,
++        fill_texture_id: AtlasTextureId,
++        start: usize,
++        len: usize,
++    ) -> Result<()> {
++        if len == 0 {
++            return Ok(());
++        }
++        let devices = self.devices.as_ref().context("devices missing")?;
++        let Some(mask_view) = self.atlas.get_texture_view(mask_texture_id) else {
++            return Ok(());
++        };
++        let fill_view = self
++            .atlas
++            .get_texture_view(fill_texture_id)
++            .unwrap_or_else(|| mask_view.clone());
++        self.pipelines.painted_texts.draw_range_with_textures(
++            &devices.device_context,
++            &mask_view,
++            &fill_view,
++            self.globals
++                .batch_params_buffer
++                .as_ref()
++                .context("batch params buffer missing")?,
++            slice::from_ref(&self.globals.sampler),
++            start as u32,
++            len as u32,
++        )
++    }
++
+     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
+         if surfaces.is_empty() {
+             return Ok(());
+@@ -1377,6 +1428,13 @@ impl DirectXRenderPipelines {
+             16,
+             create_blend_state(device)?,
+         )?;
++        let painted_texts = PipelineState::new(
++            device,
++            "painted_text_pipeline",
++            ShaderModule::PaintedText,
++            16,
++            create_blend_state(device)?,
++        )?;
+ 
+         Ok(Self {
+             shadow_pipeline,
+@@ -1387,6 +1445,7 @@ impl DirectXRenderPipelines {
+             mono_sprites,
+             subpixel_sprites,
+             poly_sprites,
++            painted_texts,
+         })
+     }
+ }
+@@ -1613,6 +1672,43 @@ impl<T> PipelineState<T> {
+         Ok(())
+     }
+ 
++    /// Draw painted texts: the mask atlas at `t0`, instances at `t1` and the
++    /// fill atlas at `t2`.
++    #[allow(clippy::too_many_arguments)]
++    fn draw_range_with_textures(
++        &self,
++        device_context: &ID3D11DeviceContext,
++        mask: &[Option<ID3D11ShaderResourceView>],
++        fill: &[Option<ID3D11ShaderResourceView>],
++        batch_params_buffer: &ID3D11Buffer,
++        sampler: &[Option<ID3D11SamplerState>],
++        first_instance: u32,
++        instance_count: u32,
++    ) -> Result<()> {
++        anyhow::ensure!(
++            first_instance as usize + instance_count as usize <= self.buffer_size,
++            "DirectX instance range exceeds the {} buffer",
++            self.label
++        );
++        update_batch_start(device_context, batch_params_buffer, first_instance)?;
++        set_pipeline_state(
++            device_context,
++            slice::from_ref(&self.view),
++            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
++            &self.vertex,
++            &self.fragment,
++            &self.blend_state,
++        );
++        unsafe {
++            device_context.PSSetSamplers(0, Some(sampler));
++            device_context.PSSetShaderResources(0, Some(mask));
++            device_context.PSSetShaderResources(2, Some(fill));
++            device_context.DrawInstanced(4, instance_count, 0, 0);
++            device_context.PSSetShaderResources(2, Some(&[None]));
++        }
++        Ok(())
++    }
++
+     fn draw_range_with_texture(
+         &self,
+         device_context: &ID3D11DeviceContext,
+@@ -2080,6 +2176,7 @@ pub(crate) mod shader_resources {
+         MonochromeSprite,
+         SubpixelSprite,
+         PolychromeSprite,
++        PaintedText,
+     }
+ 
+     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+@@ -2153,6 +2250,10 @@ pub(crate) mod shader_resources {
+                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
+                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                 },
++                ShaderModule::PaintedText => match target {
++                    ShaderTarget::Vertex => PAINTED_TEXT_VERTEX_BYTES,
++                    ShaderTarget::Fragment => PAINTED_TEXT_FRAGMENT_BYTES,
++                },
+             };
+             Self { inner: bytes }
+         }
+@@ -2233,6 +2334,7 @@ pub(crate) mod shader_resources {
+                 ShaderModule::MonochromeSprite => "monochrome_sprite",
+                 ShaderModule::SubpixelSprite => "subpixel_sprite",
+                 ShaderModule::PolychromeSprite => "polychrome_sprite",
++                ShaderModule::PaintedText => "painted_text",
+             }
+         }
+     }
+@@ -2433,7 +2535,8 @@ fn scene_instance_bytes(scene: &Scene) -> u64 {
+         + size_of_val(scene.underlines.as_slice())
+         + size_of_val(scene.monochrome_sprites.as_slice())
+         + size_of_val(scene.subpixel_sprites.as_slice())
+-        + size_of_val(scene.polychrome_sprites.as_slice())) as u64
++        + size_of_val(scene.polychrome_sprites.as_slice())
++        + size_of_val(scene.painted_texts.as_slice())) as u64
+ }
+ 
+ /// `region` as a back-buffer rectangle, grown to whole pixels and clipped to
+diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+index 2f9a00c418..0654369af3 100644
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -1266,3 +1266,295 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
+     color.a *= sprite.opacity * saturate(0.5 - distance);
+     return color;
+ }
++
++/*
++**
++**              Painted text (local Echo extension)
++**
++**  Rebuilds Echo's CPU 7TV name-paint compositor per pixel of a padded
++**  canvas: stroke rings, then the fill, drawn source-over through the glyph
++**  mask, then each drop shadow destination-over with its precomputed blurred
++**  weight. The mask tile stacks 1 + shadow_count blocks of canvas_height rows
++**  (block 0 is the glyph coverage). Colors are premultiplied RGBA in 0..1
++**  except gradient stops, which are straight RGBA in 0..255 like the CPU's u8
++**  colors, so stop interpolation rounds the same way.
++**
++*/
++
++static const uint PAINTED_TEXT_LAYER_SOLID = 1u;
++static const uint PAINTED_TEXT_LAYER_LINEAR = 2u;
++static const uint PAINTED_TEXT_LAYER_CIRCLE = 3u;
++static const uint PAINTED_TEXT_LAYER_ELLIPSE = 4u;
++static const uint PAINTED_TEXT_LAYER_IMAGE = 5u;
++static const float PAINTED_TEXT_EPSILON = 1.1920929e-7;
++
++struct PaintedTextLayer {
++    uint kind;
++    uint repeat;
++    uint stop_start;
++    uint stop_count;
++    float opacity;
++    float4 params;
++    float4 solid;
++};
++
++struct PaintedTextStop {
++    float at;
++    float4 color;
++};
++
++struct PaintedText {
++    uint order;
++    uint layer_count;
++    Bounds bounds;
++    Bounds content_mask;
++    AtlasTile mask_tile;
++    AtlasTile fill_tile;
++    uint canvas_height;
++    uint shadow_count;
++    uint ring_count;
++    uint has_fill_texture;
++    uint use_fallback;
++    float opacity;
++    float2 fill_origin;
++    float2 box_size;
++    float4 base_color;
++    float4 fallback_color;
++    float4 stroke_color;
++    int2 ring_offsets[8];
++    float4 shadow_colors[8];
++    PaintedTextLayer layers[4];
++    PaintedTextStop stops[16];
++};
++
++struct PaintedTextVertexOutput {
++    nointerpolation uint text_id: TEXCOORD0;
++    float4 position: SV_Position;
++    float4 clip_distance: SV_ClipDistance;
++};
++
++struct PaintedTextFragmentInput {
++    nointerpolation uint text_id: TEXCOORD0;
++    float4 position: SV_Position;
++};
++
++StructuredBuffer<PaintedText> painted_texts: register(t1);
++Texture2D<float4> t_paint_fill: register(t2);
++
++PaintedTextVertexOutput painted_text_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
++    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
++    uint text_id = batch_start_index + instance_id;
++    Bounds bounds = painted_texts[text_id].bounds;
++
++    PaintedTextVertexOutput output;
++    output.position = to_device_position(unit_vertex, bounds);
++    output.clip_distance = distance_from_clip_rect(unit_vertex, bounds, painted_texts[text_id].content_mask);
++    output.text_id = text_id;
++    return output;
++}
++
++// Coverage or shadow weight at canvas pixel `p` of `block`; zero outside.
++float painted_mask_value(uint id, int2 p, uint block) {
++    AtlasTile tile = painted_texts[id].mask_tile;
++    int height = int(painted_texts[id].canvas_height);
++    if (p.x < 0 || p.y < 0 || p.x >= tile.bounds.size.x || p.y >= height) {
++        return 0.0;
++    }
++    int2 texel = tile.bounds.origin + int2(p.x, p.y + int(block) * height);
++    return t_sprite.Load(int3(texel, 0)).r;
++}
++
++float4 painted_src_over(float4 dst, float4 src, float weight) {
++    return src * weight + dst * (1.0 - src.a * weight);
++}
++
++float4 painted_dst_over(float4 dst, float4 src, float weight) {
++    return dst + src * weight * (1.0 - dst.a);
++}
++
++// A straight 0..255 color as premultiplied 0..1.
++float4 painted_premultiply(float4 color) {
++    float alpha = color.a / 255.0;
++    return float4(color.rgb / 255.0 * alpha, alpha);
++}
++
++// f32::round (half away from zero) for the non-negative values used here;
++// HLSL round() rounds halves to even.
++float3 painted_round3(float3 value) {
++    return floor(value + 0.5);
++}
++
++// RgbaColor::lerp: premultiplied interpolation rounded to u8 channels.
++float4 painted_lerp_stop(float4 from, float4 to, float t) {
++    t = saturate(t);
++    float from_alpha = from.a / 255.0;
++    float to_alpha = to.a / 255.0;
++    float alpha = from_alpha + (to_alpha - from_alpha) * t;
++    if (alpha <= PAINTED_TEXT_EPSILON) {
++        return float4(0.0, 0.0, 0.0, 0.0);
++    }
++    float3 a = from.rgb * from_alpha;
++    float3 b = to.rgb * to_alpha;
++    float3 rgb = clamp(painted_round3((a + (b - a) * t) / alpha), 0.0, 255.0);
++    return float4(rgb, clamp(floor(alpha * 255.0 + 0.5), 0.0, 255.0));
++}
++
++// sample_gradient_stops.
++float4 painted_sample_stops(uint id, uint start, uint count, float ratio) {
++    ratio = saturate(ratio);
++    PaintedTextStop first = painted_texts[id].stops[start];
++    if (ratio <= first.at) {
++        return first.color;
++    }
++    [loop]
++    for (uint i = 0u; i + 1u < count; i++) {
++        PaintedTextStop left = painted_texts[id].stops[start + i];
++        PaintedTextStop right = painted_texts[id].stops[start + i + 1u];
++        if (ratio <= right.at) {
++            float span = abs(right.at - left.at);
++            float t = span <= PAINTED_TEXT_EPSILON ? 0.0 : (ratio - left.at) / (right.at - left.at);
++            return painted_lerp_stop(left.color, right.color, t);
++        }
++    }
++    return painted_texts[id].stops[start + count - 1u].color;
++}
++
++// repeating_gradient_ratio.
++float painted_repeating_ratio(uint id, uint start, uint count, float ratio) {
++    float first = painted_texts[id].stops[start].at;
++    float last = painted_texts[id].stops[start + count - 1u].at;
++    float period = last - first;
++    if (period <= PAINTED_TEXT_EPSILON) {
++        return saturate(ratio);
++    }
++    float offset = ratio - first;
++    return first + (offset - period * floor(offset / period));
++}
++
++// A premultiplied fill-texture texel, wrapped or clamped to the tile.
++float4 painted_fill_texel(AtlasTile tile, int x, int y, bool repeat) {
++    int2 size = max(tile.bounds.size, int2(1, 1));
++    if (repeat) {
++        x = ((x % size.x) + size.x) % size.x;
++        y = ((y % size.y) + size.y) % size.y;
++    } else {
++        x = clamp(x, 0, size.x - 1);
++        y = clamp(y, 0, size.y - 1);
++    }
++    float4 color = t_paint_fill.Load(int3(tile.bounds.origin + int2(x, y), 0));
++    return float4(color.rgb * color.a, color.a);
++}
++
++// sample_image_fill: the texture stretched over the paint box, bilinear in
++// premultiplied space.
++float4 painted_sample_image(uint id, float2 p, bool repeat) {
++    AtlasTile tile = painted_texts[id].fill_tile;
++    float2 f = p / painted_texts[id].box_size;
++    if (repeat) {
++        f = f - floor(f);
++    } else {
++        f = saturate(f);
++    }
++    int2 size = max(tile.bounds.size, int2(1, 1));
++    float2 s = f * float2(size) - 0.5;
++    float2 s0 = floor(s);
++    float2 t = s - s0;
++    int x0 = int(s0.x);
++    int y0 = int(s0.y);
++    float4 p00 = painted_fill_texel(tile, x0, y0, repeat);
++    float4 p10 = painted_fill_texel(tile, x0 + 1, y0, repeat);
++    float4 p01 = painted_fill_texel(tile, x0, y0 + 1, repeat);
++    float4 p11 = painted_fill_texel(tile, x0 + 1, y0 + 1, repeat);
++    float4 top = p00 + (p10 - p00) * t.x;
++    float4 bottom = p01 + (p11 - p01) * t.x;
++    return top + (bottom - top) * t.y;
++}
++
++// fill_color_at: the paint's layers composited at paint-box position `p`.
++float4 painted_fill_color(uint id, float2 p) {
++    float4 base = painted_texts[id].base_color;
++    float4 result = float4(0.0, 0.0, 0.0, 0.0);
++    bool any = false;
++    // A paint whose layers never contribute uses its representative color.
++    uint layer_count = painted_texts[id].use_fallback != 0u ? 0u : painted_texts[id].layer_count;
++    [loop]
++    for (uint l = 0u; l < layer_count; l++) {
++        PaintedTextLayer layer = painted_texts[id].layers[l];
++        if (layer.opacity <= 0.0) {
++            continue;
++        }
++        if (layer.kind == PAINTED_TEXT_LAYER_IMAGE) {
++            float4 color = base;
++            if (painted_texts[id].has_fill_texture != 0u) {
++                color = painted_src_over(color, painted_sample_image(id, p, layer.repeat != 0u), 1.0);
++            }
++            result = painted_src_over(result, color, layer.opacity);
++            any = true;
++            continue;
++        }
++        if (layer.stop_count == 0u) {
++            continue;
++        }
++        if (layer.kind == PAINTED_TEXT_LAYER_SOLID) {
++            result = painted_src_over(result, layer.solid, 1.0);
++            any = true;
++            continue;
++        }
++        float ratio = 0.0;
++        if (layer.kind == PAINTED_TEXT_LAYER_LINEAR) {
++            ratio = abs(layer.params.w) <= PAINTED_TEXT_EPSILON
++                ? 0.5
++                : (p.x * layer.params.x + p.y * layer.params.y - layer.params.z) / layer.params.w;
++        } else if (layer.kind == PAINTED_TEXT_LAYER_CIRCLE) {
++            ratio = length(p - layer.params.xy) / layer.params.z;
++        } else if (layer.kind == PAINTED_TEXT_LAYER_ELLIPSE) {
++            ratio = length((p - layer.params.xy) / layer.params.zw);
++        } else {
++            continue;
++        }
++        ratio = layer.repeat != 0u
++            ? painted_repeating_ratio(id, layer.stop_start, layer.stop_count, ratio)
++            : saturate(ratio);
++        float4 stop = painted_sample_stops(id, layer.stop_start, layer.stop_count, ratio);
++        float4 color = painted_src_over(base, painted_premultiply(stop), 1.0);
++        result = painted_src_over(result, color, layer.opacity);
++        any = true;
++    }
++    return any ? result : painted_texts[id].fallback_color;
++}
++
++float4 painted_text_fragment(PaintedTextFragmentInput input): SV_Target {
++    uint id = input.text_id;
++    int2 c = int2(floor(input.position.xy - painted_texts[id].bounds.origin));
++    float4 canvas = float4(0.0, 0.0, 0.0, 0.0);
++
++    float4 stroke = painted_texts[id].stroke_color;
++    uint ring_count = painted_texts[id].ring_count;
++    [loop]
++    for (uint i = 0u; i < ring_count; i++) {
++        float ring = painted_mask_value(id, c - painted_texts[id].ring_offsets[i], 0u);
++        if (ring > 0.0) {
++            canvas = painted_src_over(canvas, stroke, ring);
++        }
++    }
++
++    float coverage = painted_mask_value(id, c, 0u);
++    if (coverage > 0.0) {
++        float2 p = float2(c) + painted_texts[id].fill_origin;
++        canvas = painted_src_over(canvas, painted_fill_color(id, p), coverage);
++    }
++
++    uint shadow_count = painted_texts[id].shadow_count;
++    [loop]
++    for (uint k = 0u; k < shadow_count; k++) {
++        float weight = painted_mask_value(id, c, k + 1u);
++        if (weight > 0.0) {
++            canvas = painted_dst_over(canvas, painted_texts[id].shadow_colors[k], weight);
++        }
++    }
++
++    if (canvas.a <= 0.0) {
++        return float4(0.0, 0.0, 0.0, 0.0);
++    }
++    return float4(canvas.rgb / canvas.a, canvas.a * painted_texts[id].opacity);
++}
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index d5b6ebc6ff..f21663eba3 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -1090,6 +1090,10 @@ impl PlatformWindow for WindowsWindow {
+         self.state.renderer.borrow_mut().set_present_damage(regions);
+     }
+ 
++    fn supports_painted_text(&self) -> bool {
++        true
++    }
++
+     fn renderer_cpu_statistics(&self) -> Option<RendererCpuStatistics> {
+         Some(self.state.renderer.borrow().renderer_cpu_statistics())
+     }
+-- 
+2.55.0.windows.5
+

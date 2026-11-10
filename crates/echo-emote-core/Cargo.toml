@@ -1,0 +1,12 @@
+[package]
+name = "echo-emote-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-free canonical emote model and policies for Echo"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }

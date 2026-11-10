@@ -1,0 +1,5 @@
+# Literal UI styling counts in src/components; see scripts/check-ui-literals.ps1.
+color=31
+spacing=21
+radius=21
+text_size=2

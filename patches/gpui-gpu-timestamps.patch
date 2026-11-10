@@ -1,0 +1,443 @@
+From 47656da11ad67227b1b338419849aca775b4c3ac Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 23:04:41 -0700
+Subject: [PATCH] gpui: add non-blocking GPU frame timestamp queries for Echo
+
+---
+ crates/gpui/src/gpui.rs                     |  14 ++
+ crates/gpui/src/platform.rs                 |  26 ++-
+ crates/gpui/src/window.rs                   |  33 ++-
+ crates/gpui_windows/src/directx_renderer.rs | 234 +++++++++++++++++++-
+ crates/gpui_windows/src/window.rs           |  12 +
+ 5 files changed, 305 insertions(+), 14 deletions(-)
+
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index f0defe0d04..a3739ac886 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -368,3 +368,17 @@ pub struct PresentStatistics {
+     /// sampled the high-resolution counter. Approximates present-pipeline latency.
+     pub present_latency_ms: f64,
+ }
++
++/// GPU execution time for the most recently completed window frame.
++///
++/// This is a local Echo extension (branch `echo-paint-fork`). The Windows
++/// Direct3D 11 backend measures the submitted render pass with timestamp and
++/// timestamp-disjoint queries. Results are read back on later frames without
++/// flushing or blocking the GPU; other platforms return `None`.
++#[derive(Debug, Clone, Copy)]
++pub struct GpuFrameStatistics {
++    /// GPU time between the frame's start and end timestamp, in milliseconds.
++    pub gpu_frame_time_ms: f64,
++    /// Running count of successfully resolved, non-disjoint timestamp samples.
++    pub sample_count: u64,
++}
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 5a2dd16443..02085374ae 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -39,12 +39,11 @@ pub(crate) type PlatformScreenCaptureFrame =
+ use crate::{
+     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds, Corners,
+     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
+-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
+-    LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, PresentStatistics,
+-    Priority,
+-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
+-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
+-    hash, point, px, size,
++    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuFrameStatistics, GpuSpecs, Hsla,
++    ImageSource, Keymap, LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput,
++    Point, PresentStatistics, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
++    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
++    SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+ };
+ #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+ use anyhow::bail;
+@@ -1410,6 +1409,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+         None
+     }
+ 
++    /// Enable or disable diagnostic GPU frame timestamp collection.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). The default is a no-op; the
++    /// Windows Direct3D 11 backend allocates and submits timestamp queries only
++    /// while enabled.
++    fn set_gpu_timing_enabled(&self, _enabled: bool) {}
++
++    /// GPU execution time for the most recently completed frame, when available.
++    ///
++    /// Local Echo extension (`echo-paint-fork`). Implementations must not block
++    /// waiting for a result; the default returns `None`.
++    fn gpu_frame_statistics(&self) -> Option<GpuFrameStatistics> {
++        None
++    }
++
+     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
+ 
+     // Mobile platform methods.
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 66a9873346..d9db6c4a7d 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -11,13 +11,13 @@ use crate::{
+     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+-    PolychromeSprite, PresentStatistics, Priority, PromptButton, PromptLevel, Quad, Render,
+-    RenderGlyphParams,
++    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
++    GpuFrameStatistics, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
++    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
++    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
++    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
++    PlatformWindow, Point, PolychromeSprite, PresentStatistics, Priority, PromptButton, PromptLevel,
++    Quad, Render, RenderGlyphParams,
+     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+     StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+@@ -7391,6 +7391,25 @@ impl Window {
+         self.platform_window.present_statistics()
+     }
+ 
++    /// Enable or disable diagnostic GPU frame timestamp collection.
++    ///
++    /// Local Echo extension (branch `echo-paint-fork`). On Windows this lazily
++    /// creates a bounded Direct3D 11 timestamp-query ring. Disabling collection
++    /// releases the queries. Other platforms ignore the request.
++    pub fn set_gpu_timing_enabled(&self, enabled: bool) {
++        self.platform_window.set_gpu_timing_enabled(enabled);
++    }
++
++    /// GPU execution time for the most recently completed window frame.
++    ///
++    /// Local Echo extension (branch `echo-paint-fork`). The Windows Direct3D 11
++    /// backend resolves timestamp queries asynchronously on later frames and
++    /// never flushes or waits for the GPU. Returns `None` before the first query
++    /// resolves, while diagnostics are disabled, or on unsupported platforms.
++    pub fn gpu_frame_statistics(&self) -> Option<GpuFrameStatistics> {
++        self.platform_window.gpu_frame_statistics()
++    }
++
+     /// Perform titlebar double-click action.
+     /// This is macOS specific.
+     pub fn titlebar_double_click(&self) {
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index 5fdf58357c..c64a94534b 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -45,6 +45,9 @@ pub(crate) struct DirectXRenderer {
+     pipelines: DirectXRenderPipelines,
+     direct_composition: Option<DirectComposition>,
+     font_info: &'static FontInfo,
++    gpu_timing_enabled: bool,
++    gpu_timing_unavailable: bool,
++    gpu_frame_timer: Option<GpuFrameTimer>,
+ 
+     width: u32,
+     height: u32,
+@@ -83,6 +86,179 @@ struct DirectXResources {
+     viewport: D3D11_VIEWPORT,
+ }
+ 
++const GPU_TIMESTAMP_QUERY_SLOTS: usize = 4;
++
++struct GpuFrameTimer {
++    slots: Vec<GpuTimestampSlot>,
++    active_slot: Option<usize>,
++    next_slot: usize,
++    sample_count: u64,
++    latest_gpu_frame_time_ms: Option<f64>,
++}
++
++struct GpuTimestampSlot {
++    disjoint: ID3D11Query,
++    start: ID3D11Query,
++    end: ID3D11Query,
++    pending: bool,
++}
++
++enum GpuTimestampPoll {
++    Pending,
++    Complete(Option<f64>),
++}
++
++impl GpuFrameTimer {
++    fn new(device: &ID3D11Device) -> Result<Self> {
++        let mut slots = Vec::with_capacity(GPU_TIMESTAMP_QUERY_SLOTS);
++        for _ in 0..GPU_TIMESTAMP_QUERY_SLOTS {
++            slots.push(GpuTimestampSlot {
++                disjoint: Self::create_query(device, D3D11_QUERY_TIMESTAMP_DISJOINT)?,
++                start: Self::create_query(device, D3D11_QUERY_TIMESTAMP)?,
++                end: Self::create_query(device, D3D11_QUERY_TIMESTAMP)?,
++                pending: false,
++            });
++        }
++        Ok(Self {
++            slots,
++            active_slot: None,
++            next_slot: 0,
++            sample_count: 0,
++            latest_gpu_frame_time_ms: None,
++        })
++    }
++
++    fn create_query(device: &ID3D11Device, query: D3D11_QUERY) -> Result<ID3D11Query> {
++        let descriptor = D3D11_QUERY_DESC {
++            Query: query,
++            MiscFlags: 0,
++        };
++        let mut result = None;
++        unsafe { device.CreateQuery(&descriptor, Some(&mut result))? };
++        result.context("Direct3D 11 CreateQuery returned no query object")
++    }
++
++    fn begin_frame(&mut self, context: &ID3D11DeviceContext) {
++        self.collect_available(context);
++        if self.active_slot.is_some() || self.slots.is_empty() {
++            return;
++        }
++
++        let Some(index) = (0..self.slots.len())
++            .map(|offset| (self.next_slot + offset) % self.slots.len())
++            .find(|index| !self.slots[*index].pending)
++        else {
++            // The GPU is more than the bounded query ring behind. Skip this frame
++            // instead of flushing or waiting on the render thread.
++            return;
++        };
++
++        let slot = &self.slots[index];
++        unsafe {
++            context.Begin(&slot.disjoint);
++            context.End(&slot.start);
++        }
++        self.active_slot = Some(index);
++    }
++
++    fn end_frame(&mut self, context: &ID3D11DeviceContext) {
++        let Some(index) = self.active_slot.take() else {
++            return;
++        };
++        let slot = &mut self.slots[index];
++        unsafe {
++            context.End(&slot.end);
++            context.End(&slot.disjoint);
++        }
++        slot.pending = true;
++        self.next_slot = (index + 1) % self.slots.len();
++    }
++
++    fn collect_available(&mut self, context: &ID3D11DeviceContext) {
++        let mut completed_count = 0u64;
++        let mut newest_ms = None;
++        for slot in &mut self.slots {
++            if !slot.pending {
++                continue;
++            }
++            match Self::poll_slot(context, slot) {
++                Ok(GpuTimestampPoll::Pending) => {}
++                Ok(GpuTimestampPoll::Complete(duration_ms)) => {
++                    slot.pending = false;
++                    completed_count += u64::from(duration_ms.is_some());
++                    if duration_ms.is_some() {
++                        newest_ms = duration_ms;
++                    }
++                }
++                Err(error) => {
++                    slot.pending = false;
++                    log::warn!("Failed to resolve Direct3D GPU timestamp query: {error:#}");
++                }
++            }
++        }
++        self.sample_count = self.sample_count.saturating_add(completed_count);
++        if newest_ms.is_some() {
++            self.latest_gpu_frame_time_ms = newest_ms;
++        }
++    }
++
++    fn poll_slot(
++        context: &ID3D11DeviceContext,
++        slot: &GpuTimestampSlot,
++    ) -> Result<GpuTimestampPoll> {
++        let Some(disjoint) =
++            Self::try_get_data::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(context, &slot.disjoint)?
++        else {
++            return Ok(GpuTimestampPoll::Pending);
++        };
++        let Some(start) = Self::try_get_data::<u64>(context, &slot.start)? else {
++            return Ok(GpuTimestampPoll::Pending);
++        };
++        let Some(end) = Self::try_get_data::<u64>(context, &slot.end)? else {
++            return Ok(GpuTimestampPoll::Pending);
++        };
++
++        if disjoint.Disjoint.as_bool() || disjoint.Frequency == 0 || end < start {
++            return Ok(GpuTimestampPoll::Complete(None));
++        }
++        let duration_ms = (end - start) as f64 * 1000.0 / disjoint.Frequency as f64;
++        Ok(GpuTimestampPoll::Complete(
++            duration_ms.is_finite().then_some(duration_ms),
++        ))
++    }
++
++    fn try_get_data<T: Default>(
++        context: &ID3D11DeviceContext,
++        query: &ID3D11Query,
++    ) -> Result<Option<T>> {
++        let mut value = T::default();
++        let hr = unsafe {
++            (Interface::vtable(context).GetData)(
++                Interface::as_raw(context),
++                Interface::as_raw(query),
++                (&mut value as *mut T).cast(),
++                std::mem::size_of::<T>() as u32,
++                D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
++            )
++        };
++        match hr.0 {
++            0 => Ok(Some(value)), // S_OK: result is ready.
++            1 => Ok(None),        // S_FALSE: do not wait or flush.
++            _ => {
++                hr.ok().context("Direct3D 11 GetData failed")?;
++                Ok(None)
++            }
++        }
++    }
++
++    fn statistics(&self) -> Option<GpuFrameStatistics> {
++        Some(GpuFrameStatistics {
++            gpu_frame_time_ms: self.latest_gpu_frame_time_ms?,
++            sample_count: self.sample_count,
++        })
++    }
++}
++
+ struct DirectXRenderPipelines {
+     shadow_pipeline: PipelineState<Shadow>,
+     quad_pipeline: PipelineState<Quad>,
+@@ -191,6 +367,9 @@ impl DirectXRenderer {
+             pipelines,
+             direct_composition,
+             font_info: Self::get_font_info(),
++            gpu_timing_enabled: false,
++            gpu_timing_unavailable: false,
++            gpu_frame_timer: None,
+             width: 1,
+             height: 1,
+             skip_draws: false,
+@@ -263,6 +442,9 @@ impl DirectXRenderer {
+     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+         let disable_direct_composition = self.direct_composition.is_none();
+ 
++        self.gpu_frame_timer.take();
++        self.gpu_timing_unavailable = false;
++
+         unsafe {
+             #[cfg(debug_assertions)]
+             if let Some(devices) = &self.devices {
+@@ -318,6 +500,17 @@ impl DirectXRenderer {
+                 .device_context
+                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+         }
++        if self.gpu_timing_enabled {
++            match GpuFrameTimer::new(&devices.device) {
++                Ok(timer) => self.gpu_frame_timer = Some(timer),
++                Err(error) => {
++                    self.gpu_timing_unavailable = true;
++                    log::warn!(
++                        "GPU timestamp queries unavailable after device recovery: {error:#}"
++                    );
++                }
++            }
++        }
+         self.devices = Some(devices);
+         self.resources = Some(resources);
+         self.globals = globals;
+@@ -337,7 +530,14 @@ impl DirectXRenderer {
+             // and so likely do not have the textures anymore that are required for drawing
+             return Ok(());
+         }
+-        self.render(scene, background_appearance)?;
++        if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref()) {
++            timer.begin_frame(&devices.device_context);
++        }
++        let draw_result = self.render(scene, background_appearance);
++        if let (Some(timer), Some(devices)) = (self.gpu_frame_timer.as_mut(), self.devices.as_ref()) {
++            timer.end_frame(&devices.device_context);
++        }
++        draw_result?;
+         self.present()
+     }
+ 
+@@ -906,6 +1106,38 @@ impl DirectXRenderer {
+         })
+     }
+ 
++    /// Enable the bounded, asynchronous Direct3D timestamp-query ring used by Echo's
++    /// diagnostics. Query objects are allocated lazily and released when disabled.
++    pub(crate) fn set_gpu_timing_enabled(&mut self, enabled: bool) -> Result<()> {
++        if !enabled {
++            self.gpu_timing_enabled = false;
++            self.gpu_timing_unavailable = false;
++            self.gpu_frame_timer = None;
++            return Ok(());
++        }
++        self.gpu_timing_enabled = true;
++        if self.gpu_frame_timer.is_some() || self.gpu_timing_unavailable {
++            return Ok(());
++        }
++
++        let device = &self.devices.as_ref().context("devices missing")?.device;
++        match GpuFrameTimer::new(device) {
++            Ok(timer) => {
++                self.gpu_frame_timer = Some(timer);
++                Ok(())
++            }
++            Err(error) => {
++                self.gpu_timing_unavailable = true;
++                Err(error).context("Creating Direct3D GPU timestamp query ring")
++            }
++        }
++    }
++
++    /// Latest non-disjoint GPU timestamp result. Never waits for an in-flight query.
++    pub(crate) fn gpu_frame_statistics(&self) -> Option<GpuFrameStatistics> {
++        self.gpu_frame_timer.as_ref()?.statistics()
++    }
++
+     pub(crate) fn get_font_info() -> &'static FontInfo {
+         static CACHED_FONT_INFO: OnceLock<FontInfo> = OnceLock::new();
+         CACHED_FONT_INFO.get_or_init(|| unsafe {
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index e8ffa413b1..2c1751e05c 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -1067,6 +1067,18 @@ impl PlatformWindow for WindowsWindow {
+         self.state.renderer.borrow().present_statistics()
+     }
+ 
++    fn set_gpu_timing_enabled(&self, enabled: bool) {
++        self.state
++            .renderer
++            .borrow_mut()
++            .set_gpu_timing_enabled(enabled)
++            .log_err();
++    }
++
++    fn gpu_frame_statistics(&self) -> Option<GpuFrameStatistics> {
++        self.state.renderer.borrow().gpu_frame_statistics()
++    }
++
+     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+         let scale_factor = self.state.scale_factor.get();
+         let caret_position = POINT {
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,38 @@
+{
+  "op": 0,
+  "d": {
+    "type": "emote_set.update",
+    "body": {
+      "id": "shared_example_set_id",
+      "pushed": [
+        {
+          "key": "emotes",
+          "value": {
+            "id": "shared_example_emote_id",
+            "name": "EchoShared",
+            "data": {
+              "name": "EchoShared",
+              "animated": false,
+              "flags": 0,
+              "host": {
+                "url": "//cdn.7tv.app/emote/shared_example_emote_id",
+                "files": [
+                  {
+                    "name": "2x.webp",
+                    "format": "WEBP",
+                    "width": 56,
+                    "height": 56,
+                    "frame_count": 1
+                  }
+                ]
+              },
+              "owner": {
+                "display_name": "Echo Fixture"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

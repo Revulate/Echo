@@ -1,0 +1,643 @@
+From 8bee1097549ff10e2413d8fe6de3956f1dcff864 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 16:59:00 -0700
+Subject: [PATCH] fix(gpui): keep a reused cached view's accessibility nodes
+
+`A11y::begin_frame` clears the node tree, node bounds, focus
+registrations and action listeners every frame, and they are only
+rebuilt by `Drawable::prepaint` (nodes, bounds), `Interactivity::prepaint`
+(focus) and `Interactivity::paint` (action listeners). A cached view
+whose prepaint and paint are reused skips all of that for its subtree,
+and `Window::reuse_prepaint` replayed hitboxes, tooltips, element states,
+line layouts and the dispatch subtree but nothing for accessibility. On
+any frame where a cached view was reused, its whole subtree vanished from
+the tree sent to the platform, along with its focus and live regions,
+and came back on the next frame that re-rendered it. Apps that cache
+large views (chat lists, roots, bars) dropped most of their tree on
+ordinary frames.
+
+The finished nodes of a frame are now kept until the next frame instead
+of being moved into the `TreeUpdate`, together with the stack depth at
+which each node was attached. `PrepaintStateIndex` records the node
+count and stack depth, so a view's prepaint range also covers the nodes
+its subtree finished, which are contiguous because every node a subtree
+pushes is popped before its prepaint returns. `reuse_prepaint` replays
+that range through `A11y::reuse_nodes`:
+
+- the nodes move over unchanged (their child lists only name nodes of
+  the same subtree), and the ones that were children of the subtree's
+  parent are attached to the current parent, at the current depth;
+- node bounds and focus registrations are copied from the previous
+  frame's maps, which `begin_frame` now keeps aside until `end_frame`
+  instead of clearing;
+- action listeners are boxed closures and can't be cloned, so they are
+  moved out of the previous frame's map, as reused mouse listeners are
+  moved out of the rendered frame; the reused paint never registers
+  them again;
+- the focused node is restored when its focus handle is still the
+  window's focus, and the active descendant when the focused node is
+  still its ancestor, since the elements that report both are skipped.
+
+Nothing changes while accessibility is inactive: prepaint indices hold
+zeros, `reuse_prepaint` skips the replay, and a frame drawn inactive
+drops any kept tree. The first active frame after that has nothing to
+replay from, so it renders every view (the activation callback already
+requests a refresh, but a frame can be drawn before it runs). While
+active, each frame clones its node list once, for the next frame.
+
+New unit tests cover replay under a different parent and depth, replay
+of an already replayed range, the moved focus, bounds and listeners, and
+the release. `reused_cached_view_keeps_its_nodes` draws a window whose
+root re-renders around a reused cached view with accessibility active
+and checks `Window::debug_a11y_tree_json`; it fails without the replay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/window.rs      |  16 ++
+ crates/gpui/src/window/a11y.rs | 412 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 426 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index f95fa474d8..064857f8a7 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1124,6 +1124,7 @@ pub(crate) struct PrepaintStateIndex {
+     dispatch_tree_index: usize,
+     accessed_element_states_index: usize,
+     line_layout_index: LineLayoutIndex,
++    a11y_index: a11y::A11yNodeIndex,
+ }
+ 
+ #[derive(Clone, Default)]
+@@ -4068,7 +4069,14 @@ impl Window {
+ 
+         self.a11y.sync_active_flag();
+         if self.a11y.is_active() {
++            // Reused cached views replay their accessibility nodes from the
++            // previous frame's tree. Without one, render every view instead.
++            if !self.a11y.can_reuse_nodes() {
++                self.refreshing = true;
++            }
+             self.a11y.begin_frame();
++        } else {
++            self.a11y.release_finished_frame();
+         }
+ 
+         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
+@@ -4407,10 +4415,18 @@ impl Window {
+             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
+             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+             line_layout_index: self.text_system.layout_index(),
++            a11y_index: self.a11y.nodes.index(),
+         }
+     }
+ 
+     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
++        // A reused view skips `Drawable::prepaint` for its whole subtree, so its
++        // accessibility nodes are replayed from the previous frame (local Echo
++        // extension, branch `echo-paint-fork`).
++        if self.a11y.is_active() {
++            self.a11y
++                .reuse_nodes(range.start.a11y_index..range.end.a11y_index, self.focus);
++        }
+         self.next_frame.hitboxes.extend(
+             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                 .iter()
+diff --git a/crates/gpui/src/window/a11y.rs b/crates/gpui/src/window/a11y.rs
+index 5b63821232..468110736b 100644
+--- a/crates/gpui/src/window/a11y.rs
++++ b/crates/gpui/src/window/a11y.rs
+@@ -96,6 +96,15 @@
+ //!
+ //! These are cleared at the start of a frame, and re-populated during painting.
+ //!
++//! ### Cached views
++//!
++//! A cached view whose prepaint and paint are reused skips `Drawable::prepaint`
++//! for its whole subtree, so none of its nodes, bounds, focus registrations or
++//! action listeners would be recorded. Instead, the finished nodes of every
++//! frame are kept until the next one, and `Window::reuse_prepaint`
++//! replays the view's range of them through [`A11y::reuse_nodes`] (local Echo
++//! extension, branch `echo-paint-fork`).
++//!
+ //! [`NodeId`]: accesskit::NodeId
+ 
+ use crate::*;
+@@ -107,6 +116,8 @@ use accesskit::{Action, NodeId, TreeUpdate};
+ use collections::{FxHashMap, FxHashSet};
+ use smallvec::SmallVec;
+ use std::hash::{Hash, Hasher};
++use std::mem;
++use std::ops::Range;
+ use std::sync::{
+     Arc,
+     atomic::{AtomicBool, Ordering},
+@@ -149,6 +160,10 @@ pub(crate) struct A11y {
+     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
+     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
+     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
++    /// The previous frame's [`Self::focus_ids`], [`Self::node_bounds`] and
++    /// [`Self::action_listeners`], held while a frame is built so that reused
++    /// cached views can move their entries back. See [`Self::reuse_nodes`].
++    rendered: RenderedNodeState,
+     /// The window's title, used to label the root node so assistive
+     /// technology can tell windows apart.
+     window_title: Option<SharedString>,
+@@ -177,6 +192,7 @@ impl A11y {
+             focus_ids: FxHashMap::default(),
+             node_bounds: FxHashMap::default(),
+             action_listeners: FxHashMap::default(),
++            rendered: RenderedNodeState::default(),
+             window_title,
+             last_focus_without_node: None,
+             debug: debug::A11yDebug::default(),
+@@ -272,15 +288,103 @@ impl A11y {
+     }
+ 
+     /// Clear per-frame state and push the root node to start a new frame.
++    ///
++    /// The previous frame's per-node state is kept aside until the frame ends,
++    /// for [`Self::reuse_nodes`].
+     pub(crate) fn begin_frame(&mut self) {
++        mem::swap(&mut self.focus_ids, &mut self.rendered.focus_ids);
++        mem::swap(&mut self.node_bounds, &mut self.rendered.node_bounds);
++        mem::swap(
++            &mut self.action_listeners,
++            &mut self.rendered.action_listeners,
++        );
+         self.focus_ids.clear();
+         self.node_bounds.clear();
+         self.action_listeners.clear();
+         self.nodes.begin_frame(self.window_title.as_ref());
+     }
+ 
++    /// Whether the previous frame built a tree that reused cached views can
++    /// replay their nodes from. When it didn't (accessibility was inactive),
++    /// every view has to render this frame.
++    pub(crate) fn can_reuse_nodes(&self) -> bool {
++        self.nodes.has_finished_frame()
++    }
++
++    /// Drops the tree kept from the last frame that built one. Called for every
++    /// frame drawn while accessibility is inactive, so an inactive window keeps
++    /// no copy of the tree.
++    pub(crate) fn release_finished_frame(&mut self) {
++        self.nodes.release_finished_frame();
++    }
++
++    /// Replays the accessibility state that a cached view's subtree recorded in
++    /// `range` of the previous frame, for a view whose prepaint is reused.
++    ///
++    /// The view's nodes are re-attached under the current parent (see
++    /// [`A11yNodeBuilder::replay`]), and their bounds, focus handles and action
++    /// listeners move over from the previous frame. Action listeners are boxed
++    /// closures that can't be cloned, so they are moved like the reused
++    /// view's mouse listeners; a reused view's paint is reused too and never
++    /// registers them again. The view's focused node and active descendant are
++    /// restored when they still apply, because the elements that report them
++    /// during prepaint are skipped. `window_focus` is the window's focus.
++    pub(crate) fn reuse_nodes(
++        &mut self,
++        range: Range<A11yNodeIndex>,
++        window_focus: Option<FocusId>,
++    ) {
++        let replayed = self.nodes.replay(range);
++        let rendered_focus = self.nodes.rendered.focus;
++        let rendered_active_descendant = self.nodes.rendered.active_descendant;
++        let mut replayed_focus = None;
++        let mut replayed_active_descendant = None;
++        for (id, _) in &self.nodes.all_nodes[replayed] {
++            if let Some(bounds) = self.rendered.node_bounds.get(id) {
++                self.node_bounds.insert(*id, *bounds);
++            }
++            if let Some(focus_id) = self.rendered.focus_ids.get(id) {
++                self.focus_ids.insert(*id, *focus_id);
++            }
++            if let Some(listeners) = self.rendered.action_listeners.remove(id) {
++                self.action_listeners.insert(*id, listeners);
++            }
++            if rendered_focus == Some(*id) {
++                replayed_focus = Some(*id);
++            }
++            if rendered_active_descendant == Some(*id) {
++                replayed_active_descendant = Some(*id);
++            }
++        }
++
++        // As in `Interactivity::prepaint`: the node is focused while its focus
++        // handle is the window's focus.
++        if let Some(node_id) = replayed_focus
++            && window_focus.is_some()
++            && self.focus_ids.get(&node_id).copied() == window_focus
++        {
++            self.set_focus(node_id);
++        }
++
++        // An active descendant only counts while the focused node is one of its
++        // ancestors. A focused node outside the view is an ancestor exactly when
++        // it's on the stack; inside the view, the subtree is unchanged, so the
++        // node that was focused when the claim was made still qualifies.
++        if let Some(node_id) = replayed_active_descendant
++            && let Some(focus) = self.nodes.focus
++            && focus != node_id
++            && (replayed_focus == Some(focus) || self.nodes.ids_stack.contains(&focus))
++        {
++            self.nodes.set_active_descendant(node_id);
++        }
++    }
++
+     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
+     pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
++        // Whatever no reused view claimed belonged to elements that are gone.
++        self.rendered.focus_ids.clear();
++        self.rendered.node_bounds.clear();
++        self.rendered.action_listeners.clear();
+         let update = self.nodes.finalize();
+         self.debug.capture(
+             &update,
+@@ -368,12 +472,49 @@ impl<'a> A11ySubtreeBuilder<'a> {
+     }
+ }
+ 
++/// The previous frame's per-node state of [`A11y`], kept while a frame is
++/// built for [`A11y::reuse_nodes`].
++#[derive(Default)]
++struct RenderedNodeState {
++    focus_ids: FxHashMap<NodeId, FocusId>,
++    node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
++    action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
++}
++
++/// A position in the nodes built so far this frame, recorded in
++/// `PrepaintStateIndex` so a reused cached view can find its nodes in the
++/// previous frame.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct A11yNodeIndex {
++    /// The number of finished nodes.
++    nodes: usize,
++    /// The depth of the node stack: a node pushed now is a child at this depth.
++    depth: usize,
++}
++
++/// The finished nodes of the previous frame, the source of
++/// [`A11yNodeBuilder::replay`].
++#[derive(Default)]
++struct RenderedNodes {
++    nodes: Vec<(NodeId, accesskit::Node)>,
++    parent_depths: Vec<usize>,
++    focus: Option<NodeId>,
++    active_descendant: Option<NodeId>,
++    #[cfg(debug_assertions)]
++    node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
++}
++
+ pub(crate) struct A11yNodeBuilder {
+     ids_stack: SmallVec<[NodeId; 16]>,
+     nodes_stack: SmallVec<[accesskit::Node; 16]>,
+     /// This is the exact type required by accesskit, so we can't just make it a
+     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
+     all_nodes: Vec<(NodeId, accesskit::Node)>,
++    /// For each entry of `all_nodes`, the depth of the node stack when the node
++    /// was attached to its parent (1 for children of the root).
++    parent_depths: Vec<usize>,
++    /// The previous frame's finished nodes while this frame is built.
++    rendered: RenderedNodes,
+     seen_ids: FxHashSet<NodeId>,
+     /// The node that GPUI considers focused. Note that this may be different to
+     /// what is reported to accesskit - see [`Self::active_descendant`]
+@@ -393,6 +534,8 @@ impl A11yNodeBuilder {
+             ids_stack: SmallVec::new(),
+             nodes_stack: SmallVec::new(),
+             all_nodes: Vec::new(),
++            parent_depths: Vec::new(),
++            rendered: RenderedNodes::default(),
+             seen_ids: FxHashSet::default(),
+             focus: None,
+             active_descendant: None,
+@@ -453,6 +596,7 @@ impl A11yNodeBuilder {
+             parent.push_child(id);
+         }
+         self.all_nodes.push((id, node));
++        self.parent_depths.push(self.ids_stack.len());
+         true
+     }
+ 
+@@ -467,12 +611,24 @@ impl A11yNodeBuilder {
+ 
+         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
+             self.all_nodes.push((id, node));
++            self.parent_depths.push(self.ids_stack.len());
+         }
+     }
+ 
+     /// Push the root node to start a new frame.
++    ///
++    /// The previous frame's finished nodes become the source of
++    /// [`Self::replay`] for this frame.
+     fn begin_frame(&mut self, window_title: Option<&SharedString>) {
++        mem::swap(&mut self.rendered.nodes, &mut self.all_nodes);
++        mem::swap(&mut self.rendered.parent_depths, &mut self.parent_depths);
++        self.rendered.focus = self.focus;
++        self.rendered.active_descendant = self.active_descendant;
++        #[cfg(debug_assertions)]
++        mem::swap(&mut self.rendered.node_info, &mut self.node_info);
++
+         self.all_nodes.clear();
++        self.parent_depths.clear();
+         self.ids_stack.clear();
+         self.nodes_stack.clear();
+         self.seen_ids.clear();
+@@ -489,6 +645,72 @@ impl A11yNodeBuilder {
+         self.active_descendant = None;
+     }
+ 
++    /// The current position, for [`Self::replay`] in the next frame.
++    pub(crate) fn index(&self) -> A11yNodeIndex {
++        A11yNodeIndex {
++            nodes: self.all_nodes.len(),
++            depth: self.ids_stack.len(),
++        }
++    }
++
++    /// Whether `all_nodes` holds a finished frame (which always contains the
++    /// root) for the next frame to replay from.
++    fn has_finished_frame(&self) -> bool {
++        !self.all_nodes.is_empty()
++    }
++
++    fn release_finished_frame(&mut self) {
++        if self.all_nodes.capacity() == 0 && self.rendered.nodes.capacity() == 0 {
++            return;
++        }
++        self.all_nodes = Vec::new();
++        self.parent_depths = Vec::new();
++        self.rendered = RenderedNodes::default();
++        #[cfg(debug_assertions)]
++        self.node_info.clear();
++    }
++
++    /// Replays the nodes that a cached view's subtree finished in `range` of the
++    /// previous frame, and returns where they landed in `all_nodes`.
++    ///
++    /// Every node a subtree pushes is popped before its prepaint returns, so its
++    /// finished nodes are contiguous, and their child lists only name nodes of
++    /// the same subtree. The nodes are therefore moved over unchanged, except
++    /// that the ones that were children of the subtree's parent (stack depth
++    /// `range.start.depth`) become children of the current parent. A node
++    /// whose id is already in this frame's tree is dropped, as [`Self::push`]
++    /// would drop it.
++    pub(crate) fn replay(&mut self, range: Range<A11yNodeIndex>) -> Range<usize> {
++        let start = self.all_nodes.len();
++        let source = range.start.nodes..range.end.nodes;
++        if source.is_empty() || source.end > self.rendered.nodes.len() {
++            return start..start;
++        }
++        let base_depth = range.start.depth;
++        let depth = self.ids_stack.len();
++        for ix in source {
++            let parent_depth = self.rendered.parent_depths[ix];
++            let id = self.rendered.nodes[ix].0;
++            if !self.can_push(id) {
++                continue;
++            }
++            let node = mem::take(&mut self.rendered.nodes[ix].1);
++            if parent_depth == base_depth
++                && let Some(parent) = self.nodes_stack.last_mut()
++            {
++                parent.push_child(id);
++            }
++            self.all_nodes.push((id, node));
++            self.parent_depths
++                .push(depth + parent_depth.saturating_sub(base_depth));
++            #[cfg(debug_assertions)]
++            if let Some(info) = self.rendered.node_info.remove(&id) {
++                self.node_info.insert(id, info);
++            }
++        }
++        start..self.all_nodes.len()
++    }
++
+     /// Returns whether a node with the given ID has been pushed in this frame.
+     pub(crate) fn has_node(&self, id: NodeId) -> bool {
+         id == ROOT_NODE_ID || self.seen_ids.contains(&id)
+@@ -558,8 +780,14 @@ impl A11yNodeBuilder {
+         while !self.ids_stack.is_empty() {
+             if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
+                 self.all_nodes.push((id, node));
++                self.parent_depths.push(self.ids_stack.len());
+             }
+         }
++        // Nothing replays from the previous frame after this.
++        self.rendered.nodes.clear();
++        self.rendered.parent_depths.clear();
++        #[cfg(debug_assertions)]
++        self.rendered.node_info.clear();
+ 
+         let focus = match self.active_descendant {
+             Some(id) if self.has_node(id) => id,
+@@ -575,7 +803,9 @@ impl A11yNodeBuilder {
+             _ => self.focus.unwrap_or(ROOT_NODE_ID),
+         };
+ 
+-        let nodes = std::mem::take(&mut self.all_nodes);
++        // Keep this frame's nodes for the next frame's reused views; the
++        // adapter takes ownership of the update.
++        let nodes = self.all_nodes.clone();
+         let update = TreeUpdate {
+             nodes,
+             tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
+@@ -637,7 +867,7 @@ impl A11yNodeBuilder {
+ mod tests {
+     // Import specific items rather than glob-importing `super`, which would pull
+     // in gpui's own `test` attribute macro and shadow the standard one.
+-    use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
++    use super::{A11y, A11yActionListener, A11yNodeBuilder, ROOT_NODE_ID};
+     use crate::FocusId;
+     use accesskit::{NodeId, Role};
+     use std::sync::{Arc, atomic::AtomicBool};
+@@ -902,4 +1132,182 @@ mod tests {
+         let update = a11y.end_frame(Default::default());
+         assert_eq!(update.focus, a);
+     }
++
++    fn node_children(update: &accesskit::TreeUpdate, id: NodeId) -> Option<Vec<NodeId>> {
++        update
++            .nodes
++            .iter()
++            .find(|(node_id, _)| *node_id == id)
++            .map(|(_, node)| node.children().to_vec())
++    }
++
++    // A cached view's subtree is replayed from the previous frame under the
++    // parent that is current when the view is reused, at whatever depth that
++    // parent now sits, and the replayed range can be replayed again.
++    #[test]
++    fn reused_subtree_replays_under_the_current_parent() {
++        let view = NodeId(2);
++        let leaf = NodeId(3);
++        let sibling = NodeId(4);
++        let build_view = |builder: &mut A11yNodeBuilder| {
++            assert!(builder.push(view, test_node()));
++            assert!(builder.push_leaf(leaf, test_node()));
++            builder.pop(); // view
++            assert!(builder.push(sibling, test_node()));
++            builder.pop(); // sibling
++        };
++
++        // Frame 1: the view's nodes are children of the root.
++        let mut builder = new_builder();
++        let start = builder.index();
++        build_view(&mut builder);
++        let range = start..builder.index();
++        builder.finalize();
++
++        // Frame 2: the view is reused inside a new container.
++        let container = NodeId(10);
++        builder.begin_frame(None);
++        assert!(builder.push(container, test_node()));
++        let start = builder.index();
++        assert_eq!(builder.replay(range).len(), 3);
++        let range = start..builder.index();
++        builder.pop(); // container
++        let update = builder.finalize();
++        assert_eq!(node_children(&update, ROOT_NODE_ID), Some(vec![container]));
++        assert_eq!(node_children(&update, container), Some(vec![view, sibling]));
++        assert_eq!(node_children(&update, view), Some(vec![leaf]));
++        assert_eq!(update.nodes.len(), 5);
++
++        // Frame 3: reused again, back at the root, from frame 2's range.
++        builder.begin_frame(None);
++        builder.replay(range);
++        let update = builder.finalize();
++        assert_eq!(
++            node_children(&update, ROOT_NODE_ID),
++            Some(vec![view, sibling])
++        );
++        assert_eq!(node_children(&update, view), Some(vec![leaf]));
++        assert_eq!(update.nodes.len(), 4);
++    }
++
++    // Bounds, focus registration, action listeners and the focused node of a
++    // reused view survive the frame, and a frame that doesn't reuse the view
++    // drops them.
++    #[test]
++    fn reused_subtree_keeps_its_focus_bounds_and_action_listeners() {
++        let view = NodeId(2);
++        let focus_id = FocusId::default();
++        let mut a11y = new_a11y();
++        let start = a11y.nodes.index();
++        assert!(a11y.nodes.push(view, test_node()));
++        a11y.node_bounds.insert(view, Default::default());
++        a11y.set_focusable(view, focus_id);
++        a11y.set_focus(view);
++        let listener: A11yActionListener = Box::new(|_, _, _| {});
++        a11y.action_listeners
++            .entry(view)
++            .or_default()
++            .push((accesskit::Action::Click, listener));
++        a11y.nodes.pop();
++        let range = start..a11y.nodes.index();
++        assert_eq!(a11y.end_frame(Default::default()).focus, view);
++
++        a11y.begin_frame();
++        a11y.reuse_nodes(range, Some(focus_id));
++        let update = a11y.end_frame(Default::default());
++        assert_eq!(update.focus, view);
++        assert_eq!(node_children(&update, ROOT_NODE_ID), Some(vec![view]));
++        assert!(a11y.node_bounds.contains_key(&view));
++        assert_eq!(a11y.focus_ids.get(&view), Some(&focus_id));
++        assert_eq!(a11y.action_listeners.get(&view).map(Vec::len), Some(1));
++
++        a11y.begin_frame();
++        let update = a11y.end_frame(Default::default());
++        assert_eq!(update.focus, ROOT_NODE_ID);
++        assert!(a11y.node_bounds.is_empty());
++        assert!(a11y.focus_ids.is_empty());
++        assert!(a11y.action_listeners.is_empty());
++    }
++
++    // A frame drawn while accessibility is inactive drops the kept tree, so the
++    // next active frame knows it has nothing to replay.
++    #[test]
++    fn inactive_frame_releases_the_kept_tree() {
++        let mut a11y = new_a11y();
++        assert!(!a11y.can_reuse_nodes());
++        a11y.end_frame(Default::default());
++        assert!(a11y.can_reuse_nodes());
++        a11y.release_finished_frame();
++        assert!(!a11y.can_reuse_nodes());
++    }
++    // End to end through `Window::draw`: a cached view that is reused keeps its
++    // nodes in the tree sent to the platform.
++    #[gpui::test]
++    fn reused_cached_view_keeps_its_nodes(cx: &mut crate::TestAppContext) {
++        use crate::{
++            AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
++            ParentElement as _, Render, StatefulInteractiveElement as _, StyleRefinement,
++            Styled as _, Window, div,
++        };
++        use std::sync::atomic::Ordering;
++
++        struct List;
++        impl Render for List {
++            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++                div()
++                    .id("list")
++                    .role(Role::List)
++                    .size_full()
++                    .child(div().id("item").role(Role::ListItem).size_full())
++            }
++        }
++
++        struct Root {
++            list: Entity<List>,
++        }
++        impl Render for Root {
++            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++                div().size_full().child(
++                    self.list
++                        .clone()
++                        .cached(StyleRefinement::default().size_full()),
++                )
++            }
++        }
++
++        let window = cx.add_window(|_, cx| Root {
++            list: cx.new(|_| List),
++        });
++        let draw = |cx: &mut crate::TestAppContext| {
++            cx.update_window(window.into(), |_, window, cx| {
++                window.draw(cx).clear(cx);
++                // The tree sent to the platform, as the debug dump shows it.
++                let tree = window.debug_a11y_tree_json().unwrap();
++                let roles = tree.matches(r#""role": "List""#).count()
++                    + tree.matches(r#""role": "ListItem""#).count();
++                (roles, window.frame_stage_statistics.views_reused)
++            })
++            .unwrap()
++        };
++
++        window
++            .update(cx, |_, window, _| {
++                window.a11y.active_flag.store(true, Ordering::SeqCst)
++            })
++            .unwrap();
++        // The first accessible frame has no tree to replay from, so it renders
++        // the cached view.
++        let (nodes, mut reused_so_far) = draw(cx);
++        assert_eq!(nodes, 2);
++
++        // Re-render the root only: the list is reused, twice in a row, the
++        // second time from nodes that were themselves replayed.
++        for _ in 0..2 {
++            window.update(cx, |_, _, cx| cx.notify()).unwrap();
++            let (nodes, reused) = draw(cx);
++            assert!(reused > reused_so_far, "the cached list view was reused");
++            assert_eq!(nodes, 2, "the reused view's nodes are still in the tree");
++            reused_so_far = reused;
++        }
++    }
+ }
+-- 
+2.55.0.windows.5
+

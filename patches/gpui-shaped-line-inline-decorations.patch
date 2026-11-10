@@ -1,0 +1,67 @@
+From 101b6032263f4e66302c728d3adeb0674fde0e7a Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 17:21:25 -0700
+Subject: [PATCH] perf(gpui): store 8 decoration runs inline in ShapedLine
+
+ShapedLine kept 32 DecorationRuns inline, about 3 KB per shaped line
+even though adjacent runs with the same styling merge and most lines
+carry one to three. Eight stay inline; more spill to the heap with the
+same behavior.
+---
+ crates/gpui/src/text_system.rs      |  2 +-
+ crates/gpui/src/text_system/line.rs | 12 +++++++++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
+index 1eea420b3d..46b61f48bf 100644
+--- a/crates/gpui/src/text_system.rs
++++ b/crates/gpui/src/text_system.rs
+@@ -681,7 +681,7 @@ impl WindowTextSystem {
+             "text argument should not contain newlines"
+         );
+ 
+-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
++        let mut decoration_runs = line::DecorationRuns::new();
+         for run in runs {
+             if let Some(last_run) = decoration_runs.last_mut()
+                 && last_run.color == run.color
+diff --git a/crates/gpui/src/text_system/line.rs b/crates/gpui/src/text_system/line.rs
+index 8c9df4cc6b..437135d35f 100644
+--- a/crates/gpui/src/text_system/line.rs
++++ b/crates/gpui/src/text_system/line.rs
+@@ -38,6 +38,13 @@ pub struct DecorationRun {
+     pub strikethrough: Option<StrikethroughStyle>,
+ }
+ 
++/// Decoration runs a `ShapedLine` stores inline before spilling to the heap.
++///
++/// Adjacent runs with the same styling merge, so chat lines rarely need more
++/// than a few. Each run is ~100 bytes, so the upstream 32 cost ~3 KB per cached
++/// line (local Echo change).
++pub(crate) type DecorationRuns = SmallVec<[DecorationRun; 8]>;
++
+ /// A line of text that has been shaped and decorated.
+ #[derive(Clone, Default, Debug, Deref, DerefMut)]
+ pub struct ShapedLine {
+@@ -46,7 +53,7 @@ pub struct ShapedLine {
+     pub(crate) layout: Arc<LineLayout>,
+     /// The text that was shaped for this line.
+     pub text: SharedString,
+-    pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
++    pub(crate) decoration_runs: DecorationRuns,
+ }
+ 
+ impl ShapedLine {
+@@ -67,8 +74,7 @@ impl ShapedLine {
+             line: self,
+             // Echo's bidi geometry lives in `LineLayout::split_at`; only plain byte-ordered
+             // lines take the incremental path.
+-            unordered_remainder: (!byte_ordered || self.layout.has_bidi_runs)
+-                .then(|| self.clone()),
++            unordered_remainder: (!byte_ordered || self.layout.has_bidi_runs).then(|| self.clone()),
+             byte_index: 0,
+             run_index: 0,
+             glyph_index: 0,
+-- 
+2.55.0.windows.5
+

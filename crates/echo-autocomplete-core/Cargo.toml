@@ -1,0 +1,12 @@
+[package]
+name = "echo-autocomplete-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-free autocomplete context and replacement logic for Echo"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+regex = "1"

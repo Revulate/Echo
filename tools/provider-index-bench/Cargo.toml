@@ -1,0 +1,9 @@
+[package]
+name = "provider-index-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+echo_gpui = { path = "../..", features = ["provider-index-bench"] }

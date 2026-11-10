@@ -1,0 +1,21 @@
+nextest-version = "0.9.143"
+
+[profile.default]
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
+leak-timeout = { period = "500ms", result = "fail" }
+
+[profile.ci]
+fail-fast = false
+flaky-result = "fail"
+global-timeout = "60m"
+status-level = "slow"
+final-status-level = "slow"
+failure-output = "immediate-final"
+success-output = "never"
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "echo-linux"
+store-success-output = false
+store-failure-output = true

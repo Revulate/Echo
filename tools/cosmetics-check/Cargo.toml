@@ -1,0 +1,8 @@
+[package]
+name = "echo-cosmetics-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+echo-cosmetics-core = { path = "../../crates/echo-cosmetics-core" }

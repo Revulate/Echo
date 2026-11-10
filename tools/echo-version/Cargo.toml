@@ -1,0 +1,16 @@
+[package]
+name = "echo-version"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+echo-update-core = { path = "../echo-update-core" }
+
+[[bin]]
+name = "echo-version"
+path = "src/main.rs"
+test = false

@@ -1,0 +1,33 @@
+From ef3582e0bccf2ccfa7aef66248a565d98d3916e1 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:20:44 -0700
+Subject: [PATCH] perf(gpui): skip fully transparent glyphs in paint_glyph
+
+A glyph painted with alpha 0 was still rasterized into the sprite atlas
+and emitted as a sprite that draws nothing. `Window::paint_glyph` now
+returns early for such glyphs. Hit testing and text layout do not depend
+on glyph sprites.
+---
+ crates/gpui/src/window.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 6fa5825e63..9969390511 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5079,6 +5079,12 @@ impl Window {
+     ) -> Result<()> {
+         self.invalidator.debug_assert_paint();
+ 
++        // A fully transparent glyph draws nothing; skip rasterizing it and
++        // emitting its sprite.
++        if color.a == 0.0 {
++            return Ok(());
++        }
++
+         let element_opacity = self.element_opacity();
+         let scale_factor = self.scale_factor();
+         let glyph_origin = origin.scale(scale_factor);
+-- 
+2.55.0.windows.5
+

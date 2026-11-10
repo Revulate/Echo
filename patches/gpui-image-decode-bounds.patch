@@ -1,0 +1,248 @@
+From 6f19494a60cc70695fdd8a7a9e517814938bea7f Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 12:57:36 -0700
+Subject: [PATCH] Bound image URI decoded rasters
+
+A generic URI image can bypass Echo's stricter media decoder, so GPUI's
+URI loader bounds what it decodes as well as the transport body: an axis
+above 8192 px, more than 64 MiB of RGBA in one frame, more than 256 MiB
+of RGBA across all frames, or more than 1,024 frames is rejected.
+
+The limits travel as an `ImageDecodeLimits` into upstream's shared
+`decode_gif_image`/`decode_webp_image` helpers, which check the canvas
+size before decoding any frame and check every decoded frame as it
+arrives. `Image::to_image_data` (files, clipboard) passes no limits.
+Other raster formats from a URI are checked from the decoder's
+dimensions before decoding.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/elements/img.rs | 40 +++++++++++---
+ crates/gpui/src/platform.rs     | 92 ++++++++++++++++++++++++++++++---
+ 2 files changed, 117 insertions(+), 15 deletions(-)
+
+diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
+index 9a090dde05..9c9e998a61 100644
+--- a/crates/gpui/src/elements/img.rs
++++ b/crates/gpui/src/elements/img.rs
+@@ -1,19 +1,19 @@
+ use crate::{
+     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
+-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
+-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
+-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
+-    decode_static_image, decode_webp_image, px,
++    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageDecodeLimits, InspectorElementId,
++    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
++    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
++    decode_gif_image, decode_static_image, decode_static_image_from_decoder, decode_webp_image, px,
+ };
+ use anyhow::{Result, anyhow};
+ 
+ use futures::Future;
+ use gpui_util::ResultExt;
+-use image::{ImageError, ImageFormat};
++use image::{ImageDecoder as _, ImageError, ImageFormat};
+ use scheduler::Instant;
+ use std::{
+     fs,
+-    io::{self},
++    io::{self, Cursor},
+     ops::{Deref, DerefMut},
+     path::{Path, PathBuf},
+     str::FromStr,
+@@ -45,6 +45,20 @@ enum ImageUriAttemptFailure {
+     Terminal(anyhow::Error),
+ }
+ 
++// A generic URI image may bypass Echo's stricter media decoder, so keep the
++// framework's decoded raster allocation bounded as well as its transport body.
++const IMAGE_URI_MAX_DIMENSION: u32 = 8192;
++const IMAGE_URI_MAX_FRAME_RGBA_BYTES: u64 = 64 * 1024 * 1024;
++const IMAGE_URI_MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
++const IMAGE_URI_MAX_DECODED_FRAMES: usize = 1024;
++
++const IMAGE_URI_DECODE_LIMITS: ImageDecodeLimits = ImageDecodeLimits {
++    max_dimension: IMAGE_URI_MAX_DIMENSION,
++    max_frame_rgba_bytes: IMAGE_URI_MAX_FRAME_RGBA_BYTES,
++    max_decoded_bytes: IMAGE_URI_MAX_DECODED_BYTES,
++    max_frames: IMAGE_URI_MAX_DECODED_FRAMES,
++};
++
+ fn image_uri_retry_delay(uri: &SharedUri, failed_attempt: u8) -> Duration {
+     let exponential_ms = 100u64.saturating_mul(1u64 << failed_attempt.saturating_sub(1));
+     let jitter_ms = crate::hash(uri) % 100;
+@@ -651,6 +665,7 @@ impl Asset for ImageAssetLoader {
+         let svg_renderer = cx.svg_renderer();
+         let asset_source = cx.asset_source().clone();
+         async move {
++            let enforce_uri_decode_bounds = matches!(&source, Resource::Uri(_));
+             let bytes = match source.clone() {
+                 Resource::Path(uri) => fs::read(uri.as_ref())?,
+                 Resource::Uri(uri) => {
+@@ -779,9 +794,18 @@ impl Asset for ImageAssetLoader {
+             };
+ 
+             if let Ok(format) = image::guess_format(&bytes) {
++                let uri_decode_limits =
++                    enforce_uri_decode_bounds.then_some(&IMAGE_URI_DECODE_LIMITS);
+                 let data = match format {
+-                    ImageFormat::Gif => decode_gif_image(&bytes)?,
+-                    ImageFormat::WebP => decode_webp_image(&bytes)?,
++                    ImageFormat::Gif => decode_gif_image(&bytes, uri_decode_limits)?,
++                    ImageFormat::WebP => decode_webp_image(&bytes, uri_decode_limits)?,
++                    _ if enforce_uri_decode_bounds => {
++                        let decoder = image::ImageReader::with_format(Cursor::new(&bytes), format)
++                            .into_decoder()
++                            .map_err(|error| anyhow!(error).context("creating image decoder"))?;
++                        IMAGE_URI_DECODE_LIMITS.frame_rgba_bytes(decoder.dimensions())?;
++                        decode_static_image_from_decoder(decoder)?
++                    }
+                     _ => decode_static_image(&bytes, format)?,
+                 };
+ 
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 02085374ae..75f9887bd1 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -54,7 +54,7 @@ use futures::channel::oneshot;
+ #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+ use image::RgbaImage;
+ use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
+-use image::{DynamicImage, Frame, Rgba};
++use image::{DynamicImage, Frame, ImageDecoder as _, Rgba};
+ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+ use scheduler::Instant;
+ pub use scheduler::RunnableMeta;
+@@ -3410,15 +3410,76 @@ pub(crate) fn decode_static_image_from_decoder(
+     Ok(SmallVec::from_elem(Frame::new(data), 1))
+ }
+ 
++/// Decoded-size limits for untrusted image bytes (local Echo extension,
++/// branch `echo-paint-fork`).
++///
++/// The URI image loader passes these so a remote image cannot make GPUI
++/// allocate an unbounded raster. Files and the clipboard decode without limits.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct ImageDecodeLimits {
++    /// Largest accepted width or height, in pixels.
++    pub max_dimension: u32,
++    /// Largest accepted RGBA size of one frame, in bytes.
++    pub max_frame_rgba_bytes: u64,
++    /// Largest accepted RGBA size of all frames together, in bytes.
++    pub max_decoded_bytes: u64,
++    /// Largest accepted number of frames.
++    pub max_frames: usize,
++}
++
++impl ImageDecodeLimits {
++    /// Returns the RGBA size of one frame with these dimensions, or an error
++    /// when the dimensions are empty or exceed the limits.
++    pub(crate) fn frame_rgba_bytes(&self, dimensions: (u32, u32)) -> Result<u64> {
++        let (width, height) = dimensions;
++        let rgba_bytes = u64::from(width)
++            .checked_mul(u64::from(height))
++            .and_then(|pixels| pixels.checked_mul(4))
++            .with_context(|| format!("image dimensions {width}x{height} overflow"))?;
++        if width == 0
++            || height == 0
++            || width > self.max_dimension
++            || height > self.max_dimension
++            || rgba_bytes > self.max_frame_rgba_bytes
++        {
++            anyhow::bail!(
++                "image has unsupported decoded dimensions {width}x{height} \
++                 ({rgba_bytes} RGBA bytes); limits are {}px per axis and {} bytes per frame",
++                self.max_dimension,
++                self.max_frame_rgba_bytes
++            );
++        }
++        Ok(rgba_bytes)
++    }
++}
++
+ fn decode_animated_frames<'a>(
+     decoder: impl image::AnimationDecoder<'a>,
+     format_name: &str,
++    limits: Option<&ImageDecodeLimits>,
+ ) -> Result<SmallVec<[Frame; 1]>> {
+     let mut frames = SmallVec::new();
++    let mut decoded_bytes = 0u64;
+ 
+     for frame in decoder.into_frames() {
+         match frame {
+             Ok(mut frame) => {
++                if let Some(limits) = limits {
++                    if frames.len() >= limits.max_frames {
++                        anyhow::bail!(
++                            "{format_name} exceeds the {}-frame decode limit",
++                            limits.max_frames
++                        );
++                    }
++                    let frame_bytes = limits.frame_rgba_bytes(frame.buffer().dimensions())?;
++                    decoded_bytes = decoded_bytes.saturating_add(frame_bytes);
++                    if decoded_bytes > limits.max_decoded_bytes {
++                        anyhow::bail!(
++                            "{format_name} exceeds the {}-byte cumulative decode limit",
++                            limits.max_decoded_bytes
++                        );
++                    }
++                }
+                 // Convert from RGBA to BGRA.
+                 for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                     pixel.swap(0, 2);
+@@ -3438,17 +3499,34 @@ fn decode_animated_frames<'a>(
+     Ok(frames)
+ }
+ 
+-pub(crate) fn decode_gif_image(bytes: &[u8]) -> Result<SmallVec<[Frame; 1]>> {
++/// Decodes every frame of a GIF. With `limits`, the canvas size is checked
++/// before any frame is decoded and each decoded frame is checked as well.
++pub(crate) fn decode_gif_image(
++    bytes: &[u8],
++    limits: Option<&ImageDecodeLimits>,
++) -> Result<SmallVec<[Frame; 1]>> {
+     let decoder = GifDecoder::new(Cursor::new(bytes))?;
+-    decode_animated_frames(decoder, "GIF")
++    if let Some(limits) = limits {
++        limits.frame_rgba_bytes(decoder.dimensions())?;
++    }
++    decode_animated_frames(decoder, "GIF", limits)
+ }
+ 
+-pub(crate) fn decode_webp_image(bytes: &[u8]) -> Result<SmallVec<[Frame; 1]>> {
++/// Decodes a static or animated WebP. With `limits`, the canvas size is
++/// checked before any frame is decoded and each decoded frame is checked as
++/// well.
++pub(crate) fn decode_webp_image(
++    bytes: &[u8],
++    limits: Option<&ImageDecodeLimits>,
++) -> Result<SmallVec<[Frame; 1]>> {
+     let mut decoder = WebPDecoder::new(Cursor::new(bytes))?;
++    if let Some(limits) = limits {
++        limits.frame_rgba_bytes(decoder.dimensions())?;
++    }
+ 
+     if decoder.has_animation() {
+         let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
+-        decode_animated_frames(decoder, "WebP")
++        decode_animated_frames(decoder, "WebP", limits)
+     } else {
+         decode_static_image_from_decoder(decoder)
+     }
+@@ -3517,10 +3595,10 @@ impl Image {
+     /// Convert the clipboard image to an `ImageData` object.
+     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
+         let frames = match self.format {
+-            ImageFormat::Gif => decode_gif_image(&self.bytes)?,
++            ImageFormat::Gif => decode_gif_image(&self.bytes, None)?,
+             ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
+             ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
+-            ImageFormat::Webp => decode_webp_image(&self.bytes)?,
++            ImageFormat::Webp => decode_webp_image(&self.bytes, None)?,
+             ImageFormat::Bmp => decode_static_image(&self.bytes, image::ImageFormat::Bmp)?,
+             ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
+             ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,
+-- 
+2.55.0.windows.5
+

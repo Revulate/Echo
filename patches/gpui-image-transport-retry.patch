@@ -1,0 +1,125 @@
+From e8c574936e681147b05964542e081aa33cbbb88c Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 23:28:47 -0700
+Subject: [PATCH] gpui: retry transient image URI transport failures
+
+---
+ crates/gpui/src/elements/img.rs | 85 ++++++++++++++++++++++++++-------
+ 1 file changed, 68 insertions(+), 17 deletions(-)
+
+diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
+index a9878f4f70..0956d0c6c8 100644
+--- a/crates/gpui/src/elements/img.rs
++++ b/crates/gpui/src/elements/img.rs
+@@ -27,6 +27,17 @@ use super::{Stateful, StatefulInteractiveElement};
+ /// The delay before showing the loading state.
+ pub const LOADING_DELAY: Duration = Duration::from_millis(200);
+ 
++// Keep recovery bounded inside the URI loader so one broken pooled connection
++// does not permanently poison every image asset that shared it. HTTP statuses
++// and image/SVG decode failures stay terminal and never enter this loop.
++const IMAGE_URI_MAX_ATTEMPTS: u8 = 3;
++
++fn image_uri_retry_delay(uri: &SharedUri, failed_attempt: u8) -> Duration {
++    let exponential_ms = 100u64.saturating_mul(1u64 << failed_attempt.saturating_sub(1));
++    let jitter_ms = crate::hash(uri) % 100;
++    Duration::from_millis(exponential_ms.saturating_add(jitter_ms))
++}
++
+ /// A type alias to the resource loader that the `img()` element uses.
+ ///
+ /// Note: that this is only for Resources, like URLs or file paths.
+@@ -621,6 +632,7 @@ impl Asset for ImageAssetLoader {
+         cx: &mut App,
+     ) -> impl Future<Output = Self::Output> + Send + 'static {
+         let client = cx.http_client();
++        let background_executor = cx.background_executor().clone();
+         // TODO: Can we make SVGs always rescale?
+         // let scale_factor = cx.scale_factor();
+         let svg_renderer = cx.svg_renderer();
+@@ -629,26 +641,65 @@ impl Asset for ImageAssetLoader {
+             let bytes = match source.clone() {
+                 Resource::Path(uri) => fs::read(uri.as_ref())?,
+                 Resource::Uri(uri) => {
+-                    use anyhow::Context as _;
+                     use futures::AsyncReadExt as _;
+ 
+-                    let mut response = client
+-                        .get(uri.as_ref(), ().into(), true)
+-                        .await
+-                        .with_context(|| format!("loading image asset from {uri:?}"))?;
+-                    let mut body = Vec::new();
+-                    response.body_mut().read_to_end(&mut body).await?;
+-                    if !response.status().is_success() {
+-                        let mut body = String::from_utf8_lossy(&body).into_owned();
+-                        let first_line = body.lines().next().unwrap_or("").trim_end();
+-                        body.truncate(first_line.len());
+-                        return Err(ImageCacheError::BadStatus {
+-                            uri,
+-                            status: response.status(),
+-                            body,
+-                        });
++                    let mut attempt = 1u8;
++                    loop {
++                        let mut response = match client.get(uri.as_ref(), ().into(), true).await {
++                            Ok(response) => response,
++                            Err(error) if attempt < IMAGE_URI_MAX_ATTEMPTS => {
++                                let delay = image_uri_retry_delay(&uri, attempt);
++                                log::debug!(
++                                    "Retrying image asset URI {uri} after request transport failure \
++                                     (attempt {attempt}/{IMAGE_URI_MAX_ATTEMPTS}, delay={}ms): {error}",
++                                    delay.as_millis()
++                                );
++                                background_executor.timer(delay).await;
++                                attempt += 1;
++                                continue;
++                            }
++                            Err(error) => {
++                                return Err(error
++                                    .context(format!("loading image asset from {uri:?}"))
++                                    .into());
++                            }
++                        };
++
++                        let status = response.status();
++                        let mut body = Vec::new();
++                        match response.body_mut().read_to_end(&mut body).await {
++                            Ok(_) => {}
++                            Err(error)
++                                if status.is_success() && attempt < IMAGE_URI_MAX_ATTEMPTS =>
++                            {
++                                let delay = image_uri_retry_delay(&uri, attempt);
++                                log::debug!(
++                                    "Retrying image asset URI {uri} after response-body transport \
++                                     failure (attempt {attempt}/{IMAGE_URI_MAX_ATTEMPTS}, \
++                                     delay={}ms): {error}",
++                                    delay.as_millis()
++                                );
++                                background_executor.timer(delay).await;
++                                attempt += 1;
++                                continue;
++                            }
++                            Err(error) => return Err(error.into()),
++                        }
++
++                        if !status.is_success() {
++                            let mut body = String::from_utf8_lossy(&body).into_owned();
++                            let first_line = body.lines().next().unwrap_or("").trim_end();
++                            body.truncate(first_line.len());
++                            return Err(ImageCacheError::BadStatus { uri, status, body });
++                        }
++
++                        if attempt > 1 {
++                            log::debug!(
++                                "Recovered image asset URI {uri} after {attempt} transport attempts"
++                            );
++                        }
++                        break body;
+                     }
+-                    body
+                 }
+                 Resource::Embedded(path) => {
+                     let data = asset_source.load(&path).ok().flatten();
+-- 
+2.55.0.windows.5
+

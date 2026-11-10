@@ -1,0 +1,12 @@
+[package]
+name = "streamer-mode-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dirs = "6"
+echo-core = { path = "../../crates/echo-core" }
+serde = { version = "1", features = ["derive"] }
+sysinfo.workspace = true

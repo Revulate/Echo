@@ -1,0 +1,14 @@
+[package]
+name = "echo-text-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-free emoji and text similarity algorithms for Echo"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+emojis.workspace = true
+serde = { version = "1", features = ["derive"] }
+smallvec = "1.13"

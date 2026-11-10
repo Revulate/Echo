@@ -1,0 +1,136 @@
+From d04b1025f7fb6c513ca6219282fbae2589d3b203 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 17:21:25 -0700
+Subject: [PATCH] fix(gpui_windows): keep repainting after repeated minimize
+ and fix vsync fallback
+
+A second SIZE_MINIMIZED before restore (a DPI change or SetWindowPos on
+a minimized window) replaced the parked frame callback with `None`, so
+the restored window never drew again. The callback is now parked only
+when one is present.
+
+The refresh-rate fallback divided by `uiNumerator / 1_000_000`, which
+is zero for every real refresh rate, so it panicked whenever DWM
+reported an implausible QPC refresh period. Durations are now computed
+in u128 nanoseconds, and a fallback period outside 1-200 ms is rejected
+so the default interval is used.
+
+Device-loss recovery sent each window a synchronous message while
+holding the window-list read lock. The UI thread takes that lock for
+writing when it opens or closes a window, so the two could deadlock.
+The handles are copied out before sending.
+---
+ crates/gpui_windows/src/events.rs   |  9 ++++++---
+ crates/gpui_windows/src/platform.rs | 15 +++++++++++----
+ crates/gpui_windows/src/vsync.rs    | 22 ++++++++++++++++++----
+ 3 files changed, 35 insertions(+), 11 deletions(-)
+
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index aa55a8e6fc..de7e80292a 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -226,9 +226,12 @@ impl WindowsWindowInner {
+         // Don't resize the renderer when the window is minimized, but record that it was minimized so
+         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
+         if wparam.0 == SIZE_MINIMIZED as usize {
+-            self.state
+-                .restore_from_minimized
+-                .set(self.state.callbacks.request_frame.take());
++            // A second minimize report before restore (a DPI change or a
++            // SetWindowPos on the minimized window) finds the callback already
++            // parked; overwriting it with `None` would stop all repaints.
++            if let Some(request_frame) = self.state.callbacks.request_frame.take() {
++                self.state.restore_from_minimized.set(Some(request_frame));
++            }
+             return Some(0);
+         }
+ 
+diff --git a/crates/gpui_windows/src/platform.rs b/crates/gpui_windows/src/platform.rs
+index 5fcbafd203..a26968dc72 100644
+--- a/crates/gpui_windows/src/platform.rs
++++ b/crates/gpui_windows/src/platform.rs
+@@ -1844,10 +1844,15 @@ fn handle_gpu_device_lost(
+     }
+ 
+     if let Some(all_windows) = all_windows.upgrade() {
+-        for window in all_windows.read().iter() {
++        // Copy the handles out first: SendMessageW waits for the UI thread, and
++        // the UI thread takes this lock for writing when it opens or closes a
++        // window, so sending while holding the read lock can deadlock.
++        let windows: SmallVec<[HWND; 4]> =
++            all_windows.read().iter().map(TrackedWindow::as_raw).collect();
++        for &window in &windows {
+             unsafe {
+                 SendMessageW(
+-                    window.as_raw(),
++                    window,
+                     WM_GPUI_GPU_DEVICE_LOST,
+                     Some(WPARAM(validation_number)),
+                     Some(lparam),
+@@ -1855,10 +1860,12 @@ fn handle_gpu_device_lost(
+             }
+         }
+         std::thread::sleep(std::time::Duration::from_millis(200));
+-        for window in all_windows.read().iter() {
++        let windows: SmallVec<[HWND; 4]> =
++            all_windows.read().iter().map(TrackedWindow::as_raw).collect();
++        for &window in &windows {
+             unsafe {
+                 SendMessageW(
+-                    window.as_raw(),
++                    window,
+                     WM_GPUI_FORCE_UPDATE_WINDOW,
+                     Some(WPARAM(validation_number)),
+                     None,
+diff --git a/crates/gpui_windows/src/vsync.rs b/crates/gpui_windows/src/vsync.rs
+index 5121c41b61..1cadc3ac07 100644
+--- a/crates/gpui_windows/src/vsync.rs
++++ b/crates/gpui_windows/src/vsync.rs
+@@ -22,6 +22,8 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
+ 
+ const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
+ const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
++/// Longest plausible refresh period (5 Hz); anything slower is a bogus rate.
++const MAX_VSYNC_INTERVAL: Duration = Duration::from_millis(200);
+ 
+ pub(crate) struct VSyncProvider {
+     interval: Duration,
+@@ -69,19 +71,31 @@ fn get_dwm_interval() -> Result<Duration> {
+     // Check for interval values that are impossibly low. A 29 microsecond
+     // interval was seen (from a qpcRefreshPeriod of 60).
+     if interval < VSYNC_INTERVAL_THRESHOLD {
+-        Ok(retrieve_duration(
++        // `rateRefresh` is a frequency (numerator / denominator Hz), so the
++        // period is denominator / numerator seconds.
++        let interval = retrieve_duration(
+             timing_info.rateRefresh.uiDenominator as u64,
+             timing_info.rateRefresh.uiNumerator as u64,
+-        ))
++        );
++        if !(VSYNC_INTERVAL_THRESHOLD..=MAX_VSYNC_INTERVAL).contains(&interval) {
++            anyhow::bail!("DWM reported no usable refresh period");
++        }
++        Ok(interval)
+     } else {
+         Ok(interval)
+     }
+ }
+ 
++/// `counts / ticks_per_second` seconds, without truncating the rate first (a
++/// refresh rate is far below one tick per microsecond, which used to divide by
++/// zero). A zero rate yields zero, which callers treat as unusable.
+ #[inline]
+ fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
+-    let ticks_per_microsecond = ticks_per_second / 1_000_000;
+-    Duration::from_micros(counts / ticks_per_microsecond)
++    if ticks_per_second == 0 {
++        return Duration::ZERO;
++    }
++    let nanos = u128::from(counts) * 1_000_000_000 / u128::from(ticks_per_second);
++    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+ }
+ 
+ #[cfg(test)]
+-- 
+2.55.0.windows.5
+

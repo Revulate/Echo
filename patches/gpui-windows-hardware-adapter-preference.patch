@@ -1,0 +1,279 @@
+From bcfe3545dfde3a9be16d4140e07c69723673e258 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:17:33 -0700
+Subject: [PATCH] fix(gpui_windows): prefer hardware adapters and leave WARP
+ when a GPU returns
+
+Adapter selection took the first adapter that created a device in
+EnumAdapters order and logged every adapter it tried. Device-lost
+recovery during a driver reset or update could therefore land on the
+software adapter (WARP) and stay there.
+
+Hardware adapters are now tried first; a software adapter is only a
+fallback and logs a warning. The chosen adapter (name, vendor and device
+id, software flag) is logged once after the device is created.
+
+While rendering on a software adapter, the VSync thread checks about once
+per second whether the DXGI adapter enumeration changed and a hardware
+adapter is present, and then requests the existing device recovery. A
+return attempt that still lands on a software adapter backs off up to a
+minute until the enumeration changes again.
+---
+ crates/gpui_windows/src/directx_devices.rs  | 152 +++++++++++++++++---
+ crates/gpui_windows/src/directx_renderer.rs |   1 +
+ crates/gpui_windows/src/platform.rs         |  13 ++
+ 3 files changed, 144 insertions(+), 22 deletions(-)
+
+diff --git a/crates/gpui_windows/src/directx_devices.rs b/crates/gpui_windows/src/directx_devices.rs
+index 8e65e6e626..f3a2730dd9 100644
+--- a/crates/gpui_windows/src/directx_devices.rs
++++ b/crates/gpui_windows/src/directx_devices.rs
+@@ -14,13 +14,15 @@ use windows::Win32::{
+             D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+         },
+         Dxgi::{
+-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
+-            IDXGIAdapter1, IDXGIFactory6,
++            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_DEBUG,
++            DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6,
+         },
+     },
+ };
+ use windows::core::Interface;
+ 
++use std::time::{Duration, Instant};
++
+ pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+     (0..5)
+         .map(|i| {
+@@ -41,6 +43,8 @@ pub(crate) struct DirectXDevices {
+     pub(crate) dxgi_factory: IDXGIFactory6,
+     pub(crate) device: ID3D11Device,
+     pub(crate) device_context: ID3D11DeviceContext,
++    /// Whether the device runs on a software adapter (WARP).
++    pub(crate) software: bool,
+ }
+ 
+ impl DirectXDevices {
+@@ -48,7 +52,7 @@ impl DirectXDevices {
+         let debug_layer_available = check_debug_layer_available();
+         let dxgi_factory =
+             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
+-        let (adapter, device, device_context, feature_level) =
++        let (adapter, device, device_context, feature_level, software) =
+             get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?;
+         match feature_level {
+             D3D_FEATURE_LEVEL_11_1 => {
+@@ -68,10 +72,79 @@ impl DirectXDevices {
+             dxgi_factory,
+             device,
+             device_context,
++            software,
+         })
+     }
+ }
+ 
++const HARDWARE_ADAPTER_PROBE_INTERVAL: Duration = Duration::from_secs(1);
++const HARDWARE_ADAPTER_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(60);
++
++/// Watches for a hardware adapter to become available while rendering runs on
++/// a software adapter, so device recovery can move back to the GPU.
++pub(crate) struct HardwareAdapterProbe {
++    factory: Option<IDXGIFactory6>,
++    next_check: Instant,
++    retry_interval: Duration,
++}
++
++impl HardwareAdapterProbe {
++    pub(crate) fn new() -> Self {
++        Self {
++            factory: None,
++            next_check: Instant::now() + HARDWARE_ADAPTER_PROBE_INTERVAL,
++            retry_interval: HARDWARE_ADAPTER_PROBE_INTERVAL,
++        }
++    }
++
++    /// Returns true when a hardware adapter is enumerable and recovery should
++    /// be attempted. Checks at most once per second; when a return attempt
++    /// still lands on a software adapter, retries back off up to a minute
++    /// unless the adapter enumeration changes.
++    pub(crate) fn hardware_adapter_available(&mut self, devices: &DirectXDevices) -> bool {
++        let now = Instant::now();
++        if now < self.next_check {
++            return false;
++        }
++        let factory = self
++            .factory
++            .get_or_insert_with(|| devices.dxgi_factory.clone());
++        if !unsafe { factory.IsCurrent() }.as_bool() {
++            let Some(fresh) = unsafe {
++                CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS::default())
++            }
++            .log_err() else {
++                self.next_check = now + HARDWARE_ADAPTER_PROBE_INTERVAL;
++                return false;
++            };
++            *factory = fresh;
++            self.retry_interval = HARDWARE_ADAPTER_PROBE_INTERVAL;
++        }
++        if has_hardware_adapter(factory) {
++            self.next_check = now + self.retry_interval;
++            self.retry_interval =
++                (self.retry_interval * 2).min(HARDWARE_ADAPTER_RETRY_MAX_INTERVAL);
++            true
++        } else {
++            self.next_check = now + HARDWARE_ADAPTER_PROBE_INTERVAL;
++            false
++        }
++    }
++}
++
++fn is_software_adapter(adapter: &IDXGIAdapter1) -> bool {
++    unsafe { adapter.GetDesc1() }
++        .map(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
++        .unwrap_or(false)
++}
++
++fn has_hardware_adapter(dxgi_factory: &IDXGIFactory6) -> bool {
++    (0..)
++        .map_while(|adapter_index| unsafe { dxgi_factory.EnumAdapters(adapter_index) }.ok())
++        .filter_map(|adapter| adapter.cast::<IDXGIAdapter1>().ok())
++        .any(|adapter| !is_software_adapter(&adapter))
++}
++
+ #[inline]
+ fn check_debug_layer_available() -> bool {
+     #[cfg(debug_assertions)]
+@@ -111,32 +184,67 @@ fn get_adapter(
+     ID3D11Device,
+     ID3D11DeviceContext,
+     D3D_FEATURE_LEVEL,
++    bool,
+ )> {
++    let mut adapters = Vec::new();
+     for adapter_index in 0.. {
+-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
+-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+-            let gpu_name = String::from_utf16_lossy(&desc.Description)
+-                .trim_matches(char::from(0))
+-                .to_string();
+-            log::info!("Using GPU: {}", gpu_name);
++        let Ok(adapter) = (unsafe { dxgi_factory.EnumAdapters(adapter_index) }) else {
++            break;
++        };
++        if let Some(adapter) = adapter.cast::<IDXGIAdapter1>().log_err() {
++            adapters.push(adapter);
+         }
+-        // Check to see whether the adapter supports Direct3D 11 and create
+-        // the device if it does.
+-        let mut context: Option<ID3D11DeviceContext> = None;
+-        let mut feature_level = D3D_FEATURE_LEVEL::default();
+-        if let Some(device) = get_device(
+-            &adapter,
+-            Some(&mut context),
+-            Some(&mut feature_level),
+-            debug_layer_available,
+-        )
+-        .log_err()
++    }
++
++    // Hardware adapters first; a software adapter (WARP) is only a fallback.
++    for software in [false, true] {
++        for adapter in adapters
++            .iter()
++            .filter(|adapter| is_software_adapter(adapter) == software)
+         {
+-            return Ok((adapter, device, context.unwrap(), feature_level));
++            // Check to see whether the adapter supports Direct3D 11 and create
++            // the device if it does.
++            let mut context: Option<ID3D11DeviceContext> = None;
++            let mut feature_level = D3D_FEATURE_LEVEL::default();
++            let Some(device) = get_device(
++                adapter,
++                Some(&mut context),
++                Some(&mut feature_level),
++                debug_layer_available,
++            )
++            .log_err() else {
++                continue;
++            };
++            log_chosen_adapter(adapter, software);
++            return Ok((
++                adapter.clone(),
++                device,
++                context.unwrap(),
++                feature_level,
++                software,
++            ));
+         }
+     }
+ 
+-    unreachable!()
++    anyhow::bail!("No DXGI adapter could create a Direct3D 11 device")
++}
++
++fn log_chosen_adapter(adapter: &IDXGIAdapter1, software: bool) {
++    if let Ok(desc) = unsafe { adapter.GetDesc1() } {
++        let gpu_name = String::from_utf16_lossy(&desc.Description)
++            .trim_matches(char::from(0))
++            .to_string();
++        log::info!(
++            "Using GPU: {gpu_name} (vendor {:#06x}, device {:#06x}, software: {software})",
++            desc.VendorId,
++            desc.DeviceId,
++        );
++    }
++    if software {
++        log::warn!(
++            "No hardware GPU adapter could create a Direct3D 11 device; rendering is software-emulated"
++        );
++    }
+ }
+ 
+ #[inline]
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index 4f6260e05f..52cc8a5180 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -313,6 +313,7 @@ impl DirectXRendererDevices {
+             dxgi_factory,
+             device,
+             device_context,
++            ..
+         } = directx_devices;
+         let dxgi_device = if disable_direct_composition {
+             None
+diff --git a/crates/gpui_windows/src/platform.rs b/crates/gpui_windows/src/platform.rs
+index b15df45081..5fcbafd203 100644
+--- a/crates/gpui_windows/src/platform.rs
++++ b/crates/gpui_windows/src/platform.rs
+@@ -446,6 +446,7 @@ impl WindowsPlatform {
+                 let mut last_recovery_at = std::time::Instant::now();
+                 let mut presents_at_recovery = 0u64;
+                 let mut recovery_attempts = 0u32;
++                let mut hardware_probe: Option<HardwareAdapterProbe> = None;
+                 loop {
+                     let signal_source = vsync_provider.wait_for_vsync();
+                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
+@@ -494,6 +495,18 @@ impl WindowsPlatform {
+                     {
+                         device_lost_since = None;
+                         recovery_attempts = 0;
++                    } else if device_lost_since.is_none() && directx_device.software {
++                        if hardware_probe
++                            .get_or_insert_with(HardwareAdapterProbe::new)
++                            .hardware_adapter_available(&directx_device)
++                        {
++                            log::info!(
++                                "Hardware GPU adapter available; recreating DirectX devices"
++                            );
++                            invalidate_devices.store(true, Ordering::Release);
++                        }
++                    } else if !directx_device.software {
++                        hardware_probe = None;
+                     }
+                     let Some(all_windows) = all_windows.upgrade() else {
+                         break;
+-- 
+2.55.0.windows.5
+

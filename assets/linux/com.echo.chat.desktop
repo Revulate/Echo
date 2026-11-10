@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Echo
+GenericName=Twitch Chat
+Comment=Native Twitch chat client
+Exec="@ECHO_EXEC@"
+TryExec=@ECHO_EXEC@
+Icon=com.echo.chat
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+Keywords=Twitch;Chat;IRC;7TV;
+StartupNotify=true
+StartupWMClass=com.echo.chat
+SingleMainWindow=true

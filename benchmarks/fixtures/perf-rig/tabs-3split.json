@@ -1,0 +1,45 @@
+[
+  {
+    "id": "e5f658bc-21b5-48c4-8b87-c7e7cc130a4d",
+    "custom_title": "GPU-3",
+    "layout": {
+      "Split": {
+        "split_id": "a92b9647-41db-42ee-9381-c5b84b99f0f9",
+        "orientation": "Horizontal",
+        "children": [
+          {
+            "Leaf": {
+              "split_id": "6e739e74-347d-4538-81e2-6805aa380340",
+              "channel": "echofxbench0a"
+            }
+          },
+          {
+            "Leaf": {
+              "split_id": "34f4af4d-9d16-4415-a479-fba46de906ad",
+              "channel": "echofxbench0b"
+            }
+          },
+          {
+            "Leaf": {
+              "split_id": "4f16b4aa-78b4-4901-b079-9e77606ff1c0",
+              "channel": "echofxbench0c"
+            }
+          }
+        ],
+        "ratios": [
+          0.3333333333333333,
+          0.3333333333333333,
+          0.3333333333333333
+        ]
+      }
+    },
+    "selected": true,
+    "active_split_path": [
+      0
+    ],
+    "highlights_enabled": true,
+    "is_locked": false,
+    "visibility": "ShowAll",
+    "mark_unread_on_new": false
+  }
+]

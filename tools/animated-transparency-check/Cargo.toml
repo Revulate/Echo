@@ -1,0 +1,11 @@
+[package]
+name = "echo-animated-transparency-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+echo_gpui = { path = "../.." }
+image = { version = "0.25", default-features = false, features = ["gif", "webp"] }
+gif = "0.14"
+zstd = "0.14"

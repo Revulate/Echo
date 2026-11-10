@@ -1,0 +1,79 @@
+From b26df44b7718bcb87ddcf62d0003d2cf4b1c1d8f Mon Sep 17 00:00:00 2001
+From: Echo Maintainers <echo@local.invalid>
+Date: Sat, 18 Jul 2026 17:30:00 -0700
+Subject: [PATCH] gpui_windows: own drag-drop window teardown once
+
+Windows sends WM_DESTROY before invalidating an HWND. Revoke OLE drag-drop
+registration at that point and mark teardown as started. When GPUI initiates
+the close by dropping its platform window, mark teardown before issuing the
+Win32 calls so the WM_DESTROY callback cannot revoke twice.
+
+This removes invalid-HWND errors during normal window closure while retaining
+the asynchronous drop path needed to avoid re-entrant GPUI updates.
+---
+ crates/gpui_windows/src/events.rs | 9 ++++++++-
+ crates/gpui_windows/src/window.rs | 7 +++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index 4dd0c38c03..f18c070370 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -6,7 +6,7 @@ use windows::{
+     Win32::{
+         Foundation::*,
+         Graphics::Gdi::*,
+-        System::SystemServices::*,
++        System::{Ole::RevokeDragDrop, SystemServices::*},
+         UI::{
+             Controls::*,
+             HiDpi::*,
+@@ -323,6 +323,13 @@ impl WindowsWindowInner {
+     }
+ 
+     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
++        // Windows owns destruction when WM_CLOSE falls through to DefWindowProc.
++        // Revoke while the HWND is still valid, then let the platform-window
++        // drop observe the flag and avoid issuing the same Win32 calls again.
++        if !self.state.destroy_started.replace(true) {
++            unsafe { RevokeDragDrop(handle).log_err() };
++        }
++
+         let callback = { self.state.callbacks.close.take() };
+         // Re-enable parent window if this was a modal dialog
+         if let Some(parent_hwnd) = self.parent_hwnd {
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index 2c1751e05c..07f3d1e96c 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -86,6 +86,7 @@ pub struct WindowsWindowState {
+     pub invalidate_devices: Arc<AtomicBool>,
+     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
+     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
++    pub(crate) destroy_started: Cell<bool>,
+     fullscreen: Cell<Option<StyleAndBounds>>,
+     initial_placement: Cell<Option<WindowOpenStatus>>,
+     hwnd: HWND,
+@@ -186,6 +187,7 @@ impl WindowsWindowState {
+             nc_button_pressed: Cell::new(nc_button_pressed),
+             display: Cell::new(display),
+             fullscreen: Cell::new(fullscreen),
++            destroy_started: Cell::new(false),
+             initial_placement: Cell::new(initial_placement),
+             hwnd,
+             invalidate_devices,
+@@ -624,6 +626,11 @@ impl Drop for WindowsWindow {
+             .spawn(async move {
+                 this.dialog_owner.when_idle().await;
+                 let handle = this.hwnd;
++                if this.state.destroy_started.replace(true)
++                    || !unsafe { IsWindow(Some(handle)) }.as_bool()
++                {
++                    return;
++                }
+                 unsafe {
+                     RevokeDragDrop(handle).log_err();
+                     DestroyWindow(handle).log_err();
+-- 
+2.55.0.windows.5
+

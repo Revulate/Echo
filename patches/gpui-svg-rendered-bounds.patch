@@ -1,0 +1,131 @@
+From e75c68a4825cd0fb6244c83ae2dc48bdaf227792 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 14:11:30 -0700
+Subject: [PATCH] gpui: bound remote SVG raster allocations
+
+---
+ crates/gpui/src/elements/img.rs |  6 +++-
+ crates/gpui/src/svg_renderer.rs | 56 ++++++++++++++++++++++++++++++---
+ 2 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
+index 9c9e998a61..2956c1c3c9 100644
+--- a/crates/gpui/src/elements/img.rs
++++ b/crates/gpui/src/elements/img.rs
+@@ -812,7 +812,11 @@ impl Asset for ImageAssetLoader {
+                 Ok(Arc::new(RenderImage::new(data)))
+             } else {
+                 svg_renderer
+-                    .render_single_frame(&bytes, 1.0)
++                    .render_single_frame_with_max_rendered_rgba_bytes(
++                        &bytes,
++                        1.0,
++                        enforce_uri_decode_bounds.then_some(IMAGE_URI_MAX_FRAME_RGBA_BYTES),
++                    )
+                     .map_err(Into::into)
+             }
+         }
+diff --git a/crates/gpui/src/svg_renderer.rs b/crates/gpui/src/svg_renderer.rs
+index 49f77a170d..99c0f0d8da 100644
+--- a/crates/gpui/src/svg_renderer.rs
++++ b/crates/gpui/src/svg_renderer.rs
+@@ -196,6 +196,15 @@ impl SvgRenderer {
+         &self,
+         svg: &ParsedSvg,
+         size: impl Into<SvgSize>,
++    ) -> Result<Arc<RenderImage>, usvg::Error> {
++        self.render_parsed_with_max_rendered_rgba_bytes(svg, size, None)
++    }
++
++    fn render_parsed_with_max_rendered_rgba_bytes(
++        &self,
++        svg: &ParsedSvg,
++        size: impl Into<SvgSize>,
++        max_rendered_rgba_bytes: Option<u64>,
+     ) -> Result<Arc<RenderImage>, usvg::Error> {
+         let (size, image_scale_factor) = match size.into() {
+             SvgSize::Size(size) => (SvgSize::Size(size), 1.0),
+@@ -205,7 +214,7 @@ impl SvgRenderer {
+                 SMOOTH_SVG_SCALE_FACTOR,
+             ),
+         };
+-        let pixmap = rasterize_tree(&svg.0, size)?;
++        let pixmap = rasterize_tree(&svg.0, size, max_rendered_rgba_bytes)?;
+         let mut buffer =
+             image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
+ 
+@@ -223,9 +232,27 @@ impl SvgRenderer {
+         &self,
+         bytes: &[u8],
+         scale_factor: f32,
++    ) -> Result<Arc<RenderImage>, usvg::Error> {
++        self.render_single_frame_with_max_rendered_rgba_bytes(bytes, scale_factor, None)
++    }
++
++    /// Renders the given bytes into an image buffer, rejecting a raster whose
++    /// RGBA allocation would exceed `max_rendered_rgba_bytes` when provided.
++    ///
++    /// Callers loading untrusted SVG data can use this to apply a tighter
++    /// allocation policy without changing bundled or local SVG rendering.
++    pub fn render_single_frame_with_max_rendered_rgba_bytes(
++        &self,
++        bytes: &[u8],
++        scale_factor: f32,
++        max_rendered_rgba_bytes: Option<u64>,
+     ) -> Result<Arc<RenderImage>, usvg::Error> {
+         let svg = self.parse_svg(bytes)?;
+-        self.render_parsed(&svg, scale_factor)
++        self.render_parsed_with_max_rendered_rgba_bytes(
++            &svg,
++            SvgSize::ScaleFactor(scale_factor),
++            max_rendered_rgba_bytes,
++        )
+     }
+ 
+     pub(crate) fn render_alpha_mask(
+@@ -263,11 +290,15 @@ impl SvgRenderer {
+ 
+     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
+         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+-        rasterize_tree(&tree, size)
++        rasterize_tree(&tree, size, None)
+     }
+ }
+ 
+-fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
++fn rasterize_tree(
++    tree: &usvg::Tree,
++    size: SvgSize,
++    max_rendered_rgba_bytes: Option<u64>,
++) -> Result<Pixmap, usvg::Error> {
+     // Cap the size of the rendered pixmap to avoid texture allocation panics
+     // Related issue: #56466
+     const MAX_SIZE: f32 = 8192.0;
+@@ -292,8 +323,23 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
+     width *= scale;
+     height *= scale;
+ 
++    let pixmap_width = width as u32;
++    let pixmap_height = height as u32;
++    if let Some(max_rendered_rgba_bytes) = max_rendered_rgba_bytes {
++        let rendered_rgba_bytes = u64::from(pixmap_width)
++            .checked_mul(u64::from(pixmap_height))
++            .and_then(|pixels| pixels.checked_mul(4))
++            .ok_or(usvg::Error::InvalidSize)?;
++        if rendered_rgba_bytes > max_rendered_rgba_bytes {
++            log::warn!(
++                "Refusing SVG raster of {pixmap_width}x{pixmap_height} ({rendered_rgba_bytes} RGBA bytes); limit is {max_rendered_rgba_bytes} bytes"
++            );
++            return Err(usvg::Error::InvalidSize);
++        }
++    }
++
+     // Render the SVG to a pixmap with the specified width and height.
+-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width as u32, height as u32)
++    let mut pixmap = resvg::tiny_skia::Pixmap::new(pixmap_width, pixmap_height)
+         .ok_or(usvg::Error::InvalidSize)?;
+ 
+     let transform = resvg::tiny_skia::Transform::from_scale(
+-- 
+2.55.0.windows.5
+

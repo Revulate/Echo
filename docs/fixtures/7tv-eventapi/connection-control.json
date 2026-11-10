@@ -1,0 +1,50 @@
+[
+  {
+    "op": 1,
+    "d": {
+      "heartbeat_interval": 25000,
+      "session_id": "fixture-session-old"
+    }
+  },
+  {
+    "op": 4,
+    "d": {
+      "reason": "fixture reconnect"
+    }
+  },
+  {
+    "op": 6,
+    "d": {
+      "code": 4009,
+      "message": "already subscribed"
+    }
+  },
+  {
+    "op": 6,
+    "d": {
+      "code": 4008,
+      "message": "retry"
+    }
+  },
+  {
+    "op": 6,
+    "d": {
+      "op": 34,
+      "message": "resume session expired"
+    }
+  },
+  {
+    "op": 1,
+    "d": {
+      "heartbeat_interval": 25000,
+      "session_id": "fixture-session-new"
+    }
+  },
+  {
+    "op": 7,
+    "d": {
+      "code": 4007,
+      "message": "slow reconnect"
+    }
+  }
+]

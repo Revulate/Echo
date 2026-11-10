@@ -1,0 +1,3121 @@
+From c816026f86d4e7e2c54c97f56ec6ed6e9ed76903 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 03:10:45 -0700
+Subject: [PATCH] feat(gpui): platform-backed bidi text geometry and visual
+ range spans
+
+Add `ShapedLine::visual_spans_for_range`, which turns a logical UTF-8 byte
+range into sorted, disjoint visual spans, plus checked caret APIs
+(`x_for_index_with_affinity_checked`, `caret_for_x` with affinity) and
+`bidi_geometry_complete`.
+
+On Windows, `LineLayout` now carries interaction geometry separately from
+glyph ink: `VisualCell`s and leading/trailing `Caret`s at every editable
+DirectWrite cluster boundary. Boundaries come from DirectWrite's cluster
+map intersected with Unicode extended-grapheme boundaries, so fallback
+font splits never expose the inside of a combining sequence, ZWJ emoji or
+variation selector, while ligatures stay grouped. Cells come from
+`IDWriteTextLayout::HitTestTextRange` and carets from
+`HitTestTextPosition`, so selection, hit testing and caret lookup no
+longer infer rectangles from glyph origins. These per-cluster queries run
+only for lines with an odd-bidi-level run; plain LTR text keeps the old
+glyph path. The shaper honors `baselineOriginX`, `bidiLevel`, advances and
+offsets when placing RTL glyphs, maps cluster-map entries to glyphs by
+their first UTF-16 offset instead of `ClusterAnalyzer`, and uses
+`widthIncludingTrailingWhitespace` as the line width.
+
+Range and caret queries recover independently per cluster: two endpoint
+carets synthesize a missing range, the direction-aware union of range
+cells synthesizes a missing caret pair. Anything less degrades the line:
+`bidi_geometry_complete` is false, one bounded warning is logged, and the
+geometry APIs fail closed instead of returning logical-glyph positions.
+A debug-only `GPUI_DIRECTWRITE_TEXT_GEOMETRY_FAULT` seam exercises these
+paths; release builds construct only `GeometryFaultInjection::None`.
+
+Every shaped glyph also carries a monotonic source-order advance
+(`logical_x`, `logical_advance`) independent of its physical ink origin.
+Line splits, including `ShapedLineCursor`, keep the physical bidi glyph
+order and carry these fields, and wrapping is refused for lines with a
+DirectWrite bidi run (reporting the full unwrapped width). macOS and wgpu
+keep the glyph-based fallback.
+
+DirectWrite draws tabs as zero-glyph runs whose cluster map points at a
+glyph the run does not have, so those runs skip the cluster-map path.
+As upstream does, each tab keeps an invisible space glyph; here it sits
+at the tab's native hit-test box and carries the native tab width as its
+logical advance, and each tab is its own editable cluster, so tabs keep
+their advance and caret mapping in LTR and bidi lines alike. Upstream's
+`tabs_preserve_native_advances_and_cursor` test checks LTR lines against
+logical advances as before and checks bidi lines against DirectWrite's
+own leading caret and tab cell width, since this geometry reports
+physical carets.
+
+`examples/platform_text_geometry.rs` (Windows, real platform text system,
+now including tab lines) and `examples/visual_range_spans.rs`
+(platform-independent fallback) exercise the contract. The obsolete
+`ClusterAnalyzer` unit test is removed with the type it tested, and the
+upstream `ShapedLine` tests in `text_system/line.rs` that build
+`LineLayout` and `ShapedGlyph` literals fill the new geometry fields, so
+gpui's lib tests compile again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/Cargo.toml                        |   4 +
+ .../gpui/examples/platform_text_geometry.rs   | 608 ++++++++++++
+ crates/gpui/examples/visual_range_spans.rs    |  97 ++
+ crates/gpui/src/platform.rs                   |   6 +
+ crates/gpui/src/text_system/line.rs           | 138 ++-
+ crates/gpui/src/text_system/line_layout.rs    | 471 ++++++++-
+ crates/gpui_apple/src/text_system.rs          |   8 +
+ crates/gpui_wgpu/src/cosmic_text_system.rs    |  12 +
+ crates/gpui_windows/Cargo.toml                |   1 +
+ crates/gpui_windows/src/direct_write.rs       | 907 +++++++++++++-----
+ 10 files changed, 1990 insertions(+), 262 deletions(-)
+ create mode 100644 crates/gpui/examples/platform_text_geometry.rs
+ create mode 100644 crates/gpui/examples/visual_range_spans.rs
+
+diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
+index f215c006fd..ccf95a7640 100644
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -303,3 +303,7 @@ path = "examples/view_example/view_example_main.rs"
+ [[example]]
+ name = "toggle_headless"
+ path = "examples/toggle_headless.rs"
++
++[[example]]
++name = "platform_text_geometry"
++path = "examples/platform_text_geometry.rs"
+diff --git a/crates/gpui/examples/platform_text_geometry.rs b/crates/gpui/examples/platform_text_geometry.rs
+new file mode 100644
+index 0000000000..acb2a6a4f9
+--- /dev/null
++++ b/crates/gpui/examples/platform_text_geometry.rs
+@@ -0,0 +1,608 @@
++//! Windows non-test diagnostic for platform text geometry.
++//!
++//! Run with `cargo run -p gpui --example platform_text_geometry`. It creates GPUI's normal
++//! platform text system, shapes several DirectWrite-sensitive strings, and exits without opening
++//! an application window. The checks cover UTF-8 source boundaries, bidi platform cells/carets,
++//! logical split/wrap compatibility coordinates, and a mixed-direction range that must occupy
++//! more than one visual span.
++
++#![cfg_attr(not(target_os = "windows"), allow(unused_imports, dead_code))]
++
++#[cfg(target_os = "windows")]
++use unicode_segmentation::UnicodeSegmentation;
++
++#[cfg(not(target_os = "windows"))]
++fn main() {
++    eprintln!("platform_text_geometry is a Windows DirectWrite diagnostic");
++}
++
++#[cfg(target_os = "windows")]
++fn main() {
++    use gpui::{App, TextRun, WindowTextSystem, px};
++    use gpui_platform::application;
++
++    application().run(|cx: &mut App| {
++        let text_system = WindowTextSystem::new(cx.text_system().clone());
++        for text in [
++            "abcdאבגX",
++            "plain LTR",
++            "אבגדה",
++            "office ffi",
++            "a\u{0301}b",
++            "A😀B",
++            // This relies on the normal DirectWrite system fallback configured by the platform
++            // text system; it must still produce source cells/carets even when a fallback face
++            // supplies the emoji glyphs.
++            "👩\u{200d}💻",
++            // DirectWrite draws tabs as zero-glyph runs; each tab must keep its own cell and
++            // caret pair, including inside a bidi line.
++            "a\tb",
++            "a\tאב\tb",
++        ] {
++            let expects_bidi_geometry = text
++                .chars()
++                .any(|character| ('\u{0590}'..='\u{08ff}').contains(&character));
++            let line = text_system.layout_line(
++                text,
++                px(16.),
++                &[TextRun {
++                    len: text.len(),
++                    ..Default::default()
++                }],
++                None,
++            );
++            assert!(
++                line.width.as_f32().is_finite(),
++                "{text:?} has a finite width"
++            );
++            let width_tolerance = px(0.1);
++            assert_eq!(
++                !line.carets.is_empty(),
++                expects_bidi_geometry,
++                "{text:?} only pays DirectWrite per-cluster hit testing for bidi runs"
++            );
++            assert_eq!(
++                !line.visual_cells.is_empty(),
++                expects_bidi_geometry,
++                "{text:?} exposes visual cells exactly when bidi needs platform geometry"
++            );
++            for cell in &line.visual_cells {
++                assert!(text.is_char_boundary(cell.source.start));
++                assert!(text.is_char_boundary(cell.source.end));
++                assert!(cell.source.start < cell.source.end);
++                assert!(cell.visual.start <= cell.visual.end);
++                assert!(cell.visual.start.as_f32().is_finite());
++                assert!(cell.visual.end.as_f32().is_finite());
++                assert!(cell.visual.start >= -width_tolerance);
++                assert!(cell.visual.end <= line.width + width_tolerance);
++                if cell.visual.end > cell.visual.start {
++                    let middle = (cell.visual.start + cell.visual.end) / 2.;
++                    assert_eq!(line.index_for_x(middle), Some(cell.source.start));
++                }
++            }
++            for caret in &line.carets {
++                assert!(text.is_char_boundary(caret.index));
++                assert!(caret.x.as_f32().is_finite());
++                assert!(caret.x >= -width_tolerance);
++                assert!(caret.x <= line.width + width_tolerance);
++                assert_eq!(
++                    line.x_for_index_with_affinity_checked(caret.index, caret.affinity),
++                    Some(caret.x),
++                    "{text:?} retains both logical caret affinities"
++                );
++                let closest = line.closest_index_for_x(caret.x);
++                assert!(
++                    line.carets
++                        .iter()
++                        .any(|candidate| candidate.index == closest && candidate.x == caret.x),
++                    "{text:?} caret point maps to a concrete physical caret"
++                );
++                let reverse = line.caret_for_x(caret.x).unwrap();
++                assert_eq!(
++                    line.x_for_index_with_affinity_checked(reverse.index, reverse.affinity),
++                    Some(caret.x),
++                    "{text:?} x -> Caret(index, affinity) -> x is exact"
++                );
++            }
++            if expects_bidi_geometry {
++                assert_cluster_safe_geometry(text, &line);
++            }
++            for (tab, _) in text.match_indices('\t') {
++                assert!(
++                    line.runs
++                        .iter()
++                        .flat_map(|run| run.glyphs.iter())
++                        .any(|glyph| glyph.index == tab),
++                    "{text:?} keeps an invisible glyph for the tab at {tab}"
++                );
++                let spans = line.visual_spans_for_range(tab..tab + 1);
++                assert!(
++                    spans.len() == 1 && spans[0].end - spans[0].start > px(1.),
++                    "{text:?} tab at {tab} keeps its native advance: {spans:?}"
++                );
++            }
++        }
++
++        // All of these contain a bidi trigger plus a sequence that must be atomic to editing:
++        // combining mark, ZWJ emoji, variation selector, and the common ffi ligature candidate.
++        let complex_bidi = "אב a\u{0301} 👩\u{200d}💻 ✈\u{fe0f} office ffi";
++        let complex_line = text_system.layout_line(
++            complex_bidi,
++            px(16.),
++            &[TextRun {
++                len: complex_bidi.len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        assert!(!complex_line.visual_cells.is_empty() && !complex_line.carets.is_empty());
++        assert_cluster_safe_geometry(complex_bidi, &complex_line);
++
++        let range_failure = layout_line_with_geometry_fault(&text_system, "range", complex_bidi);
++        assert!(
++            !range_failure.visual_cells.is_empty() && !range_failure.carets.is_empty(),
++            "endpoint carets synthesize cluster cells when range hit testing fails"
++        );
++        assert_cluster_safe_geometry(
++            "אב a\u{0301} 👩\u{200d}💻 ✈\u{fe0f} office ffi [range]",
++            &range_failure,
++        );
++
++        let caret_failure = layout_line_with_geometry_fault(&text_system, "caret", complex_bidi);
++        assert!(
++            !caret_failure.visual_cells.is_empty() && !caret_failure.carets.is_empty(),
++            "range cells synthesize both cluster caret sides when caret hit testing fails"
++        );
++        assert_cluster_safe_geometry(
++            "אב a\u{0301} 👩\u{200d}💻 ✈\u{fe0f} office ffi [caret]",
++            &caret_failure,
++        );
++        assert_synthesized_carets_bound_cells(&caret_failure);
++
++        let single_endpoint_failure =
++            layout_line_with_geometry_fault(&text_system, "range-leading-caret", complex_bidi);
++        assert!(
++            single_endpoint_failure.has_bidi_runs
++                && !single_endpoint_failure.bidi_geometry_complete
++                && single_endpoint_failure.visual_cells.is_empty()
++                && single_endpoint_failure.carets.is_empty(),
++            "range failure plus only one endpoint must not fabricate zero-width selection or an opposite caret"
++        );
++        assert_eq!(single_endpoint_failure.index_for_x(px(1.)), None);
++        assert!(single_endpoint_failure.caret_for_x(px(1.)).is_none());
++        assert!(
++            single_endpoint_failure
++                .visual_spans_for_range(0..complex_bidi.len())
++                .is_empty()
++        );
++        assert_eq!(
++            single_endpoint_failure.x_for_index_with_affinity_checked(
++                0,
++                gpui::CaretAffinity::Leading,
++            ),
++            None
++        );
++        assert_eq!(
++            single_endpoint_failure
++                .x_for_index_with_affinity(0, gpui::CaretAffinity::Leading),
++            px(0.),
++            "the scalar x API uses its documented fail-closed sentinel"
++        );
++
++        let both_failure = layout_line_with_geometry_fault(&text_system, "both", complex_bidi);
++        assert!(
++            both_failure.visual_cells.is_empty() && both_failure.carets.is_empty(),
++            "only simultaneous range and caret failure degrades bidi geometry"
++        );
++        assert!(
++            both_failure.has_bidi_runs && !both_failure.bidi_geometry_complete,
++            "both-source failure exposes degraded bidi geometry instead of a glyph fallback hit"
++        );
++        assert_eq!(both_failure.index_for_x(px(1.)), None);
++        assert!(both_failure.caret_for_x(px(1.)).is_none());
++        assert_eq!(both_failure.closest_index_for_x(px(1.)), both_failure.len);
++        assert!(
++            both_failure
++                .visual_spans_for_range(0..complex_bidi.len())
++                .is_empty(),
++            "degraded bidi selection cannot expose partial platform cells"
++        );
++        assert_eq!(
++            both_failure.x_for_index_with_affinity_checked(0, gpui::CaretAffinity::Leading),
++            None,
++            "degraded bidi caret x is explicitly unavailable"
++        );
++        let both_failure_wrap_text = format!("{complex_bidi} [both wrap]");
++        let both_failure_wrapped = {
++            let _guard = DiagnosticGeometryFaultGuard::new("both");
++            text_system
++                .shape_text(
++                    both_failure_wrap_text.clone().into(),
++                    px(16.),
++                    &[TextRun {
++                        len: both_failure_wrap_text.len(),
++                        ..Default::default()
++                    }],
++                    Some(px(45.)),
++                    None,
++                )
++                .unwrap()
++        };
++        assert!(
++            both_failure_wrapped[0].unwrapped_layout.has_bidi_runs
++                && !both_failure_wrapped[0]
++                    .unwrapped_layout
++                    .bidi_geometry_complete
++                && both_failure_wrapped[0].wrap_boundaries().is_empty(),
++            "degraded bidi lines still refuse legacy wrapping rather than reorder physical ink"
++        );
++        assert_eq!(
++            both_failure_wrapped[0].width(),
++            both_failure_wrapped[0].unwrapped_layout.width,
++            "refused bidi wrapping retains its complete unwrapped physical extent"
++        );
++        let ltr_under_fault = layout_line_with_geometry_fault(&text_system, "both", "ordinary LTR");
++        assert!(
++            ltr_under_fault.visual_cells.is_empty() && ltr_under_fault.carets.is_empty(),
++            "the odd-bidi gate leaves ordinary LTR outside the diagnostic hit-test seam"
++        );
++        assert!(ltr_under_fault.bidi_geometry_complete);
++
++        let mixed = "abcdאבגX";
++        let line = text_system.layout_line(
++            mixed,
++            px(16.),
++            &[TextRun {
++                len: mixed.len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        // Select the LTR suffix plus only the first two RTL scalars. The omitted final RTL
++        // scalar remains between those logical pieces in visual order, so DirectWrite must return
++        // two physical spans rather than an endpoint rectangle.
++        let two_rtl_scalars_end = "abcdאב".len();
++        let spans = line.visual_spans_for_range(1..two_rtl_scalars_end);
++        assert!(
++            spans.len() >= 2,
++            "mixed logical range must retain its discontiguous DirectWrite geometry: {spans:?}"
++        );
++        for caret in line
++            .carets
++            .iter()
++            .filter(|caret| caret.index == 4 || caret.index == 10)
++        {
++            let reverse = line.caret_for_x(caret.x).unwrap();
++            assert_eq!(
++                line.x_for_index_with_affinity_checked(reverse.index, reverse.affinity),
++                Some(caret.x),
++                "mixed bidi boundary preserves reverse-hit affinity"
++            );
++        }
++        let rtl_origins = line
++            .runs
++            .iter()
++            .flat_map(|run| run.glyphs.iter())
++            .filter(|glyph| (4.."abcdאבג".len()).contains(&glyph.index))
++            .map(|glyph| glyph.position.x)
++            .collect::<Vec<_>>();
++        assert!(
++            rtl_origins.windows(2).all(|pair| pair[0] > pair[1]),
++            "RTL glyph origins must descend in DirectWrite logical order: {rtl_origins:?}"
++        );
++
++        let pure_rtl = "אבגדה";
++        let pure_rtl_line = text_system.shape_line(
++            pure_rtl.into(),
++            px(16.),
++            &[TextRun {
++                len: pure_rtl.len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        assert_logical_and_physical_fragment("pure RTL", &pure_rtl_line);
++        let (rtl_left, rtl_right) = pure_rtl_line.split_at("אב".len());
++        assert_logical_and_physical_fragment("pure RTL split left", &rtl_left);
++        assert_logical_and_physical_fragment("pure RTL split right", &rtl_right);
++        assert_physical_bidi_order("pure RTL split left", &rtl_left, "אב");
++        assert_physical_bidi_order("pure RTL split right", &rtl_right, "גדה");
++        assert!(rtl_left.width() <= pure_rtl_line.width());
++        assert!(rtl_right.width() <= pure_rtl_line.width());
++        assert!(
++            rtl_left.width() + rtl_right.width() >= pure_rtl_line.width(),
++            "split physical paint extents are never understated"
++        );
++
++        let mixed_line = text_system.shape_line(
++            mixed.into(),
++            px(16.),
++            &[TextRun {
++                len: mixed.len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        let (mixed_left, mixed_right) = mixed_line.split_at("abcdאב".len());
++        assert_logical_and_physical_fragment("mixed split left", &mixed_left);
++        assert_logical_and_physical_fragment("mixed split right", &mixed_right);
++        assert!(mixed_left.width() <= mixed_line.width());
++        assert!(mixed_right.width() <= mixed_line.width());
++        assert!(
++            mixed_left.width() + mixed_right.width() >= mixed_line.width(),
++            "mixed split physical paint extents are never understated"
++        );
++
++        let wrapped = text_system
++            .shape_text(
++                format!("{pure_rtl} {mixed} {pure_rtl}").into(),
++                px(16.),
++                &[TextRun {
++                    len: format!("{pure_rtl} {mixed} {pure_rtl}").len(),
++                    ..Default::default()
++                }],
++                Some(px(45.)),
++                None,
++            )
++            .unwrap();
++        assert!(
++            wrapped[0].wrap_boundaries().is_empty(),
++            "legacy GPUI wrapping fails closed for platform-bidi lines until rows are reshaped"
++        );
++        assert_eq!(
++            wrapped[0].width(),
++            wrapped[0].unwrapped_layout.width,
++            "refused bidi wrapping does not understate the physical ink extent"
++        );
++        assert_physical_bidi_order("bidi wrap fallback", &wrapped[0].unwrapped_layout, pure_rtl);
++        assert_wrapped_row_coordinates("bidi wrap fail-closed", &wrapped[0]);
++
++        let trailing = text_system.layout_line(
++            "trailing   ",
++            px(16.),
++            &[TextRun {
++                len: "trailing   ".len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        let no_trailing = text_system.layout_line(
++            "trailing",
++            px(16.),
++            &[TextRun {
++                len: "trailing".len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        assert!(
++            trailing.width >= no_trailing.width,
++            "DirectWrite width includes trailing whitespace"
++        );
++
++        let long_ltr = "chat ".repeat(2_048);
++        let long_ltr_line = text_system.layout_line(
++            &long_ltr,
++            px(16.),
++            &[TextRun {
++                len: long_ltr.len(),
++                ..Default::default()
++            }],
++            None,
++        );
++        assert!(long_ltr_line.width.as_f32().is_finite());
++        assert!(
++            long_ltr_line.visual_cells.is_empty() && long_ltr_line.carets.is_empty(),
++            "ordinary long LTR text retains the established no-COM-hit-test fallback"
++        );
++        let long_ltr_wrapped = text_system
++            .shape_text(
++                long_ltr.clone().into(),
++                px(16.),
++                &[TextRun {
++                    len: long_ltr.len(),
++                    ..Default::default()
++                }],
++                Some(px(45.)),
++                None,
++            )
++            .unwrap();
++        assert!(
++            !long_ltr_wrapped[0].wrap_boundaries().is_empty(),
++            "the bidi fail-closed rule does not disable ordinary LTR wrapping"
++        );
++        println!(
++            "platform text geometry diagnostic passed: cells={}, carets={}, mixed_spans={spans:?}",
++            line.visual_cells.len(),
++            line.carets.len(),
++        );
++        cx.quit();
++    });
++}
++
++#[cfg(target_os = "windows")]
++fn layout_line_with_geometry_fault(
++    text_system: &gpui::WindowTextSystem,
++    fault: &str,
++    text: &str,
++) -> std::sync::Arc<gpui::LineLayout> {
++    let decorated_text = format!("{text} [{fault}]");
++    let _guard = DiagnosticGeometryFaultGuard::new(fault);
++    text_system.layout_line(
++        &decorated_text,
++        gpui::px(16.),
++        &[gpui::TextRun {
++            len: decorated_text.len(),
++            ..Default::default()
++        }],
++        None,
++    )
++}
++
++#[cfg(target_os = "windows")]
++struct DiagnosticGeometryFaultGuard(Option<std::ffi::OsString>);
++
++#[cfg(target_os = "windows")]
++impl DiagnosticGeometryFaultGuard {
++    fn new(fault: &str) -> Self {
++        let previous = std::env::var_os("GPUI_DIRECTWRITE_TEXT_GEOMETRY_FAULT");
++        // Rust 2024 marks process environment mutation unsafe. This non-test diagnostic is
++        // single-threaded and restores the prior value on every exit path through Drop.
++        unsafe { std::env::set_var("GPUI_DIRECTWRITE_TEXT_GEOMETRY_FAULT", fault) };
++        Self(previous)
++    }
++}
++
++#[cfg(target_os = "windows")]
++impl Drop for DiagnosticGeometryFaultGuard {
++    fn drop(&mut self) {
++        unsafe {
++            if let Some(previous) = self.0.take() {
++                std::env::set_var("GPUI_DIRECTWRITE_TEXT_GEOMETRY_FAULT", previous);
++            } else {
++                std::env::remove_var("GPUI_DIRECTWRITE_TEXT_GEOMETRY_FAULT");
++            }
++        }
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn assert_cluster_safe_geometry(text: &str, line: &gpui::LineLayout) {
++    use std::collections::BTreeSet;
++
++    let grapheme_boundaries = text
++        .grapheme_indices(true)
++        .map(|(offset, _)| offset)
++        .chain([text.len()])
++        .collect::<BTreeSet<_>>();
++    let directwrite_cluster_boundaries = line
++        .runs
++        .iter()
++        .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
++        .chain([0, text.len()])
++        .collect::<BTreeSet<_>>();
++    let editable_boundaries = grapheme_boundaries
++        .intersection(&directwrite_cluster_boundaries)
++        .copied()
++        .collect::<BTreeSet<_>>();
++
++    for cell in &line.visual_cells {
++        assert!(
++            editable_boundaries.contains(&cell.source.start)
++                && editable_boundaries.contains(&cell.source.end),
++            "{text:?}: visual cell {:?} exposes an internal shaping or grapheme offset",
++            cell.source
++        );
++    }
++    for caret in &line.carets {
++        assert!(
++            editable_boundaries.contains(&caret.index),
++            "{text:?}: reverse hit caret {} exposes an internal shaping or grapheme offset",
++            caret.index
++        );
++        let reverse = line.caret_for_x(caret.x).unwrap();
++        assert!(
++            editable_boundaries.contains(&reverse.index),
++            "{text:?}: reverse hit result {} exposes an internal shaping or grapheme offset",
++            reverse.index
++        );
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn assert_synthesized_carets_bound_cells(line: &gpui::LineLayout) {
++    for cell in &line.visual_cells {
++        let carets = line
++            .carets
++            .iter()
++            .filter(|caret| caret.index == cell.source.start || caret.index == cell.source.end)
++            .collect::<Vec<_>>();
++        assert!(
++            carets.iter().any(|caret| caret.x <= cell.visual.start)
++                && carets.iter().any(|caret| caret.x >= cell.visual.end),
++            "synthesized caret endpoints must bound every recovered range cell: {cell:?}"
++        );
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn assert_physical_bidi_order(label: &str, line: &gpui::LineLayout, rtl_text: &str) {
++    let rtl_origins = line
++        .runs
++        .iter()
++        .flat_map(|run| run.glyphs.iter())
++        .filter(|glyph| glyph.index < rtl_text.len())
++        .map(|glyph| glyph.position.x)
++        .collect::<Vec<_>>();
++    assert!(
++        rtl_origins.windows(2).all(|pair| pair[0] > pair[1]),
++        "{label}: physical RTL glyph origins remain descending, not logical-repainted: {rtl_origins:?}"
++    );
++}
++
++#[cfg(target_os = "windows")]
++fn assert_logical_and_physical_fragment(label: &str, line: &gpui::ShapedLine) {
++    assert!(
++        line.width().as_f32().is_finite() && line.width() >= gpui::px(0.),
++        "{label}: width"
++    );
++    let mut logical = line
++        .runs
++        .iter()
++        .flat_map(|run| run.glyphs.iter())
++        .collect::<Vec<_>>();
++    logical.sort_by_key(|glyph| glyph.index);
++    assert!(
++        logical
++            .windows(2)
++            .all(|pair| pair[0].logical_x <= pair[1].logical_x),
++        "{label}: source-order logical advances are monotonic"
++    );
++    for glyph in logical {
++        assert!(
++            glyph.position.x.as_f32().is_finite() && glyph.position.x >= gpui::px(0.),
++            "{label}: physical origin is finite and nonnegative"
++        );
++        assert!(
++            glyph.logical_x >= gpui::px(0.),
++            "{label}: logical coordinate is nonnegative"
++        );
++        assert!(
++            glyph.position.x <= line.width() + gpui::px(0.1)
++                && glyph.position.x + glyph.logical_advance <= line.width() + gpui::px(0.1),
++            "{label}: normalized physical extent stays inside logical fragment width"
++        );
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn assert_wrapped_row_coordinates(label: &str, line: &gpui::WrappedLine) {
++    let layout = &line.unwrapped_layout;
++    let bidi_wrap_refused = line.wrap_boundaries().is_empty() && layout.has_bidi_runs;
++    let mut row_starts = vec![gpui::px(0.)];
++    row_starts.extend(
++        line.wrap_boundaries()
++            .iter()
++            .map(|boundary| layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].logical_x),
++    );
++    let mut previous_start = gpui::px(0.);
++    for (row_ix, row_start) in row_starts.iter().copied().enumerate() {
++        let row_end = row_starts.get(row_ix + 1).copied().unwrap_or(layout.width);
++        let width = row_end - row_start;
++        assert!(
++            row_start.as_f32().is_finite()
++                && row_end.as_f32().is_finite()
++                && row_start >= previous_start
++                && width >= gpui::px(0.)
++                && (bidi_wrap_refused || width <= line.width() + gpui::px(0.1)),
++            "{label}: wrapped foreground/background row {row_ix} has a bounded nonnegative logical width"
++        );
++        previous_start = row_start;
++    }
++    for glyph in layout.runs.iter().flat_map(|run| run.glyphs.iter()) {
++        assert!(
++            glyph.logical_x.as_f32().is_finite() && glyph.logical_x >= gpui::px(0.),
++            "{label}: wrapped glyph logical coordinate is finite and nonnegative"
++        );
++    }
++}
+diff --git a/crates/gpui/examples/visual_range_spans.rs b/crates/gpui/examples/visual_range_spans.rs
+new file mode 100644
+index 0000000000..6468cff91a
+--- /dev/null
++++ b/crates/gpui/examples/visual_range_spans.rs
+@@ -0,0 +1,97 @@
++//! Non-test diagnostic for the `LineLayout::visual_spans_for_range` contract.
++//!
++//! Run with `cargo run -p gpui --example visual_range_spans`. It deliberately
++//! constructs visual glyph positions so the range algorithm can be checked
++//! without opening a window or relying on a platform text system.
++
++use gpui::{FontId, GlyphId, LineLayout, ShapedGlyph, ShapedRun, point, px};
++
++fn glyph(x: f32, index: usize) -> ShapedGlyph {
++    ShapedGlyph {
++        id: GlyphId(0),
++        position: point(px(x), px(0.)),
++        logical_x: px(x),
++        logical_advance: px(10.),
++        index,
++        is_emoji: false,
++    }
++}
++
++fn layout(width: f32, len: usize, glyphs: Vec<ShapedGlyph>) -> LineLayout {
++    LineLayout {
++        font_size: px(16.),
++        width: px(width),
++        ascent: px(12.),
++        descent: px(4.),
++        runs: vec![ShapedRun {
++            font_id: FontId(0),
++            glyphs,
++        }],
++        visual_cells: Vec::new(),
++        carets: Vec::new(),
++        has_bidi_runs: false,
++        bidi_geometry_complete: true,
++        len,
++    }
++}
++
++fn spans(layout: &LineLayout, range: std::ops::Range<usize>) -> Vec<(f32, f32)> {
++    layout
++        .visual_spans_for_range(range)
++        .into_iter()
++        .map(|span| (span.start.as_f32(), span.end.as_f32()))
++        .collect()
++}
++
++fn main() {
++    // Pure LTR remains one visual rectangle.
++    assert_eq!(
++        spans(
++            &layout(30., 3, vec![glyph(0., 0), glyph(10., 1), glyph(20., 2)]),
++            1..3
++        ),
++        vec![(10., 30.)]
++    );
++
++    // Pure RTL remains one visual rectangle despite descending source indices.
++    assert_eq!(
++        spans(
++            &layout(30., 3, vec![glyph(20., 0), glyph(10., 1), glyph(0., 2)]),
++            1..3
++        ),
++        vec![(0., 20.)]
++    );
++
++    // A logical range can skip the visually intervening third RTL cluster. The
++    // result must stay discontiguous instead of using logical endpoint bounds.
++    assert_eq!(
++        spans(
++            &layout(
++                80.,
++                12,
++                vec![
++                    glyph(0., 0),
++                    glyph(10., 1),
++                    glyph(20., 2),
++                    glyph(30., 3),
++                    glyph(60., 4),
++                    glyph(50., 6),
++                    glyph(40., 8),
++                    glyph(70., 10),
++                ],
++            ),
++            1..7,
++        ),
++        vec![(10., 40.), (50., 70.)]
++    );
++
++    // A single glyph cluster (ligature, combining sequence, or ZWJ sequence)
++    // owns its complete advance. Selecting inside its byte interval keeps the
++    // cluster whole rather than producing a zero-width endpoint rectangle.
++    assert_eq!(
++        spans(&layout(20., 8, vec![glyph(0., 0)]), 3..7),
++        vec![(0., 20.)]
++    );
++
++    println!("visual range span diagnostic passed");
++}
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 75f9887bd1..9378989ec4 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1694,6 +1694,8 @@ impl PlatformTextSystem for NoopTextSystem {
+                 glyphs.push(ShapedGlyph {
+                     id: glyph,
+                     position: point(position, px(0.)),
++                    logical_x: position,
++                    logical_advance: em_width,
+                     index: ix,
+                     is_emoji: glyph.0 == 2,
+                 });
+@@ -1722,6 +1724,10 @@ impl PlatformTextSystem for NoopTextSystem {
+             ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
+             descent: font_size * (metrics.descent / metrics.units_per_em as f32),
+             runs,
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: false,
++            bidi_geometry_complete: true,
+             len: text.len(),
+         }
+     }
+diff --git a/crates/gpui/src/text_system/line.rs b/crates/gpui/src/text_system/line.rs
+index 5691782151..8c9df4cc6b 100644
+--- a/crates/gpui/src/text_system/line.rs
++++ b/crates/gpui/src/text_system/line.rs
+@@ -65,13 +65,17 @@ impl ShapedLine {
+             .is_sorted();
+         ShapedLineCursor {
+             line: self,
+-            unordered_remainder: (!byte_ordered).then(|| self.clone()),
++            // Echo's bidi geometry lives in `LineLayout::split_at`; only plain byte-ordered
++            // lines take the incremental path.
++            unordered_remainder: (!byte_ordered || self.layout.has_bidi_runs)
++                .then(|| self.clone()),
+             byte_index: 0,
+             run_index: 0,
+             glyph_index: 0,
+             decoration_index: 0,
+             decoration_offset: 0,
+             x_offset: px(0.),
++            logical_x_offset: px(0.),
+         }
+     }
+ 
+@@ -89,16 +93,38 @@ impl ShapedLine {
+         self.layout.width
+     }
+ 
++    /// Returns every visual advance span occupied by a logical UTF-8 byte range.
++    ///
++    /// Invalid or out-of-bounds offsets are safely clamped to the containing character
++    /// boundaries before the range is resolved against the platform-shaped glyph clusters.
++    pub fn visual_spans_for_range(&self, byte_range: Range<usize>) -> SmallVec<[Range<Pixels>; 4]> {
++        let mut start = byte_range.start.min(self.text.len());
++        let mut end = byte_range.end.min(self.text.len());
++        while start > 0 && !self.text.is_char_boundary(start) {
++            start -= 1;
++        }
++        while end < self.text.len() && !self.text.is_char_boundary(end) {
++            end += 1;
++        }
++        self.layout.visual_spans_for_range(start..end)
++    }
++
+     /// Override the len, useful if you're rendering text a
+     /// as text b (e.g. rendering invisibles).
+     pub fn with_len(mut self, len: usize) -> Self {
+         let layout = self.layout.as_ref();
++        // Reinterpreting byte length does not preserve a platform geometry mapping. Keep the
++        // original glyph fallback rather than exposing stale DirectWrite cells/carets.
+         self.layout = Arc::new(LineLayout {
+             font_size: layout.font_size,
+             width: layout.width,
+             ascent: layout.ascent,
+             descent: layout.descent,
+             runs: layout.runs.clone(),
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: layout.has_bidi_runs,
++            bidi_geometry_complete: !layout.has_bidi_runs,
+             len,
+         });
+         self
+@@ -183,13 +209,16 @@ impl ShapedLine {
+ 
+     /// Split this shaped line at a byte index, returning `(prefix, suffix)`.
+     ///
+-    /// - `prefix` contains glyphs for bytes `[0, byte_index)` with original positions.
+-    ///   Its width equals the x-advance up to the split point.
++    /// - `prefix` contains glyphs for bytes `[0, byte_index)`. Its width equals the logical
++    ///   advance up to the split point.
+     /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
+     ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
+     /// - Decoration runs are partitioned at the boundary; a run that straddles it is
+     ///   split into two with adjusted lengths.
+     /// - `font_size`, `ascent`, and `descent` are copied to both halves.
++    /// - Platform text geometry is deliberately not split or rebased. The pre-existing glyph
++    ///   fallback remains authoritative for split/wrapped fragments until a range-aware fragment
++    ///   geometry contract is added.
+     pub fn split_at(&self, byte_index: usize) -> (ShapedLine, ShapedLine) {
+         let (left_layout, right_layout) = self.layout.split_at(byte_index);
+ 
+@@ -272,6 +301,7 @@ pub struct ShapedLineCursor<'a> {
+     decoration_index: usize,
+     decoration_offset: u32,
+     x_offset: Pixels,
++    logical_x_offset: Pixels,
+ }
+ 
+ impl<'a> ShapedLineCursor<'a> {
+@@ -294,6 +324,7 @@ impl<'a> ShapedLineCursor<'a> {
+         );
+         let previous_index = self.byte_index;
+         let previous_x = self.x_offset;
++        let previous_logical_x = self.logical_x_offset;
+         if let Some(remainder) = &mut self.unordered_remainder {
+             let (piece, rest) = remainder.split_at(byte_index - previous_index);
+             *remainder = rest;
+@@ -303,6 +334,7 @@ impl<'a> ShapedLineCursor<'a> {
+         }
+         let mut runs = Vec::new();
+         let mut next_x = self.line.layout.width;
++        let mut next_logical_x = self.line.layout.width;
+         while let Some(run) = self.line.layout.runs.get(self.run_index) {
+             let start = self.glyph_index;
+             while let Some(glyph) = run.glyphs.get(self.glyph_index) {
+@@ -320,6 +352,8 @@ impl<'a> ShapedLineCursor<'a> {
+                         .map(|glyph| crate::ShapedGlyph {
+                             id: glyph.id,
+                             position: point(glyph.position.x - previous_x, glyph.position.y),
++                            logical_x: glyph.logical_x - previous_logical_x,
++                            logical_advance: glyph.logical_advance,
+                             index: glyph.index - previous_index,
+                             is_emoji: glyph.is_emoji,
+                         })
+@@ -328,6 +362,7 @@ impl<'a> ShapedLineCursor<'a> {
+             }
+             if let Some(glyph) = run.glyphs.get(self.glyph_index) {
+                 next_x = glyph.position.x;
++                next_logical_x = glyph.logical_x;
+                 break;
+             }
+             self.run_index += 1;
+@@ -359,6 +394,7 @@ impl<'a> ShapedLineCursor<'a> {
+         }
+         self.byte_index = byte_index;
+         self.x_offset = next_x;
++        self.logical_x_offset = next_logical_x;
+         ShapedLine {
+             layout: Arc::new(LineLayout {
+                 font_size: self.line.layout.font_size,
+@@ -366,6 +402,10 @@ impl<'a> ShapedLineCursor<'a> {
+                 ascent: self.line.layout.ascent,
+                 descent: self.line.layout.descent,
+                 runs,
++                visual_cells: Vec::new(),
++                carets: Vec::new(),
++                has_bidi_runs: false,
++                bidi_geometry_complete: true,
+                 len: byte_index - previous_index,
+             }),
+             text: SharedString::new(&self.line.text[previous_index..byte_index]),
+@@ -566,14 +606,15 @@ fn paint_line(
+             ),
+             origin.y,
+         );
+-        let mut prev_glyph_position = Point::default();
++        let mut prev_glyph_x = px(0.);
+         let mut max_glyph_size = size(px(0.), px(0.));
+         let mut first_glyph_x = origin.x;
+         for (run_ix, run) in layout.runs.iter().enumerate() {
+             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+ 
+             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+-                glyph_origin.x += glyph.position.x - prev_glyph_position.x;
++                let glyph_x = glyph.position.x;
++                glyph_origin.x += glyph_x - prev_glyph_x;
+                 if glyph_ix == 0 && run_ix == 0 {
+                     first_glyph_x = glyph_origin.x;
+                 }
+@@ -589,7 +630,7 @@ fn paint_line(
+                         paint_underline(
+                             underline_range.clone(),
+                             *underline_origin,
+-                            glyph_origin.x - underline_origin.x,
++                            nonnegative_row_width(glyph_origin.x - underline_origin.x),
+                             underline_style,
+                             window,
+                         );
+@@ -608,7 +649,7 @@ fn paint_line(
+                         };
+                         window.paint_strikethrough(
+                             *strikethrough_origin,
+-                            glyph_origin.x - strikethrough_origin.x,
++                            nonnegative_row_width(glyph_origin.x - strikethrough_origin.x),
+                             strikethrough_style,
+                         );
+                         if glyph.index < run_end {
+@@ -622,14 +663,14 @@ fn paint_line(
+                     glyph_origin.x = aligned_origin_x(
+                         origin,
+                         align_width.unwrap_or(layout.width),
+-                        glyph.position.x,
++                        glyph_x,
+                         &align,
+                         layout,
+                         wraps.peek(),
+                     );
+                     glyph_origin.y += line_height;
+                 }
+-                prev_glyph_position = glyph.position;
++                prev_glyph_x = glyph_x;
+ 
+                 let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> =
+                     None;
+@@ -704,7 +745,7 @@ fn paint_line(
+                     paint_underline(
+                         underline_range,
+                         underline_origin,
+-                        glyph_origin.x - underline_origin.x,
++                        nonnegative_row_width(glyph_origin.x - underline_origin.x),
+                         &underline_style,
+                         window,
+                     );
+@@ -718,7 +759,7 @@ fn paint_line(
+                     };
+                     window.paint_strikethrough(
+                         strikethrough_origin,
+-                        glyph_origin.x - strikethrough_origin.x,
++                        nonnegative_row_width(glyph_origin.x - strikethrough_origin.x),
+                         &strikethrough_style,
+                     );
+                 }
+@@ -767,7 +808,7 @@ fn paint_line(
+             paint_underline(
+                 underline_range,
+                 underline_start,
+-                last_line_end_x - underline_start.x,
++                nonnegative_row_width(last_line_end_x - underline_start.x),
+                 &underline_style,
+                 window,
+             );
+@@ -779,7 +820,7 @@ fn paint_line(
+             };
+             window.paint_strikethrough(
+                 strikethrough_start,
+-                last_line_end_x - strikethrough_start.x,
++                nonnegative_row_width(last_line_end_x - strikethrough_start.x),
+                 &strikethrough_style,
+             );
+         }
+@@ -824,13 +865,14 @@ fn paint_line_background(
+             ),
+             origin.y,
+         );
+-        let mut prev_glyph_position = Point::default();
++        let mut prev_glyph_x = px(0.);
+         let mut max_glyph_size = size(px(0.), px(0.));
+         for (run_ix, run) in layout.runs.iter().enumerate() {
+             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+ 
+             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+-                glyph_origin.x += glyph.position.x - prev_glyph_position.x;
++                let glyph_x = glyph.position.x;
++                glyph_origin.x += glyph_x - prev_glyph_x;
+ 
+                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
+                     wraps.next();
+@@ -842,7 +884,10 @@ fn paint_line_background(
+                         window.paint_quad(fill(
+                             Bounds {
+                                 origin: *background_origin,
+-                                size: size(glyph_origin.x - background_origin.x, line_height),
++                                size: size(
++                                    nonnegative_row_width(glyph_origin.x - background_origin.x),
++                                    line_height,
++                                ),
+                             },
+                             *background_color,
+                         ));
+@@ -857,14 +902,14 @@ fn paint_line_background(
+                     glyph_origin.x = aligned_origin_x(
+                         origin,
+                         align_width.unwrap_or(layout.width),
+-                        glyph.position.x,
++                        glyph_x,
+                         &align,
+                         layout,
+                         wraps.peek(),
+                     );
+                     glyph_origin.y += line_height;
+                 }
+-                prev_glyph_position = glyph.position;
++                prev_glyph_x = glyph_x;
+ 
+                 let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
+                 if glyph.index >= run_end {
+@@ -899,7 +944,7 @@ fn paint_line_background(
+                 }
+ 
+                 if let Some((mut background_origin, background_color)) = finished_background {
+-                    let width = glyph_origin.x - background_origin.x;
++                    let width = nonnegative_row_width(glyph_origin.x - background_origin.x);
+                     if background_origin.x == glyph_origin.x {
+                         background_origin.x -= max_glyph_size.width.half();
+                     };
+@@ -928,7 +973,10 @@ fn paint_line_background(
+             window.paint_quad(fill(
+                 Bounds {
+                     origin: background_origin,
+-                    size: size(last_line_end_x - background_origin.x, line_height),
++                    size: size(
++                        nonnegative_row_width(last_line_end_x - background_origin.x),
++                        line_height,
++                    ),
+                 },
+                 background_color,
+             ));
+@@ -1006,6 +1054,14 @@ fn aligned_origin_x(
+     }
+ }
+ 
++/// Decoration and background rectangles cannot have a negative width. Wrapped rows should be
++/// monotonic by construction; keep the assertion in debug diagnostics and fail closed in release
++/// builds if a future shaper violates that contract.
++fn nonnegative_row_width(width: Pixels) -> Pixels {
++    debug_assert!(width >= Pixels::ZERO, "paint row width must be nonnegative");
++    width.max(Pixels::ZERO)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1028,6 +1084,8 @@ mod tests {
+             .map(|&(index, x)| ShapedGlyph {
+                 id: GlyphId(0),
+                 position: point(px(x), px(0.0)),
++                logical_x: px(x),
++                logical_advance: px(10.),
+                 index,
+                 is_emoji: false,
+             })
+@@ -1043,6 +1101,10 @@ mod tests {
+                     font_id: FontId(0),
+                     glyphs: shaped_glyphs,
+                 }],
++                visual_cells: Vec::new(),
++                carets: Vec::new(),
++                has_bidi_runs: false,
++                bidi_geometry_complete: true,
+                 len: text.len(),
+             }),
+             text: SharedString::new(text),
+@@ -1492,18 +1554,24 @@ mod tests {
+                             ShapedGlyph {
+                                 id: GlyphId(0),
+                                 position: point(px(0.0), px(0.0)),
++                                logical_x: px(0.0),
++                                logical_advance: px(10.0),
+                                 index: 0,
+                                 is_emoji: false,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(0),
+                                 position: point(px(10.0), px(0.0)),
++                                logical_x: px(10.0),
++                                logical_advance: px(10.0),
+                                 index: 1,
+                                 is_emoji: false,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(0),
+                                 position: point(px(20.0), px(0.0)),
++                                logical_x: px(20.0),
++                                logical_advance: px(10.0),
+                                 index: 2,
+                                 is_emoji: false,
+                             },
+@@ -1515,24 +1583,34 @@ mod tests {
+                             ShapedGlyph {
+                                 id: GlyphId(0),
+                                 position: point(px(30.0), px(0.0)),
++                                logical_x: px(30.0),
++                                logical_advance: px(10.0),
+                                 index: 3,
+                                 is_emoji: false,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(0),
+                                 position: point(px(40.0), px(0.0)),
++                                logical_x: px(40.0),
++                                logical_advance: px(10.0),
+                                 index: 4,
+                                 is_emoji: false,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(0),
+                                 position: point(px(50.0), px(0.0)),
++                                logical_x: px(50.0),
++                                logical_advance: px(10.0),
+                                 index: 5,
+                                 is_emoji: false,
+                             },
+                         ],
+                     },
+                 ],
++                visual_cells: Vec::new(),
++                carets: Vec::new(),
++                has_bidi_runs: false,
++                bidi_geometry_complete: true,
+                 len: 6,
+             }),
+             text: "abcdef".into(),
+@@ -1697,6 +1775,8 @@ mod tests {
+         let mut width = px(0.);
+         for glyph in runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+             glyph.position.x = width;
++            glyph.logical_x = width;
++            glyph.logical_advance = advance;
+             width += advance;
+         }
+         line.layout = Arc::new(LineLayout {
+@@ -1705,6 +1785,10 @@ mod tests {
+             ascent: layout.ascent,
+             descent: layout.descent,
+             runs,
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: false,
++            bidi_geometry_complete: true,
+             len: layout.len,
+         });
+         line
+@@ -1738,18 +1822,24 @@ mod tests {
+                             ShapedGlyph {
+                                 id: GlyphId(11),
+                                 position: point(px(0.0), px(1.0)),
++                                logical_x: px(0.0),
++                                logical_advance: px(17.0),
+                                 index: 0,
+                                 is_emoji: true,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(12),
+                                 position: point(px(17.0), px(1.0)),
++                                logical_x: px(17.0),
++                                logical_advance: px(2.0),
+                                 index: 1,
+                                 is_emoji: false,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(13),
+                                 position: point(px(19.0), px(-1.0)),
++                                logical_x: px(17.0),
++                                logical_advance: px(6.0),
+                                 index: 1,
+                                 is_emoji: false,
+                             },
+@@ -1761,18 +1851,26 @@ mod tests {
+                             ShapedGlyph {
+                                 id: GlyphId(21),
+                                 position: point(px(25.0), px(1.0)),
++                                logical_x: px(25.0),
++                                logical_advance: px(16.0),
+                                 index: 5,
+                                 is_emoji: true,
+                             },
+                             ShapedGlyph {
+                                 id: GlyphId(22),
+                                 position: point(px(41.0), px(1.0)),
++                                logical_x: px(41.0),
++                                logical_advance: px(9.0),
+                                 index: 7,
+                                 is_emoji: false,
+                             },
+                         ],
+                     },
+                 ],
++                visual_cells: Vec::new(),
++                carets: Vec::new(),
++                has_bidi_runs: false,
++                bidi_geometry_complete: true,
+                 len: 10,
+             }),
+             text: "a😀bcdef".into(),
+diff --git a/crates/gpui/src/text_system/line_layout.rs b/crates/gpui/src/text_system/line_layout.rs
+index bfccb8b704..00d1ce077d 100644
+--- a/crates/gpui/src/text_system/line_layout.rs
++++ b/crates/gpui/src/text_system/line_layout.rs
+@@ -28,10 +28,56 @@ pub struct LineLayout {
+     pub descent: Pixels,
+     /// The shaped runs that make up this line
+     pub runs: Vec<ShapedRun>,
++    /// Platform-provided visual text cells. This is empty on platform text systems that do not
++    /// expose a hit-testing layout, and on derived layouts such as split fragments.
++    pub visual_cells: Vec<VisualCell>,
++    /// Platform-provided caret positions. A logical boundary can have both a leading and a
++    /// trailing caret when adjacent bidi runs meet.
++    pub carets: Vec<Caret>,
++    /// Whether the platform shaper emitted an odd-level bidi run. This survives auxiliary
++    /// geometry-query failure so legacy wrapping can refuse to reorder physical bidi ink.
++    pub has_bidi_runs: bool,
++    /// Whether every editable bidi cluster retained platform geometry. When false, callers must
++    /// not treat glyph fallback positions as exact bidi hit/caret geometry.
++    pub bidi_geometry_complete: bool,
+     /// The length of the line in utf-8 bytes
+     pub len: usize,
+ }
+ 
++/// One contiguous visual cell reported by the platform text shaper.
++///
++/// `source` is a logical UTF-8 byte interval. `visual` is normalized so `start <= end`, even for
++/// RTL cells. `bidi_level` is the platform bidi level for the source interval.
++#[derive(Clone, Debug)]
++pub struct VisualCell {
++    /// Logical UTF-8 byte interval represented by this cell.
++    pub source: Range<usize>,
++    /// Left-to-right normalized physical advance interval for this cell.
++    pub visual: Range<Pixels>,
++    /// Platform Unicode bidi embedding level for `source`.
++    pub bidi_level: u32,
++}
++
++/// Which logical side of a text boundary a caret represents.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub enum CaretAffinity {
++    /// The caret immediately before the character at the logical index.
++    Leading,
++    /// The caret immediately after the character before the logical index.
++    Trailing,
++}
++
++/// A platform-reported caret at a logical UTF-8 byte boundary.
++#[derive(Clone, Debug)]
++pub struct Caret {
++    /// Logical UTF-8 byte boundary for this caret.
++    pub index: usize,
++    /// Physical horizontal caret coordinate.
++    pub x: Pixels,
++    /// Logical side represented by this physical caret.
++    pub affinity: CaretAffinity,
++}
++
+ /// A run of text that has been shaped .
+ #[derive(Debug, Clone)]
+ pub struct ShapedRun {
+@@ -50,6 +96,15 @@ pub struct ShapedGlyph {
+     /// The position of this glyph in its containing line.
+     pub position: Point<Pixels>,
+ 
++    /// Monotonic logical advance coordinate used by legacy source-order layout operations such as
++    /// wrapping and splitting. Unlike [`Self::position`], this is never a physical RTL ink
++    /// origin and therefore remains nondecreasing in logical source order.
++    pub logical_x: Pixels,
++
++    /// Logical advance contributed by this glyph. Multi-glyph clusters share `logical_x`; their
++    /// advances are accumulated before the next distinct source cluster.
++    pub logical_advance: Pixels,
++
+     /// The index of this glyph in the original text.
+     pub index: usize,
+ 
+@@ -58,14 +113,141 @@ pub struct ShapedGlyph {
+ }
+ 
+ impl LineLayout {
++    /// Returns the visual advance spans occupied by a logical UTF-8 byte range.
++    ///
++    /// The spans are ordered from left to right and adjacent spans are coalesced. This differs
++    /// from [`Self::x_for_index`]: a logical range can occupy multiple disjoint visual regions
++    /// when it crosses bidirectional runs. The caller must pass UTF-8 character boundaries; use
++    /// [`ShapedLine::visual_spans_for_range`](super::ShapedLine::visual_spans_for_range) when the
++    /// shaped text is available and the range may need normalizing.
++    pub fn visual_spans_for_range(&self, byte_range: Range<usize>) -> SmallVec<[Range<Pixels>; 4]> {
++        if self.has_bidi_runs && !self.bidi_geometry_complete {
++            // Partial platform cells cannot be presented as an exact bidi selection.
++            return SmallVec::new();
++        }
++        let start = byte_range.start.min(self.len);
++        let end = byte_range.end.min(self.len);
++        if start >= end {
++            return SmallVec::new();
++        }
++
++        if self.has_bidi_runs {
++            let mut cells = self
++                .visual_cells
++                .iter()
++                .filter(|cell| cell.source.start < end && cell.source.end > start)
++                .map(|cell| cell.visual.clone())
++                .filter(|visual| visual.end > visual.start)
++                .collect::<Vec<_>>();
++            cells.sort_by(|left, right| {
++                left.start
++                    .as_f32()
++                    .total_cmp(&right.start.as_f32())
++                    .then_with(|| left.end.as_f32().total_cmp(&right.end.as_f32()))
++            });
++
++            let mut spans: SmallVec<[Range<Pixels>; 4]> = SmallVec::new();
++            for cell in cells {
++                if let Some(last) = spans.last_mut().filter(|last| last.end >= cell.start) {
++                    last.end = last.end.max(cell.end);
++                } else {
++                    spans.push(cell);
++                }
++            }
++            return spans;
++        }
++
++        // A glyph's index identifies the source cluster it belongs to. Its source interval lasts
++        // until the next distinct source index (or the end of the line), while its visual advance
++        // lasts until the next distinct x origin. Keeping those two orders independent is what
++        // preserves the separate rectangles of mixed LTR/RTL selections.
++        let mut glyphs: Vec<_> = self
++            .runs
++            .iter()
++            .flat_map(|run| run.glyphs.iter())
++            .filter(|glyph| glyph.index < self.len)
++            .collect();
++        if glyphs.is_empty() {
++            return SmallVec::new();
++        }
++
++        let mut source_indices: Vec<_> = glyphs.iter().map(|glyph| glyph.index).collect();
++        source_indices.sort_unstable();
++        source_indices.dedup();
++
++        glyphs.sort_by(|left, right| {
++            left.position
++                .x
++                .as_f32()
++                .total_cmp(&right.position.x.as_f32())
++        });
++        let mut spans: SmallVec<[Range<Pixels>; 4]> = SmallVec::new();
++        let mut glyph_start = 0;
++        while glyph_start < glyphs.len() {
++            let x0 = glyphs[glyph_start].position.x;
++            let mut glyph_end = glyph_start + 1;
++            let mut intersects = false;
++            while glyph_end < glyphs.len() && glyphs[glyph_end].position.x == x0 {
++                glyph_end += 1;
++            }
++
++            for glyph in &glyphs[glyph_start..glyph_end] {
++                let source_end = source_indices
++                    .get(source_indices.partition_point(|&index| index <= glyph.index))
++                    .copied()
++                    .unwrap_or(self.len);
++                if glyph.index < end && source_end > start {
++                    intersects = true;
++                    break;
++                }
++            }
++
++            let x1 = glyphs
++                .get(glyph_end)
++                .map(|glyph| glyph.position.x)
++                .unwrap_or(self.width)
++                .max(x0);
++            if intersects && x1 > x0 {
++                if let Some(last) = spans.last_mut().filter(|last| last.end >= x0) {
++                    last.end = last.end.max(x1);
++                } else {
++                    spans.push(x0..x1);
++                }
++            }
++            glyph_start = glyph_end;
++        }
++
++        spans
++    }
++
+     /// The index for the character at the given x coordinate
+     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
++        if self.has_bidi_runs && !self.bidi_geometry_complete {
++            return None;
++        }
++        if !self.visual_cells.is_empty() {
++            if x >= self.width {
++                return None;
++            }
++
++            if let Some(cell) = self.geometry_cell_at_x(x) {
++                // `index_for_x` is character-under-point, not caret placement. Even for RTL a
++                // cell has one logical source start; physical/bidi ordering only chooses among
++                // overlapping fallback/cluster cells. Boundary movement remains `closest_index_for_x`.
++                return Some(cell.source.start);
++            }
++        }
++
++        if !self.carets.is_empty() {
++            return (x < self.width).then(|| self.closest_geometry_caret(x).index);
++        }
++
+         if x >= self.width {
+             None
+         } else {
+             for run in self.runs.iter().rev() {
+                 for glyph in run.glyphs.iter().rev() {
+-                    if glyph.position.x <= x {
++                    if glyph.logical_x <= x {
+                         return Some(glyph.index);
+                     }
+                 }
+@@ -77,20 +259,39 @@ impl LineLayout {
+     /// closest_index_for_x returns the character boundary closest to the given x coordinate
+     /// (e.g. to handle aligning up/down arrow keys)
+     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
++        if self.has_bidi_runs && !self.bidi_geometry_complete {
++            // The legacy integer API cannot express an unavailable platform hit. Return its
++            // conventional end-of-line sentinel rather than silently consulting logical glyph
++            // coordinates; exact callers must use `caret_for_x` and this status field.
++            return self.len;
++        }
++        return self
++            .caret_for_x(x)
++            .map_or_else(|| self.closest_legacy_index_for_x(x), |caret| caret.index);
++    }
++
++    /// Resolves a physical coordinate to the complete logical caret identity, including its bidi
++    /// affinity. [`Self::closest_index_for_x`] remains for integer-only callers.
++    pub fn caret_for_x(&self, x: Pixels) -> Option<Caret> {
++        (self.bidi_geometry_complete && !self.carets.is_empty())
++            .then(|| self.closest_geometry_caret(x).clone())
++    }
++
++    fn closest_legacy_index_for_x(&self, x: Pixels) -> usize {
+         let mut prev_index = 0;
+         let mut prev_x = px(0.);
+ 
+         for run in self.runs.iter() {
+             for glyph in run.glyphs.iter() {
+-                if glyph.position.x >= x {
+-                    if glyph.position.x - x < x - prev_x {
++                if glyph.logical_x >= x {
++                    if glyph.logical_x - x < x - prev_x {
+                         return glyph.index;
+                     } else {
+                         return prev_index;
+                     }
+                 }
+                 prev_index = glyph.index;
+-                prev_x = glyph.position.x;
++                prev_x = glyph.logical_x;
+             }
+         }
+ 
+@@ -107,16 +308,142 @@ impl LineLayout {
+ 
+     /// The x position of the character at the given index
+     pub fn x_for_index(&self, index: usize) -> Pixels {
++        let affinity = if index.min(self.len) == self.len {
++            CaretAffinity::Trailing
++        } else {
++            CaretAffinity::Leading
++        };
++        self.x_for_index_with_affinity(index, affinity)
++    }
++
++    /// Returns the x position for an explicit logical caret side.
++    ///
++    /// Bidi boundaries can have two valid physical positions. The ordinary [`Self::x_for_index`]
++    /// policy requests [`CaretAffinity::Leading`] except for the final line boundary, which uses
++    /// [`CaretAffinity::Trailing`]. Callers that need the opposite physical side can use this
++    /// method instead.
++    pub fn x_for_index_with_affinity(&self, index: usize, affinity: CaretAffinity) -> Pixels {
++        self.x_for_index_with_affinity_checked(index, affinity)
++            // The scalar-returning legacy API has no unavailable value. Do not silently return
++            // a logical glyph coordinate for degraded bidi geometry; zero is its documented
++            // fail-closed sentinel. Exact callers must use the checked API and status field.
++            .unwrap_or(Pixels::ZERO)
++    }
++
++    /// Returns an explicit logical caret side only when its geometry is available.
++    ///
++    /// `None` means the platform shaper marked this bidi line as degraded; callers must not
++    /// substitute a logical glyph coordinate for a physical caret. The scalar-returning
++    /// [`Self::x_for_index_with_affinity`] compatibility wrapper returns `Pixels::ZERO` in that
++    /// case, so new pointer and selection code should prefer this checked API.
++    pub fn x_for_index_with_affinity_checked(
++        &self,
++        index: usize,
++        affinity: CaretAffinity,
++    ) -> Option<Pixels> {
++        if self.has_bidi_runs && !self.bidi_geometry_complete {
++            return None;
++        }
++        if !self.carets.is_empty() {
++            let index = index.min(self.len);
++            if let Some(caret) = self
++                .carets
++                .iter()
++                .find(|caret| caret.index == index && caret.affinity == affinity)
++                .or_else(|| {
++                    self.carets
++                        .iter()
++                        .find(|caret| caret.index == index && caret.affinity != affinity)
++                })
++            {
++                return Some(caret.x);
++            }
++        }
++
++        Some(self.logical_x_for_index(index))
++    }
++
++    /// Returns the monotonic source-order advance coordinate for an index.
++    ///
++    /// This intentionally ignores platform caret geometry. It exists for legacy wrapping,
++    /// splitting, and fragment rebasing, which operate on logical source order rather than a
++    /// potentially discontiguous bidi caret position.
++    pub fn logical_x_for_index(&self, index: usize) -> Pixels {
++        let index = index.min(self.len);
+         for run in &self.runs {
+             for glyph in &run.glyphs {
+                 if glyph.index >= index {
+-                    return glyph.position.x;
++                    return glyph.logical_x;
+                 }
+             }
+         }
+         self.width
+     }
+ 
++    /// The geometry hit-test policy is nearest physical caret. Exact ties first follow the
++    /// containing cell's directional half, then choose the leading side and lower logical index.
++    /// This keeps repeated pointer input deterministic while retaining both bidi-boundary sides.
++    fn closest_geometry_caret(&self, x: Pixels) -> &Caret {
++        let directional_target = self.geometry_cell_at_x(x).map(|cell| {
++            let left_half = x <= (cell.visual.start + cell.visual.end) / 2.;
++            if cell.bidi_level & 1 == 0 {
++                if left_half {
++                    (cell.source.start, CaretAffinity::Leading)
++                } else {
++                    (cell.source.end, CaretAffinity::Trailing)
++                }
++            } else if left_half {
++                (cell.source.end, CaretAffinity::Trailing)
++            } else {
++                (cell.source.start, CaretAffinity::Leading)
++            }
++        });
++        self.carets
++            .iter()
++            .min_by(|left, right| {
++                let left_distance = (left.x - x).abs().as_f32();
++                let right_distance = (right.x - x).abs().as_f32();
++                left_distance
++                    .total_cmp(&right_distance)
++                    .then_with(|| {
++                        directional_target
++                            .map(|target| usize::from((left.index, left.affinity) != target))
++                            .cmp(
++                                &directional_target.map(|target| {
++                                    usize::from((right.index, right.affinity) != target)
++                                }),
++                            )
++                    })
++                    .then_with(|| left.affinity.cmp(&right.affinity))
++                    .then_with(|| left.index.cmp(&right.index))
++            })
++            .expect("non-empty caret geometry was checked by the caller")
++    }
++
++    fn geometry_cell_at_x(&self, x: Pixels) -> Option<&VisualCell> {
++        // Half-open cells make an exact shared edge belong to the cell starting at that x. That
++        // is the deterministic directional policy used when two logical bidi carets occupy one
++        // physical coordinate; callers preserving a particular logical side use explicit affinity.
++        self.visual_cells
++            .iter()
++            .filter(|cell| {
++                cell.visual.end > cell.visual.start && x >= cell.visual.start && x < cell.visual.end
++            })
++            .min_by(|left, right| {
++                (left.visual.end - left.visual.start)
++                    .as_f32()
++                    .total_cmp(&(right.visual.end - right.visual.start).as_f32())
++                    .then_with(|| {
++                        left.visual
++                            .start
++                            .as_f32()
++                            .total_cmp(&right.visual.start.as_f32())
++                    })
++                    .then_with(|| left.bidi_level.cmp(&right.bidi_level))
++                    .then_with(|| left.source.start.cmp(&right.source.start))
++            })
++    }
++
+     /// The corresponding Font at the given index
+     pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
+         for run in &self.runs {
+@@ -137,9 +464,8 @@ impl LineLayout {
+     ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
+     /// - `font_size`, `ascent`, and `descent` are copied to both halves.
+     pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
+-        let x_offset = self.x_for_index(byte_index);
++        let logical_x_offset = self.logical_x_for_index(byte_index);
+ 
+-        // Partition glyph runs. A single run may contribute glyphs to both halves.
+         let mut left_runs = Vec::new();
+         let mut right_runs = Vec::new();
+ 
+@@ -158,7 +484,9 @@ impl LineLayout {
+                     .iter()
+                     .map(|g| ShapedGlyph {
+                         id: g.id,
+-                        position: point(g.position.x - x_offset, g.position.y),
++                        position: g.position,
++                        logical_x: g.logical_x - logical_x_offset,
++                        logical_advance: g.logical_advance,
+                         index: g.index - byte_index,
+                         is_emoji: g.is_emoji,
+                     })
+@@ -170,21 +498,35 @@ impl LineLayout {
+             }
+         }
+ 
++        let left_width = normalize_fragment_physical_origins(&mut left_runs, logical_x_offset);
++        let right_width = normalize_fragment_physical_origins(
++            &mut right_runs,
++            (self.width - logical_x_offset).max(Pixels::ZERO),
++        );
++
+         let left = LineLayout {
+             font_size: self.font_size,
+-            width: x_offset,
++            width: left_width,
+             ascent: self.ascent,
+             descent: self.descent,
+             runs: left_runs,
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: self.has_bidi_runs,
++            bidi_geometry_complete: !self.has_bidi_runs,
+             len: byte_index,
+         };
+ 
+         let right = LineLayout {
+             font_size: self.font_size,
+-            width: self.width - x_offset,
++            width: right_width,
+             ascent: self.ascent,
+             descent: self.descent,
+             runs: right_runs,
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: self.has_bidi_runs,
++            bidi_geometry_complete: !self.has_bidi_runs,
+             len: self.len - byte_index,
+         };
+ 
+@@ -198,6 +540,13 @@ impl LineLayout {
+         max_lines: Option<usize>,
+         scratch: &mut WrapScratch,
+     ) -> SmallVec<[WrapBoundary; 1]> {
++        // GPUI wraps pre-shaped glyphs rather than reshaping each visual row. Explicit platform
++        // cells mean the source contains bidi runs, whose physical ink positions are not a
++        // monotonic row coordinate. Refuse to create a misleading wrapped row until a
++        // row-aware bidi reshaping contract exists; the unwrapped physical layout remains exact.
++        if self.has_bidi_runs {
++            return SmallVec::new();
++        }
+         let mut boundaries = SmallVec::new();
+         let mut current_segment: Option<Range<usize>> = None;
+         let mut last_candidate_ix = None;
+@@ -231,7 +580,7 @@ impl LineLayout {
+                     (
+                         WrapBoundary { run_ix, glyph_ix },
+                         glyph.index,
+-                        glyph.position.x,
++                        glyph.logical_x,
+                     )
+                 })
+             })
+@@ -292,6 +641,56 @@ impl LineLayout {
+     }
+ }
+ 
++/// Preserve physical glyph ordering when it fits the logical fragment width;
++/// otherwise fail closed to monotonic logical positions without claiming a
++/// fresh bidi resolution for a derived fragment.
++fn normalize_fragment_physical_origins(runs: &mut [ShapedRun], logical_width: Pixels) -> Pixels {
++    if runs.iter().flat_map(|run| run.glyphs.iter()).any(|glyph| {
++        !glyph.position.x.as_f32().is_finite()
++            || !glyph.logical_x.as_f32().is_finite()
++            || !glyph.logical_advance.as_f32().is_finite()
++    }) {
++        let mut extent = logical_width.max(Pixels::ZERO);
++        for glyph in runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
++            glyph.logical_x = glyph.logical_x.max(Pixels::ZERO);
++            glyph.logical_advance = glyph.logical_advance.max(Pixels::ZERO);
++            glyph.position.x = glyph.logical_x.max(Pixels::ZERO);
++            extent = extent.max(glyph.position.x + glyph.logical_advance);
++        }
++        return extent;
++    }
++
++    let Some(min_x) = runs
++        .iter()
++        .flat_map(|run| run.glyphs.iter())
++        .map(|glyph| glyph.position.x)
++        .min_by(|left, right| left.as_f32().total_cmp(&right.as_f32()))
++    else {
++        return logical_width;
++    };
++    for glyph in runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
++        glyph.position.x -= min_x;
++    }
++
++    let physical_extent = runs
++        .iter()
++        .flat_map(|run| run.glyphs.iter())
++        .map(|glyph| glyph.position.x + glyph.logical_advance)
++        .max_by(|left, right| left.as_f32().total_cmp(&right.as_f32()))
++        .unwrap_or(Pixels::ZERO);
++    if !physical_extent.as_f32().is_finite() {
++        let mut extent = logical_width.max(Pixels::ZERO);
++        for glyph in runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
++            glyph.logical_x = glyph.logical_x.max(Pixels::ZERO);
++            glyph.logical_advance = glyph.logical_advance.max(Pixels::ZERO);
++            glyph.position.x = glyph.logical_x.max(Pixels::ZERO);
++            extent = extent.max(glyph.position.x + glyph.logical_advance);
++        }
++        return extent;
++    }
++    physical_extent.max(logical_width)
++}
++
+ /// A line of text that has been wrapped to fit a given width
+ #[derive(Default, Debug)]
+ pub struct WrappedLineLayout {
+@@ -323,6 +722,11 @@ impl WrappedLineLayout {
+ 
+     /// The width of this line, in pixels, whether or not it was wrapped.
+     pub fn width(&self) -> Pixels {
++        if self.unwrapped_layout.has_bidi_runs {
++            // Bidi wrapping is refused until each row is reshaped. Reporting the requested wrap
++            // width here would clip or understate the still-unwrapped physical ink extent.
++            return self.unwrapped_layout.width;
++        }
+         self.wrap_width
+             .unwrap_or(Pixels::MAX)
+             .min(self.unwrapped_layout.width)
+@@ -403,7 +807,7 @@ impl WrappedLineLayout {
+             let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
+             let glyph = &run.glyphs[line_start_boundary.glyph_ix];
+             wrapped_line_start_index = glyph.index;
+-            wrapped_line_start_x = glyph.position.x;
++            wrapped_line_start_x = glyph.logical_x;
+         } else {
+             wrapped_line_start_index = 0;
+             wrapped_line_start_x = Pixels::ZERO;
+@@ -417,7 +821,7 @@ impl WrappedLineLayout {
+             let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_ix];
+             let glyph = &run.glyphs[next_wrap_boundary.glyph_ix];
+             wrapped_line_end_index = glyph.index;
+-            wrapped_line_end_x = glyph.position.x;
++            wrapped_line_end_x = glyph.logical_x;
+         } else {
+             wrapped_line_end_index = self.unwrapped_layout.len;
+             wrapped_line_end_x = self.unwrapped_layout.width;
+@@ -465,8 +869,8 @@ impl WrappedLineLayout {
+                 line_start_ix = line_end_ix;
+                 continue;
+             } else {
+-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
+-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
++                let line_start_x = self.unwrapped_layout.logical_x_for_index(line_start_ix);
++                let x = self.unwrapped_layout.logical_x_for_index(index) - line_start_x;
+                 return Some(point(x, line_y));
+             }
+         }
+@@ -633,7 +1037,8 @@ impl LineLayoutCache {
+         } else {
+             drop(state);
+             let text = SharedString::from(text);
+-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
++            let mut unwrapped_layout =
++                self.layout_line::<&SharedString>(&text, font_size, runs, None);
+             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
+                 unwrapped_layout.compute_wrap_boundaries(
+                     text.as_ref(),
+@@ -644,6 +1049,25 @@ impl LineLayoutCache {
+             } else {
+                 SmallVec::new()
+             };
++            if !wrap_boundaries.is_empty() && !unwrapped_layout.visual_cells.is_empty() {
++                // DirectWrite geometry is line-global. Existing wrapping derives rows by glyph
++                // boundaries and rebases their x positions, so retaining original cells/carets
++                // would make row hit testing stale. Preserve the pre-existing glyph fallback for
++                // wrapped fragments until range-aware fragment geometry is introduced.
++                let line = unwrapped_layout.as_ref();
++                unwrapped_layout = Arc::new(LineLayout {
++                    font_size: line.font_size,
++                    width: line.width,
++                    ascent: line.ascent,
++                    descent: line.descent,
++                    runs: line.runs.clone(),
++                    visual_cells: Vec::new(),
++                    carets: Vec::new(),
++                    has_bidi_runs: line.has_bidi_runs,
++                    bidi_geometry_complete: line.bidi_geometry_complete,
++                    len: line.len,
++                });
++            }
+             let layout = Arc::new(WrappedLineLayout {
+                 unwrapped_layout,
+                 wrap_boundaries,
+@@ -751,6 +1175,11 @@ impl LineLayoutCache {
+ // otherwise they get displaced into the next cell. We detect them by checking
+ // whether shaped x has advanced by at least half a cell beyond the last base.
+ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
++    // Forced-width layout mutates glyph positions without a corresponding platform hit-test
++    // layout. Dropping geometry prevents stale DirectWrite cells/carets from disagreeing with
++    // paint; this derived layout intentionally follows the established glyph fallback.
++    layout.visual_cells.clear();
++    layout.carets.clear();
+     let mut glyph_pos: usize = 0;
+     // NEG_INFINITY ensures the first glyph is always classified as a base.
+     let mut last_base_shaped_x = px(f32::NEG_INFINITY);
+@@ -771,6 +1200,10 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+             } else {
+                 glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
+             }
++            // The glyph fallback, wrapping, and split paths now read this monotonic coordinate
++            // rather than physical platform carets. Forced width is itself a derived layout, so
++            // keep that compatibility coordinate synchronized with the mutated glyph position.
++            glyph.logical_x = glyph.position.x;
+         }
+     }
+ }
+@@ -864,6 +1297,8 @@ mod tests {
+         ShapedGlyph {
+             id: GlyphId(0),
+             position: point(px(x), px(0.)),
++            logical_x: px(x),
++            logical_advance: px(0.),
+             index,
+             is_emoji: false,
+         }
+@@ -879,6 +1314,10 @@ mod tests {
+                 font_id: FontId(0),
+                 glyphs,
+             }],
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: false,
++            bidi_geometry_complete: true,
+             len: 0,
+         }
+     }
+diff --git a/crates/gpui_apple/src/text_system.rs b/crates/gpui_apple/src/text_system.rs
+index 74cd7cc7ce..00af442937 100644
+--- a/crates/gpui_apple/src/text_system.rs
++++ b/crates/gpui_apple/src/text_system.rs
+@@ -626,6 +626,8 @@ impl AppleTextSystemState {
+                 glyphs.push(ShapedGlyph {
+                     id: GlyphId(glyph_id as u32),
+                     position: point(position.x as f32, position.y as f32).map(px),
++                    logical_x: px(position.x as f32),
++                    logical_advance: Pixels::ZERO,
+                     index: ix_converter.utf8_ix,
+                     is_emoji: self.is_emoji(font_id),
+                 });
+@@ -639,6 +641,12 @@ impl AppleTextSystemState {
+             ascent: max_ascent.into(),
+             descent: max_descent.into(),
+             len: text.len(),
++            // CoreText's glyph positions remain the legacy fallback until its run-index and
++            // caret geometry are promoted to the same contract as DirectWrite.
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: false,
++            bidi_geometry_complete: true,
+         }
+     }
+ }
+diff --git a/crates/gpui_wgpu/src/cosmic_text_system.rs b/crates/gpui_wgpu/src/cosmic_text_system.rs
+index 775067518c..528453be33 100644
+--- a/crates/gpui_wgpu/src/cosmic_text_system.rs
++++ b/crates/gpui_wgpu/src/cosmic_text_system.rs
+@@ -772,6 +772,10 @@ impl CosmicTextSystemState {
+                 ascent: Pixels::ZERO,
+                 descent: Pixels::ZERO,
+                 runs: Vec::new(),
++                visual_cells: Vec::new(),
++                carets: Vec::new(),
++                has_bidi_runs: false,
++                bidi_geometry_complete: true,
+                 len: text.len(),
+             };
+         };
+@@ -817,6 +821,8 @@ impl CosmicTextSystemState {
+             let shaped_glyph = ShapedGlyph {
+                 id: GlyphId(glyph.glyph_id as u32),
+                 position: point(glyph.x.into(), glyph.y.into()),
++                logical_x: glyph.x.into(),
++                logical_advance: glyph.w.into(),
+                 index: glyph.start,
+                 is_emoji,
+             };
+@@ -844,6 +850,12 @@ impl CosmicTextSystemState {
+             ascent: layout.max_ascent.into(),
+             descent: layout.max_descent.into(),
+             runs,
++            // The cross-platform glyph cache does not yet expose a stable hit-test geometry
++            // contract. Preserve the established glyph fallback outside DirectWrite.
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: false,
++            bidi_geometry_complete: true,
+             len: text.len(),
+         }
+     }
+diff --git a/crates/gpui_windows/Cargo.toml b/crates/gpui_windows/Cargo.toml
+index 37e4a2f7f2..417bdbc100 100644
+--- a/crates/gpui_windows/Cargo.toml
++++ b/crates/gpui_windows/Cargo.toml
+@@ -37,6 +37,7 @@ rand.workspace = true
+ raw-window-handle.workspace = true
+ scheduler.workspace = true
+ smallvec.workspace = true
++unicode-segmentation.workspace = true
+ uuid = { workspace = true, features = ["v5"] }
+ windows = { workspace = true, features = [
+     "Data_Xml_Dom",
+diff --git a/crates/gpui_windows/src/direct_write.rs b/crates/gpui_windows/src/direct_write.rs
+index 82ff963c1d..ae8fb76523 100644
+--- a/crates/gpui_windows/src/direct_write.rs
++++ b/crates/gpui_windows/src/direct_write.rs
+@@ -1,7 +1,9 @@
+ use std::{
+     borrow::Cow,
++    collections::{BTreeMap, BTreeSet},
+     ffi::{c_uint, c_void},
+     mem::ManuallyDrop,
++    sync::atomic::{AtomicBool, Ordering},
+ };
+ 
+ use anyhow::{Context, Result};
+@@ -9,6 +11,7 @@ use collections::HashMap;
+ use gpui_util::{ResultExt, maybe};
+ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+ use smallvec::SmallVec;
++use unicode_segmentation::UnicodeSegmentation;
+ use windows::{
+     Win32::{
+         Foundation::*,
+@@ -573,13 +576,15 @@ impl DirectWriteState {
+             }
+ 
+             let mut runs = Vec::new();
++            let utf16_index_map = Utf16IndexMap::new(text);
+             let mut renderer_context = RendererContext {
+                 text_system: self,
+                 components,
+-                index_converter: StringIndexConverter::new(text),
++                utf16_index_map: &utf16_index_map,
+                 runs: &mut runs,
+                 layout: &text_layout,
+-                width: 0.0,
++                has_bidi_runs: false,
++                editable_utf16_boundaries: BTreeSet::from([0, utf16_index_map.utf16_len()]),
+             };
+             text_layout.Draw(
+                 Some((&raw mut renderer_context).cast::<c_void>().cast_const()),
+@@ -587,14 +592,41 @@ impl DirectWriteState {
+                 0.0,
+                 0.0,
+             )?;
+-            let width = px(renderer_context.width);
++            let has_bidi_runs = renderer_context.has_bidi_runs;
++            let editable_utf16_boundaries =
++                std::mem::take(&mut renderer_context.editable_utf16_boundaries);
++            drop(renderer_context);
++            normalize_logical_advances(&mut runs);
++            // DirectWrite has already told us whether a shaped run is bidi. Keep ordinary LTR
++            // chat on GPUI's established glyph fallback instead of adding O(scalars) COM
++            // hit-test calls to every line; only mixed/RTL layouts need explicit visual cells
++            // and dual-sided carets.
++            let geometry = if has_bidi_runs {
++                text_geometry_from_layout(
++                    &text_layout,
++                    text,
++                    &utf16_index_map,
++                    &editable_utf16_boundaries,
++                    GeometryFaultInjection::for_diagnostic(),
++                )
++            } else {
++                TextGeometry::default()
++            };
++            let mut text_metrics = DWRITE_TEXT_METRICS::default();
++            text_layout.GetMetrics(&mut text_metrics)?;
+ 
+             Ok(LineLayout {
+                 font_size,
+-                width,
++                // The layout API owns the advance width, including trailing whitespace. Glyph
++                // pen positions are intentionally not used to reconstruct width or selection.
++                width: px(text_metrics.widthIncludingTrailingWhitespace),
+                 ascent,
+                 descent,
+                 runs,
++                visual_cells: geometry.cells,
++                carets: geometry.carets,
++                has_bidi_runs,
++                bidi_geometry_complete: !has_bidi_runs || geometry.complete,
+                 len: text.len(),
+             })
+         }
+@@ -1165,91 +1197,390 @@ fn apply_alpha_correction(alpha: f32, brightness: f32, gamma_ratios: [f32; 4]) -
+     alpha + alpha * (1.0 - alpha) * correction
+ }
+ 
+-struct TextRendererWrapper(IDWriteTextRenderer);
+-
+-impl TextRendererWrapper {
+-    fn new(locale_str: HSTRING) -> Self {
+-        let inner = TextRenderer::new(locale_str);
+-        TextRendererWrapper(inner.into())
+-    }
++/// DirectWrite's hit-test APIs retain the visual text geometry that is not recoverable from
++/// logical glyph runs alone. `HitTestTextRange` returns discontiguous bidi cells for selection;
++/// `HitTestTextPosition` records both logical sides of each editable cluster boundary for caret
++/// placement. Geometry is deliberately cluster- and grapheme-granular: no reverse hit may expose
++/// an internal ligature, combining-mark, ZWJ, or variation-selector offset.
++#[derive(Default)]
++struct TextGeometry {
++    cells: Vec<VisualCell>,
++    carets: Vec<Caret>,
++    complete: bool,
+ }
+ 
+-#[implement(IDWriteTextRenderer)]
+-struct TextRenderer {
+-    locale: HSTRING,
++const E_NOT_SUFFICIENT_BUFFER_HRESULT: HRESULT = HRESULT(0x8007_007Au32 as i32);
++
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum GeometryFaultInjection {
++    None,
++    RangeOnly,
++    CaretOnly,
++    RangeAndLeadingCaret,
++    Both,
+ }
+ 
+-impl TextRenderer {
+-    fn new(locale: HSTRING) -> Self {
+-        TextRenderer { locale }
++impl GeometryFaultInjection {
++    /// This seam is intentionally debug-only and is used by the non-test
++    /// `platform_text_geometry` example. Release builds cannot have geometry queries changed by
++    /// the environment.
++    #[cfg(debug_assertions)]
++    fn for_diagnostic() -> Self {
++        match std::env::var("GPUI_DIRECTWRITE_TEXT_GEOMETRY_FAULT").as_deref() {
++            Ok("range") => Self::RangeOnly,
++            Ok("caret") => Self::CaretOnly,
++            Ok("range-leading-caret") => Self::RangeAndLeadingCaret,
++            Ok("both") => Self::Both,
++            _ => Self::None,
++        }
++    }
++
++    #[cfg(not(debug_assertions))]
++    fn for_diagnostic() -> Self {
++        Self::None
++    }
++
++    fn fails_range(self) -> bool {
++        matches!(
++            self,
++            Self::RangeOnly | Self::RangeAndLeadingCaret | Self::Both
++        )
++    }
++
++    fn fails_caret(self, trailing: bool) -> bool {
++        matches!(self, Self::CaretOnly | Self::Both)
++            || matches!(self, Self::RangeAndLeadingCaret) && !trailing
+     }
+ }
+ 
+-struct RendererContext<'t, 'a, 'b> {
+-    text_system: &'t mut DirectWriteState,
+-    components: &'a DirectWriteComponents,
+-    index_converter: StringIndexConverter<'a>,
+-    runs: &'b mut Vec<ShapedRun>,
+-    layout: &'b IDWriteTextLayout,
+-    width: f32,
++#[derive(Clone, Debug)]
++struct EditableCluster {
++    source: std::ops::Range<usize>,
++    utf16: std::ops::Range<u32>,
+ }
+ 
+-#[derive(Debug)]
+-struct ClusterAnalyzer<'t> {
+-    utf16_idx: usize,
+-    glyph_idx: usize,
+-    glyph_count: usize,
+-    cluster_map: &'t [u16],
++#[derive(Clone, Debug)]
++struct CaretHit {
++    caret: Caret,
++    bidi_level: u32,
+ }
+ 
+-impl<'t> ClusterAnalyzer<'t> {
+-    fn new(cluster_map: &'t [u16], glyph_count: usize) -> Self {
+-        ClusterAnalyzer {
+-            utf16_idx: 0,
+-            glyph_idx: 0,
+-            glyph_count,
+-            cluster_map,
++fn text_geometry_from_layout(
++    text_layout: &IDWriteTextLayout,
++    text: &str,
++    utf16_index_map: &Utf16IndexMap,
++    directwrite_cluster_boundaries: &BTreeSet<u32>,
++    fault: GeometryFaultInjection,
++) -> TextGeometry {
++    let clusters = editable_clusters(text, utf16_index_map, directwrite_cluster_boundaries);
++    let mut cells = Vec::new();
++    let mut carets = Vec::with_capacity(clusters.len() * 2);
++    let mut complete = !clusters.is_empty();
++
++    for cluster in clusters {
++        let range_result = if fault.fails_range() {
++            Err(Error::new(E_FAIL, "diagnostic range hit-test failure"))
++        } else {
++            hit_test_text_range(
++                text_layout,
++                cluster.utf16.start,
++                cluster.utf16.end - cluster.utf16.start,
++            )
++        };
++        let mut cluster_cells = range_result
++            .as_ref()
++            .ok()
++            .map(|metrics| cells_from_metrics(metrics, &cluster))
++            .unwrap_or_default();
++
++        let leading_result =
++            hit_cluster_caret(text_layout, &cluster, false, CaretAffinity::Leading, fault);
++        let trailing_result =
++            hit_cluster_caret(text_layout, &cluster, true, CaretAffinity::Trailing, fault);
++        let mut leading = leading_result.ok();
++        let mut trailing = trailing_result.ok();
++
++        if cluster_cells.is_empty() {
++            if let (Some(leading_hit), Some(trailing_hit)) = (&leading, &trailing) {
++                cluster_cells.push(cell_from_caret_endpoints(
++                    &cluster,
++                    leading_hit,
++                    trailing_hit,
++                ));
++            }
+         }
++
++        if leading.is_none() || trailing.is_none() {
++            if let Some((synthesized_leading, synthesized_trailing, bidi_level)) =
++                caret_pair_from_cells(&cluster_cells)
++            {
++                leading.get_or_insert(CaretHit {
++                    caret: Caret {
++                        index: cluster.source.start,
++                        x: synthesized_leading,
++                        affinity: CaretAffinity::Leading,
++                    },
++                    bidi_level,
++                });
++                trailing.get_or_insert(CaretHit {
++                    caret: Caret {
++                        index: cluster.source.end,
++                        x: synthesized_trailing,
++                        affinity: CaretAffinity::Trailing,
++                    },
++                    bidi_level,
++                });
++            }
++        }
++
++        match (leading, trailing) {
++            (Some(leading), Some(trailing)) => {
++                cells.extend(cluster_cells);
++                carets.push(leading.caret);
++                carets.push(trailing.caret);
++            }
++            _ if !cluster_cells.is_empty() => {
++                // Selection remains exact even if a malformed mixed-parity cluster prevents a
++                // safe affinity synthesis. Do not discard a successful range query, but surface
++                // that the line cannot provide complete reverse-hit/caret geometry.
++                cells.extend(cluster_cells);
++                complete = false;
++            }
++            _ => {
++                // A range failure plus only one endpoint is insufficient to recover either an
++                // exact selection extent or a second caret side. Keep neither fabricated zero
++                // width cells nor a synthetic opposite caret, and fail this bidi line closed.
++                static GEOMETRY_DEGRADATION_LOGGED: AtomicBool = AtomicBool::new(false);
++                if !GEOMETRY_DEGRADATION_LOGGED.swap(true, Ordering::Relaxed) {
++                    log::warn!(
++                        "DirectWrite bidi geometry degraded after a cluster lost its exact range/caret geometry; retaining glyph layout"
++                    );
++                }
++                complete = false;
++            }
++        }
++    }
++    carets.sort_by(|left, right| {
++        left.index
++            .cmp(&right.index)
++            .then_with(|| left.affinity.cmp(&right.affinity))
++            .then_with(|| left.x.as_f32().total_cmp(&right.x.as_f32()))
++    });
++    carets.dedup_by(|left, right| {
++        left.index == right.index
++            && left.affinity == right.affinity
++            && left.x.as_f32().to_bits() == right.x.as_f32().to_bits()
++    });
++
++    TextGeometry {
++        cells,
++        carets,
++        complete,
+     }
+ }
+ 
+-impl Iterator for ClusterAnalyzer<'_> {
+-    type Item = (usize, usize);
++fn editable_clusters(
++    text: &str,
++    utf16_index_map: &Utf16IndexMap,
++    directwrite_cluster_boundaries: &BTreeSet<u32>,
++) -> Vec<EditableCluster> {
++    // DirectWrite's cluster map is the same shaper-owned source used to emit glyph runs. Its
++    // transition boundaries are the only editable boundaries we expose. Intersect them with
++    // Unicode extended-grapheme boundaries before creating ranges: fallback-font runs may split
++    // a DirectWrite cluster inside a grapheme, while a ligature may span several graphemes. This
++    // conservatively groups either case instead of exposing an internal editing boundary.
++    let grapheme_boundaries = text
++        .grapheme_indices(true)
++        .map(|(offset, _)| offset)
++        .chain([text.len()])
++        .collect::<BTreeSet<_>>();
++    let boundaries = directwrite_cluster_boundaries
++        .iter()
++        .copied()
++        .filter_map(|utf16_offset| {
++            utf16_index_map
++                .utf8_boundary_at(utf16_offset as usize)
++                .filter(|utf8_offset| grapheme_boundaries.contains(utf8_offset))
++                .map(|utf8_offset| (utf16_offset, utf8_offset))
++        })
++        .collect::<Vec<_>>();
++    boundaries
++        .windows(2)
++        .filter_map(|window| {
++            let (start, source_start) = window[0];
++            let (end, source_end) = window[1];
++            (source_start < source_end).then_some(EditableCluster {
++                source: source_start..source_end,
++                utf16: start..end,
++            })
++        })
++        .collect()
++}
++
++fn cells_from_metrics(
++    metrics: &[DWRITE_HIT_TEST_METRICS],
++    cluster: &EditableCluster,
++) -> Vec<VisualCell> {
++    metrics
++        .iter()
++        .map(|metrics| {
++            let left = px(metrics.left);
++            let right = px(metrics.left + metrics.width);
++            VisualCell {
++                source: cluster.source.clone(),
++                visual: left.min(right)..left.max(right),
++                bidi_level: metrics.bidiLevel,
++            }
++        })
++        .collect()
++}
+ 
+-    fn next(&mut self) -> Option<(usize, usize)> {
+-        if self.utf16_idx >= self.cluster_map.len() {
+-            return None; // No more clusters
++fn cell_from_caret_endpoints(
++    cluster: &EditableCluster,
++    leading: &CaretHit,
++    trailing: &CaretHit,
++) -> VisualCell {
++    VisualCell {
++        source: cluster.source.clone(),
++        visual: leading.caret.x.min(trailing.caret.x)..leading.caret.x.max(trailing.caret.x),
++        bidi_level: leading.bidi_level,
++    }
++}
++
++fn caret_pair_from_cells(cells: &[VisualCell]) -> Option<(Pixels, Pixels, u32)> {
++    let first = cells.first()?;
++    let bidi_parity = first.bidi_level & 1;
++    if cells.iter().any(|cell| cell.bidi_level & 1 != bidi_parity) {
++        static MIXED_PARITY_RECOVERY_LOGGED: AtomicBool = AtomicBool::new(false);
++        if !MIXED_PARITY_RECOVERY_LOGGED.swap(true, Ordering::Relaxed) {
++            log::warn!(
++                "DirectWrite bidi geometry retained selection cells but could not synthesize caret affinities for a mixed-parity cluster"
++            );
+         }
+-        let start_utf16_idx = self.utf16_idx;
+-        let current_glyph = self.cluster_map[start_utf16_idx] as usize;
++        return None;
++    }
++    let visual_start = cells
++        .iter()
++        .map(|cell| cell.visual.start)
++        .min_by(|left, right| left.as_f32().total_cmp(&right.as_f32()))?;
++    let visual_end = cells
++        .iter()
++        .map(|cell| cell.visual.end)
++        .max_by(|left, right| left.as_f32().total_cmp(&right.as_f32()))?;
++    if bidi_parity == 0 {
++        Some((visual_start, visual_end, first.bidi_level))
++    } else {
++        Some((visual_end, visual_start, first.bidi_level))
++    }
++}
+ 
+-        // Find the end of current cluster (where glyph index changes)
+-        let mut end_utf16_idx = start_utf16_idx + 1;
+-        while end_utf16_idx < self.cluster_map.len()
+-            && self.cluster_map[end_utf16_idx] as usize == current_glyph
+-        {
+-            end_utf16_idx += 1;
++fn hit_test_text_range(
++    text_layout: &IDWriteTextLayout,
++    utf16_start: u32,
++    utf16_len: u32,
++) -> windows::core::Result<Vec<DWRITE_HIT_TEST_METRICS>> {
++    let mut required = 0u32;
++    match unsafe {
++        text_layout.HitTestTextRange(utf16_start, utf16_len, 0., 0., None, &mut required)
++    } {
++        Ok(()) => return Ok(Vec::new()),
++        Err(error) if error.code() == E_NOT_SUFFICIENT_BUFFER_HRESULT && required > 0 => {}
++        Err(error) => return Err(error),
++    }
++
++    let mut metrics = vec![DWRITE_HIT_TEST_METRICS::default(); required as usize];
++    loop {
++        let mut actual = 0u32;
++        match unsafe {
++            text_layout.HitTestTextRange(
++                utf16_start,
++                utf16_len,
++                0.,
++                0.,
++                Some(&mut metrics),
++                &mut actual,
++            )
++        } {
++            Ok(()) => {
++                metrics.truncate(actual as usize);
++                return Ok(metrics);
++            }
++            Err(error)
++                if error.code() == E_NOT_SUFFICIENT_BUFFER_HRESULT
++                    && actual as usize > metrics.len() =>
++            {
++                metrics.resize(actual as usize, DWRITE_HIT_TEST_METRICS::default());
++            }
++            Err(error) => return Err(error),
+         }
++    }
++}
+ 
+-        let utf16_len = end_utf16_idx - start_utf16_idx;
++fn hit_cluster_caret(
++    text_layout: &IDWriteTextLayout,
++    cluster: &EditableCluster,
++    trailing: bool,
++    affinity: CaretAffinity,
++    fault: GeometryFaultInjection,
++) -> windows::core::Result<CaretHit> {
++    if fault.fails_caret(trailing) {
++        return Err(Error::new(E_FAIL, "diagnostic caret hit-test failure"));
++    }
++    let mut x = 0.;
++    let mut y = 0.;
++    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
++    // DirectWrite's `isTrailingHit` selects the far side of the text position supplied here.
++    // Both affinities therefore originate at the editable cluster start; passing `end` with a
++    // trailing hit would skip into the following cluster.
++    let utf16_position = cluster.utf16.start;
++    unsafe {
++        text_layout.HitTestTextPosition(utf16_position, trailing, &mut x, &mut y, &mut metrics)?;
++    }
++    Ok(CaretHit {
++        caret: Caret {
++            index: if trailing {
++                cluster.source.end
++            } else {
++                cluster.source.start
++            },
++            x: px(x),
++            affinity,
++        },
++        bidi_level: metrics.bidiLevel,
++    })
++}
+ 
+-        // Calculate glyph count for this cluster
+-        let next_glyph = if end_utf16_idx < self.cluster_map.len() {
+-            self.cluster_map[end_utf16_idx] as usize
+-        } else {
+-            self.glyph_count
+-        };
++struct TextRendererWrapper(IDWriteTextRenderer);
+ 
+-        let glyph_count = next_glyph - current_glyph;
++impl TextRendererWrapper {
++    fn new(locale_str: HSTRING) -> Self {
++        let inner = TextRenderer::new(locale_str);
++        TextRendererWrapper(inner.into())
++    }
++}
+ 
+-        // Update state for next call
+-        self.utf16_idx = end_utf16_idx;
+-        self.glyph_idx = next_glyph;
++#[implement(IDWriteTextRenderer)]
++struct TextRenderer {
++    locale: HSTRING,
++}
+ 
+-        Some((utf16_len, glyph_count))
++impl TextRenderer {
++    fn new(locale: HSTRING) -> Self {
++        TextRenderer { locale }
+     }
+ }
+ 
++struct RendererContext<'t, 'a, 'b> {
++    text_system: &'t mut DirectWriteState,
++    components: &'a DirectWriteComponents,
++    utf16_index_map: &'a Utf16IndexMap,
++    runs: &'b mut Vec<ShapedRun>,
++    layout: &'b IDWriteTextLayout,
++    has_bidi_runs: bool,
++    editable_utf16_boundaries: BTreeSet<u32>,
++}
++
+ #[allow(non_snake_case)]
+ impl IDWritePixelSnapping_Impl for TextRenderer_Impl {
+     fn IsPixelSnappingDisabled(
+@@ -1300,16 +1631,6 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+         let glyphrun = unsafe { &*glyphrun };
+         let glyph_count = glyphrun.glyphCount as usize;
+         let desc = unsafe { &*glyphrundescription };
+-        let text = match glyph_count {
+-            0 => Some(unsafe {
+-                slice_from_nullable(
+-                    desc.string.as_ptr(),
+-                    desc.stringLength as usize,
+-                    "DirectWrite returned a null run string",
+-                )?
+-            }),
+-            _ => None,
+-        };
+         let context = unsafe { &mut *(clientdrawingcontext.cast::<RendererContext>().cast_mut()) };
+         let Some(font_face) = glyphrun.fontFace.as_ref() else {
+             return Ok(());
+@@ -1351,15 +1672,35 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+                 Ok,
+             )?;
+ 
+-        if let Some(text) = text {
+-            // Tabs have layout advances but no glyph advances. Keep invisible
+-            // glyphs so LineLayout can map their byte indices to caret positions.
++        let right_to_left = glyphrun.bidiLevel & 1 != 0;
++        context.has_bidi_runs |= right_to_left;
++
++        if glyph_count == 0 {
++            // DirectWrite draws tabs as zero-glyph runs: they have a layout advance but no
++            // glyphs, and their cluster map points at a glyph the run does not have. Keep an
++            // invisible space glyph per tab, placed at the tab's native hit-test box and carrying
++            // its native width as the logical advance, so LineLayout can map the tab's byte
++            // index to caret positions. Each tab is its own editable cluster.
++            let text = unsafe {
++                slice_from_nullable(
++                    desc.string.as_ptr(),
++                    desc.stringLength as usize,
++                    "DirectWrite returned a null run string",
++                )?
++            };
++            let text_position = desc.textPosition;
++            context.editable_utf16_boundaries.insert(text_position);
++            context
++                .editable_utf16_boundaries
++                .insert(text_position + text.len() as u32);
+             let mut glyphs = Vec::new();
+             for (offset, &character) in text.iter().enumerate() {
+                 if character != u16::from(b'\t') {
+                     continue;
+                 }
+-                let position = desc.textPosition + offset as u32;
++                let position = text_position + offset as u32;
++                context.editable_utf16_boundaries.insert(position);
++                context.editable_utf16_boundaries.insert(position + 1);
+                 let mut x = 0.0;
+                 let mut y = 0.0;
+                 let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+@@ -1374,83 +1715,143 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
+                     )?;
+                     font_face.GetGlyphIndices(&u32::from(b' '), 1, &mut space)?;
+                 }
+-                context
+-                    .index_converter
+-                    .advance_to_utf16_ix(position as usize);
++                let index = context
++                    .utf16_index_map
++                    .utf8_at(position as usize)
++                    .ok_or_else(|| {
++                        Error::new(
++                            E_INVALIDARG,
++                            "DirectWrite tab position exceeded the UTF-16 source map",
++                        )
++                    })?;
+                 glyphs.push(ShapedGlyph {
+                     id: GlyphId(u32::from(space)),
+-                    position: point(px(context.width), px(0.0)),
+-                    index: context.index_converter.utf8_ix,
++                    // The left edge of the tab's box is its ink origin in either direction,
++                    // like the RTL glyph placement below.
++                    position: point(px(metrics.left), px(0.0)),
++                    logical_x: Pixels::ZERO,
++                    logical_advance: px(metrics.width),
++                    index,
+                     is_emoji: false,
+                 });
+-                context.width += metrics.width;
+             }
+             if !glyphs.is_empty() {
+                 context.runs.push(ShapedRun { font_id, glyphs });
+             }
+-        } else {
+-            let color_font = unsafe { font_face.IsColorFont().as_bool() };
++            return Ok(());
++        }
+ 
+-            let glyph_ids = unsafe {
+-                slice_from_nullable(
+-                    glyphrun.glyphIndices,
+-                    glyph_count,
+-                    "DirectWrite returned a null glyph indices array",
+-                )?
+-            };
+-            let glyph_advances = unsafe {
+-                slice_from_nullable(
+-                    glyphrun.glyphAdvances,
+-                    glyph_count,
+-                    "DirectWrite returned a null glyph advances array",
+-                )?
+-            };
+-            let glyph_offsets = unsafe {
+-                slice_from_nullable(
+-                    glyphrun.glyphOffsets,
+-                    glyph_count,
+-                    "DirectWrite returned a null glyph offsets array",
+-                )?
+-            };
+-            let cluster_map = unsafe {
+-                slice_from_nullable(
+-                    desc.clusterMap,
+-                    desc.stringLength as usize,
+-                    "DirectWrite returned a null cluster map",
+-                )?
+-            };
++        let color_font = unsafe { font_face.IsColorFont().as_bool() };
+ 
+-            let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
+-            let mut utf16_idx = desc.textPosition as usize;
+-            let mut glyph_idx = 0;
+-            let mut glyphs = Vec::with_capacity(glyph_count);
+-            for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
+-                context.index_converter.advance_to_utf16_ix(utf16_idx);
+-                utf16_idx += cluster_utf16_len;
+-                for (cluster_glyph_idx, glyph_id) in glyph_ids
+-                    [glyph_idx..(glyph_idx + cluster_glyph_count)]
+-                    .iter()
+-                    .enumerate()
+-                {
+-                    let id = GlyphId(*glyph_id as u32);
+-                    let is_emoji =
+-                        color_font && is_color_glyph(font_face, id, &context.components.factory);
+-                    let this_glyph_idx = glyph_idx + cluster_glyph_idx;
+-                    glyphs.push(ShapedGlyph {
+-                        id,
+-                        position: point(
+-                            px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
+-                            px(-glyph_offsets[this_glyph_idx].ascenderOffset),
+-                        ),
+-                        index: context.index_converter.utf8_ix,
+-                        is_emoji,
+-                    });
+-                    context.width += glyph_advances[this_glyph_idx];
+-                }
+-                glyph_idx += cluster_glyph_count;
++        let glyph_ids = unsafe {
++            slice_from_nullable(
++                glyphrun.glyphIndices,
++                glyph_count,
++                "DirectWrite returned a null glyph indices array",
++            )?
++        };
++        let glyph_advances = unsafe {
++            slice_from_nullable(
++                glyphrun.glyphAdvances,
++                glyph_count,
++                "DirectWrite returned a null glyph advances array",
++            )?
++        };
++        let glyph_offsets = unsafe {
++            slice_from_nullable(
++                glyphrun.glyphOffsets,
++                glyph_count,
++                "DirectWrite returned a null glyph offsets array",
++            )?
++        };
++        let cluster_map = unsafe {
++            slice_from_nullable(
++                desc.clusterMap,
++                desc.stringLength as usize,
++                "DirectWrite returned a null cluster map",
++            )?
++        };
++
++        let text_position = desc.textPosition;
++        context.editable_utf16_boundaries.insert(text_position);
++        context
++            .editable_utf16_boundaries
++            .insert(text_position + cluster_map.len() as u32);
++        for utf16_offset in 1..cluster_map.len() {
++            if cluster_map[utf16_offset - 1] != cluster_map[utf16_offset] {
++                context
++                    .editable_utf16_boundaries
++                    .insert(text_position + utf16_offset as u32);
++            }
++        }
++
++        // `clusterMap` maps UTF-16 code units to the first glyph in their cluster; it is not
++        // a visual-order iterator. First materialize every glyph's logical UTF-8 cluster start
++        // from the map's glyph indices, then independently place the glyphs from DrawGlyphRun's
++        // baseline and bidi direction. This keeps ligatures/multi-glyph clusters whole and makes
++        // mixed-direction shaped lines retain their actual visual geometry.
++        let mut cluster_starts = BTreeMap::<usize, usize>::new();
++        for (utf16_offset, &glyph_start) in cluster_map.iter().enumerate() {
++            let glyph_start = glyph_start as usize;
++            if glyph_start >= glyph_count {
++                return Err(Error::new(
++                    E_INVALIDARG,
++                    "DirectWrite cluster map referred to a glyph outside its run",
++                ));
+             }
+-            context.runs.push(ShapedRun { font_id, glyphs });
++            cluster_starts
++                .entry(glyph_start)
++                .and_modify(|first_offset| *first_offset = (*first_offset).min(utf16_offset))
++                .or_insert(utf16_offset);
+         }
++
++        let cluster_starts = cluster_starts.into_iter().collect::<Vec<_>>();
++        let mut glyph_indices = vec![0; glyph_count];
++        for (cluster_ix, &(glyph_start, utf16_offset)) in cluster_starts.iter().enumerate() {
++            let glyph_end = cluster_starts
++                .get(cluster_ix + 1)
++                .map(|(glyph_start, _)| *glyph_start)
++                .unwrap_or(glyph_count);
++            let utf8_index = context
++                .utf16_index_map
++                .utf8_at(desc.textPosition as usize + utf16_offset)
++                .ok_or_else(|| {
++                    Error::new(
++                        E_INVALIDARG,
++                        "DirectWrite cluster position exceeded the UTF-16 source map",
++                    )
++                })?;
++            glyph_indices[glyph_start..glyph_end].fill(utf8_index);
++        }
++
++        // DirectWrite provides glyphs in logical order. The baseline origin is the pen location
++        // for the first glyph and every advance moves in the direction indicated by `bidiLevel`.
++        // Keep this logical glyph order: paint maintains combining/ligature ordering and GPUI's
++        // split fallback relies on source indices remaining monotonic within a run. Selection and
++        // hit testing use the independent `TextGeometry` captured from `IDWriteTextLayout`.
++        let mut advance = 0.0;
++        let mut glyphs = Vec::with_capacity(glyph_count);
++        for glyph_ix in 0..glyph_count {
++            let glyph_advance = glyph_advances[glyph_ix];
++            let offset = glyph_offsets[glyph_ix];
++            let x = if right_to_left {
++                _baselineoriginx - advance - glyph_advance - offset.advanceOffset
++            } else {
++                _baselineoriginx + advance + offset.advanceOffset
++            };
++            let id = GlyphId(glyph_ids[glyph_ix] as u32);
++            let is_emoji = color_font && is_color_glyph(font_face, id, &context.components.factory);
++            glyphs.push(ShapedGlyph {
++                id,
++                position: point(px(x), px(-offset.ascenderOffset)),
++                logical_x: Pixels::ZERO,
++                logical_advance: px(glyph_advance),
++                index: glyph_indices[glyph_ix],
++                is_emoji,
++            });
++            advance += glyph_advance;
++        }
++        context.runs.push(ShapedRun { font_id, glyphs });
+         Ok(())
+     }
+ 
+@@ -1522,42 +1923,82 @@ unsafe fn slice_from_nullable<'a, T>(
+     }
+ }
+ 
+-struct StringIndexConverter<'a> {
+-    text: &'a str,
+-    utf8_ix: usize,
+-    utf16_ix: usize,
++/// O(1) mapping from a DirectWrite UTF-16 cluster position to its containing UTF-8 scalar start.
++/// It is constructed once per shaped line instead of rescanning the source for every cluster.
++struct Utf16IndexMap {
++    utf8_at_utf16: Vec<usize>,
++    utf8_boundary_at_utf16: Vec<Option<usize>>,
+ }
+ 
+-impl<'a> StringIndexConverter<'a> {
+-    fn new(text: &'a str) -> Self {
++impl Utf16IndexMap {
++    fn new(text: &str) -> Self {
++        let utf16_len = text.encode_utf16().count();
++        let mut utf8_at_utf16 = vec![text.len(); utf16_len + 1];
++        let mut utf8_boundary_at_utf16 = vec![None; utf16_len + 1];
++        let mut utf16_offset = 0;
++        for (utf8_offset, character) in text.char_indices() {
++            utf8_boundary_at_utf16[utf16_offset] = Some(utf8_offset);
++            for slot in &mut utf8_at_utf16[utf16_offset..utf16_offset + character.len_utf16()] {
++                *slot = utf8_offset;
++            }
++            utf16_offset += character.len_utf16();
++        }
++        utf8_at_utf16[utf16_len] = text.len();
++        utf8_boundary_at_utf16[utf16_len] = Some(text.len());
+         Self {
+-            text,
+-            utf8_ix: 0,
+-            utf16_ix: 0,
++            utf8_at_utf16,
++            utf8_boundary_at_utf16,
+         }
+     }
+ 
+-    #[allow(dead_code)]
+-    fn advance_to_utf8_ix(&mut self, utf8_target: usize) {
+-        for (ix, c) in self.text[self.utf8_ix..].char_indices() {
+-            if self.utf8_ix + ix >= utf8_target {
+-                self.utf8_ix += ix;
+-                return;
+-            }
+-            self.utf16_ix += c.len_utf16();
+-        }
+-        self.utf8_ix = self.text.len();
++    fn utf8_at(&self, utf16_offset: usize) -> Option<usize> {
++        self.utf8_at_utf16.get(utf16_offset).copied()
+     }
+ 
+-    fn advance_to_utf16_ix(&mut self, utf16_target: usize) {
+-        for (ix, c) in self.text[self.utf8_ix..].char_indices() {
+-            if self.utf16_ix >= utf16_target {
+-                self.utf8_ix += ix;
+-                return;
+-            }
+-            self.utf16_ix += c.len_utf16();
++    fn utf8_boundary_at(&self, utf16_offset: usize) -> Option<usize> {
++        self.utf8_boundary_at_utf16
++            .get(utf16_offset)
++            .copied()
++            .flatten()
++    }
++
++    fn utf16_len(&self) -> u32 {
++        (self.utf8_at_utf16.len() - 1) as u32
++    }
++}
++
++/// Rebuild source-order advances after DirectWrite has emitted physically positioned glyph runs.
++/// Physical RTL positions are deliberately allowed to descend; these logical coordinates are the
++/// monotonic compatibility lane for pre-existing wrap, split, and source-order layout code.
++fn normalize_logical_advances(runs: &mut [ShapedRun]) {
++    let mut glyph_locations = runs
++        .iter()
++        .enumerate()
++        .flat_map(|(run_ix, run)| {
++            run.glyphs
++                .iter()
++                .enumerate()
++                .map(move |(glyph_ix, glyph)| (glyph.index, run_ix, glyph_ix))
++        })
++        .collect::<Vec<_>>();
++    glyph_locations.sort_unstable_by_key(|(index, run_ix, glyph_ix)| (*index, *run_ix, *glyph_ix));
++
++    let mut logical_x = Pixels::ZERO;
++    let mut cursor = 0;
++    while cursor < glyph_locations.len() {
++        let index = glyph_locations[cursor].0;
++        let mut group_end = cursor + 1;
++        while group_end < glyph_locations.len() && glyph_locations[group_end].0 == index {
++            group_end += 1;
++        }
++        let mut cluster_advance = Pixels::ZERO;
++        for &(_, run_ix, glyph_ix) in &glyph_locations[cursor..group_end] {
++            let glyph = &mut runs[run_ix].glyphs[glyph_ix];
++            glyph.logical_x = logical_x;
++            cluster_advance += glyph.logical_advance;
+         }
+-        self.utf8_ix = self.text.len();
++        logical_x += cluster_advance;
++        cursor = group_end;
+     }
+ }
+ 
+@@ -1798,11 +2239,15 @@ fn is_line_separator(character: char) -> bool {
+ #[cfg(test)]
+ mod tests {
+     use super::DirectWriteTextSystem;
+-    use crate::direct_write::ClusterAnalyzer;
+     use anyhow::Result;
+-    use gpui::{Font, FontWeight, PlatformTextSystem, TextRun, TextSystem, WindowTextSystem, px};
++    use gpui::{
++        CaretAffinity, Font, FontWeight, PlatformTextSystem, TextRun, TextSystem, WindowTextSystem,
++        px,
++    };
+     use std::sync::Arc;
+-    use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_STRETCH_NORMAL, DWRITE_TEXT_METRICS};
++    use windows::Win32::Graphics::DirectWrite::{
++        DWRITE_FONT_STRETCH_NORMAL, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_METRICS,
++    };
+ 
+     #[test]
+     fn tabs_preserve_native_advances_and_cursor() -> Result<()> {
+@@ -1849,7 +2294,7 @@ mod tests {
+                     "a\tאב\tb",
+                 ] {
+                     let mut native_metrics = DWRITE_TEXT_METRICS::default();
+-                    unsafe {
++                    let native_layout = unsafe {
+                         let layout = platform_text_system.components.factory.CreateTextLayout(
+                             &text.encode_utf16().collect::<Vec<_>>(),
+                             &format,
+@@ -1857,7 +2302,14 @@ mod tests {
+                             f32::INFINITY,
+                         )?;
+                         layout.GetMetrics(&mut native_metrics)?;
+-                    }
++                        layout
++                    };
++                    // Echo's geometry reports physical carets for lines with an RTL run, so
++                    // those are compared with DirectWrite's own hit test instead of the
++                    // logical advance sum used for LTR lines.
++                    let bidi = text
++                        .chars()
++                        .any(|character| ('\u{0590}'..='\u{08ff}').contains(&character));
+                     for split_runs in [false, true] {
+                         let runs = if split_runs {
+                             text.chars()
+@@ -1897,23 +2349,61 @@ mod tests {
+                                         )
+                                         .width
+                             };
+-                            assert!(
+-                                (shaped.x_for_index(index) - expected_x).abs() < px(0.001),
+-                                "{family}, {font_size:?}, {text:?}, {split_runs}, index={index}: \
+-                                 expected {expected_x:?}, got {:?}",
+-                                shaped.x_for_index(index)
+-                            );
+-                            assert_eq!(
+-                                shaped.index_for_x(expected_x + px(0.01)),
+-                                Some(index),
+-                                "{family}, {text:?}, index={index}"
+-                            );
+                             let piece = cursor.take_until(end);
+                             assert_eq!(piece.text.as_ref(), character.to_string());
+-                            assert!(
+-                                (piece.width - (expected_end - expected_x)).abs() < px(0.001),
+-                                "{family}, {text:?}, index={index}"
+-                            );
++                            if bidi {
++                                let utf16_index = text[..index].encode_utf16().count() as u32;
++                                let mut native_x = 0.0;
++                                let mut native_y = 0.0;
++                                let mut native_hit = DWRITE_HIT_TEST_METRICS::default();
++                                unsafe {
++                                    native_layout.HitTestTextPosition(
++                                        utf16_index,
++                                        false,
++                                        &mut native_x,
++                                        &mut native_y,
++                                        &mut native_hit,
++                                    )?;
++                                }
++                                let caret = shaped
++                                    .x_for_index_with_affinity_checked(
++                                        index,
++                                        CaretAffinity::Leading,
++                                    )
++                                    .expect("complete bidi geometry");
++                                assert!(
++                                    (caret - px(native_x)).abs() < px(0.01),
++                                    "{family}, {font_size:?}, {text:?}, {split_runs}, index={index}: \
++                                     expected caret {native_x}, got {caret:?}"
++                                );
++                                if character == '\t' {
++                                    let spans = shaped.visual_spans_for_range(index..end);
++                                    assert_eq!(spans.len(), 1, "{family}, {text:?}, index={index}");
++                                    assert!(
++                                        ((spans[0].end - spans[0].start)
++                                            - (expected_end - expected_x))
++                                            .abs()
++                                            < px(0.01),
++                                        "{family}, {text:?}, index={index}: tab cell {spans:?}"
++                                    );
++                                }
++                            } else {
++                                assert!(
++                                    (shaped.x_for_index(index) - expected_x).abs() < px(0.001),
++                                    "{family}, {font_size:?}, {text:?}, {split_runs}, index={index}: \
++                                     expected {expected_x:?}, got {:?}",
++                                    shaped.x_for_index(index)
++                                );
++                                assert_eq!(
++                                    shaped.index_for_x(expected_x + px(0.01)),
++                                    Some(index),
++                                    "{family}, {text:?}, index={index}"
++                                );
++                                assert!(
++                                    (piece.width - (expected_end - expected_x)).abs() < px(0.001),
++                                    "{family}, {text:?}, index={index}"
++                                );
++                            }
+                             expected_x = expected_end;
+                         }
+                         assert!((shaped.width - expected_x).abs() < px(0.001));
+@@ -1922,7 +2412,9 @@ mod tests {
+                                 .abs()
+                                 < px(0.001)
+                         );
+-                        assert_eq!(shaped.x_for_index(text.len()), shaped.width);
++                        if !bidi {
++                            assert_eq!(shaped.x_for_index(text.len()), shaped.width);
++                        }
+                     }
+                 }
+             }
+@@ -2036,41 +2528,4 @@ mod tests {
+         }
+         Ok(())
+     }
+-
+-    #[test]
+-    fn test_cluster_map() {
+-        let cluster_map = [0];
+-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 1);
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((1, 1)));
+-        let next = analyzer.next();
+-        assert_eq!(next, None);
+-
+-        let cluster_map = [0, 1, 2];
+-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 3);
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((1, 1)));
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((1, 1)));
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((1, 1)));
+-        let next = analyzer.next();
+-        assert_eq!(next, None);
+-        // 👨‍👩‍👧‍👦👩‍💻
+-        let cluster_map = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4];
+-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 5);
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((11, 4)));
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((5, 1)));
+-        let next = analyzer.next();
+-        assert_eq!(next, None);
+-        // 👩‍💻
+-        let cluster_map = [0, 0, 0, 0, 0];
+-        let mut analyzer = ClusterAnalyzer::new(&cluster_map, 1);
+-        let next = analyzer.next();
+-        assert_eq!(next, Some((5, 1)));
+-        let next = analyzer.next();
+-        assert_eq!(next, None);
+-    }
+ }
+-- 
+2.55.0.windows.5
+

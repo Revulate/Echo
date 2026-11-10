@@ -1,0 +1,46 @@
+From 572e4e7c6da83176db2241740173b2a3e83b5658 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Wed, 10 Jun 2026 22:12:50 -0700
+Subject: [PATCH] gpui: include source in asset load failure log for Echo
+ diagnostics
+
+"Failed to load asset: IO error: ..." without the URI/path made field
+failures (embed thumbnails, tooltip previews) undiagnosable. Log the
+Debug form of the asset source alongside the error. AssetLogger now
+requires Source: Debug, satisfied by all in-tree sources (Resource and
+friends derive Debug).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ crates/gpui/src/asset_cache.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui/src/asset_cache.rs b/crates/gpui/src/asset_cache.rs
+index 4c7bee1207..9887fdce3b 100644
+--- a/crates/gpui/src/asset_cache.rs
++++ b/crates/gpui/src/asset_cache.rs
+@@ -119,6 +119,7 @@ pub enum AssetLogger<T> {
+ impl<T, R, E> Asset for AssetLogger<T>
+ where
+     T: Asset<Output = Result<R, E>>,
++    T::Source: Debug,
+     R: Clone + Send,
+     E: Clone + Send + Debug,
+ {
+@@ -130,8 +131,12 @@ where
+         source: Self::Source,
+         cx: &mut App,
+     ) -> impl Future<Output = Self::Output> + Send + 'static {
++        // Local Echo extension (branch `echo-paint-fork`): include the source in
++        // the failure log - "Failed to load asset" without the URI/path is
++        // undiagnosable in the field.
++        let source_for_log = source.clone();
+         let load = T::load(source, cx);
+-        load.inspect_err(|e| log::error!("Failed to load asset: {:?}", e))
++        load.inspect_err(move |e| log::error!("Failed to load asset {:?}: {:?}", source_for_log, e))
+     }
+ }
+ 
+-- 
+2.55.0.windows.5
+

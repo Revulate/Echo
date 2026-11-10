@@ -1,0 +1,172 @@
+From 192f2f67983a3f1989dcae9d7d51a04fc3d34d46 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:27:42 -0700
+Subject: [PATCH] fix(gpui): refresh after an atlas drop only when the scene
+ still draws the tile
+
+Window::drop_image and drop_paint_mask called refresh() whenever a tile was
+removed, which disables cached-view reuse for the next frame. Echo releases
+evicted animation frames every 250 ms, so every idle wake frame re-rendered
+every cached view (17 rendered / 0 reused). The guard only matters when the
+last rendered scene, which cached views replay, still references a retired
+tile; PlatformAtlas::remove now returns the removed tile so drop_image can
+check that and refresh only then.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/platform.rs              | 14 ++++----
+ crates/gpui/src/window.rs                | 41 ++++++++++++++++++------
+ crates/gpui_apple/src/metal_atlas.rs     |  2 +-
+ crates/gpui_wgpu/src/wgpu_atlas.rs       |  2 +-
+ crates/gpui_windows/src/directx_atlas.rs |  2 +-
+ 5 files changed, 40 insertions(+), 21 deletions(-)
+
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index b9aa64cf99..938313fef3 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1856,8 +1856,8 @@ pub trait PlatformAtlas {
+         key: AtlasKey,
+         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+     ) -> Result<Option<AtlasTile>>;
+-    /// Removes the tile for `key`, returning whether a tile was present.
+-    fn remove(&self, key: &AtlasKey) -> bool;
++    /// Removes the tile for `key`, returning the tile if one was present.
++    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile>;
+ 
+     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+     fn contains(&self, _key: &AtlasKey) -> bool {
+@@ -1929,12 +1929,10 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
+         }
+     }
+ 
+-    pub fn remove(&mut self, key: &AtlasKey) -> bool {
+-        let Some(tile) = self.tiles_by_key.remove(key) else {
+-            return false;
+-        };
++    pub fn remove(&mut self, key: &AtlasKey) -> Option<AtlasTile> {
++        let tile = self.tiles_by_key.remove(key)?;
+         self.backend.remove(tile);
+-        true
++        Some(tile)
+     }
+ }
+ 
+@@ -1987,7 +1985,7 @@ impl PlatformAtlas for HeadlessAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
+-    fn remove(&self, key: &AtlasKey) -> bool {
++    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
+         self.0.lock().remove(key)
+     }
+ 
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 12a5215092..52aca034d0 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5923,31 +5923,52 @@ impl Window {
+ 
+     /// Removes a [`PaintMask`] from the sprite atlas (local Echo extension).
+     pub fn drop_paint_mask(&mut self, mask_id: u64) {
+-        if self.sprite_atlas.remove(&AtlasKey::PaintMask(mask_id)) {
+-            // Cached scenes can still reference the retired tile.
+-            self.refresh();
++        if let Some(tile) = self.sprite_atlas.remove(&AtlasKey::PaintMask(mask_id)) {
++            self.refresh_if_scene_uses_tiles(&[tile]);
+         }
+     }
+ 
+     /// Removes an image from the sprite atlas.
+     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+-        let mut removed_any = false;
++        let mut removed = SmallVec::<[AtlasTile; 4]>::new();
+         for frame_index in 0..data.frame_count() {
+             let params = RenderImageParams {
+                 image_id: data.id,
+                 frame_index,
+             };
+ 
+-            removed_any |= self.sprite_atlas.remove(&params.into());
++            removed.extend(self.sprite_atlas.remove(&params.into()));
+         }
++        self.refresh_if_scene_uses_tiles(&removed);
++
++        Ok(())
++    }
+ 
+-        if removed_any {
+-            // Cached scenes can still reference the retired atlas slots. Force
+-            // the next draw to rebuild them before they are presented again.
++    /// Cached views replay primitives from the last rendered scene, so a
++    /// retired tile it still draws would be presented again after its atlas
++    /// slot is freed or reused. Only then force a redraw without cached views
++    /// (local Echo extension): a blanket refresh on every eviction re-rendered
++    /// every cached view each time Echo released animation frames.
++    fn refresh_if_scene_uses_tiles(&mut self, tiles: &[AtlasTile]) {
++        if tiles.is_empty() {
++            return;
++        }
++        let retired = |tile: &AtlasTile| {
++            tiles
++                .iter()
++                .any(|t| t.texture_id == tile.texture_id && t.tile_id == tile.tile_id)
++        };
++        let scene = &self.rendered_frame.scene;
++        let referenced = scene.polychrome_sprites.iter().any(|s| retired(&s.tile))
++            || scene.monochrome_sprites.iter().any(|s| retired(&s.tile))
++            || scene.subpixel_sprites.iter().any(|s| retired(&s.tile))
++            || scene
++                .painted_texts
++                .iter()
++                .any(|s| retired(&s.mask_tile) || retired(&s.fill_tile));
++        if referenced {
+             self.refresh();
+         }
+-
+-        Ok(())
+     }
+ 
+     /// Returns whether every frame of an image is present in the sprite atlas.
+diff --git a/crates/gpui_apple/src/metal_atlas.rs b/crates/gpui_apple/src/metal_atlas.rs
+index 7cce345b7d..6858b07c19 100644
+--- a/crates/gpui_apple/src/metal_atlas.rs
++++ b/crates/gpui_apple/src/metal_atlas.rs
+@@ -55,7 +55,7 @@ impl PlatformAtlas for MetalAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
+-    fn remove(&self, key: &AtlasKey) -> bool {
++    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
+         self.0.lock().remove(key)
+     }
+ }
+diff --git a/crates/gpui_wgpu/src/wgpu_atlas.rs b/crates/gpui_wgpu/src/wgpu_atlas.rs
+index 8e2bf07956..f9fbc3b5c7 100644
+--- a/crates/gpui_wgpu/src/wgpu_atlas.rs
++++ b/crates/gpui_wgpu/src/wgpu_atlas.rs
+@@ -119,7 +119,7 @@ impl PlatformAtlas for WgpuAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
+-    fn remove(&self, key: &AtlasKey) -> bool {
++    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
+         self.0.lock().remove(key)
+     }
+ }
+diff --git a/crates/gpui_windows/src/directx_atlas.rs b/crates/gpui_windows/src/directx_atlas.rs
+index da34ec19d8..7489790d76 100644
+--- a/crates/gpui_windows/src/directx_atlas.rs
++++ b/crates/gpui_windows/src/directx_atlas.rs
+@@ -83,7 +83,7 @@ impl PlatformAtlas for DirectXAtlas {
+         self.0.lock().get_or_insert_with(key, build)
+     }
+ 
+-    fn remove(&self, key: &AtlasKey) -> bool {
++    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
+         self.0.lock().remove(key)
+     }
+ }
+-- 
+2.55.0.windows.5
+

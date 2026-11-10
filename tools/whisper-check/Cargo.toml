@@ -1,0 +1,11 @@
+[package]
+name = "whisper-check"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dashmap = "6"
+echo-core = { path = "../../crates/echo-core" }
+rustc-hash = "2"
+uuid = { version = "1", features = ["v4"] }

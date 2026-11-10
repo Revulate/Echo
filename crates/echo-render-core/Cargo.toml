@@ -1,0 +1,19 @@
+[package]
+name = "echo-render-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-free rendering data structures for Echo"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+echo-core = { path = "../echo-core" }
+lru = "0.19"
+smallvec = "1.13"
+tracing = "0.1"
+unicode-bidi = "0.3"
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]

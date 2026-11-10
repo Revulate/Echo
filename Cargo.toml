@@ -1,0 +1,348 @@
+[workspace]
+members = [
+    ".",
+    "crates/*",
+    "tools/*",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.9.35"
+edition = "2024"
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/Revulate/Echo"
+
+[workspace.dependencies]
+emojis = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
+[package]
+name = "echo_gpui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPUI-based Twitch chat client"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# GPUI framework from Zed (pinned to the current upstream main commit).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
+reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3" }
+gpui_platform = {
+    git = "https://github.com/zed-industries/zed",
+    rev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3",
+    features = ["wayland", "x11"],
+}
+raw-window-handle = "0.6"
+
+# Async runtime (trimmed features for faster builds)
+# Required: rt-multi-thread, macros, sync, time, fs, net, io-util
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"
+] }
+futures-util = "0.3"
+
+# Twitch IRC (used for connection management)
+twitch-irc = { version = "6.0.0", default-features = false, features = ["transport-tcp-rustls-native-roots"] }
+
+# WebSocket (for 7TV EventSub)
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-native-roots"] }
+async-trait = "0.1"
+tokio-socks = "0.5"
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+
+# Audio (sounds for mentions)
+rodio = { version = "0.23", default-features = false, features = ["playback", "vorbis", "mp3", "wav"] }
+
+# Desktop notifications
+notify-rust = "4"
+
+# Retry logic
+backon = "1.6"
+
+# Rate limiting for third-party APIs (7TV, BTTV, FFZ)
+governor = "0.10"
+
+# Config directory paths
+dirs = "6.0"
+
+# URL parsing
+url = "2.5"
+
+# Unicode text handling (grapheme clusters for proper text wrapping)
+unicode-segmentation = "1.11"
+# Unicode line breaking algorithm (UAX #14) for proper word wrap
+unicode-linebreak = "0.1"
+
+# Emoji detection and metadata (Unicode 17.0, O(1) lookup)
+emojis.workspace = true
+
+# Stable current persistence codec. Defaults are disabled so the desktop build
+# does not pull in heapless solely through Postcard's embedded-first defaults.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+# Bounded read-only compatibility for Echo's existing Bincode 2 payloads. This
+# maintained fork is wire-compatible with 2.0.1; no current writer may use it.
+bincode = { package = "cu-bincode", version = "2.0.2", features = ["serde"] }
+
+# Compression (emote cache disk storage)
+zstd = "0.14"
+
+# Serialization
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+schemars = "1"  # JSON schema for GPUI actions
+
+# Image handling (only decoders needed for Twitch emotes/badges). Do not add
+# `avif`: that image-crate feature is an encoder, not a decoder. The native
+# decoder requires a system dav1d installation and is not release-portable.
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "webp"] }
+
+# Caching
+lru = "0.19"
+dashmap = "6"
+parking_lot = "0.12"  # Fast RwLock for concurrent caches
+crossbeam-channel = "0.5"  # MPMC channel for lock-free worker-pool job dispatch
+arc-swap = "1"  # Lock-free atomic Arc swapping for hot-path reads
+ahash = "0.8"  # Fast hashing for animation state
+
+# Memory optimization
+smallvec = "1.13"
+rustc-hash = "2"  # Fast FxHashMap for hot-path integer/small-string keys
+
+# Asset embedding
+# include-exclude must be explicit: relying on feature unification lets a
+# re-lock silently drop it, breaking src/assets.rs.
+rust-embed = { version = "8", features = ["include-exclude"] }
+
+# System information (for streamer mode process detection)
+sysinfo.workspace = true
+
+# HTML parsing (for link preview OpenGraph scraping)
+scraper = "0.29"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-chrome = { version = "0.7", optional = true }
+# Heap profiler, only compiled under the `dhat-heap` feature.
+dhat = { version = "0.3", optional = true }
+regex = "1"
+echo-core = { path = "crates/echo-core" }
+echo-cache-policy = { path = "crates/echo-cache-policy" }
+echo-autocomplete-core = { path = "crates/echo-autocomplete-core" }
+echo-chat-render = { path = "crates/echo-chat-render" }
+echo-cosmetics-core = { path = "crates/echo-cosmetics-core" }
+echo-emote-core = { path = "crates/echo-emote-core" }
+echo-link-core = { path = "crates/echo-link-core" }
+echo-media-cache = { path = "crates/echo-media-cache" }
+echo-render-core = { path = "crates/echo-render-core" }
+echo-text-core = { path = "crates/echo-text-core" }
+urlencoding = "2"
+base64 = "0.23"
+ring = "0.17"
+semver = "1"
+echo-update-core = { path = "tools/echo-update-core" }
+
+# URL opening
+open = "5"
+keyring-core = "1"
+
+# HTTP client (rustls for consistent cross-platform TLS)
+# gzip/brotli: emote providers serve multi-MB JSON (a large 7TV channel set is
+# ~2MB raw, ~10x smaller compressed). Without compressed transfer the body read
+# can outlive the request timeout on a slow API day and every affected channel
+# loses its 7TV emotes ("error decoding response body").
+# http2: negotiated through ALPN, so the parallel emote and API requests to one
+# host share a connection instead of each paying a TCP and TLS handshake.
+reqwest = { workspace = true, features = ["json", "form", "multipart", "socks", "gzip", "brotli", "http2"] }
+# TLS crypto provider (needed for rustls 0.23+ with tokio-tungstenite)
+rustls.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "Media_Control", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_WinRT", "Win32_Security", "Win32_Security_Cryptography", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
+windows-native-keyring-store = "1"
+
+# mimalloc: the Linux allocator, and on Windows behind `windows-mimalloc`. Its
+# FFI also backs the memory report's process counters.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+mimalloc = "0.1.48"
+# Raw mimalloc FFI for periodic mi_collect (return freed memory to the OS).
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# Clipboard on Windows; Linux uses GPUI's own clipboard (src/utils/clipboard.rs).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = "3"
+
+# Unix: SIGTERM/SIGINT/SIGHUP quit through GPUI's normal shutdown (main.rs).
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", default-features = false, features = ["signal"] }
+libc = "0.2"
+
+# Linux: KWin scripting over D-Bus for always-on-top and taskbar attention
+# (src/utils/kwin.rs). notify-rust and GPUI already build this zbus.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[[bin]]
+name = "echo"
+path = "src/main.rs"
+test = false
+
+# Maximum performance release profile
+[profile.release]
+opt-level = 3
+lto = "fat"           # Maximum cross-crate optimization
+codegen-units = 1     # Maximum optimization (single codegen unit)
+panic = "abort"
+strip = true
+debug = 0
+
+[profile.dev]
+opt-level = 0       # No optimization for fastest compile times
+incremental = false # Prefer bounded disk usage over cached workspace codegen
+debug = "line-tables-only" # File/line backtraces without full variable/type symbols
+lto = false         # No link-time optimization
+
+# PERF: Optimize dependencies in dev builds for usable runtime performance
+# Your code stays unoptimized (fast compile), but gpui/image/etc are fast at runtime
+[profile.dev.package."*"]
+opt-level = 2       # Full optimization for all dependencies
+
+# Fast dev builds with Cranelift backend (nightly only, ~30-50% faster compile)
+# Usage: cargo +nightly build --profile dev-fast -Zcodegen-backend=cranelift
+# Or use alias: cargo fast
+[profile.dev-fast]
+inherits = "dev"
+incremental = true
+# Note: Cranelift doesn't support all optimizations, keep opt-level low
+
+# Test profile - prevents rustc stack overflow on large GPUI projects
+# Requires: RUST_MIN_STACK=268435456 cargo test
+# CI policy: compile test targets on Linux; Windows should run non-test checks only.
+[profile.test]
+opt-level = 1       # Light optimization to reduce compiler stack usage
+incremental = false # Match the disk-conscious development policy
+debug = "line-tables-only" # Keep file/line diagnostics without full symbols
+
+# ============================================================================
+# Profiling & Debugging Profiles (Linux-focused)
+# ============================================================================
+
+# Release with debug symbols for profiling (perf, flamegraph, heaptrack)
+# Usage: cargo build --profile release-with-debug
+[profile.release-with-debug]
+inherits = "release"
+debug = 2           # Full debug symbols (DWARF)
+strip = false       # Keep symbols for profilers
+
+# Development with some optimization for realistic profiling
+# Usage: cargo build --profile dev-profiling
+[profile.dev-profiling]
+inherits = "dev"
+opt-level = 2       # Some optimization for realistic performance
+debug = 2           # Full debug symbols
+
+# Sanitizer-friendly profile (for asan/tsan/msan - requires nightly)
+# Usage: RUSTFLAGS="-Zsanitizer=address" cargo +nightly build --profile sanitize
+[profile.sanitize]
+inherits = "dev"
+opt-level = 1       # Light optimization (sanitizers work better)
+debug = 2           # Full debug info for stack traces
+
+# Optimized distribution profile for normal release iteration. ThinLTO keeps
+# cross-crate optimization while allowing LLVM to use the machine's parallel
+# capacity instead of serializing the final crate into one codegen unit.
+# Usage: cargo dist-build
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = false # Preserve release optimization; do not trade it for rebuild caching
+# Line tables go to a separate echo.pdb so crash backtraces can be symbolized
+# offline. MSVC keeps symbols out of the exe; any `strip` value suppresses the PDB.
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "none"
+panic = "abort"     # Distribution builds favor size/RSS over unwind metadata
+
+# Opt-in maximum-optimization build for benchmarked milestone comparisons. It
+# keeps release's fat LTO and single codegen unit without charging that link
+# cost to every routine distribution build.
+# Usage: cargo dist-max-build
+[profile.dist-max]
+inherits = "release"
+strip = "symbols"
+panic = "abort"
+
+[features]
+default = []
+profiling = ["dep:tracing-chrome"]
+# Compile GPUI's cumulative per-window HDR histograms only into intentional
+# diagnostic builds. Ordinary dev/dist binaries avoid the per-frame recorder.
+# GPUI's `profiler` feature provides the frame/foreground/present histograms.
+gpui-frame-duration-histogram = ["gpui/profiler"]
+# Build the production-shaped GPUI chat scene benchmark without pulling GPUI's
+# test/benchmark support into ordinary Echo binaries.
+gpui-bench = ["gpui/bench"]
+# Compile the production provider-index A/B entry point only into its evaluator.
+provider-index-bench = []
+# Compile the allocation-counting global allocator used by ECHO_ALLOC_PROFILE.
+# Distribution builds intentionally use mimalloc directly so every allocation
+# does not pay a disabled runtime branch.
+alloc-profile = []
+# Heap profiling with call-stack attribution (dhat). Replaces mimalloc with
+# dhat's tracking allocator, so it is MUCH slower and its absolute numbers are
+# not comparable to a normal build -- it exists to answer "which call sites own
+# the live bytes", which no aggregate counter can. See docs/MEMORY_PROFILING.md.
+dhat-heap = ["dep:dhat"]
+# Use mimalloc instead of the Windows heap on Windows (Linux always uses
+# mimalloc). GPUI's application manifest opts into the segment heap, which in
+# a 100 msg/s replay measurement held 80-100 MB less RAM than mimalloc at the
+# same CPU.
+windows-mimalloc = []
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+[dev-dependencies]
+# Temp files/directories for tests
+tempfile = "3.12"
+
+# Benchmarking
+[dev-dependencies.criterion]
+version = "0.8"
+features = ["html_reports", "async_tokio"]
+
+[[bench]]
+name = "layout_bench"
+harness = false
+
+[[bench]]
+name = "filter_bench"
+harness = false
+
+[[bench]]
+name = "loading_bench"
+harness = false
+
+
+# Reconstructible GPUI fork used by Echo's additive rendering/metrics extensions.
+# `scripts/setup-gpui-fork.ps1` creates the sibling checkout from the pinned Zed
+# revision plus the patches documented in `docs/GPUI_FORK.md`, including the
+# diagnostic GPU timestamp extension. Keeping this path relative makes local and CI
+# resolution identical and avoids machine-specific Cargo metadata.
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "../zed-gpui-fork/crates/gpui" }
+gpui_platform = { path = "../zed-gpui-fork/crates/gpui_platform" }
+reqwest_client = { path = "../zed-gpui-fork/crates/reqwest_client" }

@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo: check",
+      "type": "shell",
+      "command": "cargo check",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "cargo: clippy (-D warnings)",
+      "type": "shell",
+      "command": "cargo clippy -- -D warnings",
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "cargo: fmt",
+      "type": "shell",
+      "command": "cargo fmt",
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent", "panel": "dedicated" }
+    },
+    {
+      "label": "cargo: build (dev)",
+      "type": "shell",
+      "command": "cargo build --bin echo",
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "cargo: build (release-with-debug)",
+      "type": "shell",
+      "command": "cargo build --profile release-with-debug --bin echo",
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "cargo: run (debug logging)",
+      "type": "shell",
+      "command": "cargo run --bin echo",
+      "options": { "env": { "RUST_LOG": "debug" } },
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    }
+  ]
+}
