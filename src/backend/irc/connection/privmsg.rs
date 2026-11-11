@@ -737,6 +737,7 @@ pub(crate) fn badge_names_for_filter<'a>(names: impl IntoIterator<Item = &'a str
 #[cfg(test)]
 mod tests {
     use super::strip_reply_mention;
+    use core::prelude::v1::test;
 
     #[test]
     fn strips_only_the_parent_mention_from_a_reply() {

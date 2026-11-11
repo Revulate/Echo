@@ -1199,6 +1199,7 @@ impl InputManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::prelude::v1::test;
 
     #[test]
     fn history_up_survives_a_channel_with_a_shorter_history() {

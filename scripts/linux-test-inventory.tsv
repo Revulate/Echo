@@ -157,6 +157,7 @@ core_test	crates/echo-core/src/env.rs	recognises_the_enabled_spellings
 core_test	crates/echo-core/src/env.rs	treats_everything_else_as_off
 core_test	crates/echo-core/src/env.rs	tristate_separates_forced_states_from_the_default
 core_test	crates/echo-core/src/filter_expression.rs	division_by_zero_evaluates_false
+core_test	crates/echo-core/src/filter_expression.rs	division_is_not_read_as_a_regex_when_a_later_slash_follows
 core_test	crates/echo-core/src/filter_expression.rs	evaluates_compound_boolean_expressions
 core_test	crates/echo-core/src/filter_expression.rs	evaluates_math_left_to_right_without_precedence
 core_test	crates/echo-core/src/filter_expression.rs	long_boolean_chains_parse_and_short_circuit
@@ -291,6 +292,7 @@ core_test	crates/echo-core/src/tab_state.rs	moving_a_split_to_the_bottom_edge_sp
 core_test	crates/echo-core/src/tab_state.rs	moving_a_split_to_the_top_of_a_stack_joins_it_with_an_equal_share
 core_test	crates/echo-core/src/tab_state.rs	moving_another_pane_preserves_the_active_split
 core_test	crates/echo-core/src/tab_state.rs	moving_one_of_two_splits_to_an_edge_survives_the_root_collapse
+core_test	crates/echo-core/src/tab_state.rs	restoring_a_channel_preserves_the_active_split
 core_test	crates/echo-core/src/tab_state.rs	test_adjacent_split_uses_effective_ratios_for_malformed_layout
 core_test	crates/echo-core/src/tab_state.rs	test_adjacent_split_uses_painted_bounds_when_available
 core_test	crates/echo-core/src/tab_state.rs	test_new_tab
@@ -514,11 +516,14 @@ root_test	src/backend/irc/connection.rs	restart_aimed_at_the_running_connection_
 root_test	src/backend/irc/connection.rs	shared_chat_emote_lookup_uses_source_or_global_scope_never_foreign_host
 root_test	src/backend/irc/connection.rs	stale_permit_for_an_older_connection_is_ignored
 root_test	src/backend/irc/connection.rs	timeout_durations_read_compactly
+root_test	src/backend/irc/connection/privmsg.rs	strips_only_the_parent_mention_from_a_reply
 root_test	src/backend/irc/user_colors.rs	preserves_user_color_resolution_contract
 root_test	src/backend/retry.rs	ratelimit_reset_is_epoch_relative
 root_test	src/backend/retry.rs	retry_after_parsing
 root_test	src/backend/retry.rs	retryable_statuses
 root_test	src/backend/retry.rs	server_wait_delay_jitters_within_cap
+root_test	src/backend/settings.rs	an_unreadable_value_resets_only_its_own_setting
+root_test	src/backend/settings.rs	broken_json_is_left_to_backup_recovery
 root_test	src/backend/settings.rs	empty_document_deserializes_to_defaults_except_migration_markers
 root_test	src/backend/settings.rs	export_redacts_uploader_query_values
 root_test	src/backend/settings.rs	export_scrubs_uploader_headers_and_proxy_credentials
@@ -576,6 +581,7 @@ root_test	src/components/chat/canvas_renderer/text_shaping.rs	long_url_wraps_and
 root_test	src/components/chat/canvas_renderer/text_shaping.rs	rtl_text_keeps_logical_order_in_source_text
 root_test	src/components/chat/canvas_renderer/text_shaping.rs	text_after_unicode_emoji_gets_boundary_space
 root_test	src/components/chat/canvas_renderer/text_shaping.rs	text_after_unicode_emoji_with_authored_space_uses_boundary_gap
+root_test	src/components/chat/canvas_renderer/text_shaping.rs	whitespace_at_a_wrap_point_stays_in_source_text
 root_test	src/components/chat/canvas_renderer/text_shaping.rs	zero_width_overlay_reserves_layered_box_before_following_text
 root_test	src/components/overlays/global_tooltip.rs	poisoned_transient_state_is_reset_and_unpoisoned
 root_test	src/components/overlays/hotkey_cheat_sheet.rs	test_category_actions
@@ -738,6 +744,7 @@ root_test	src/log.rs	redact_url_strips_userinfo_query_and_fragment
 root_test	src/log.rs	secret_never_prints_its_value
 root_test	src/managers/dynamic_tick_scheduler.rs	test_reset
 root_test	src/managers/dynamic_tick_scheduler.rs	test_stats
+root_test	src/managers/input_manager.rs	history_up_survives_a_channel_with_a_shorter_history
 root_test	src/managers/polling_coordinator.rs	offline_benchmark_suppresses_polling_coordinator
 root_test	src/managers/tab_manager.rs	close_button_closes_only_on_a_completed_click
 root_test	src/managers/tab_manager.rs	drag_reorder_preserves_every_tab_for_each_drop_zone
@@ -774,6 +781,7 @@ media_cache_test	crates/echo-media-cache/src/decode.rs	test_decode_simple_png
 media_cache_test	crates/echo-media-cache/src/disk.rs	legacy_index_is_used_only_when_current_index_is_absent
 media_cache_test	crates/echo-media-cache/src/disk.rs	legacy_source_index_native_bincode_fixture_migrates_to_postcard
 media_cache_test	crates/echo-media-cache/src/disk.rs	postcard_index_payload_rejects_trailing_bytes
+media_cache_test	crates/echo-media-cache/src/disk.rs	saving_a_source_blob_replaces_a_truncated_file
 media_cache_test	crates/echo-media-cache/src/disk.rs	test_disk_insert_replacement_updates_byte_stats
 media_cache_test	crates/echo-media-cache/src/disk.rs	test_expired_entry_detection
 media_cache_test	crates/echo-media-cache/src/disk.rs	unlisted_legacy_files_are_removed_and_listed_ones_kept
@@ -808,6 +816,7 @@ media_cache_test	crates/echo-media-cache/src/warming.rs	test_access_recording
 media_cache_test	crates/echo-media-cache/src/warming.rs	test_warming_score
 chat_render_test	crates/echo-chat-render/src/font_metrics.rs	test_estimated_char_widths
 chat_render_test	crates/echo-chat-render/src/font_metrics.rs	test_measure_string
+chat_render_test	crates/echo-chat-render/src/hit_mapping.rs	hit_test_maps_mixed_direction_lines
 chat_render_test	crates/echo-chat-render/src/hit_mapping.rs	hit_test_uses_visual_to_logical_mapping_for_rtl_lines
 chat_render_test	crates/echo-chat-render/src/hit_testing.rs	translate_cached_range_to_scroll_respects_guards
 chat_render_test	crates/echo-chat-render/src/hit_testing.rs	translate_cached_range_to_scroll_updates_bounds_and_cache_scroll
@@ -834,16 +843,16 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	362
+summary	root_tests	367
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
-summary	chat_render_tests	27
+summary	chat_render_tests	28
 summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
-summary	media_cache_tests	38
-summary	core_tests	240
+summary	media_cache_tests	39
+summary	core_tests	242
 summary	render_core_tests	46
 summary	text_core_tests	26
 summary	root_doctests_runnable	3
