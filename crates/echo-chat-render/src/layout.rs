@@ -1362,23 +1362,52 @@ impl ShapedLineData {
         }
     }
 
-    /// Map a visual boundary index to a logical source character index.
+    /// Map a visual boundary index to the logical caret index at that
+    /// boundary. The caret before a left-to-right character is its own index;
+    /// a right-to-left character has its logical start on its right edge, so
+    /// the caret on its left edge is the index after it.
     #[inline]
     pub fn logical_index_from_visual_boundary(&self, visual_boundary_idx: usize) -> usize {
-        let clamped_visual = visual_boundary_idx.min(self.source_len_chars);
-        if clamped_visual == self.source_len_chars {
-            return self.source_len_chars;
+        let len = self.source_len_chars;
+        let boundary = visual_boundary_idx.min(len);
+        if self.visual_to_logical.len() != len
+            || self.visual_char_positions.len() != len + 1
+            || len == 0
+        {
+            return boundary;
         }
-
-        if self.visual_to_logical.len() == self.source_len_chars {
-            self.visual_to_logical
-                .get(clamped_visual)
-                .copied()
-                .unwrap_or(clamped_visual)
-                .min(self.source_len_chars)
+        let logical = if boundary < len {
+            let start = self.visual_to_logical[boundary];
+            if self.visual_char_is_rtl(boundary) {
+                start + 1
+            } else {
+                start
+            }
         } else {
-            clamped_visual
-        }
+            let start = self.visual_to_logical[len - 1];
+            if self.visual_char_is_rtl(len - 1) {
+                start
+            } else {
+                start + 1
+            }
+        };
+        logical.min(len)
+    }
+
+    /// Whether the character at `visual_idx` sits in a right-to-left run, read
+    /// off the mapping: logical indices fall from left to right inside one. A
+    /// run of a single character has no neighbour to compare with and counts
+    /// as left-to-right, which selects the same character either way.
+    fn visual_char_is_rtl(&self, visual_idx: usize) -> bool {
+        let logical = self.visual_to_logical[visual_idx];
+        let next_is_previous_char = self
+            .visual_to_logical
+            .get(visual_idx + 1)
+            .is_some_and(|next| next + 1 == logical);
+        let previous_is_next_char = visual_idx
+            .checked_sub(1)
+            .is_some_and(|previous| self.visual_to_logical[previous] == logical + 1);
+        next_is_previous_char || previous_is_next_char
     }
 }
 

@@ -51,14 +51,41 @@ mod tests {
             char_positions: smallvec![0.0, 1.0, 2.0, 3.0, 4.0],
             // Visual-order boundaries used during hit testing.
             visual_char_positions: vec![0.0, 1.0, 2.0, 3.0, 4.0],
-            // Leftmost visual boundary maps to the final logical character.
+            // The leftmost visual character is the final logical character.
             visual_to_logical: vec![3, 2, 1, 0],
             source_start_char: 0,
             source_len_chars: 4,
             seventv_paint: None,
         };
 
-        let (logical_idx, _) = line_char_index_for_x(&line_data, 0.2);
-        assert_eq!(logical_idx, 3);
+        // The left edge of the line is the logical end, the right edge the
+        // logical start, so a drag across the word covers all of it.
+        let carets: Vec<usize> = [0.2, 1.1, 2.0, 2.9, 3.8]
+            .into_iter()
+            .map(|x| line_char_index_for_x(&line_data, x).0)
+            .collect();
+        assert_eq!(carets, [4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn hit_test_maps_mixed_direction_lines() {
+        // Logical "abשלcd": the two Hebrew characters swap places visually.
+        let line_data = ShapedLineData {
+            text: "abשלcd".into(),
+            gpui_runs: SmallVec::new(),
+            gpui_runs_hash: 0,
+            char_positions: smallvec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            visual_char_positions: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            visual_to_logical: vec![0, 1, 3, 2, 4, 5],
+            source_start_char: 0,
+            source_len_chars: 6,
+            seventv_paint: None,
+        };
+
+        let carets: Vec<usize> = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(|x| line_char_index_for_x(&line_data, x).0)
+            .collect();
+        assert_eq!(carets, [0, 1, 4, 3, 4, 5, 6]);
     }
 }
