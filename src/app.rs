@@ -389,7 +389,9 @@ impl SplitVerticalChrome {
 #[derive(Clone)]
 struct ClosedSplitHotkeyState {
     channel: String,
-    tab_index: usize,
+    /// The tab the split was closed in, by id: its position can change before
+    /// the split is reopened.
+    tab_id: String,
     restore_anchor: Option<ClosedSplitRestoreAnchor>,
 }
 
@@ -5558,13 +5560,13 @@ impl EchoApp {
         self.split_layout
             .update(cx, |layout, _| layout.forget_split_bounds(&key));
 
-        let (split_id, channel, active_tab_idx, restore_anchor) = {
+        let (split_id, channel, tab_id, restore_anchor) = {
             let app_state = self.app_state.read(cx);
             let active_tab = app_state.active_tab();
             (
                 active_tab.layout.split_id_at_path(&path),
                 active_tab.layout.channel_at_path(&path),
-                app_state.active_tab_idx,
+                active_tab.id.clone(),
                 active_tab
                     .reopen_anchor_for_path(&path)
                     .map(|(split_id, direction)| ClosedSplitRestoreAnchor {
@@ -5594,7 +5596,7 @@ impl EchoApp {
         if let Some(channel) = closed_channel.as_ref() {
             self.last_closed_split = Some(ClosedSplitHotkeyState {
                 channel: channel.clone(),
-                tab_index: active_tab_idx,
+                tab_id,
                 restore_anchor,
             });
         }
@@ -5617,15 +5619,15 @@ impl EchoApp {
         };
         self.cancel_pointer_drags(cx);
 
-        if self
+        let tab_index = self
             .app_state
             .read(cx)
             .tabs
-            .get(closed_split.tab_index)
-            .is_some()
-        {
+            .iter()
+            .position(|tab| tab.id == closed_split.tab_id);
+        if let Some(tab_index) = tab_index {
             self.app_state.update(cx, |state, cx| {
-                state.switch_tab(closed_split.tab_index, cx);
+                state.switch_tab(tab_index, cx);
             });
         }
 
