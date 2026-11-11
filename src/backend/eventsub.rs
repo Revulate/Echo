@@ -656,7 +656,9 @@ impl EventSubClient {
             old_sender = sender.replace(tx);
             *self.is_connected.write_or_recover() = true;
             *self.session_id.write_or_recover() = None;
-            self.last_message_time.store(0, Ordering::Relaxed);
+            // Start the keepalive clock at install, so a socket that never
+            // delivers its welcome is reconnected like any other silent one.
+            self.touch_keepalive();
             *self.reconnect_url.write_or_recover() = None;
             self.server_reconnect_pending
                 .store(false, Ordering::Release);
