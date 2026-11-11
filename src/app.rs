@@ -284,6 +284,9 @@ pub struct EchoApp {
     _subscriptions: Vec<Subscription>,
     /// Most recently closed non-placeholder split available for reopen hotkeys.
     last_closed_split: Option<ClosedSplitHotkeyState>,
+    /// The split the open split settings menu belongs to, with the path it
+    /// was opened at.
+    split_menu_target: Option<(crate::managers::split_layout_manager::PathKey, SplitId)>,
     /// Last `AppState::closed_tab_generation` offered as an Undo toast.
     seen_closed_tab_generation: u64,
     /// Last `followed_live::version` pushed to the open Live now lists.
@@ -560,6 +563,7 @@ impl EchoApp {
             _live_ui_smoke_task: live_ui_smoke_task,
             _subscriptions: subscriptions,
             last_closed_split: None,
+            split_menu_target: None,
             seen_closed_tab_generation: 0,
             seen_followed_live_version: 0,
             seen_embed_metadata_version: 0,

@@ -134,13 +134,34 @@ impl EchoApp {
         let Some((path_key, channel)) =
             self.overlay_manager.read(cx).open_settings_dropdown.clone()
         else {
+            self.split_menu_target = None;
             return div().into_any_element();
         };
 
         crate::components::overlays::clear_global_tooltip();
 
+        // The menu is keyed by split path. A tab switch or a closed split can
+        // put another split at that path while the menu is open, so the split
+        // found there on the menu's first frame is remembered and the menu
+        // closes once the path holds a different one.
+        let split_at_path = self
+            .app_state
+            .read(cx)
+            .active_tab()
+            .layout
+            .split_id_at_path(path_key.as_slice());
+        let same_split = match &self.split_menu_target {
+            Some((target_path, target_split)) if *target_path == path_key => {
+                split_at_path == Some(*target_split)
+            }
+            _ => {
+                self.split_menu_target = split_at_path.map(|split_id| (path_key.clone(), split_id));
+                true
+            }
+        };
         let bounds = self.split_layout.read(cx).hit_area_for(&path_key);
-        let Some(bounds) = bounds else {
+        let Some(bounds) = bounds.filter(|_| same_split) else {
+            self.split_menu_target = None;
             self.overlay_manager
                 .update(cx, |overlays, _| overlays.close_all_split_settings());
             return div().into_any_element();
