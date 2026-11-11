@@ -1810,7 +1810,7 @@ async fn refresh_and_save_tokens_expected(
                 return Err("Token refresh superseded by an account change".to_string());
             }
 
-            {
+            let irc_was_anonymous = {
                 let _commit_guard = AUTH_CREDENTIAL_COMMIT_LOCK.lock_or_recover();
                 if credential_generation() != committed_credential_generation
                     || !active_access_token_matches(&new_access_token)
@@ -1818,8 +1818,16 @@ async fn refresh_and_save_tokens_expected(
                     crate::log_auth!(debug, "Discarding stale completed token refresh");
                     return Err("Token refresh superseded by an account change".to_string());
                 }
-                super::irc::reset_anonymous_mode();
+                let irc_was_anonymous = super::irc::reset_anonymous_mode();
                 sync_auth_state_from_active_account(true);
+                irc_was_anonymous
+            };
+            // An IRC login rejection whose own refresh attempt failed (no
+            // network yet after wake, a cooldown) left the socket anonymous;
+            // an anonymous socket is never treated as stale, so reopen it.
+            // Chosen anonymous mode sets the same flag and stays anonymous.
+            if irc_was_anonymous && !super::irc::is_anonymous_mode() {
+                super::irc::reconnect_with_current_auth();
             }
             spawn_user_scoped_resource_refresh(
                 new_access_token.clone(),

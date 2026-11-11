@@ -9,15 +9,18 @@ pub(super) static USE_ANONYMOUS_MODE: AtomicBool = AtomicBool::new(false);
 pub(super) static FORCE_ANONYMOUS_MODE: LazyLock<bool> =
     LazyLock::new(|| echo_core::env::flag("FORCE_ANON_IRC"));
 
-/// Reset anonymous mode flag (call after successful re-auth)
-pub fn reset_anonymous_mode() {
-    if USE_ANONYMOUS_MODE.swap(false, Ordering::Release) {
+/// Reset anonymous mode flag (call after successful re-auth). Returns whether
+/// the runtime had fallen back to anonymous mode.
+pub fn reset_anonymous_mode() -> bool {
+    let was_anonymous = USE_ANONYMOUS_MODE.swap(false, Ordering::Release);
+    if was_anonymous {
         crate::log_irc!(info, "Anonymous mode reset - authenticated mode restored");
         crate::backend::eventsub::notify_auth_readiness_changed();
         crate::state::ui_invalidation::request(
             crate::state::ui_invalidation::UiInvalidation::TopBarState,
         );
     }
+    was_anonymous
 }
 
 /// Set runtime anonymous mode without changing persisted settings.
@@ -31,7 +34,7 @@ pub fn set_runtime_anonymous_mode(enabled: bool) {
             crate::state::ui_invalidation::UiInvalidation::TopBarState,
         );
     } else {
-        reset_anonymous_mode();
+        let _ = reset_anonymous_mode();
     }
 }
 
