@@ -110,6 +110,9 @@ struct SplitDraft {
     ime_composition_start: Option<DraftEditSnapshot>,
     /// Position in the channel's sent-message history while navigating it.
     history_index: Option<usize>,
+    /// The channel `history_index` points into. The index is per split and
+    /// the history per channel, and a Watching split changes channel in place.
+    history_channel: Option<String>,
     /// The draft stashed by the first Up, restored by Down past the newest entry.
     stashed_input: Option<String>,
     /// The history entry last recalled into the draft.
@@ -887,7 +890,8 @@ impl InputManager {
             return None;
         }
 
-        let current_index = self.slot(split_id).and_then(|draft| draft.history_index);
+        let history_len = self.input_history.get(channel)?.len();
+        let current_index = self.history_index_in(channel, split_id, history_len);
         if current_index.is_none_or(|idx| idx > 0) {
             self.record_undo_state(split_id);
         }
@@ -904,6 +908,7 @@ impl InputManager {
                 }
                 let last_idx = channel_history.len() - 1;
                 draft.history_index = Some(last_idx);
+                draft.history_channel = Some(channel.to_string());
                 let text = channel_history[last_idx].clone();
                 draft.show_recalled(text.clone());
                 Some(text)
@@ -919,10 +924,25 @@ impl InputManager {
         }
     }
 
+    /// The split's history position, if it is navigating `channel`'s history.
+    /// A position left over from another channel counts as not navigating.
+    fn history_index_in(
+        &self,
+        channel: &str,
+        split_id: SplitId,
+        history_len: usize,
+    ) -> Option<usize> {
+        let draft = self.slot(split_id)?;
+        draft
+            .history_index
+            .filter(|idx| *idx < history_len && draft.history_channel.as_deref() == Some(channel))
+    }
+
     /// Navigate to next message in history (down arrow)
     pub fn history_down(&mut self, channel: &str, split_id: SplitId) -> Option<String> {
         self.break_edit_transaction(split_id);
-        let current_index = self.slot(split_id).and_then(|draft| draft.history_index);
+        let history_len = self.input_history.get(channel).map_or(0, Vec::len);
+        let current_index = self.history_index_in(channel, split_id, history_len);
         if current_index.is_none() {
             let current_text = self.text_for_split(split_id);
             let can_restore = self.slot(split_id).is_some_and(|draft| {
@@ -957,6 +977,7 @@ impl InputManager {
                 }
             }
             None => {
+                draft.history_index = None;
                 draft.recalled_text = None;
                 let restored = draft.stashed_input.take()?;
                 draft.show_text(restored.clone());
@@ -1172,5 +1193,47 @@ impl InputManager {
         }
 
         chars.get(idx).map(|(byte, _)| *byte).unwrap_or(text.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_up_survives_a_channel_with_a_shorter_history() {
+        let mut manager = InputManager::new();
+        let split_id = SplitId::new();
+        manager.input_history.insert(
+            "long".to_string(),
+            vec!["one".into(), "two".into(), "three".into(), "four".into()],
+        );
+        manager
+            .input_history
+            .insert("short".to_string(), vec!["only".into()]);
+
+        assert_eq!(
+            manager.history_up("long", split_id).as_deref(),
+            Some("four")
+        );
+        assert_eq!(
+            manager.history_up("long", split_id).as_deref(),
+            Some("three")
+        );
+
+        // The split now shows another channel, as a Watching split does when
+        // the browser moves on; its index is past this history's end.
+        assert_eq!(
+            manager.history_up("short", split_id).as_deref(),
+            Some("only")
+        );
+        assert_eq!(manager.history_up("short", split_id), None);
+
+        // Back on the longer history the leftover index is in range, but it
+        // belongs to the other channel: navigation starts from the newest.
+        assert_eq!(
+            manager.history_up("long", split_id).as_deref(),
+            Some("four")
+        );
     }
 }
