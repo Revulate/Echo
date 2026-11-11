@@ -126,6 +126,7 @@ Upstream references:
 
 ```sh
 ./scripts/verify-linux-build.sh   # or: make linux-verify
+./scripts/package-linux-release.sh   # stripped release tarball under target/dist/package/
 ```
 
 The harness checks native build dependencies, reconstructs or validates the pinned

@@ -82,6 +82,11 @@ Echo is an independent project and is not affiliated with or endorsed by Twitch.
 
 ## Building
 
+Prebuilt Windows and Linux x64 builds are attached to each
+[release](https://github.com/Revulate/Echo/releases), with a changelog and
+SHA-256 checksums. Installed Windows builds update themselves. To build from
+source instead:
+
 Echo builds against a small fork of GPUI that is reconstructed from a pinned Zed
 revision plus the patches in [`patches/`](patches/). The setup script clones Zed
 into `../zed-gpui-fork`, next to your Echo checkout, applies the patch series and
