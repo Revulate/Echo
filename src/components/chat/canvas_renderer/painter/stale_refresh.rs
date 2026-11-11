@@ -111,10 +111,31 @@ impl CanvasMessageList {
                     && local_layout.is_none()
                     && global_layout.is_none();
 
-            if !local_stale && !global_stale && !missing_current_width_layout {
-                continue;
-            }
-            if local_layout.is_some() && !local_stale && !global_stale_for_channel {
+            let keeps_current_layout =
+                (!local_stale && !global_stale && !missing_current_width_layout)
+                    || (local_layout.is_some() && !local_stale && !global_stale_for_channel);
+            if keeps_current_layout {
+                // A width refresh can find this row's layout for the new width
+                // already cached (the width was used before, or a sibling
+                // split uses it). The row is not rebuilt, so its height slot
+                // still holds the previous width's height unless synced here.
+                if self.layout_store.runtime.refresh_missing_layouts_for_width {
+                    let current_height = local_layout
+                        .as_ref()
+                        .filter(|_| !local_stale)
+                        .or(global_layout.as_ref().filter(|_| !global_stale))
+                        .map(|layout| layout.height);
+                    if let Some(height) = current_height
+                        && self.update_height_preserving_viewport_anchor(
+                            idx,
+                            height,
+                            viewport_anchor_start,
+                            was_at_bottom,
+                        )
+                    {
+                        heights_updated += 1;
+                    }
+                }
                 continue;
             }
 
