@@ -144,6 +144,10 @@ fn update_login_attempt_state(generation: u64, state: LoginAttemptState) {
 /// publish only while that generation is still current under this lock.
 static AUTH_CREDENTIAL_COMMIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static AUTH_CREDENTIAL_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Advances with `AUTH_CREDENTIAL_GENERATION` except when a token refresh
+/// rotates the credentials of the same account. Work that only depends on who
+/// is signed in (an open IRC socket) fences on this instead.
+static AUTH_ACCOUNT_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_AUTH_USER_ID: LazyLock<RwLock<Option<(u64, String)>>> =
     LazyLock::new(|| RwLock::new(None));
 
@@ -659,11 +663,14 @@ pub(crate) fn credential_generation() -> u64 {
 
 #[inline]
 fn advance_credential_generation() -> u64 {
+    AUTH_ACCOUNT_GENERATION.fetch_add(1, Ordering::AcqRel);
     AUTH_CREDENTIAL_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
 }
 
+/// A token refresh for the account that is already active: the credentials
+/// are new, the account is not.
 fn advance_credential_generation_preserving_user_id() -> u64 {
-    let generation = advance_credential_generation();
+    let generation = AUTH_CREDENTIAL_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     if let Some((identity_generation, _)) = ACTIVE_AUTH_USER_ID.write_or_recover().as_mut() {
         *identity_generation = generation;
     }
@@ -713,6 +720,7 @@ pub(crate) fn active_authenticated_user_id() -> Option<String> {
 /// socket must not be allowed to invalidate credentials published afterward.
 pub(crate) struct IrcCredentialFence {
     generation: u64,
+    account_generation: u64,
     normalized_access_token: String,
 }
 
@@ -720,14 +728,28 @@ pub(crate) fn capture_irc_credential_fence(access_token: &str) -> Option<IrcCred
     let _commit_guard = AUTH_CREDENTIAL_COMMIT_LOCK.lock_or_recover();
     active_access_token_matches(access_token).then(|| IrcCredentialFence {
         generation: credential_generation(),
+        account_generation: AUTH_ACCOUNT_GENERATION.load(Ordering::Acquire),
         normalized_access_token: normalize_oauth_token(access_token).to_string(),
     })
 }
 
 impl IrcCredentialFence {
+    /// Whether the socket still belongs to the active account. A token
+    /// refresh keeps this true: Twitch checks the token at login only, so the
+    /// socket stays usable, and later logins ask for `current_account_token`.
     #[inline]
-    pub(crate) fn generation_is_current(&self) -> bool {
-        credential_generation() == self.generation
+    pub(crate) fn account_is_current(&self) -> bool {
+        AUTH_ACCOUNT_GENERATION.load(Ordering::Acquire) == self.account_generation
+    }
+
+    /// The active account's token as of now, without the `oauth:` prefix, or
+    /// `None` once the socket's account is no longer the active one.
+    pub(crate) fn current_account_token(&self) -> Option<String> {
+        let _commit_guard = AUTH_CREDENTIAL_COMMIT_LOCK.lock_or_recover();
+        if !self.account_is_current() {
+            return None;
+        }
+        super::settings::get_token().map(|token| normalize_oauth_token(&token).to_string())
     }
 
     pub(crate) fn is_current(&self) -> bool {

@@ -44,7 +44,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use twitch_irc::ClientConfig;
 use twitch_irc::TwitchIRCClient;
-use twitch_irc::login::StaticLoginCredentials;
+use twitch_irc::login::{CredentialsPair, LoginCredentials};
 use twitch_irc::message::ServerMessage;
 use uuid::Uuid;
 
@@ -380,13 +380,60 @@ fn broadcast_connection_event(event: ConnectionEvent) {
     }
 }
 
+/// Login for the read connection. twitch-irc asks for credentials each time
+/// its pool opens a socket, which it also does on its own (a server RECONNECT,
+/// a ping timeout, a full connection) long after the client was built, so the
+/// token is read at that moment rather than captured once.
+pub struct EchoIrcCredentials {
+    login: String,
+    /// The token the client was built with; `None` logs in anonymously.
+    token: Option<String>,
+    fence: Option<Arc<crate::backend::auth::IrcCredentialFence>>,
+}
+
+impl EchoIrcCredentials {
+    fn anonymous() -> Self {
+        Self {
+            login: "justinfan12345".to_string(),
+            token: None,
+            fence: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for EchoIrcCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EchoIrcCredentials")
+            .field("login", &self.login)
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl LoginCredentials for EchoIrcCredentials {
+    type Error = std::convert::Infallible;
+
+    async fn get_credentials(&self) -> Result<CredentialsPair, Self::Error> {
+        let token = self
+            .fence
+            .as_ref()
+            .and_then(|fence| fence.current_account_token())
+            .or_else(|| self.token.clone());
+        Ok(CredentialsPair {
+            login: self.login.clone(),
+            token,
+        })
+    }
+}
+
 pub static IRC_SENDER: LazyLock<
-    arc_swap::ArcSwap<Option<TwitchIRCClient<EchoIrcTransport, StaticLoginCredentials>>>,
+    arc_swap::ArcSwap<Option<TwitchIRCClient<EchoIrcTransport, EchoIrcCredentials>>>,
 > = LazyLock::new(|| arc_swap::ArcSwap::from_pointee(None));
 
 /// Get the current IRC client, if connected.
 /// Clones the client out of the ArcSwap guard so callers get an owned value.
-pub fn get_irc_client() -> Option<TwitchIRCClient<EchoIrcTransport, StaticLoginCredentials>> {
+pub fn get_irc_client() -> Option<TwitchIRCClient<EchoIrcTransport, EchoIrcCredentials>> {
     let guard = IRC_SENDER.load();
     guard.as_ref().clone()
 }
@@ -1211,29 +1258,34 @@ async fn connect_and_listen_inner(
     let config = if !use_anon {
         if let (Some(token), Some(username)) = (get_token(), get_username()) {
             let clean_token = token.strip_prefix("oauth:").unwrap_or(&token).to_string();
-            credential_fence = crate::backend::auth::capture_irc_credential_fence(&clean_token);
+            credential_fence =
+                crate::backend::auth::capture_irc_credential_fence(&clean_token).map(Arc::new);
             crate::log_irc!(
                 info,
                 "Using authenticated IRC (user: {}, token_len: {})",
                 username,
                 clean_token.len()
             );
-            ClientConfig::new_simple(StaticLoginCredentials::new(username, Some(clean_token)))
+            ClientConfig::new_simple(EchoIrcCredentials {
+                login: username,
+                token: Some(clean_token),
+                fence: credential_fence.clone(),
+            })
         } else {
             crate::log_irc!(info, "Using anonymous IRC (no credentials)");
-            ClientConfig::default()
+            ClientConfig::new_simple(EchoIrcCredentials::anonymous())
         }
     } else {
         crate::log_irc!(
             info,
             "Using anonymous IRC (auth previously failed or forced)"
         );
-        ClientConfig::default()
+        ClientConfig::new_simple(EchoIrcCredentials::anonymous())
     };
 
-    let self_login = config.login_credentials.credentials.login.to_lowercase();
+    let self_login = config.login_credentials.login.to_lowercase();
     let (mut incoming_messages, client) =
-        TwitchIRCClient::<EchoIrcTransport, StaticLoginCredentials>::new(config);
+        TwitchIRCClient::<EchoIrcTransport, EchoIrcCredentials>::new(config);
 
     IRC_SENDER.store(Arc::new(Some(client.clone())));
 
@@ -1420,7 +1472,7 @@ async fn connect_and_listen_inner(
             || (!anonymous_connection
                 && credential_fence
                     .as_ref()
-                    .is_none_or(|fence| !fence.generation_is_current()));
+                    .is_none_or(|fence| !fence.account_is_current()));
         if stale_connection {
             return Err("Discarding queued event from a superseded IRC connection".to_string());
         }
@@ -1434,7 +1486,7 @@ async fn connect_and_listen_inner(
         if let ServerMessage::Notice(n) = &message
             && n.message_text.contains("Login authentication failed")
         {
-            return recover_from_irc_auth_failure(credential_fence.as_ref()).await;
+            return recover_from_irc_auth_failure(credential_fence.as_deref()).await;
         }
 
         match message {
