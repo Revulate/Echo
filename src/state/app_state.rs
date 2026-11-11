@@ -448,7 +448,7 @@ impl AppState {
         };
         self.tabs_mut().iter_mut().any(|tab| {
             tab.split_path_for_id(split_id)
-                .is_some_and(|path| tab.set_channel_at_path(&path, previous.clone()))
+                .is_some_and(|path| tab.restore_channel_at_path(&path, previous.clone()))
         })
     }
 
@@ -482,7 +482,7 @@ impl AppState {
         for (split_id, previous) in &self.pending_channel_changes {
             for tab in &mut tabs {
                 if let Some(path) = tab.split_path_for_id(*split_id) {
-                    tab.set_channel_at_path(&path, previous.clone());
+                    tab.restore_channel_at_path(&path, previous.clone());
                 }
             }
         }
@@ -885,7 +885,7 @@ impl AppState {
             tab.is_selected = false;
             for (split_id, previous) in &self.pending_channel_changes {
                 if let Some(path) = tab.split_path_for_id(*split_id) {
-                    tab.set_channel_at_path(&path, previous.clone());
+                    tab.restore_channel_at_path(&path, previous.clone());
                 }
             }
         }

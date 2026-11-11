@@ -682,6 +682,13 @@ impl TabState {
         changed
     }
 
+    /// Put a channel back on a leaf without making that leaf the active
+    /// split: undoing a dismissed channel chooser must not pull focus away
+    /// from the split the user has moved to since.
+    pub fn restore_channel_at_path(&mut self, path: &[usize], channel: String) -> bool {
+        Arc::make_mut(&mut self.layout).replace_channel_at_path(path, channel)
+    }
+
     /// Persist the channel-header visibility for one leaf without changing its
     /// channel, split id, active-path ownership, or neighbouring panes.
     pub fn set_header_collapsed_at_path(&mut self, path: &[usize], collapsed: bool) -> bool {
@@ -1116,6 +1123,25 @@ mod tests {
                 .iter()
                 .all(|id| !copy.layout.collect_split_ids().contains(id))
         );
+    }
+
+    #[test]
+    fn restoring_a_channel_preserves_the_active_split() {
+        let layout = SplitNode::split(
+            SplitOrientation::Vertical,
+            vec![
+                SplitNode::leaf("a".to_string()),
+                SplitNode::leaf("b".to_string()),
+            ],
+            vec![0.5; 2],
+        );
+        let mut tab = TabState::with_layout(layout);
+        tab.set_active_split_path(vec![1]);
+
+        assert!(tab.restore_channel_at_path(&[0], "c".to_string()));
+
+        assert_eq!(tab.active_split_path, vec![1]);
+        assert_eq!(tab.layout.channel_at_path(&[0]).as_deref(), Some("c"));
     }
 
     #[test]
