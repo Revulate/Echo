@@ -2468,7 +2468,7 @@ impl EchoApp {
 
         if !active_channels.contains(channel) {
             self.app_state.update(cx, |state, cx| {
-                state.cleanup_orphaned_states(cx);
+                state.release_closed_channel(channel, cx);
             });
         }
 

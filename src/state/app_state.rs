@@ -1325,6 +1325,30 @@ impl AppState {
         }
     }
 
+    /// Release a channel that just left the layout. Chat states are swept by
+    /// `cleanup_orphaned_states`, but a channel whose tab was never shown this
+    /// session has no chat state while its startup connection request has
+    /// already joined it (or is still queued), so it is parted here.
+    pub fn release_closed_channel(&mut self, channel: &str, cx: &mut gpui::Context<Self>) {
+        let key = channel.trim_start_matches('#').to_lowercase();
+        let has_chat_state = self.chat_backend.read(cx).channels.contains_key(&key);
+        self.cleanup_orphaned_states(cx);
+        if has_chat_state
+            || key.is_empty()
+            || super::is_placeholder(&key)
+            || backend::browser_watching::is_watching_channel(&key)
+            || self
+                .all_active_channels()
+                .iter()
+                .any(|active| active.eq_ignore_ascii_case(&key))
+        {
+            return;
+        }
+        self.chat_backend.update(cx, |backend, cx| {
+            backend.remove_channel(&key, cx);
+        });
+    }
+
     /// Clean up orphaned chat states and stream info.
     /// Call this periodically or after removing tabs/channels to prevent memory leaks
     pub fn cleanup_orphaned_states(&mut self, cx: &mut gpui::Context<Self>) {
