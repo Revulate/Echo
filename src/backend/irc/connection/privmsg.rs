@@ -45,17 +45,28 @@ pub(super) fn privmsg_tag_owned(
     privmsg_tag(msg, key).map(str::to_string)
 }
 
-/// Removes the `@parent ` mention Twitch prepends to a reply's text and returns
-/// how many chars were removed, which is the shift the emotes tag needs. Text
-/// that is only the mention is kept as is.
-pub(super) fn strip_reply_mention(text: &mut String) -> usize {
-    let Some(rest) = text.strip_prefix('@') else {
+/// Removes the `@parent ` mention a reply's text starts with and returns how
+/// many chars were removed, which is the shift the emotes tag needs. Only the
+/// parent's own name is removed: a reply that opens by mentioning someone else
+/// keeps that mention. Text that is only the mention is kept as is.
+pub(crate) fn strip_reply_mention(
+    text: &mut String,
+    parent_login: &str,
+    parent_display_name: Option<&str>,
+) -> usize {
+    let prefix_len = [Some(parent_login), parent_display_name]
+        .into_iter()
+        .flatten()
+        .filter(|name| !name.is_empty())
+        .find_map(|name| {
+            let rest = text.strip_prefix('@')?;
+            let mentioned = rest.get(..name.len())?;
+            (mentioned.eq_ignore_ascii_case(name) && rest[name.len()..].starts_with(' '))
+                .then_some(1 + name.len() + 1)
+        });
+    let Some(prefix_len) = prefix_len else {
         return 0;
     };
-    let Some(space_idx) = rest.find(' ') else {
-        return 0;
-    };
-    let prefix_len = 1 + space_idx + 1;
     if text.len() <= prefix_len {
         return 0;
     }
@@ -166,11 +177,15 @@ pub(super) async fn process_privmsg_message(msg: twitch_irc::message::PrivmsgMes
     let reply_parent_msg_id = privmsg_tag_owned(&msg, "reply-parent-msg-id");
     let reply_parent_user_login = privmsg_tag_owned(&msg, "reply-parent-user-login");
 
-    let reply_mention_strip_len = if reply_parent_user_login.is_some() {
-        strip_reply_mention(&mut clean_text)
-    } else {
-        0
-    };
+    let reply_mention_strip_len = reply_parent_user_login
+        .as_deref()
+        .map_or(0, |parent_login| {
+            strip_reply_mention(
+                &mut clean_text,
+                parent_login,
+                privmsg_tag(&msg, "reply-parent-display-name"),
+            )
+        });
 
     let username = get_username_lowercase();
     let contains_account_name = contains_account_mention(&clean_text, &username);
@@ -717,4 +732,31 @@ pub(crate) fn badge_names_for_filter<'a>(names: impl IntoIterator<Item = &'a str
     }
 
     badges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_reply_mention;
+
+    #[test]
+    fn strips_only_the_parent_mention_from_a_reply() {
+        let mut text = "@Alice thanks Kappa".to_string();
+        assert_eq!(strip_reply_mention(&mut text, "alice", None), 7);
+        assert_eq!(text, "thanks Kappa");
+
+        let mut text = "@bob look at this".to_string();
+        assert_eq!(strip_reply_mention(&mut text, "alice", Some("Alice")), 0);
+        assert_eq!(text, "@bob look at this");
+
+        let mut text = "@アリス はい".to_string();
+        assert_eq!(strip_reply_mention(&mut text, "alice", Some("アリス")), 5);
+        assert_eq!(text, "はい");
+
+        let mut text = "@alice ".to_string();
+        assert_eq!(strip_reply_mention(&mut text, "alice", None), 0);
+        assert_eq!(text, "@alice ");
+
+        let mut text = "@alicia hi".to_string();
+        assert_eq!(strip_reply_mention(&mut text, "alice", None), 0);
+    }
 }

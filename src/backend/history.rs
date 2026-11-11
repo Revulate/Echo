@@ -448,21 +448,16 @@ async fn convert_irc_message(
             let reply_parent_user_id = msg.tags.0.get("reply-parent-user-id").cloned();
             let reply_parent_msg_body = msg.tags.0.get("reply-parent-msg-body").cloned();
 
-            let reply_mention_strip_len = if let Some(ref parent_user) = reply_parent_user_login {
-                let mention_prefix = format!("@{} ", parent_user);
-                if clean_content
-                    .as_bytes()
-                    .get(..mention_prefix.len())
-                    .is_some_and(|head| head.eq_ignore_ascii_case(mention_prefix.as_bytes()))
-                {
-                    clean_content = clean_content[mention_prefix.len()..].to_string();
-                    mention_prefix.len()
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
+            let reply_mention_strip_len =
+                reply_parent_user_login
+                    .as_deref()
+                    .map_or(0, |parent_login| {
+                        super::irc::strip_reply_mention(
+                            &mut clean_content,
+                            parent_login,
+                            reply_parent_display_name.as_deref(),
+                        )
+                    });
 
             let reply = match (reply_parent_msg_id, reply_parent_user_login) {
                 (Some(parent_id), Some(parent_user)) => Some(super::models::ReplyInfo {
