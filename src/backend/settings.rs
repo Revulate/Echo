@@ -2901,6 +2901,51 @@ impl Default for SettingsManager {
     }
 }
 
+/// Read a settings document that is valid JSON but holds values this build
+/// cannot decode, such as an option written by a newer version. Each top-level
+/// key that does not decode on its own is left out, so it takes its default,
+/// and the rest of the document is kept. Returns the settings with the keys
+/// left out, or `None` when the document cannot be read this way.
+fn salvage_settings(content: &str) -> Option<(AppSettings, Vec<String>)> {
+    let serde_json::Value::Object(mut fields) = serde_json::from_str(content).ok()? else {
+        return None;
+    };
+    let mut reset_keys = Vec::new();
+    fields.retain(|key, value| {
+        let alone = serde_json::Map::from_iter([(key.clone(), value.clone())]);
+        let readable =
+            serde_json::from_value::<AppSettings>(serde_json::Value::Object(alone)).is_ok();
+        if !readable {
+            reset_keys.push(key.clone());
+        }
+        readable
+    });
+    if reset_keys.is_empty() {
+        return None;
+    }
+    let settings = serde_json::from_value(serde_json::Value::Object(fields)).ok()?;
+    Some((settings, reset_keys))
+}
+
+fn note_settings_reset_to_defaults(reset_keys: &[String], preserved: Option<&std::path::Path>) {
+    let mut detail = format!(
+        "These settings could not be read and were reset to their defaults: {}.",
+        reset_keys.join(", ")
+    );
+    match preserved {
+        Some(path) => {
+            detail.push_str(&format!(
+                "\nPreserved the original file: {}",
+                path.display()
+            ));
+        }
+        None => detail.push_str(
+            "\nThe original file could not be copied aside and is protected from overwrite.",
+        ),
+    }
+    super::reliability::note_startup_degraded_feature("Some settings were reset", detail);
+}
+
 impl SettingsManager {
     pub fn load(&self) -> AppSettings {
         if matches!(self.file_path.try_exists(), Ok(false))
@@ -2927,12 +2972,24 @@ impl SettingsManager {
                 Err(e) => {
                     crate::log_persist!(
                         error,
-                        "Settings file '{}' is unparseable ({}); recovering from backup",
+                        "Settings file '{}' is unparseable ({}); recovering what can be read",
                         self.file_path.display(),
                         crate::utils::json_error_summary(&e)
                     );
                     let preserved = self.quarantine_unloadable_primary();
-                    self.recover_settings_from_backup(preserved)
+                    match salvage_settings(&content) {
+                        Some((settings, reset_keys)) => {
+                            crate::log_persist!(
+                                warn,
+                                "Loaded settings without {} unreadable value(s): {}",
+                                reset_keys.len(),
+                                reset_keys.join(", ")
+                            );
+                            note_settings_reset_to_defaults(&reset_keys, preserved.as_deref());
+                            settings
+                        }
+                        None => self.recover_settings_from_backup(preserved),
+                    }
                 }
             },
             Err(e) => {
@@ -7716,6 +7773,33 @@ pub fn set_deleted_message_mode(mode: DeletedMessageMode) {
     }
     bump_layout_settings_version();
     save_settings();
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn an_unreadable_value_resets_only_its_own_setting() {
+        let mut document = serde_json::to_value(AppSettings::default()).unwrap();
+        document["primary_accent_color"] = serde_json::json!("#123456");
+        document["font_scale"] = serde_json::json!("from a newer build");
+        let content = document.to_string();
+        assert!(serde_json::from_str::<AppSettings>(&content).is_err());
+
+        let (settings, reset_keys) = salvage_settings(&content).unwrap();
+
+        assert_eq!(reset_keys, ["font_scale"]);
+        assert_eq!(settings.primary_accent_color, "#123456");
+        assert_eq!(settings.font_scale, AppSettings::default().font_scale);
+    }
+
+    #[test]
+    fn broken_json_is_left_to_backup_recovery() {
+        assert!(salvage_settings("{ \"font_scale\": 1.2").is_none());
+        assert!(salvage_settings("[]").is_none());
+    }
 }
 
 #[cfg(test)]
