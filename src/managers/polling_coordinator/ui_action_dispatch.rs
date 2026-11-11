@@ -7,6 +7,7 @@
 
 use super::{open_external_link, spawn_clear_files};
 use crate::backend;
+use crate::backend::lock_utils::MutexExt;
 use crate::components::overlays::ConfirmationModal;
 use crate::managers::OverlayManager;
 use crate::state::AppState;
@@ -879,7 +880,26 @@ fn reset_settings_to_defaults() {
     }
 }
 
+/// The channel Watching splits followed as of the last change, kept so the
+/// next change can release it.
+static LAST_FOLLOWED_WATCHING_CHANNEL: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
 fn follow_watching_channel(channel: Option<&str>, app_state: &Entity<AppState>, cx: &mut AsyncApp) {
+    // The channel a Watching split showed until now has left the layout
+    // without any split being closed, so nothing else releases it.
+    let previous = std::mem::replace(
+        &mut *LAST_FOLLOWED_WATCHING_CHANNEL.lock_or_recover(),
+        channel.map(str::to_string),
+    );
+    cx.update(|cx| {
+        app_state.update(cx, |state, cx| match previous.as_deref() {
+            Some(previous) if Some(previous) != channel => {
+                state.release_closed_channel(previous, cx)
+            }
+            _ => state.cleanup_orphaned_states(cx),
+        })
+    });
     if let Some(channel) = channel {
         let is_consumed =
             cx.update(|cx| app_state.read(cx).all_active_channels().contains(channel));
