@@ -587,6 +587,23 @@ enum Token {
     Op(BinaryOp),
 }
 
+impl Token {
+    /// Whether an expression operand can end with this token.
+    fn ends_operand(&self) -> bool {
+        matches!(
+            self,
+            Token::Ident(_)
+                | Token::Int(_)
+                | Token::String(_)
+                | Token::Regex(_)
+                | Token::True
+                | Token::False
+                | Token::RParen
+                | Token::RBrace
+        )
+    }
+}
+
 struct Lexer<'a> {
     source: &'a str,
     cursor: usize,
@@ -690,6 +707,12 @@ impl<'a> Lexer<'a> {
                 '%' => {
                     self.bump_char();
                     Token::Op(BinaryOp::Mod)
+                }
+                // After an operand `/` is division; where an operand is
+                // expected it opens a `/regex/` literal.
+                '/' if tokens.last().is_some_and(Token::ends_operand) => {
+                    self.bump_char();
+                    Token::Op(BinaryOp::Div)
                 }
                 '/' => self.lex_slash_or_regex()?,
                 '"' => Token::String(self.lex_quoted_string()?),
@@ -1197,6 +1220,17 @@ mod tests {
             r#"message.content match ri"HELLO""#,
             base_context()
         ));
+    }
+
+    #[test]
+    fn division_is_not_read_as_a_regex_when_a_later_slash_follows() {
+        let context = base_context();
+        assert!(evaluate("bits / 2 > 1 || bits / 3 > 1", context.clone()));
+        assert!(evaluate(
+            r#"message.length / 2 > 100 || message.content contains "12/31""#,
+            context.clone()
+        ));
+        assert!(evaluate(r"message.content match /\d\d\/\d\d/", context));
     }
 
     #[test]
