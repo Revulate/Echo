@@ -105,9 +105,11 @@ that makes no performance claim does not need a benchmark run.
 Linux is Echo's authoritative Rust test platform. `cargo test`, `cargo nextest`,
 unit tests, integration tests, and doctests are allowed on Linux when they are
 proportional to the slice or part of an explicit milestone. Set
-`RUST_MIN_STACK=268435456` for Echo's large GPUI test target. Do not run the
-root crate's Rust test graph on Windows: its GPUI test target overflows rustc's
-stack there. GPUI-free extracted crates test fine on Windows.
+`RUST_MIN_STACK=268435456` for Echo's large GPUI test target on every platform:
+without it rustc overflows its stack compiling that target. With it, the root
+library tests also run on Windows (`cargo test -p echo_gpui --lib`), which is a
+useful pre-push check but does not replace the Linux run, since platform-gated
+code and tests differ. GPUI-free extracted crates test on Windows as they are.
 
 ### Proportional validation ladder
 

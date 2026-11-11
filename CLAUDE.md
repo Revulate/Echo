@@ -28,7 +28,7 @@ Windows (primary dev machine):
 - Run: `cargo run` / `cargo run --release`; fixture tools: `cargo run -p <tool-name>`
 - Distribution build: `cargo build --profile dist --locked --bin echo` (thin LTO, ~4 min). `--release` is fat LTO with one codegen unit, so even an incremental release build of `echo_gpui` takes ~15 min. Both profiles use `panic = "abort"`, so `catch_unwind` recovery (e.g. the layout workers) only works in dev/test builds.
 - Format: `rustfmt <exact files>` for a slice; `cargo fmt --all -- --check` is canonical (never pass paths after `cargo fmt --`)
-- Do **not** run `cargo test` for the root crate on Windows. GPUI-free extracted crates test fine there, e.g. `cargo test -p echo-core --lib chat_snapshot`, `cargo test -p echo-render-core --lib animation_timing`.
+- Root-crate tests need `RUST_MIN_STACK=268435456` (rustc overflows its stack on the GPUI test target without it): `RUST_MIN_STACK=268435456 cargo test -p echo_gpui --lib` in Git Bash, or set `$env:RUST_MIN_STACK` first in PowerShell. Linux stays authoritative because platform-gated code differs. GPUI-free extracted crates need no variable, e.g. `cargo test -p echo-core --lib chat_snapshot`, `cargo test -p echo-render-core --lib animation_timing`.
 
 Linux (authoritative test platform, see `docs/LINUX_DEVELOPMENT.md`):
 

@@ -3808,7 +3808,7 @@ mod exact_target_tests {
                 );
             }
         }
-        assert_eq!(actions, 84);
+        assert_eq!(actions, 88);
         for descriptor in COMMANDS_CUSTOM_SETTINGS {
             assert_eq!(
                 setting_target_by_id(descriptor.id)
@@ -4027,8 +4027,14 @@ mod exact_target_tests {
 
     #[test]
     fn migrated_pages_keep_their_primary_and_secondary_inventory() {
+        // The two tray settings on the General page exist only on Windows.
+        let tray_settings = usize::from(cfg!(target_os = "windows")) * 2;
         for (page, total, primary) in [
-            (SettingsSectionId::General, 17, 5),
+            (
+                SettingsSectionId::General,
+                17 + tray_settings,
+                5 + tray_settings,
+            ),
             (SettingsSectionId::Theme, 31, 7),
             (SettingsSectionId::ChatBehavior, 47, 8),
         ] {
@@ -4950,7 +4956,7 @@ mod exact_target_tests {
             38,
         );
         assert_eq!(PAGE_ORDER.len(), 8);
-        let expected_setting_count = 366 + usize::from(cfg!(target_os = "windows")) * 2;
+        let expected_setting_count = 378 + usize::from(cfg!(target_os = "windows")) * 2;
         assert_eq!(setting_targets().count(), expected_setting_count);
     }
 

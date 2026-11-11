@@ -57,8 +57,8 @@ pub(super) type SevenTvGlobalFetchResult = Arc<Vec<Arc<Emote>>>;
 
 #[derive(Clone)]
 pub(super) struct SevenTvChannelFetchCacheEntry {
-    fetched_at: Instant,
-    result: SevenTvChannelFetchResult,
+    pub(super) fetched_at: Instant,
+    pub(super) result: SevenTvChannelFetchResult,
 }
 
 #[derive(Clone)]

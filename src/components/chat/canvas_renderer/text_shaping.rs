@@ -1440,6 +1440,7 @@ fn message_takes_mod_buttons(msg: &ChatMessage) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::builder::PendingLayeredImage;
     use super::*;
     use core::prelude::v1::test;
     use std::sync::Arc;

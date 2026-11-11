@@ -144,8 +144,8 @@ proportional validation, commit-message convention) and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for an overview of the code. Linux
 is the authoritative test platform: `./scripts/test-linux.sh quick` runs the
 main test suite. On Windows, use `cargo check -p echo_gpui --bins` and
-`cargo lint` (Clippy, the same gate CI runs), and don't run `cargo test` for
-the root crate.
+`cargo lint` (Clippy, the same gate CI runs); the root crate's tests need
+`RUST_MIN_STACK=268435456` set before `cargo test -p echo_gpui --lib`.
 
 ## License
 

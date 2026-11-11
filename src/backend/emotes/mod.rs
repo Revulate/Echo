@@ -5344,13 +5344,13 @@ mod provider_index_tests {
             cache_key.clone(),
             SevenTvChannelFetchCacheEntry {
                 fetched_at: Instant::now(),
-                result: Arc::new((
-                    SevenTvExactSetFetchOutcome::Present {
+                result: Arc::new(SevenTvChannelFetch {
+                    outcome: SevenTvExactSetFetchOutcome::Present {
                         emotes: vec![emote(EmoteProvider::SevenTV, "stale", "Stale")],
                         emote_set_id: Some("set-id".to_string()),
                     },
-                    None,
-                )),
+                    subscription: None,
+                }),
             },
         );
         let live_window = Duration::from_secs(SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS);

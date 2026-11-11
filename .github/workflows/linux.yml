@@ -19,6 +19,9 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_MIN_STACK: "268435456"
+  # A hosted runner compiles the test profile from cold, which outlasts the
+  # harness default of 900 seconds per test stage.
+  ECHO_LINUX_TEST_TIMEOUT_SECONDS: "2700"
 
 jobs:
   verify:
