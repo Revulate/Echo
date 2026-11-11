@@ -637,7 +637,23 @@ impl ThreadViewer {
             push_thread_send_blocked_toast(&block.to_string());
             return;
         }
+        // The input is cleared as soon as the reply is handed off, so anything
+        // known to make Twitch reject it is checked while the text is still
+        // there to edit.
+        let reply_chars =
+            unicode_segmentation::UnicodeSegmentation::graphemes(reply_text.as_str(), true).count();
+        if reply_chars > crate::config::TWITCH_MESSAGE_CHAR_LIMIT {
+            push_thread_send_blocked_toast(&format!(
+                "Message too long: {reply_chars} / {} characters",
+                crate::config::TWITCH_MESSAGE_CHAR_LIMIT
+            ));
+            return;
+        }
         if let (Some(channel), Some(msg_id)) = (&self.state.channel, &self.state.root_message_id) {
+            if let Err(block) = backend::irc::ensure_channel_send_ready(channel) {
+                push_thread_send_blocked_toast(block.trim());
+                return;
+            }
             let root_user = self
                 .thread_messages
                 .iter()
@@ -645,7 +661,9 @@ impl ThreadViewer {
                 .map(|m| m.sender.clone())
                 .unwrap_or_default();
 
-            if !root_user.is_empty() {
+            if root_user.is_empty() {
+                push_thread_send_blocked_toast("The message this thread replies to is gone.");
+            } else {
                 backend::send_reply_async(
                     channel.to_string(),
                     reply_text,
