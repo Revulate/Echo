@@ -902,6 +902,15 @@ impl<'a> LayoutBuilder<'a> {
         self.line_offsets.push(self.source_offset);
     }
 
+    /// Wrap at authored whitespace that does not fit the line. The whitespace
+    /// is not shaped, but it stays in the source text so copied text and word
+    /// selection keep the gap between the words on either side of the wrap.
+    pub(super) fn wrap_at_whitespace(&mut self, whitespace: &str) {
+        self.flush_text_segment();
+        self.append_source_text_at_current_x(whitespace);
+        self.wrap_line();
+    }
+
     /// Commit an authored hard line break without shaping it as a whitespace
     /// glyph. Source and selection indices still retain the original newline
     /// bytes as Unicode scalar positions.

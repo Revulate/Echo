@@ -284,7 +284,7 @@ fn push_wrapped_text_fragment(builder: &mut LayoutBuilder<'_>, text: &str, color
                     if builder.current_x + ws_width > builder.right_boundary
                         && builder.current_x > MESSAGE_PADDING_LEFT
                     {
-                        builder.wrap_line();
+                        builder.wrap_at_whitespace(run);
                     } else {
                         builder.add_text_run(run, color, false, false);
                         builder.last_token_type = LastTokenType::Text;
@@ -312,7 +312,7 @@ fn push_wrapped_text_fragment(builder: &mut LayoutBuilder<'_>, text: &str, color
                 if builder.current_x + ws_width > builder.right_boundary
                     && builder.current_x > MESSAGE_PADDING_LEFT
                 {
-                    builder.wrap_line();
+                    builder.wrap_at_whitespace(run);
                 } else {
                     builder.add_text_run(run, color, false, false);
                     builder.last_token_type = LastTokenType::Text;
@@ -1451,6 +1451,23 @@ mod tests {
         builder.content_start_x = MESSAGE_PADDING_LEFT;
         builder.current_x = MESSAGE_PADDING_LEFT + 120.0;
         builder
+    }
+
+    #[test]
+    fn whitespace_at_a_wrap_point_stays_in_source_text() {
+        let mut builder = spacing_test_builder();
+        builder.mark_content_start();
+        builder.add_text_run("foo", colors::text_primary(), false, false);
+        builder.last_token_type = LastTokenType::Text;
+        builder.right_boundary = builder.current_x;
+
+        push_wrapped_text_fragment(&mut builder, " bar", colors::text_primary());
+
+        let mut layout = CanvasMessageLayout::new("wrap-space".to_string(), "test-channel");
+        builder.finalize(&mut layout);
+        assert_eq!(layout.source_text, "foo bar");
+        assert_eq!(layout.shaped_lines.len(), 2);
+        assert_eq!(layout.shaped_lines[1].source_start_char, 4);
     }
 
     #[test]
