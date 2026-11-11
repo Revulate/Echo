@@ -2150,7 +2150,10 @@ async fn fetch_user_profile_helix(
     username: &str,
     token: &str,
 ) -> Result<TwitchUserProfile, ApiError> {
-    let url = format!("https://api.twitch.tv/helix/users?login={}", username);
+    let url = format!(
+        "https://api.twitch.tv/helix/users?login={}",
+        urlencoding::encode(username)
+    );
 
     let resp = http::send_logged(
         http::LogCategory::Net,
@@ -2193,7 +2196,7 @@ pub async fn get_user_id_helix(username: &str, token: &str) -> Result<String, St
 async fn user_id_helix(username: &str, token: &str) -> Result<String, ApiError> {
     let url = format!(
         "https://api.twitch.tv/helix/users?login={}",
-        username.to_lowercase()
+        urlencoding::encode(&username.to_lowercase())
     );
 
     let resp = send_helix_idempotent(token, |token| {
@@ -2363,7 +2366,7 @@ pub async fn get_stream_info_helix(
 
     let url = format!(
         "https://api.twitch.tv/helix/streams?user_login={}",
-        username.to_lowercase()
+        urlencoding::encode(&username.to_lowercase())
     );
 
     let resp = send_helix_idempotent(token, |token| {
