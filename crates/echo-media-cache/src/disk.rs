@@ -1082,18 +1082,29 @@ fn save_source_blob_sync(
         std::fs::create_dir_all(parent)?;
     }
 
-    if path.exists() {
-        let size = std::fs::metadata(&path)?.len();
-        return Ok((hash, encoding, size, bytes.len() as u64));
+    // The name is the content hash, so an existing file should already hold
+    // this payload. One that does not (truncated or zeroed by a crash before
+    // its data reached the disk) is replaced; trusting it would leave every
+    // later download of this blob unable to repair the cache.
+    let holds_payload = std::fs::metadata(&path)
+        .is_ok_and(|metadata| metadata.len() == payload.len() as u64)
+        && std::fs::read(&path).is_ok_and(|existing| existing == payload);
+    if holds_payload {
+        return Ok((hash, encoding, payload.len() as u64, bytes.len() as u64));
     }
 
     let temp_path = persist::temp_path_for(&path);
-    {
+    let written = (|| {
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(payload)?;
         file.flush()?;
+        drop(file);
+        std::fs::rename(&temp_path, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
     }
-    std::fs::rename(&temp_path, &path)?;
+    written?;
 
     let size = std::fs::metadata(&path)?.len();
     crate::log_cache!(
@@ -1782,6 +1793,21 @@ mod tests {
             .saturating_sub(MAX_DISK_CACHE_ENTRY_AGE_SECS)
             .saturating_sub(1);
         assert!(is_entry_expired_at(&entry, now));
+    }
+
+    #[test]
+    fn saving_a_source_blob_replaces_a_truncated_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"GIF89a source bytes that stay uncompressed";
+        let (hash, encoding, size, _) = save_source_blob_sync(temp.path(), bytes).unwrap();
+        let path = source_blob_path_for(temp.path(), &hash, encoding);
+        let stored = std::fs::read(&path).unwrap();
+        assert_eq!(size, stored.len() as u64);
+
+        std::fs::write(&path, &stored[..stored.len() / 2]).unwrap();
+        save_source_blob_sync(temp.path(), bytes).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), stored);
     }
 
     #[test]
