@@ -484,6 +484,24 @@ impl MessageBuffer {
         false
     }
 
+    /// Mutate the message at `index` in place when it is still `id`. `update`
+    /// must leave the id alone.
+    pub fn update_at_with<F>(&mut self, index: usize, id: &str, update: F) -> bool
+    where
+        F: FnOnce(&mut ChatMessage),
+    {
+        let Some(existing) = self
+            .messages
+            .get_mut(index)
+            .filter(|existing| existing.id.as_ref() == id)
+        else {
+            return false;
+        };
+        update(existing);
+        self.invalidate_cache();
+        true
+    }
+
     /// Mutate a message by ID.
     pub fn update_by_id<F>(&mut self, id: &str, update: F) -> bool
     where

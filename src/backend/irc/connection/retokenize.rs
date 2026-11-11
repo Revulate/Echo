@@ -224,6 +224,32 @@ pub(super) fn reparse_message_slots(
     semantic_changed
 }
 
+/// Install the slots of `reparsed`, a row cloned and reparsed with no lock
+/// held, on the resident row it came from. Only the slots are written: the row
+/// may have been deleted or redacted since the clone, and a row whose text or
+/// emote scope changed keeps the slots that belong to its new state.
+fn install_reparsed_slots(
+    buffer: &mut MessageBuffer,
+    index_hint: Option<usize>,
+    reparsed: &ChatMessage,
+) -> bool {
+    let install = |row: &mut ChatMessage| {
+        if row.content == reparsed.content
+            && row.emote_lookup_channel == reparsed.emote_lookup_channel
+        {
+            row.slots = reparsed.slots.clone();
+            row.structure_hash = reparsed.structure_hash;
+        }
+    };
+    let id = reparsed.id.as_ref();
+    if index_hint.is_some_and(|index| buffer.update_at_with(index, id, install)) {
+        return true;
+    }
+    buffer
+        .index_of(id)
+        .is_some_and(|index| buffer.update_at_with(index, id, install))
+}
+
 /// Reparse the resident rows `user_id` sent in `channels` after that user's
 /// 7TV personal emote set loaded or changed.
 pub fn retokenize_user_messages(user_id: &str, channels: &[Arc<str>]) {
@@ -246,10 +272,8 @@ pub fn retokenize_user_messages(user_id: &str, channels: &[Arc<str>]) {
             continue;
         }
         if let Some(mut buffer) = CHAT_MESSAGES.get_mut(&channel) {
-            for msg in updated {
-                if let Some(index) = buffer.index_of(msg.id.as_ref()) {
-                    buffer.update_at(index, msg);
-                }
+            for msg in &updated {
+                install_reparsed_slots(&mut buffer, None, msg);
             }
         }
         any_updated = true;
@@ -329,11 +353,7 @@ pub(super) fn retokenize_channel_messages_if_current(
             if !is_current() {
                 return false;
             }
-            if !buffer.update_at(idx, updated_msg.clone())
-                && let Some(real_idx) = buffer.index_of(updated_msg.id.as_ref())
-            {
-                buffer.update_at(real_idx, updated_msg);
-            }
+            install_reparsed_slots(&mut buffer, Some(idx), &updated_msg);
         }
     }
 
