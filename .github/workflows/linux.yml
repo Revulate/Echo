@@ -36,6 +36,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The test, lint and distribution profiles together need more disk than
+      # a hosted runner has free, so drop preinstalled SDKs Echo never uses.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
       # Keep this list in step with scripts/check-linux-build-deps.sh, which
       # names the pkg-config modules and commands the build needs.
       - name: Install Linux build dependencies
