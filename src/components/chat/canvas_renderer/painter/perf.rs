@@ -80,7 +80,7 @@ pub(super) fn element_fallback_reasons_label(counts: &[u64; 8]) -> String {
 }
 
 /// Stable-reuse gate terms, in `stable_frame_gate_failures` bit order.
-const STABLE_GATE_TERM_NAMES: [&str; 17] = [
+const STABLE_GATE_TERM_NAMES: [&str; 18] = [
     "async_in_flight",
     "pending_width",
     "needs_rebuild",
@@ -98,9 +98,10 @@ const STABLE_GATE_TERM_NAMES: [&str; 17] = [
     "eviction_seq",
     "channel_emotes",
     "scale_or_mod_mode",
+    "pending_scroll",
 ];
 
-pub(super) fn stable_gate_failures_label(counts: &[u64; 17]) -> String {
+pub(super) fn stable_gate_failures_label(counts: &[u64; 18]) -> String {
     counts_label(&STABLE_GATE_TERM_NAMES, counts)
 }
 
@@ -172,7 +173,7 @@ pub(super) struct RenderPerfAggregateStats {
     pub(super) last_rebuild_reason_flags: u8,
     pub(super) last_order_reset_reason: Option<&'static str>,
     pub(super) stable_gate_fail_mask: u32,
-    pub(super) stable_gate_fail_counts: [u64; 17],
+    pub(super) stable_gate_fail_counts: [u64; 18],
 }
 
 pub(super) fn rebuild_reason_flags_label(flags: u8) -> String {

@@ -447,6 +447,16 @@ impl CanvasMessageList {
             || self.mod_buttons_active != self.layout_store.runtime.last_layout_mod_buttons
     }
 
+    /// A queued scroll-to-bottom or scroll ratio is applied by
+    /// `update_layouts`, so a frame that still holds one must not skip it. An
+    /// empty list has nothing to scroll and keeps the target for its first row.
+    #[inline]
+    fn has_pending_scroll_target(&self) -> bool {
+        !self.message_model.messages.is_empty()
+            && (self.message_state.pending_scroll_to_bottom
+                || self.message_state.pending_scroll_ratio.is_some())
+    }
+
     #[inline]
     pub(super) fn can_reuse_visible_rows_for_stable_frame(
         &self,
@@ -481,6 +491,7 @@ impl CanvasMessageList {
             || crate::state::VersionRegistry::channel_emote_version(&self.channel_name)
                 != self.layout_store.runtime.last_checked_channel_emote_version
             || self.layout_mode_outdated()
+            || self.has_pending_scroll_target()
         {
             return false;
         }
@@ -519,6 +530,7 @@ impl CanvasMessageList {
             crate::state::VersionRegistry::channel_emote_version(&self.channel_name)
                 != runtime.last_checked_channel_emote_version,
             self.layout_mode_outdated(),
+            self.has_pending_scroll_target(),
         ];
         terms
             .iter()
@@ -564,6 +576,7 @@ impl CanvasMessageList {
             || crate::state::VersionRegistry::channel_emote_version(&self.channel_name)
                 != self.layout_store.runtime.last_checked_channel_emote_version
             || self.layout_mode_outdated()
+            || self.has_pending_scroll_target()
         {
             return false;
         }
