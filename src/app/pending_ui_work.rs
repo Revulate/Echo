@@ -2,7 +2,7 @@
 //! entities is drained by its own step, and [`EchoApp::process_pending_ui_work`]
 //! runs the steps in a fixed order.
 
-use super::{EchoApp, TabCloseScope, find_open_split_target, find_open_tab_channel_target};
+use super::{EchoApp, TabCloseScope, find_open_split_channel_target, find_open_tab_channel_target};
 use crate::backend;
 use crate::backend::lock_utils::MutexExt;
 use crate::components::chat::{ChatInputRenderer, ChatView, ChatViewDirtyReason};
@@ -101,7 +101,7 @@ impl EchoApp {
             }
             let target = {
                 let app_state = self.app_state.read(cx);
-                find_open_split_target(app_state, edit.split_id, "")
+                find_open_split_channel_target(app_state, edit.split_id, "")
             };
             let Some((tab_index, path, channel)) = target else {
                 continue;
@@ -179,7 +179,9 @@ impl EchoApp {
                 let app_state = self.app_state.read(cx);
                 insertion.source_split_id.map_or_else(
                     || find_open_tab_channel_target(app_state, &insertion.channel),
-                    |split_id| find_open_split_target(app_state, split_id, &insertion.channel),
+                    |split_id| {
+                        find_open_split_channel_target(app_state, split_id, &insertion.channel)
+                    },
                 )
             };
             let Some((tab_index, path, channel)) = target else {
@@ -380,7 +382,7 @@ impl EchoApp {
             processed = true;
             let target = {
                 let app_state = self.app_state.read(cx);
-                find_open_split_target(app_state, upload.split_id, &upload.channel)
+                find_open_split_channel_target(app_state, upload.split_id, &upload.channel)
             };
             let Some((tab_index, path, channel)) = target else {
                 crate::log_ui!(
@@ -437,7 +439,9 @@ impl EchoApp {
                 let app_state = self.app_state.read(cx);
                 mention.source_split_id.map_or_else(
                     || find_open_tab_channel_target(app_state, &mention.channel),
-                    |split_id| find_open_split_target(app_state, split_id, &mention.channel),
+                    |split_id| {
+                        find_open_split_channel_target(app_state, split_id, &mention.channel)
+                    },
                 )
             };
             if target.is_none()
@@ -688,7 +692,7 @@ impl EchoApp {
                             .map(|(tab_index, path, _)| (tab_index, path))
                     },
                     |split_id| {
-                        find_open_split_target(app_state, split_id, &reply.channel)
+                        find_open_split_channel_target(app_state, split_id, &reply.channel)
                             .map(|(tab_index, path, _)| (tab_index, path))
                     },
                 )
@@ -771,7 +775,7 @@ impl EchoApp {
             processed = true;
             let target = {
                 let app_state = self.app_state.read(cx);
-                find_open_split_target(app_state, jump.split_id, &jump.channel)
+                find_open_split_channel_target(app_state, jump.split_id, &jump.channel)
             };
 
             let Some((tab_index, path, channel)) = target else {

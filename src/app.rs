@@ -171,12 +171,12 @@ pub(crate) fn find_open_tab_channel_target(
         })
 }
 
+/// Locate an open split by id, with the channel its layout leaf stores (the
+/// Watching sentinel for a Watching split).
 fn find_open_split_target(
     app_state: &AppState,
     split_id: SplitId,
-    expected_channel: &str,
 ) -> Option<(usize, Vec<usize>, String)> {
-    let expected_channel = expected_channel.trim_start_matches('#');
     app_state
         .tabs
         .iter()
@@ -184,12 +184,27 @@ fn find_open_split_target(
         .find_map(|(tab_index, tab)| {
             let path = tab.split_path_for_id(split_id)?;
             let channel = tab.layout.channel_at_path(&path)?;
-            (expected_channel.is_empty()
-                || channel
-                    .trim_start_matches('#')
-                    .eq_ignore_ascii_case(expected_channel))
-            .then_some((tab_index, path, channel))
+            Some((tab_index, path, channel))
         })
+}
+
+/// Locate an open split by id, with the channel it currently shows. A Watching
+/// split resolves to the channel it follows, which is the name chat rows and
+/// composers of that split carry. `None` when the split is gone or shows a
+/// different channel than `expected_channel` (empty matches any).
+fn find_open_split_channel_target(
+    app_state: &AppState,
+    split_id: SplitId,
+    expected_channel: &str,
+) -> Option<(usize, Vec<usize>, String)> {
+    let (tab_index, path, stored) = find_open_split_target(app_state, split_id)?;
+    let channel = backend::browser_watching::resolve_layout_channel(&stored)?;
+    let expected_channel = expected_channel.trim_start_matches('#');
+    (expected_channel.is_empty()
+        || channel
+            .trim_start_matches('#')
+            .eq_ignore_ascii_case(expected_channel))
+    .then_some((tab_index, path, channel))
 }
 
 fn tab_active_split_target(
@@ -1056,7 +1071,7 @@ impl EchoApp {
     }
 
     fn composer_target_is_current(&self, split_id: SplitId, channel: &str, cx: &App) -> bool {
-        find_open_split_target(self.app_state.read(cx), split_id, "")
+        find_open_split_target(self.app_state.read(cx), split_id)
             .and_then(|(_, _, stored)| backend::browser_watching::resolve_layout_channel(&stored))
             .is_some_and(|current| {
                 current
@@ -1815,7 +1830,7 @@ impl EchoApp {
                     split_id,
                 } => {
                     let origin = split_id.and_then(|split_id| {
-                        find_open_split_target(self.app_state.read(cx), split_id, "")
+                        find_open_split_target(self.app_state.read(cx), split_id)
                     });
                     let target = if let Some((tab_index, path, stored_channel)) = origin {
                         let Some(current_channel) =
@@ -2187,7 +2202,7 @@ impl EchoApp {
         cx: &mut Context<Self>,
     ) {
         let empty_target = fill_split.and_then(|split_id| {
-            find_open_split_target(self.app_state.read(cx), split_id, "")
+            find_open_split_target(self.app_state.read(cx), split_id)
                 .filter(|(_, _, channel)| is_placeholder(channel))
         });
         if let Some((tab_index, path, _)) = empty_target {
@@ -2261,7 +2276,7 @@ impl EchoApp {
         cx: &mut Context<Self>,
     ) {
         let fill_split = source.filter(|split_id| {
-            find_open_split_target(self.app_state.read(cx), *split_id, "")
+            find_open_split_target(self.app_state.read(cx), *split_id)
                 .is_some_and(|(_, _, channel)| is_placeholder(&channel))
         });
         let channels = crate::event_handlers::quick_switch_items(self, cx);
