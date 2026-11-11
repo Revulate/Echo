@@ -590,7 +590,9 @@ impl DiskLayer {
 
         for blob in removed_blobs {
             let path = self.source_blob_path(&blob.hash, blob.encoding);
-            if tokio::fs::remove_file(&path).await.is_ok() {
+            // The index entry is already gone, so a file that was missing
+            // gives its bytes back as well.
+            if removed_or_missing(tokio::fs::remove_file(&path).await) {
                 Self::atomic_saturating_sub(&self.total_size, blob.size_bytes);
                 Self::atomic_usize_saturating_sub(&self.stats.disk_entries, 1);
                 Self::atomic_usize_saturating_sub(&self.stats.disk_bytes, blob.size_bytes as usize);
@@ -700,14 +702,21 @@ impl DiskLayer {
         if current_size.saturating_sub(evicted_bytes) > target {
             for (blob_hash, entry) in source_entries_to_evict {
                 let path = self.source_blob_path(&entry.hash, entry.encoding);
-                let deleted = tokio::fs::remove_file(&path).await.is_ok();
+                let deleted = removed_or_missing(tokio::fs::remove_file(&path).await);
 
-                if deleted {
+                // The file may be gone because an alias removal got to this
+                // blob first; whoever takes the entry out of the index gives
+                // its bytes back, so they are returned once.
+                if deleted
+                    && self
+                        .source_index
+                        .write()
+                        .await
+                        .remove_blob(&blob_hash)
+                        .is_some()
+                {
                     evicted_bytes += entry.size_bytes;
                     evicted_count += 1;
-
-                    let mut source_index = self.source_index.write().await;
-                    source_index.remove_blob(&blob_hash);
                 }
 
                 if current_size.saturating_sub(evicted_bytes) <= target {
