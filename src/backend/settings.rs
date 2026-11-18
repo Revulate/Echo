@@ -2906,19 +2906,30 @@ impl Default for SettingsManager {
 /// key that does not decode on its own is left out, so it takes its default,
 /// and the rest of the document is kept. Returns the settings with the keys
 /// left out, or `None` when the document cannot be read this way.
+///
+/// A list or map with some unreadable entries loses only those entries, as
+/// long as what remains still decodes. Such a key is reported with the number
+/// of entries dropped.
 fn salvage_settings(content: &str) -> Option<(AppSettings, Vec<String>)> {
     let serde_json::Value::Object(mut fields) = serde_json::from_str(content).ok()? else {
         return None;
     };
     let mut reset_keys = Vec::new();
     fields.retain(|key, value| {
-        let alone = serde_json::Map::from_iter([(key.clone(), value.clone())]);
-        let readable =
-            serde_json::from_value::<AppSettings>(serde_json::Value::Object(alone)).is_ok();
-        if !readable {
-            reset_keys.push(key.clone());
+        if setting_value_is_readable(key, value.clone()) {
+            return true;
         }
-        readable
+        match salvage_setting_entries(key, value) {
+            Some((kept, dropped, total)) => {
+                *value = kept;
+                reset_keys.push(format!("{key} ({dropped} of {total} entries dropped)"));
+                true
+            }
+            None => {
+                reset_keys.push(key.clone());
+                false
+            }
+        }
     });
     if reset_keys.is_empty() {
         return None;
@@ -2927,9 +2938,55 @@ fn salvage_settings(content: &str) -> Option<(AppSettings, Vec<String>)> {
     Some((settings, reset_keys))
 }
 
+fn setting_value_is_readable(key: &str, value: serde_json::Value) -> bool {
+    let alone = serde_json::Map::from_iter([(key.to_string(), value)]);
+    serde_json::from_value::<AppSettings>(serde_json::Value::Object(alone)).is_ok()
+}
+
+/// Drop the entries of a list or map setting that do not decode on their own.
+/// Returns the remaining value with the dropped and total entry counts, or
+/// `None` when no entry is readable or the remainder still does not decode (a
+/// fixed-shape value, for example), in which case the whole key is reset to
+/// its default instead of being left empty.
+fn salvage_setting_entries(
+    key: &str,
+    value: &serde_json::Value,
+) -> Option<(serde_json::Value, usize, usize)> {
+    use serde_json::Value;
+    let (kept, total, kept_count) = match value {
+        Value::Array(items) => {
+            let kept: Vec<Value> = items
+                .iter()
+                .filter(|item| setting_value_is_readable(key, Value::Array(vec![(*item).clone()])))
+                .cloned()
+                .collect();
+            let kept_count = kept.len();
+            (Value::Array(kept), items.len(), kept_count)
+        }
+        Value::Object(entries) => {
+            let kept: serde_json::Map<String, Value> = entries
+                .iter()
+                .filter(|(name, entry)| {
+                    let one = serde_json::Map::from_iter([((*name).clone(), (*entry).clone())]);
+                    setting_value_is_readable(key, Value::Object(one))
+                })
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect();
+            let kept_count = kept.len();
+            (Value::Object(kept), entries.len(), kept_count)
+        }
+        _ => return None,
+    };
+    if kept_count == 0 || kept_count == total || !setting_value_is_readable(key, kept.clone()) {
+        return None;
+    }
+    Some((kept, total - kept_count, total))
+}
+
 fn note_settings_reset_to_defaults(reset_keys: &[String], preserved: Option<&std::path::Path>) {
     let mut detail = format!(
-        "These settings could not be read and were reset to their defaults: {}.",
+        "These settings could not be read and were reset to their defaults, or lost the \
+         entries noted: {}.",
         reset_keys.join(", ")
     );
     match preserved {
@@ -7793,6 +7850,64 @@ mod salvage_tests {
         assert_eq!(reset_keys, ["font_scale"]);
         assert_eq!(settings.primary_accent_color, "#123456");
         assert_eq!(settings.font_scale, AppSettings::default().font_scale);
+    }
+
+    #[test]
+    fn an_unreadable_list_entry_is_dropped_without_resetting_the_list() {
+        let mut settings = AppSettings::default();
+        settings.trusted_link_domains = vec!["one.example".into(), "two.example".into()];
+        settings.hotkeys.insert(
+            "salvage_test_action".to_string(),
+            settings
+                .hotkeys
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let hotkey_count = settings.hotkeys.len();
+        let mut document = serde_json::to_value(&settings).unwrap();
+        document["trusted_link_domains"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, serde_json::json!({ "from": "a newer build" }));
+        document["hotkeys"]["from_a_newer_build"] = serde_json::json!(42);
+        let content = document.to_string();
+        assert!(serde_json::from_str::<AppSettings>(&content).is_err());
+
+        let (salvaged, reset_keys) = salvage_settings(&content).unwrap();
+
+        assert_eq!(
+            salvaged.trusted_link_domains,
+            ["one.example", "two.example"]
+        );
+        assert_eq!(salvaged.hotkeys.len(), hotkey_count);
+        assert!(salvaged.hotkeys.contains_key("salvage_test_action"));
+        assert!(!salvaged.hotkeys.contains_key("from_a_newer_build"));
+        let mut reset_keys = reset_keys;
+        reset_keys.sort();
+        assert_eq!(
+            reset_keys,
+            [
+                format!("hotkeys (1 of {} entries dropped)", hotkey_count + 1),
+                "trusted_link_domains (1 of 3 entries dropped)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_readable_entry_resets_to_its_default() {
+        let mut document = serde_json::to_value(AppSettings::default()).unwrap();
+        document["mod_buttons"] = serde_json::json!([1, 2]);
+        let content = document.to_string();
+
+        let (salvaged, reset_keys) = salvage_settings(&content).unwrap();
+
+        assert_eq!(reset_keys, ["mod_buttons"]);
+        assert_eq!(
+            salvaged.mod_buttons.len(),
+            AppSettings::default().mod_buttons.len()
+        );
     }
 
     #[test]

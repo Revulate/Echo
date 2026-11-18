@@ -522,6 +522,8 @@ root_test	src/backend/retry.rs	ratelimit_reset_is_epoch_relative
 root_test	src/backend/retry.rs	retry_after_parsing
 root_test	src/backend/retry.rs	retryable_statuses
 root_test	src/backend/retry.rs	server_wait_delay_jitters_within_cap
+root_test	src/backend/settings.rs	a_list_with_no_readable_entry_resets_to_its_default
+root_test	src/backend/settings.rs	an_unreadable_list_entry_is_dropped_without_resetting_the_list
 root_test	src/backend/settings.rs	an_unreadable_value_resets_only_its_own_setting
 root_test	src/backend/settings.rs	broken_json_is_left_to_backup_recovery
 root_test	src/backend/settings.rs	empty_document_deserializes_to_defaults_except_migration_markers
