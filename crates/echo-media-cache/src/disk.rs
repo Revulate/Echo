@@ -592,10 +592,32 @@ impl DiskLayer {
             let path = self.source_blob_path(&blob.hash, blob.encoding);
             // The index entry is already gone, so a file that was missing
             // gives its bytes back as well.
-            if removed_or_missing(tokio::fs::remove_file(&path).await) {
-                Self::atomic_saturating_sub(&self.total_size, blob.size_bytes);
-                Self::atomic_usize_saturating_sub(&self.stats.disk_entries, 1);
-                Self::atomic_usize_saturating_sub(&self.stats.disk_bytes, blob.size_bytes as usize);
+            let deleted = removed_or_missing(tokio::fs::remove_file(&path).await);
+            // A file that could not be deleted (held open, for example) is
+            // still on disk, so its entry goes back into the index without
+            // aliases and stays counted until eviction removes it. If the
+            // same blob was stored again meanwhile, that insert counted it a
+            // second time and this copy's bytes are given back.
+            let still_indexed = !deleted && {
+                let mut source_index = self.source_index.write().await;
+                if source_index.blobs.contains_key(&blob.hash) {
+                    false
+                } else {
+                    // Nothing can reach it any more, so eviction takes it first.
+                    let mut unreachable = blob.clone();
+                    unreachable.last_accessed = 0;
+                    unreachable.access_count = 0;
+                    source_index.insert_blob(unreachable);
+                    true
+                }
+            };
+            if still_indexed {
+                continue;
+            }
+            Self::atomic_saturating_sub(&self.total_size, blob.size_bytes);
+            Self::atomic_usize_saturating_sub(&self.stats.disk_entries, 1);
+            Self::atomic_usize_saturating_sub(&self.stats.disk_bytes, blob.size_bytes as usize);
+            if deleted {
                 self.stats.disk_evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1962,5 +1984,40 @@ mod tests {
         assert_eq!(layer.size(), 250);
         assert_eq!(stats.disk_entries.load(Ordering::Relaxed), 1);
         assert_eq!(stats.disk_bytes.load(Ordering::Relaxed), 250);
+    }
+
+    #[tokio::test]
+    async fn a_source_blob_that_cannot_be_deleted_stays_indexed_and_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        let stats = Arc::new(CacheStats::new());
+        let layer = DiskLayer::new(
+            temp.path().join("cache"),
+            Arc::new(BudgetManager::new()),
+            stats.clone(),
+        );
+        let url = "https://example.test/held-open.webp";
+        let blob = SourceBlobEntry::new(
+            "held-blob".into(),
+            SourceBlobEncoding::Zstd,
+            300,
+            300,
+            28,
+            28,
+        );
+        // A directory at the blob's path makes deleting it as a file fail on
+        // every platform, the way a file held open does on Windows.
+        let path = layer.source_blob_path(&blob.hash, blob.encoding);
+        std::fs::create_dir_all(path.join("child")).unwrap();
+        layer.insert_source_blob(None, url.to_string(), blob).await;
+        assert_eq!(layer.size(), 300);
+
+        layer.remove_source_aliases(None, Some(url)).await;
+
+        assert_eq!(layer.size(), 300);
+        assert_eq!(stats.disk_entries.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.disk_bytes.load(Ordering::Relaxed), 300);
+        let source_index = layer.source_index.read().await;
+        assert!(source_index.blobs.contains_key("held-blob"));
+        assert_eq!(source_index.blob_alias_count("held-blob"), 0);
     }
 }

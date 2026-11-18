@@ -778,6 +778,7 @@ cache_preload_tool_test	tools/cache-preload-check/src/lib.rs	no_argument_output_
 media_cache_test	crates/echo-media-cache/src/decode.rs	test_bgra_conversion
 media_cache_test	crates/echo-media-cache/src/decode.rs	test_bgra_conversion_consistency
 media_cache_test	crates/echo-media-cache/src/decode.rs	test_decode_simple_png
+media_cache_test	crates/echo-media-cache/src/disk.rs	a_source_blob_that_cannot_be_deleted_stays_indexed_and_counted
 media_cache_test	crates/echo-media-cache/src/disk.rs	legacy_index_is_used_only_when_current_index_is_absent
 media_cache_test	crates/echo-media-cache/src/disk.rs	legacy_source_index_native_bincode_fixture_migrates_to_postcard
 media_cache_test	crates/echo-media-cache/src/disk.rs	postcard_index_payload_rejects_trailing_bytes
