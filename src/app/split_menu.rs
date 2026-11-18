@@ -167,6 +167,19 @@ impl EchoApp {
             return div().into_any_element();
         };
 
+        // The channel was captured when the menu opened. A Watching split
+        // follows the browser, so its channel can change under the open menu;
+        // the rows act on the channel the split shows now.
+        let channel = self
+            .app_state
+            .read(cx)
+            .active_tab()
+            .layout
+            .channel_ref_at_path(path_key.as_slice())
+            .filter(|stored| backend::browser_watching::is_watching_channel(stored))
+            .and_then(backend::browser_watching::resolve_layout_channel)
+            .unwrap_or(channel);
+
         let compact_split_header = backend::settings::get_compact_split_header();
         let header_height = main_split_header_height(compact_split_header);
         let header_collapsed = self
