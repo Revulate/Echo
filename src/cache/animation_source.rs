@@ -112,7 +112,7 @@ impl AnimationSource {
         match &*self.storage.read() {
             Storage::Memory(frames) => {
                 let frame = frames.get(index)?;
-                let data = zstd::bulk::decompress(&frame.compressed, frame.raw_len).ok()?;
+                let data = decompress_frame(&frame.compressed, frame.raw_len)?;
                 (data.len() == frame.raw_len).then_some((data, frame.width, frame.height))
             }
             Storage::Disk(sidecar) => {
@@ -120,7 +120,7 @@ impl AnimationSource {
                 let mut compressed = vec![0u8; frame.compressed_len as usize];
                 read_exact_at(&sidecar.file, &mut compressed, frame.offset).ok()?;
                 let raw_len = frame.raw_len as usize;
-                let data = zstd::bulk::decompress(&compressed, raw_len).ok()?;
+                let data = decompress_frame(&compressed, raw_len)?;
                 (data.len() == raw_len).then_some((data, frame.width, frame.height))
             }
         }
@@ -145,7 +145,11 @@ impl AnimationSource {
         {
             use std::os::windows::fs::OpenOptionsExt;
             const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            // The file lives only for this session, so the cache manager may
+            // keep it in memory instead of lazily writing it to the disk.
+            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
             options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+            options.attributes(FILE_ATTRIBUTE_TEMPORARY);
         }
         let mut file = options.open(&path).ok()?;
         let mut table = Vec::with_capacity(frames.len());
@@ -190,6 +194,26 @@ impl AnimationSource {
     }
 }
 
+/// Decompress one frame with this thread's zstd context, created on first
+/// use, rather than a new context per frame. The result is what
+/// `zstd::bulk::decompress` returns, allocated at the frame's recorded size.
+fn decompress_frame(compressed: &[u8], raw_len: usize) -> Option<Vec<u8>> {
+    thread_local! {
+        static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    DECOMPRESSOR
+        .try_with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(zstd::bulk::Decompressor::new().ok()?);
+            }
+            slot.as_mut()?.decompress(compressed, raw_len).ok()
+        })
+        // The thread is exiting and its context is gone.
+        .unwrap_or_else(|_| zstd::bulk::decompress(compressed, raw_len).ok())
+}
+
 /// The session's sidecar directory under the media cache, emptied the first
 /// time it is used. `None` when it cannot be created; sources then stay in RAM.
 fn sidecar_dir() -> Option<&'static Path> {
@@ -227,4 +251,39 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
 #[cfg(not(any(windows, unix)))]
 fn read_exact_at(_file: &File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn frame_reads_reuse_a_context_and_match_bulk_decompress() {
+        let gradient: Vec<u8> = (0..96u32 * 96 * 4).map(|i| (i % 251) as u8).collect();
+        let frames: Vec<Vec<u8>> = vec![
+            gradient.clone(),
+            vec![0; 128 * 128 * 4],
+            vec![9, 8, 7, 255],
+            gradient,
+        ];
+        for (index, raw) in frames.iter().enumerate() {
+            let compressed = zstd::bulk::compress(raw, 3).unwrap();
+            let expected = zstd::bulk::decompress(&compressed, raw.len()).unwrap();
+            let decompressed = decompress_frame(&compressed, raw.len()).unwrap();
+            assert_eq!(decompressed, expected, "frame {index}");
+            assert_eq!(&decompressed, raw, "frame {index}");
+            assert_eq!(decompressed.capacity(), raw.len(), "frame {index}");
+        }
+
+        // A frame larger than its recorded length is refused, as before, and
+        // the context still works afterwards.
+        let compressed = zstd::bulk::compress(&frames[0], 3).unwrap();
+        assert!(decompress_frame(&compressed, frames[0].len() - 1).is_none());
+        assert!(zstd::bulk::decompress(&compressed, frames[0].len() - 1).is_err());
+        assert_eq!(
+            decompress_frame(&compressed, frames[0].len()).as_deref(),
+            Some(frames[0].as_slice())
+        );
+    }
 }

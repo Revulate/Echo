@@ -177,6 +177,34 @@ fn normalize_animation_delay_ms(raw_ms: u32) -> u32 {
     }
 }
 
+/// Compresses a decode's frames for the refill source. One zstd context and
+/// one `compress_bound`-sized scratch buffer serve every frame, and each frame
+/// is stored as an exact-size copy of the scratch's compressed bytes, which are
+/// the same bytes `zstd::bulk::compress` gives at the same level.
+///
+/// The stored copy must be exact-size: a buffer allocated at
+/// `compress_bound()`, which is slightly LARGER than the uncompressed frame,
+/// would keep a raw-frame-sized allocation alive for every "compressed" frame
+/// and make the cache's accounting (which sums capacity) misreport the heap.
+#[derive(Default)]
+struct FrameCompressor {
+    context: Option<zstd::bulk::Compressor<'static>>,
+    scratch: Vec<u8>,
+}
+
+impl FrameCompressor {
+    fn compress(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        if self.context.is_none() {
+            self.context = Some(zstd::bulk::Compressor::new(ANIMATION_SOURCE_ZSTD_LEVEL).ok()?);
+        }
+        let context = self.context.as_mut()?;
+        self.scratch.clear();
+        self.scratch.reserve(zstd::compress_bound(frame.len()));
+        context.compress_to_buffer(frame, &mut self.scratch).ok()?;
+        Some(self.scratch.as_slice().to_vec())
+    }
+}
+
 #[inline]
 fn compressed_frame_allocation_bytes(frame: &CompressedDecodedFrameData) -> usize {
     frame.compressed.capacity()
@@ -412,6 +440,7 @@ fn decode_gif_frames(data: &[u8], max_frames: usize) -> Option<DecodedAnimationD
     let mut truncation = None;
     // Running full-canvas accumulator for the sub-frame fallback below.
     let mut canvas: Option<RgbaImage> = None;
+    let mut frame_compressor = FrameCompressor::default();
 
     for (i, frame_result) in frames_iter.enumerate() {
         if i >= max_frames {
@@ -483,16 +512,9 @@ fn decode_gif_frames(data: &[u8], max_frames: usize) -> Option<DecodedAnimationD
         let base = canvas.as_mut()?;
         convert_to_gpu_format_in_place(base.as_mut());
         let raw_len = base.as_raw().len();
-        let compressed = zstd::bulk::compress(base.as_raw(), ANIMATION_SOURCE_ZSTD_LEVEL);
+        let compressed = frame_compressor.compress(base.as_raw());
         convert_to_gpu_format_in_place(base.as_mut());
-        let mut compressed = compressed.ok()?;
-        // zstd allocates the destination at compress_bound(), which is slightly
-        // LARGER than the uncompressed frame, then sets len to the compressed
-        // size. Storing that buffer unshrunk keeps a raw-frame-sized allocation
-        // alive for every "compressed" frame -- which defeats the entire point of
-        // compressing the source, and made the cache's own accounting (which sums
-        // len) report a small fraction of what the heap actually held.
-        compressed.shrink_to_fit();
+        let compressed = compressed?;
         let retained_frame_bytes = compressed.capacity();
         let projected_frame_count = frames.len().saturating_add(1);
         let projected_source_bytes = compressed_source_bytes
@@ -570,6 +592,7 @@ fn decode_webp_frames(data: &[u8], max_frames: usize) -> Option<DecodedAnimation
     let mut truncation = None;
     // Running full-canvas accumulator for the sub-frame fallback below.
     let mut canvas: Option<RgbaImage> = None;
+    let mut frame_compressor = FrameCompressor::default();
 
     for (i, frame_result) in frames_iter.enumerate() {
         if i >= max_frames {
@@ -636,16 +659,9 @@ fn decode_webp_frames(data: &[u8], max_frames: usize) -> Option<DecodedAnimation
         let base = canvas.as_mut()?;
         convert_to_gpu_format_in_place(base.as_mut());
         let raw_len = base.as_raw().len();
-        let compressed = zstd::bulk::compress(base.as_raw(), ANIMATION_SOURCE_ZSTD_LEVEL);
+        let compressed = frame_compressor.compress(base.as_raw());
         convert_to_gpu_format_in_place(base.as_mut());
-        let mut compressed = compressed.ok()?;
-        // zstd allocates the destination at compress_bound(), which is slightly
-        // LARGER than the uncompressed frame, then sets len to the compressed
-        // size. Storing that buffer unshrunk keeps a raw-frame-sized allocation
-        // alive for every "compressed" frame -- which defeats the entire point of
-        // compressing the source, and made the cache's own accounting (which sums
-        // len) report a small fraction of what the heap actually held.
-        compressed.shrink_to_fit();
+        let compressed = compressed?;
         let retained_frame_bytes = compressed.capacity();
         let projected_frame_count = frames.len().saturating_add(1);
         let projected_source_bytes = compressed_source_bytes
@@ -878,5 +894,66 @@ mod tests {
         // This may or may not decode depending on the exact PNG validity
         // The main point is it shouldn't panic
         let _ = decode_to_render_image(&png_bytes);
+    }
+
+    fn frame_inputs() -> Vec<Vec<u8>> {
+        let gradient: Vec<u8> = (0..96u32 * 96 * 4).map(|i| (i % 251) as u8).collect();
+        let mut state = 0x9E37_79B9_u32;
+        let noise: Vec<u8> = (0..64 * 64 * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        vec![
+            gradient.clone(),
+            vec![0; 256 * 256 * 4],
+            noise,
+            vec![7, 1, 2, 255],
+            Vec::new(),
+            gradient,
+        ]
+    }
+
+    #[test]
+    fn frame_compressor_matches_bulk_compress_and_stores_exact_size() {
+        let mut compressor = FrameCompressor::default();
+        for (index, frame) in frame_inputs().iter().enumerate() {
+            let expected = zstd::bulk::compress(frame, ANIMATION_SOURCE_ZSTD_LEVEL).unwrap();
+            let compressed = compressor.compress(frame).unwrap();
+            assert_eq!(compressed, expected, "input {index}");
+            assert_eq!(compressed.capacity(), compressed.len(), "input {index}");
+        }
+    }
+
+    #[test]
+    fn decoded_gif_frames_hold_the_bulk_compress_bytes() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, Rgba};
+
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut bytes);
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            for seed in 0..4u32 {
+                let image = RgbaImage::from_fn(48, 40, |x, y| {
+                    Rgba([(x * 5 + seed * 40) as u8, (y * 6) as u8, (x + y) as u8, 255])
+                });
+                let frame = Frame::from_parts(image, 0, 0, Delay::from_numer_denom_ms(50, 1));
+                encoder.encode_frame(frame).unwrap();
+            }
+        }
+
+        let decoded = decode_animated_frames(&bytes).unwrap();
+        assert_eq!(decoded.frames.len(), 4);
+        for frame in &decoded.frames {
+            let raw = zstd::bulk::decompress(&frame.compressed, frame.raw_len).unwrap();
+            assert_eq!(raw.len(), frame.raw_len);
+            let expected = zstd::bulk::compress(&raw, ANIMATION_SOURCE_ZSTD_LEVEL).unwrap();
+            assert_eq!(frame.compressed, expected);
+            assert_eq!(frame.compressed.capacity(), frame.compressed.len());
+        }
     }
 }
