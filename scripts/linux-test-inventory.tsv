@@ -416,6 +416,8 @@ text_core_test	crates/echo-text-core/src/timestamp.rs	serde_shapes_preserve_lega
 root_test	src/backend/auth.rs	retry_delays_back_off_then_go_hourly
 root_test	src/backend/blocked_users.rs	omits_cursor_on_the_initial_page
 root_test	src/backend/blocked_users.rs	preserves_blocked_user_query_order_and_opaque_cursor_value
+root_test	src/backend/bridge/chat.rs	offline_info_keeps_the_last_title_between_metadata_refreshes
+root_test	src/backend/bridge/chat.rs	offline_metadata_is_refreshed_for_all_when_any_is_due
 root_test	src/backend/browser_watching.rs	extension_selection_notifies_only_for_channel_or_source_changes
 root_test	src/backend/browser_watching.rs	media_session_updates_channel_until_extension_is_authoritative
 root_test	src/backend/commands/helix.rs	builds_role_endpoints_and_omits_absent_cursor
@@ -582,8 +584,10 @@ root_test	src/backend/streamer_mode.rs	the_backstop_trips_only_after_its_full_du
 root_test	src/backend/streamer_mode.rs	the_detection_loop_scans_on_every_tick_and_survives_a_panicking_scan
 root_test	src/backend/twitch_api.rs	a_huge_retry_after_pauses_at_most_five_minutes
 root_test	src/backend/twitch_api.rs	a_later_429_never_shortens_the_pause
+root_test	src/backend/twitch_api.rs	a_polled_batch_reports_every_requested_login
 root_test	src/backend/twitch_api.rs	answer_cache_is_bounded
 root_test	src/backend/twitch_api.rs	cap_is_hard_and_evicts_oldest
+root_test	src/backend/twitch_api.rs	channels_url_repeats_the_broadcaster_id
 root_test	src/backend/twitch_api.rs	logs_once_per_key_per_interval
 root_test	src/backend/twitch_api.rs	missing_or_unparseable_retry_after_pauses_sixty_seconds
 root_test	src/backend/twitch_api.rs	preserves_repeated_login_order_and_query_encoding
@@ -916,7 +920,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	424
+summary	root_tests	428
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

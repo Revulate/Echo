@@ -11,6 +11,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 /// Connect to a Twitch channel
 /// Uses immediate join when IRC is already connected (bypasses 5-second poll)
@@ -1212,6 +1213,14 @@ static PENDING_STREAM_INFO: LazyLock<DashMap<String, Option<StreamInfo>>> =
     LazyLock::new(DashMap::new);
 static STREAM_INFO_DIRTY: AtomicBool = AtomicBool::new(false);
 static STREAM_FETCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// When a signed-in poll last asked Helix for each offline channel's title
+/// and category.
+static OFFLINE_METADATA_FETCHED_AT: LazyLock<DashMap<String, Instant>> =
+    LazyLock::new(DashMap::new);
+/// How often a signed-in poll refreshes offline channels' title and category.
+/// Live status, and a live channel's title, category and viewers, come with
+/// every poll's batched `/streams` request.
+const OFFLINE_STREAM_METADATA_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 struct StreamFetchInFlightGuard;
 
@@ -1300,6 +1309,103 @@ async fn fetch_stream_info(channel: &str) -> Option<StreamInfo> {
     }
 }
 
+fn stream_info_from_result(result: crate::backend::twitch_api::StreamInfoResult) -> StreamInfo {
+    StreamInfo {
+        title: result.title,
+        game_name: result.game_name,
+        viewer_count: result.viewer_count,
+        started_at: result.started_at,
+        is_live: result.is_live,
+    }
+}
+
+/// Whether a signed-in poll should refresh offline channels' title and
+/// category: one of `offline` was never asked, or was asked longer than
+/// [`OFFLINE_STREAM_METADATA_INTERVAL`] ago. The poll then asks for all of
+/// them, so their refreshes stay in one batch.
+fn offline_metadata_due(
+    offline: &[String],
+    fetched_at: &DashMap<String, Instant>,
+    now: Instant,
+) -> bool {
+    offline.iter().any(|login| {
+        fetched_at
+            .get(login)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= OFFLINE_STREAM_METADATA_INTERVAL)
+    })
+}
+
+/// An offline channel's info from a signed-in poll: the title and category
+/// Helix returned, or else the last known ones (the previous offline refresh,
+/// or the stream's own while it was live).
+fn offline_stream_info(
+    previous: Option<&StreamInfo>,
+    metadata: Option<crate::backend::twitch_api::StreamInfoResult>,
+) -> StreamInfo {
+    let (title, game_name) = match metadata {
+        Some(metadata) => (metadata.title, metadata.game_name),
+        None => previous
+            .map(|info| (info.title.clone(), info.game_name.clone()))
+            .unwrap_or_default(),
+    };
+    StreamInfo {
+        title,
+        game_name,
+        viewer_count: 0,
+        started_at: 0,
+        is_live: false,
+    }
+}
+
+/// Stream info for `channels` from one batched Helix poll, keyed like
+/// `channels`; `None` when there is no signed-in account or the batch
+/// failed, and the caller looks the channels up one at a time instead.
+async fn poll_stream_infos(channels: &[String]) -> Option<Vec<(String, StreamInfo)>> {
+    let mut logins: Vec<String> = channels
+        .iter()
+        .map(|channel| normalize_stream_status_channel(channel))
+        .filter(|login| !login.is_empty())
+        .collect();
+    logins.sort_unstable();
+    logins.dedup();
+    let states = crate::backend::twitch_api::poll_stream_states_helix(&logins, |offline| {
+        let now = Instant::now();
+        let due = offline_metadata_due(offline, &OFFLINE_METADATA_FETCHED_AT, now);
+        if due {
+            for login in offline {
+                OFFLINE_METADATA_FETCHED_AT.insert(login.clone(), now);
+            }
+        }
+        due
+    })
+    .await?;
+    let mut states = match states {
+        Ok(states) => states,
+        Err(error) => {
+            crate::log_net!(debug, "stream refresh batch failed: {error}");
+            return None;
+        }
+    };
+    let mut infos = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let key = normalize_stream_status_channel(channel);
+        let info = match states.remove(&key) {
+            Some(crate::backend::twitch_api::PolledStreamState::Live(result)) => {
+                stream_info_from_result(result)
+            }
+            Some(crate::backend::twitch_api::PolledStreamState::Offline(metadata)) => {
+                let previous = LAST_STREAM_INFO.get(&key).map(|info| info.clone());
+                offline_stream_info(previous.as_ref(), metadata)
+            }
+            None => continue,
+        };
+        set_cached_channel_live_status(&key, info.is_live);
+        LAST_STREAM_INFO.insert(key, info.clone());
+        infos.push((channel.clone(), info));
+    }
+    Some(infos)
+}
+
 pub fn stage_eventsub_stream_info(channel: &str, is_live: bool, started_at: Option<i64>) -> u64 {
     let channel_key = normalize_stream_status_channel(channel);
     let previous_info = LAST_STREAM_INFO.get(&channel_key).map(|info| info.clone());
@@ -1367,18 +1473,29 @@ pub fn queue_stream_info_refresh(
     RUNTIME.spawn(async move {
         let _in_flight = StreamFetchInFlightGuard;
         let mut changed = 0usize;
-
-        for channel in channels {
-            let info = fetch_stream_info(&channel).await;
+        let mut stage = |channel: String, info: Option<StreamInfo>| {
             let previous_hash = last_hashes.get(&channel).copied();
             let should_stage = match info.as_ref() {
                 Some(info) => previous_hash != Some(stream_info_gate_hash(Some(info))),
                 None => previous_hash.is_none(),
             };
-
             if should_stage {
                 PENDING_STREAM_INFO.insert(channel, info);
                 changed += 1;
+            }
+        };
+
+        // Signed in, one Helix request answers up to 100 channels; otherwise
+        // (or if it fails) each channel is looked up on its own, through the
+        // API proxy first.
+        if let Some(infos) = poll_stream_infos(&channels).await {
+            for (channel, info) in infos {
+                stage(channel, Some(info));
+            }
+        } else {
+            for channel in channels {
+                let info = fetch_stream_info(&channel).await;
+                stage(channel, info);
             }
         }
 
@@ -1610,4 +1727,75 @@ pub fn clear_all_activity() -> bool {
     let had_events = !crate::backend::components::event_notification::recent_events(1).is_empty();
     crate::backend::components::event_notification::clear_recent_events();
     had_mentions || whispers || had_events
+}
+
+#[cfg(test)]
+mod stream_poll_tests {
+    use super::*;
+    use crate::backend::twitch_api::StreamInfoResult;
+    use core::prelude::v1::test;
+
+    fn metadata(title: &str, game: Option<&str>) -> StreamInfoResult {
+        StreamInfoResult {
+            title: title.to_string(),
+            game_name: game.map(str::to_string),
+            viewer_count: 0,
+            started_at: 0,
+            is_live: false,
+            thumbnail_url: None,
+        }
+    }
+
+    #[test]
+    fn offline_metadata_is_refreshed_for_all_when_any_is_due() {
+        let fetched_at = DashMap::new();
+        let now = Instant::now();
+        let offline = vec!["a".to_string(), "b".to_string()];
+        assert!(offline_metadata_due(&offline, &fetched_at, now));
+
+        fetched_at.insert("a".to_string(), now);
+        fetched_at.insert("b".to_string(), now);
+        assert!(!offline_metadata_due(&offline, &fetched_at, now));
+        assert!(!offline_metadata_due(
+            &offline,
+            &fetched_at,
+            now + OFFLINE_STREAM_METADATA_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(offline_metadata_due(
+            &offline,
+            &fetched_at,
+            now + OFFLINE_STREAM_METADATA_INTERVAL
+        ));
+
+        let with_new_channel = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(
+            offline_metadata_due(&with_new_channel, &fetched_at, now),
+            "a newly opened offline channel gets its title on the next poll"
+        );
+    }
+
+    #[test]
+    fn offline_info_keeps_the_last_title_between_metadata_refreshes() {
+        let was_live = StreamInfo {
+            title: "stream title".to_string(),
+            game_name: Some("Chess".to_string()),
+            viewer_count: 1_234,
+            started_at: 1_900_000_000,
+            is_live: true,
+        };
+        let offline = offline_stream_info(Some(&was_live), None);
+        assert!(!offline.is_live);
+        assert_eq!(offline.viewer_count, 0);
+        assert_eq!(offline.started_at, 0);
+        assert_eq!(offline.title, "stream title");
+        assert_eq!(offline.game_name.as_deref(), Some("Chess"));
+
+        let refreshed = offline_stream_info(Some(&was_live), Some(metadata("new title", None)));
+        assert_eq!(refreshed.title, "new title");
+        assert_eq!(refreshed.game_name, None);
+
+        let unknown = offline_stream_info(None, None);
+        assert!(unknown.title.is_empty());
+        assert!(!unknown.is_live);
+    }
 }

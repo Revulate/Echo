@@ -913,11 +913,24 @@ async fn fetch_live_logins_helix(
         .collect())
 }
 
+/// `/streams` for up to [`USER_LIVE_HELIX_BATCH_MAX`] logins. Helix returns 20
+/// rows per page unless `first` asks for more, so a batch with more live
+/// logins than that would report the rest offline.
 fn live_logins_helix_url(logins: &[String]) -> Url {
     let mut url = Url::parse("https://api.twitch.tv/helix/streams")
         .expect("static Twitch Helix streams URL must be valid");
     url.query_pairs_mut()
-        .extend_pairs(logins.iter().map(|login| ("user_login", login)));
+        .extend_pairs(logins.iter().map(|login| ("user_login", login)))
+        .append_pair("first", &USER_LIVE_HELIX_BATCH_MAX.to_string());
+    url
+}
+
+/// `/channels` for up to [`USER_LIVE_HELIX_BATCH_MAX`] broadcaster ids.
+fn channels_helix_url(broadcaster_ids: &[String]) -> Url {
+    let mut url = Url::parse("https://api.twitch.tv/helix/channels")
+        .expect("static Twitch Helix channels URL must be valid");
+    url.query_pairs_mut()
+        .extend_pairs(broadcaster_ids.iter().map(|id| ("broadcaster_id", id)));
     url
 }
 
@@ -974,7 +987,82 @@ mod live_logins_helix_url_tests {
             vec![
                 ("user_login".to_string(), "first_user".to_string()),
                 ("user_login".to_string(), "reserved+value".to_string()),
+                ("first".to_string(), "100".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn channels_url_repeats_the_broadcaster_id() {
+        let url = channels_helix_url(&["11".to_string(), "22".to_string()]);
+        assert_eq!(url.path(), "/helix/channels");
+        assert_eq!(
+            url.query_pairs().into_owned().collect::<Vec<_>>(),
+            vec![
+                ("broadcaster_id".to_string(), "11".to_string()),
+                ("broadcaster_id".to_string(), "22".to_string()),
+            ]
+        );
+    }
+
+    fn stream_row(login: &str, stream_type: &str, game: &str) -> StreamData {
+        StreamData {
+            user_login: login.to_string(),
+            game_name: game.to_string(),
+            stream_type: stream_type.to_string(),
+            title: format!("{login} title"),
+            viewer_count: 7,
+            started_at: "2026-11-20T10:00:00Z".to_string(),
+            thumbnail_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_polled_batch_reports_every_requested_login() {
+        let logins = vec![
+            "livechan".to_string(),
+            "offchan".to_string(),
+            "quietchan".to_string(),
+            "rerunchan".to_string(),
+        ];
+        let live = live_streams_by_login(vec![
+            stream_row("LiveChan", "live", "Just Chatting"),
+            stream_row("rerunchan", "", ""),
+        ]);
+        let mut metadata = HashMap::from([(
+            "offchan".to_string(),
+            StreamInfoResult {
+                title: "configured".to_string(),
+                game_name: Some("Chess".to_string()),
+                viewer_count: 0,
+                started_at: 0,
+                is_live: false,
+                thumbnail_url: None,
+            },
+        )]);
+        let states = polled_stream_states(&logins, live, &mut metadata);
+
+        assert_eq!(states.len(), 4);
+        let PolledStreamState::Live(live) = &states["livechan"] else {
+            panic!("a live row is live");
+        };
+        assert!(live.is_live);
+        assert_eq!(live.title, "LiveChan title");
+        assert_eq!(live.game_name.as_deref(), Some("Just Chatting"));
+        assert_eq!(live.viewer_count, 7);
+        assert!(live.started_at > 0);
+        let PolledStreamState::Offline(Some(offline)) = &states["offchan"] else {
+            panic!("an offline login keeps its fetched metadata");
+        };
+        assert_eq!(offline.title, "configured");
+        assert!(!offline.is_live);
+        assert!(matches!(
+            states["quietchan"],
+            PolledStreamState::Offline(None)
+        ));
+        assert!(
+            matches!(states["rerunchan"], PolledStreamState::Offline(None)),
+            "a row that is not type live is offline"
         );
     }
 }
@@ -2279,6 +2367,8 @@ struct ChannelsResponse {
 #[derive(Deserialize, Debug)]
 struct ChannelData {
     #[serde(default)]
+    broadcaster_id: String,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     game_name: String,
@@ -2462,6 +2552,191 @@ async fn get_offline_channel_info_helix(
         is_live: false,
         thumbnail_url: None,
     })
+}
+
+/// One open channel's state from [`poll_stream_states_helix`].
+pub enum PolledStreamState {
+    Live(StreamInfoResult),
+    /// Offline, with the channel's configured title and category when the
+    /// poll asked for them and Helix returned them.
+    Offline(Option<StreamInfoResult>),
+}
+
+fn stream_info_from_helix(stream: StreamData) -> StreamInfoResult {
+    StreamInfoResult {
+        game_name: (!stream.game_name.is_empty()).then_some(stream.game_name),
+        viewer_count: stream.viewer_count,
+        started_at: parse_iso8601_to_unix(&stream.started_at),
+        is_live: true,
+        thumbnail_url: non_empty_trimmed_string(&stream.thumbnail_url),
+        title: stream.title,
+    }
+}
+
+/// The live rows of a `/streams` answer by lowercase login.
+fn live_streams_by_login(rows: Vec<StreamData>) -> HashMap<String, StreamInfoResult> {
+    rows.into_iter()
+        .filter(|stream| stream.stream_type == "live")
+        .map(|stream| {
+            (
+                stream.user_login.to_lowercase(),
+                stream_info_from_helix(stream),
+            )
+        })
+        .collect()
+}
+
+/// Every requested login's state: live when `/streams` listed it, otherwise
+/// offline with its entry from `offline_metadata`, if any.
+fn polled_stream_states(
+    logins: &[String],
+    mut live: HashMap<String, StreamInfoResult>,
+    offline_metadata: &mut HashMap<String, StreamInfoResult>,
+) -> HashMap<String, PolledStreamState> {
+    logins
+        .iter()
+        .map(|login| {
+            let state = match live.remove(login) {
+                Some(info) => PolledStreamState::Live(info),
+                None => PolledStreamState::Offline(offline_metadata.remove(login)),
+            };
+            (login.clone(), state)
+        })
+        .collect()
+}
+
+/// Live state of the open channels `logins` (lowercase) from batched Helix
+/// `/streams` requests of up to 100 logins, and, when `offline_metadata_due`
+/// says so for the logins found offline, their configured title and category
+/// from batched `/channels` requests. `None` without a signed-in account
+/// (Helix needs one; the caller keeps its per-channel lookups), `Some(Err)`
+/// when a `/streams` request failed or the account changed meanwhile. A
+/// failed `/channels` request only leaves the offline metadata out.
+pub async fn poll_stream_states_helix(
+    logins: &[String],
+    offline_metadata_due: impl FnOnce(&[String]) -> bool,
+) -> Option<Result<HashMap<String, PolledStreamState>, String>> {
+    let auth = super::auth::capture_authenticated_resource_fence()?;
+    let mut live = HashMap::new();
+    for chunk in logins.chunks(USER_LIVE_HELIX_BATCH_MAX) {
+        let url = live_logins_helix_url(chunk);
+        let response = match send_helix_idempotent_quiet(auth.access_token(), |token| {
+            TWITCH_HTTP_CLIENT.get(url.clone()).helix_auth(token)
+        })
+        .await
+        {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                return Some(Err(format!(
+                    "stream status batch returned status {}",
+                    response.status()
+                )));
+            }
+            Err(error) => {
+                return Some(Err(format!(
+                    "stream status batch failed: {}",
+                    error.without_url()
+                )));
+            }
+        };
+        let rows = match response.json::<StreamsResponse>().await {
+            Ok(data) => data.data,
+            Err(error) => {
+                return Some(Err(format!("failed to parse stream status batch: {error}")));
+            }
+        };
+        live.extend(live_streams_by_login(rows));
+    }
+    if !auth.is_current() {
+        return Some(Err(
+            "account changed during the stream status poll".to_string()
+        ));
+    }
+
+    let offline: Vec<String> = logins
+        .iter()
+        .filter(|login| !live.contains_key(*login))
+        .cloned()
+        .collect();
+    let mut offline_metadata = HashMap::new();
+    if !offline.is_empty() && offline_metadata_due(&offline) {
+        offline_metadata = fetch_offline_channel_infos_helix(&offline, auth.access_token()).await;
+        if !auth.is_current() {
+            offline_metadata.clear();
+        }
+    }
+    Some(Ok(polled_stream_states(
+        logins,
+        live,
+        &mut offline_metadata,
+    )))
+}
+
+/// Configured title and category of offline channels from batched Helix
+/// `/channels` requests, by login. Logins whose id cannot be resolved, rows
+/// Helix leaves out and failed requests are missing from the result.
+async fn fetch_offline_channel_infos_helix(
+    logins: &[String],
+    token: &str,
+) -> HashMap<String, StreamInfoResult> {
+    let mut login_by_id = HashMap::with_capacity(logins.len());
+    for login in logins {
+        if let Ok(id) = get_user_id_cached(login).await {
+            login_by_id.insert(id, login.clone());
+        }
+    }
+    let ids: Vec<String> = login_by_id.keys().cloned().collect();
+    let mut infos = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(USER_LIVE_HELIX_BATCH_MAX) {
+        let url = channels_helix_url(chunk);
+        let rows = match send_helix_idempotent_quiet(token, |token| {
+            TWITCH_HTTP_CLIENT.get(url.clone()).helix_auth(token)
+        })
+        .await
+        {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<ChannelsResponse>().await {
+                    Ok(data) => data.data,
+                    Err(error) => {
+                        crate::log_net!(debug, "Failed to parse offline channel batch: {error}");
+                        continue;
+                    }
+                }
+            }
+            Ok(response) => {
+                crate::log_net!(
+                    debug,
+                    "Offline channel batch returned status {}",
+                    response.status()
+                );
+                continue;
+            }
+            Err(error) => {
+                crate::log_net!(
+                    debug,
+                    "Offline channel batch failed: {}",
+                    error.without_url()
+                );
+                continue;
+            }
+        };
+        for row in rows {
+            if let Some(login) = login_by_id.get(&row.broadcaster_id) {
+                infos.insert(
+                    login.clone(),
+                    StreamInfoResult {
+                        game_name: (!row.game_name.trim().is_empty()).then_some(row.game_name),
+                        title: row.title,
+                        viewer_count: 0,
+                        started_at: 0,
+                        is_live: false,
+                        thumbnail_url: None,
+                    },
+                );
+            }
+        }
+    }
+    infos
 }
 
 /// Public metadata for a Twitch VOD. Twitch has no documented Echo proxy route
