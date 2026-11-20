@@ -461,6 +461,11 @@ async fn run_detection_loop(
     // A scan that overruns the period does not start the next one back to
     // back; the cadence resumes at the next whole period.
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Debug logging happens on change only: the first scan, a new result or
+    // outcome, a discarded scan, the first failure of a run of failures. A
+    // steady state would otherwise log every period.
+    let mut last_logged: Option<(bool, Option<String>, DetectionOutcome)> = None;
+    let mut failure_logged = false;
     loop {
         tokio::select! {
             _ = ticks.tick() => {}
@@ -477,23 +482,39 @@ async fn run_detection_loop(
         let Ok(detection) = scan.await else {
             // It panicked or never ran; either way nothing holds the claim.
             cache.write_or_recover().refresh_in_flight = false;
-            crate::log_ui!(warn, "Streamer-mode detection scan did not finish");
+            if !std::mem::replace(&mut failure_logged, true) {
+                crate::log_ui!(warn, "Streamer-mode detection scan did not finish");
+            }
             continue;
         };
-        let active = detection.active;
+        failure_logged = false;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (active, source) = (detection.active, detection.source.clone());
         let outcome = record_detection_into(
             &mut cache.write_or_recover(),
             detection,
             generation,
             Instant::now(),
         );
-        crate::log_ui!(
-            debug,
-            duration_ms = started.elapsed().as_millis() as u64,
-            active,
-            outcome = ?outcome,
-            "Streamer-mode detection scan completed"
-        );
+        let logged = (active, source, outcome);
+        if last_logged.as_ref() != Some(&logged) {
+            crate::log_ui!(
+                debug,
+                duration_ms,
+                active,
+                outcome = ?outcome,
+                "Streamer-mode detection result changed"
+            );
+            let previous_source = last_logged
+                .as_ref()
+                .and_then(|(_, source, _)| source.as_deref());
+            if let Some(source) = logged.1.as_deref()
+                && previous_source != Some(source)
+            {
+                crate::log_ui!(debug, "Detected streaming software: {}", source);
+            }
+            last_logged = Some(logged);
+        }
         on_outcome(outcome);
     }
 }
@@ -547,7 +568,6 @@ fn detect_streaming_software_impl() -> DetectionResult {
         let mut probes = CAPTURE_PROBE_CACHE.lock_or_recover();
         if obs_running {
             if let Some(source) = update_obs_activity(&mut probes.obs) {
-                crate::log_ui!(debug, "Detected active OBS output: {}", source);
                 return DetectionResult {
                     active: true,
                     source: Some(source),
@@ -566,7 +586,6 @@ fn detect_streaming_software_impl() -> DetectionResult {
             };
             let probe = probes.discord.entry(path.clone()).or_default();
             if update_discord_activity(&path, probe) {
-                crate::log_ui!(debug, "Detected active Discord screen share");
                 return DetectionResult {
                     active: true,
                     source: Some("Discord screen share is active".to_string()),
@@ -576,7 +595,6 @@ fn detect_streaming_software_impl() -> DetectionResult {
     }
 
     if let Some(process_name) = generic_streaming_process {
-        crate::log_ui!(debug, "Detected streaming software: {}", process_name);
         return DetectionResult {
             active: true,
             source: Some(format!("{process_name} detected")),
