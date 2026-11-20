@@ -417,4 +417,16 @@ mod tests {
         );
         assert_eq!(server_wait_delay(cap, Duration::from_secs(10), cap, 7), cap);
     }
+
+    #[test]
+    fn provider_limiter_runs_on_the_std_clock_and_holds_its_burst() {
+        let _: governor::clock::MonotonicClock = governor::clock::DefaultClock::default();
+        let limiter: ProviderLimiter = governor::RateLimiter::direct(governor::Quota::per_second(
+            std::num::NonZeroU32::new(5).unwrap(),
+        ));
+        for _ in 0..5 {
+            assert!(limiter.check().is_ok());
+        }
+        assert!(limiter.check().is_err());
+    }
 }
