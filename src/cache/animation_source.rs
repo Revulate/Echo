@@ -145,11 +145,7 @@ impl AnimationSource {
         {
             use std::os::windows::fs::OpenOptionsExt;
             const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-            // The file lives only for this session, so the cache manager may
-            // keep it in memory instead of lazily writing it to the disk.
-            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
             options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
-            options.attributes(FILE_ATTRIBUTE_TEMPORARY);
         }
         let mut file = options.open(&path).ok()?;
         let mut table = Vec::with_capacity(frames.len());
