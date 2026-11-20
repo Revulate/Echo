@@ -426,6 +426,9 @@ impl EchoApp {
         let input_focus = cx.focus_handle();
         let main_window = gpui::Window::window_handle(window);
         app_state.update(cx, |state, _| state.main_window = Some(main_window));
+        // The root mouse-move handler (`event_handlers`) moves the global
+        // tooltip with the pointer in this window.
+        crate::components::overlays::set_pointer_follow_window(main_window);
 
         Self::init_backend();
 

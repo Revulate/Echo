@@ -269,7 +269,34 @@ pub fn estimate_tooltip_size_for_hitbox(kind: &HitboxKind) -> (f32, f32) {
     }
 }
 
+/// Whether hovering `kind` shows a tooltip at all, without building it.
+/// [`render_tooltip_content_for_hitbox`] returns `None` exactly for these.
+pub fn hitbox_has_tooltip(kind: &HitboxKind) -> bool {
+    match kind {
+        HitboxKind::Username {
+            login,
+            display_name,
+            ..
+        } => !display_name.eq_ignore_ascii_case(login),
+        HitboxKind::Mention { .. }
+        | HitboxKind::MessageBackground { .. }
+        | HitboxKind::AutomodAction { .. }
+        | HitboxKind::ModAction { .. } => false,
+        HitboxKind::Emote { .. }
+        | HitboxKind::LayeredEmote { .. }
+        | HitboxKind::Badge { .. }
+        | HitboxKind::Url { .. }
+        | HitboxKind::Emoji { .. }
+        | HitboxKind::EmbedPreview { .. }
+        | HitboxKind::MediaInspector { .. }
+        | HitboxKind::ReplyIndicator { .. } => true,
+    }
+}
+
 pub fn render_tooltip_content_for_hitbox(hovered: &HitboxKind) -> Option<AnyElement> {
+    if !hitbox_has_tooltip(hovered) {
+        return None;
+    }
     let content: AnyElement = match hovered {
         HitboxKind::Emote { name, url, meta } => render_emote_tooltip(name, url, meta.as_deref()),
         HitboxKind::LayeredEmote { emotes } => render_layered_emote_tooltip(emotes),
@@ -284,12 +311,7 @@ pub fn render_tooltip_content_for_hitbox(hovered: &HitboxKind) -> Option<AnyElem
             display_name,
             color,
             ..
-        } => {
-            if display_name.eq_ignore_ascii_case(login) {
-                return None;
-            }
-            render_username_tooltip(display_name, login, *color)
-        }
+        } => render_username_tooltip(display_name, login, *color),
         HitboxKind::Url { url, .. } => render_url_tooltip(url),
         HitboxKind::Mention { .. } | HitboxKind::MessageBackground { .. } => return None,
         HitboxKind::EmbedPreview { url, .. } => render_url_tooltip(url),
@@ -885,4 +907,52 @@ fn render_reply_tooltip(parent_display_name: &str, parent_preview: Option<&str>)
                 .child("Click to jump • Right-click for thread"),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HitboxKind, hitbox_has_tooltip, render_tooltip_content_for_hitbox};
+    use core::prelude::v1::test;
+
+    fn username(login: &'static str, display_name: &'static str) -> HitboxKind {
+        HitboxKind::Username {
+            login: login.into(),
+            display_name: display_name.into(),
+            user_id: None,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn hitboxes_without_tooltip_content_count_as_no_tooltip() {
+        let silent = [
+            username("someone", "SomeOne"),
+            HitboxKind::Mention {
+                username: "someone".into(),
+            },
+            HitboxKind::MessageBackground {
+                message_id: "m1".into(),
+            },
+            HitboxKind::AutomodAction { allow: true },
+            HitboxKind::ModAction {
+                label: "ban".into(),
+                command: "/ban {user}".into(),
+            },
+        ];
+        for kind in &silent {
+            assert!(!hitbox_has_tooltip(kind), "{kind:?}");
+            assert!(
+                render_tooltip_content_for_hitbox(kind).is_none(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_localized_display_name_and_an_emoji_have_tooltips() {
+        assert!(hitbox_has_tooltip(&username("someone", "誰か")));
+        assert!(hitbox_has_tooltip(&HitboxKind::Emoji {
+            emoji: "🙂".into()
+        }));
+    }
 }

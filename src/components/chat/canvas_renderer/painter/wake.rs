@@ -84,21 +84,23 @@ impl CanvasMessageList {
         self.wake_state.width_stabilization_waker_running = false;
     }
 
+    /// Publish the hovered hitbox to the global tooltip overlay. Returns true
+    /// when the overlay needs a repaint that only this canvas's notify brings
+    /// (see [`show_canvas_hitbox_tooltip`]).
     #[inline]
     pub(super) fn sync_global_tooltip_overlay_from_state(&mut self) -> bool {
         if self.interaction_state.tooltip.should_show()
             && let (Some(owner_window), Some(kind)) = (
                 self.interaction_state.tooltip.owner_window,
-                self.interaction_state.tooltip.hovered.clone(),
+                self.interaction_state.tooltip.hovered.as_ref(),
             )
         {
-            show_canvas_hitbox_tooltip(
+            return show_canvas_hitbox_tooltip(
                 owner_window,
-                self.interaction_state.tooltip_overlay_source_id.clone(),
+                &self.interaction_state.tooltip_overlay_source_id,
                 kind,
                 self.interaction_state.tooltip.position,
             );
-            return true;
         }
 
         if let Some(owner_window) = self.interaction_state.tooltip.owner_window {
