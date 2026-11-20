@@ -604,6 +604,51 @@ fn global_disk_set_hydration(cached: &CachedEmoteSet) -> Option<bool> {
     Some(!cached.is_fresh_enough_to_delay())
 }
 
+/// Fetch the Twitch set of every channel whose load ran without the session's
+/// token, now that `token` has arrived, and replace only its Twitch rows.
+fn fetch_twitch_sets_awaiting_token(token: &str) {
+    let keys: Vec<String> = TWITCH_SETS_AWAITING_TOKEN
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    for key in keys {
+        let Some((cache_key, (channel_id, login))) = TWITCH_SETS_AWAITING_TOKEN.remove(&key) else {
+            continue;
+        };
+        if crate::backend::irc::is_channel_closed(&cache_key) {
+            continue;
+        }
+        let token = token.to_string();
+        crate::backend::bridge::get_runtime().spawn(async move {
+            match fetch_twitch_channel_emotes(&channel_id, Some(&token), &login).await {
+                Ok(emotes) => {
+                    let count = EMOTE_CACHE
+                        .apply_channel_provider_emotes(
+                            &cache_key,
+                            &login,
+                            EmoteProvider::Twitch,
+                            emotes,
+                            None,
+                        )
+                        .await;
+                    crate::log_emotes!(
+                        info,
+                        "Loaded {} Twitch channel emotes for {} after the session's token arrived",
+                        count,
+                        login
+                    );
+                }
+                Err(error) => crate::log_emotes!(
+                    warn,
+                    "Twitch channel emote fetch failed for {} after the token arrived: {} (kept cached emotes)",
+                    login,
+                    error
+                ),
+            }
+        });
+    }
+}
+
 /// Give `channel` an empty catalog, which history counts as ready, or remove
 /// it; for tests outside this module.
 #[cfg(test)]
@@ -964,6 +1009,37 @@ impl FromIterator<Arc<Emote>> for EmoteIdentityMap {
 
 /// Re-insert one provider's emotes from the previous cache snapshot after that
 /// provider's fetch failed, so an outage keeps stale emotes instead of erasing them.
+/// The Twitch provider's error for a channel load that runs while a
+/// signed-in session's token has not reached the emote cache yet (startup
+/// validation still running). The merge keeps the channel's resident Twitch
+/// rows, and the Twitch set is fetched once the token arrives.
+const TWITCH_TOKEN_NOT_DISTRIBUTED: &str =
+    "the session's token has not reached the emote cache yet";
+
+/// Channel key -> (channel id, login) of loads that ran without the session's
+/// token, whose Twitch set is fetched when [`EmoteCache::set_token`] runs.
+static TWITCH_SETS_AWAITING_TOKEN: LazyLock<DashMap<String, (String, String)>> =
+    LazyLock::new(DashMap::new);
+
+/// Whether a stored Twitch token stands behind this session (signed in and
+/// not in anonymous mode), whether or not it has been distributed yet.
+fn session_has_stored_token() -> bool {
+    !crate::backend::irc::is_anonymous_mode()
+        && crate::backend::settings::get_token().is_some_and(|token| !token.trim().is_empty())
+}
+
+/// The Twitch provider's result for a channel load that has no token: an
+/// error while a signed-in session's token is still on its way, so the merge
+/// carries the resident Twitch rows over instead of replacing them with
+/// nothing, and no emotes for a logged-out user, as before.
+fn twitch_channel_emotes_without_token(session_signed_in: bool) -> Result<Vec<Emote>, String> {
+    if session_signed_in {
+        Err(TWITCH_TOKEN_NOT_DISTRIBUTED.to_string())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn carry_over_provider_emotes(
     previous: &[Arc<Emote>],
     provider: EmoteProvider,
@@ -1728,9 +1804,24 @@ impl EmoteCache {
         provider_count
     }
 
-    /// Set the OAuth token for Twitch API requests
+    /// Set the OAuth token for Twitch API requests, and fetch the Twitch set
+    /// of channels whose load ran before it arrived.
     pub fn set_token(&self, token: String) {
-        *self.token.write_or_recover() = Some(token);
+        *self.token.write_or_recover() = Some(token.clone());
+        fetch_twitch_sets_awaiting_token(&token);
+    }
+
+    /// Remember a channel whose load ran without the session's token. A token
+    /// that arrived meanwhile fetches its Twitch set at once.
+    fn note_twitch_set_awaits_token(&self, cache_key: &str, channel_id: &str, login: &str) {
+        TWITCH_SETS_AWAITING_TOKEN.insert(
+            cache_key.to_string(),
+            (channel_id.to_string(), login.to_string()),
+        );
+        let token = self.token.read_or_recover().clone();
+        if let Some(token) = token {
+            fetch_twitch_sets_awaiting_token(&token);
+        }
     }
 
     /// Clear the OAuth token (used when entering anonymous mode)
@@ -3409,7 +3500,21 @@ impl EmoteCache {
             },
             async {
                 let started_at = Instant::now();
-                let result = fetch_twitch_channel_emotes(&actual_id, token, channel_login).await;
+                let result = match token {
+                    Some(_) => fetch_twitch_channel_emotes(&actual_id, token, channel_login).await,
+                    None => {
+                        let result =
+                            twitch_channel_emotes_without_token(session_has_stored_token());
+                        if result.is_err() {
+                            self.note_twitch_set_awaits_token(
+                                &cache_key,
+                                &actual_id,
+                                channel_login,
+                            );
+                        }
+                        result
+                    }
+                };
                 let items = result.as_ref().map(|v| v.len()).unwrap_or(0);
                 record_emote_stage_timed("emotes.channel.fetch.twitch", started_at, items);
                 result
@@ -3455,14 +3560,24 @@ impl EmoteCache {
                         &mut insert_emote,
                     );
                     provider_gap |= kept == 0;
-                    crate::log_emotes!(
-                        warn,
-                        "{} channel emote fetch failed for {}: {} (kept {} cached emotes)",
-                        label,
-                        channel_login,
-                        err,
-                        kept
-                    );
+                    if err == TWITCH_TOKEN_NOT_DISTRIBUTED {
+                        crate::log_emotes!(
+                            debug,
+                            "{} channel emotes for {} wait for the session's token (kept {} cached emotes)",
+                            label,
+                            channel_login,
+                            kept
+                        );
+                    } else {
+                        crate::log_emotes!(
+                            warn,
+                            "{} channel emote fetch failed for {}: {} (kept {} cached emotes)",
+                            label,
+                            channel_login,
+                            err,
+                            kept
+                        );
+                    }
                 }
             };
         merge_provider(EmoteProvider::Twitch, "Twitch", twitch);
@@ -5152,6 +5267,42 @@ mod provider_index_tests {
         assert!(
             EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
             "closing the channel drops ownership, so a reopen fetches again"
+        );
+    }
+
+    #[test]
+    fn a_load_without_the_sessions_token_keeps_resident_twitch_rows() {
+        let previous = vec![
+            emote(EmoteProvider::Twitch, "tw-sub", "subEmote"),
+            emote(EmoteProvider::BTTV, "bttv-1", "bttvEmote"),
+        ];
+        let merge = |result: Result<Vec<Emote>, String>| {
+            let mut kept = Vec::new();
+            match result {
+                Ok(emotes) => kept.extend(emotes.into_iter().map(Arc::new)),
+                Err(_) => {
+                    carry_over_provider_emotes(&previous, EmoteProvider::Twitch, |emote| {
+                        kept.push(emote)
+                    });
+                }
+            }
+            kept.iter()
+                .map(|emote| emote.id.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Signed in, token not distributed yet: the Twitch rows survive.
+        let signed_in = twitch_channel_emotes_without_token(true);
+        assert_eq!(
+            signed_in.as_ref().err().map(String::as_str),
+            Some(TWITCH_TOKEN_NOT_DISTRIBUTED)
+        );
+        assert_eq!(merge(signed_in), ["tw-sub"]);
+
+        // Logged out: no Twitch channel emotes, as before.
+        assert_eq!(
+            merge(twitch_channel_emotes_without_token(false)),
+            Vec::<String>::new()
         );
     }
 
