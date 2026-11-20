@@ -77,52 +77,23 @@ impl GlobalTooltipState {
     }
 }
 
-/// What a chat canvas hover needs from the shared tooltip state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CanvasTooltipUpdate {
-    /// A new owner, source or target: store it and repaint the overlay.
-    Show,
-    /// The same target in a window whose root does not follow the pointer:
-    /// store the new position and repaint the overlay.
-    MovePosition,
-    /// The same target in a window whose root follows the pointer: leave the
-    /// position to the root's mouse-move handler, which repaints only the
-    /// overlay's owner.
-    Keep,
-}
-
-fn canvas_tooltip_update(
+/// Whether a canvas hover over `kind` from `source` is a different tooltip
+/// than the one `shown` (source and kind of the owner window's current
+/// tooltip): a new source or target, compared in full so a payload change
+/// counts.
+fn is_new_canvas_tooltip(
     shown: Option<(&str, &GlobalTooltipKind)>,
     source: &str,
     kind: &HitboxKind,
-    root_follows_pointer: bool,
-) -> CanvasTooltipUpdate {
-    let same_target = shown.is_some_and(|(shown_source, shown_kind)| {
+) -> bool {
+    !shown.is_some_and(|(shown_source, shown_kind)| {
         shown_source == source
             && matches!(shown_kind, GlobalTooltipKind::CanvasHitbox(shown) if shown == kind)
-    });
-    match (same_target, root_follows_pointer) {
-        (false, _) => CanvasTooltipUpdate::Show,
-        (true, false) => CanvasTooltipUpdate::MovePosition,
-        (true, true) => CanvasTooltipUpdate::Keep,
-    }
+    })
 }
 
 static GLOBAL_TOOLTIP_STATE: LazyLock<Mutex<GlobalTooltipState>> =
     LazyLock::new(|| Mutex::new(GlobalTooltipState::default()));
-/// The window whose root mouse-move handler moves the tooltip with the pointer
-/// ([`update_global_tooltip_position`]); `u64::MAX` when none.
-static POINTER_FOLLOW_WINDOW_ID: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Record that `window`'s root moves the global tooltip with the pointer, so a
-/// chat canvas in it reports only tooltip target changes.
-pub fn set_pointer_follow_window(window: AnyWindowHandle) {
-    POINTER_FOLLOW_WINDOW_ID.store(window.window_id().as_u64(), Ordering::Relaxed);
-}
-
-fn root_follows_pointer(window: AnyWindowHandle) -> bool {
-    POINTER_FOLLOW_WINDOW_ID.load(Ordering::Relaxed) == window.window_id().as_u64()
-}
 static GLOBAL_TOOLTIP_CONTENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Lock a transient tooltip mutex, discarding its contents if a panic poisoned
@@ -154,10 +125,14 @@ fn next_global_tooltip_content_generation() -> u64 {
 static GLOBAL_TOOLTIP_ANIMATION_WAKER_OWNER: LazyLock<Mutex<Option<AnyWindowHandle>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// Show the tooltip of a chat canvas hitbox. Returns true when the overlay
-/// must be repainted: the target changed, or the pointer moved in a window
-/// whose root does not move the tooltip itself. A hitbox without tooltip
-/// content clears this source's tooltip instead and returns false.
+/// Show the tooltip of a chat canvas hitbox. Returns true when the target
+/// changed and the overlay must be repainted. A pointer move over the same
+/// target stores nothing and needs no canvas repaint: in the main window
+/// EchoApp's root mouse-move handler moves the tooltip
+/// ([`update_global_tooltip_position`]), and the channel popout, the only
+/// other window with a chat canvas, does not draw the global tooltip. A
+/// hitbox without tooltip content clears this source's tooltip instead and
+/// returns false.
 pub fn show_canvas_hitbox_tooltip(
     owner_window: AnyWindowHandle,
     source: &str,
@@ -175,22 +150,16 @@ pub fn show_canvas_hitbox_tooltip(
         .as_deref()
         .zip(state.kind.as_ref())
         .filter(|_| state.owner_window == Some(owner_window));
-    match canvas_tooltip_update(shown, source, kind, root_follows_pointer(owner_window)) {
-        CanvasTooltipUpdate::Show => {
-            state.show(
-                owner_window,
-                source.to_string(),
-                GlobalTooltipKind::CanvasHitbox(kind.clone()),
-                position,
-            );
-            true
-        }
-        CanvasTooltipUpdate::MovePosition => {
-            state.position = Some(position);
-            true
-        }
-        CanvasTooltipUpdate::Keep => false,
+    if !is_new_canvas_tooltip(shown, source, kind) {
+        return false;
     }
+    state.show(
+        owner_window,
+        source.to_string(),
+        GlobalTooltipKind::CanvasHitbox(kind.clone()),
+        position,
+    );
+    true
 }
 
 pub fn show_text_tooltip(
@@ -791,7 +760,7 @@ fn render_text_tooltip(text: &str) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanvasTooltipUpdate, GlobalTooltipKind, canvas_tooltip_update, lock_or_reset};
+    use super::{GlobalTooltipKind, is_new_canvas_tooltip, lock_or_reset};
     use crate::components::chat::canvas_renderer::layout::HitboxKind;
     use core::prelude::v1::test;
     use std::sync::{Arc, Mutex};
@@ -805,52 +774,32 @@ mod tests {
     #[test]
     fn a_new_target_or_source_shows_the_tooltip() {
         let shown = GlobalTooltipKind::CanvasHitbox(emoji("a"));
-        for root_follows in [false, true] {
-            assert_eq!(
-                canvas_tooltip_update(None, "split-1", &emoji("a"), root_follows),
-                CanvasTooltipUpdate::Show
-            );
-            assert_eq!(
-                canvas_tooltip_update(
-                    Some(("split-1", &shown)),
-                    "split-1",
-                    &emoji("b"),
-                    root_follows
-                ),
-                CanvasTooltipUpdate::Show
-            );
-            assert_eq!(
-                canvas_tooltip_update(
-                    Some(("split-2", &shown)),
-                    "split-1",
-                    &emoji("a"),
-                    root_follows
-                ),
-                CanvasTooltipUpdate::Show
-            );
-            assert_eq!(
-                canvas_tooltip_update(
-                    Some(("split-1", &GlobalTooltipKind::Text("a".into()))),
-                    "split-1",
-                    &emoji("a"),
-                    root_follows
-                ),
-                CanvasTooltipUpdate::Show
-            );
-        }
+        assert!(is_new_canvas_tooltip(None, "split-1", &emoji("a")));
+        assert!(is_new_canvas_tooltip(
+            Some(("split-1", &shown)),
+            "split-1",
+            &emoji("b")
+        ));
+        assert!(is_new_canvas_tooltip(
+            Some(("split-2", &shown)),
+            "split-1",
+            &emoji("a")
+        ));
+        assert!(is_new_canvas_tooltip(
+            Some(("split-1", &GlobalTooltipKind::Text("a".into()))),
+            "split-1",
+            &emoji("a")
+        ));
     }
 
     #[test]
-    fn the_same_target_moves_only_where_the_root_does_not_follow_the_pointer() {
+    fn the_same_target_is_not_shown_again() {
         let shown = GlobalTooltipKind::CanvasHitbox(emoji("a"));
-        assert_eq!(
-            canvas_tooltip_update(Some(("split-1", &shown)), "split-1", &emoji("a"), true),
-            CanvasTooltipUpdate::Keep
-        );
-        assert_eq!(
-            canvas_tooltip_update(Some(("split-1", &shown)), "split-1", &emoji("a"), false),
-            CanvasTooltipUpdate::MovePosition
-        );
+        assert!(!is_new_canvas_tooltip(
+            Some(("split-1", &shown)),
+            "split-1",
+            &emoji("a")
+        ));
     }
 
     #[test]

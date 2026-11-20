@@ -313,7 +313,6 @@ pub fn render_tooltip_content_for_hitbox(hovered: &HitboxKind) -> Option<AnyElem
             ..
         } => render_username_tooltip(display_name, login, *color),
         HitboxKind::Url { url, .. } => render_url_tooltip(url),
-        HitboxKind::Mention { .. } | HitboxKind::MessageBackground { .. } => return None,
         HitboxKind::EmbedPreview { url, .. } => render_url_tooltip(url),
         HitboxKind::MediaInspector { url, .. } => render_url_tooltip(url),
         HitboxKind::ReplyIndicator {
@@ -322,7 +321,11 @@ pub fn render_tooltip_content_for_hitbox(hovered: &HitboxKind) -> Option<AnyElem
             ..
         } => render_reply_tooltip(parent_display_name, parent_preview.as_deref()),
         HitboxKind::Emoji { emoji } => render_emoji_tooltip(emoji),
-        HitboxKind::AutomodAction { .. } | HitboxKind::ModAction { .. } => return None,
+        // Excluded by `hitbox_has_tooltip` above.
+        HitboxKind::Mention { .. }
+        | HitboxKind::MessageBackground { .. }
+        | HitboxKind::AutomodAction { .. }
+        | HitboxKind::ModAction { .. } => return None,
     };
     Some(content)
 }
@@ -912,6 +915,7 @@ fn render_reply_tooltip(parent_display_name: &str, parent_preview: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::{HitboxKind, hitbox_has_tooltip, render_tooltip_content_for_hitbox};
+    use crate::components::chat::canvas_renderer::layout::LayeredTooltipEmote;
     use core::prelude::v1::test;
 
     fn username(login: &'static str, display_name: &'static str) -> HitboxKind {
@@ -943,6 +947,62 @@ mod tests {
             assert!(!hitbox_has_tooltip(kind), "{kind:?}");
             assert!(
                 render_tooltip_content_for_hitbox(kind).is_none(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hitbox_with_a_tooltip_renders_one() {
+        let emote = || LayeredTooltipEmote {
+            name: "Kappa".into(),
+            url: "https://example.com/kappa.png".into(),
+            meta: None,
+        };
+        let shown = [
+            HitboxKind::Emote {
+                name: "Kappa".into(),
+                url: "https://example.com/kappa.png".into(),
+                meta: None,
+            },
+            HitboxKind::LayeredEmote {
+                emotes: vec![emote(), emote()],
+            },
+            HitboxKind::Badge {
+                name: "subscriber".into(),
+                url: "https://example.com/badge.png".into(),
+                description: Some("12-Month Subscriber".into()),
+                meta: None,
+            },
+            username("someone", "誰か"),
+            HitboxKind::Url {
+                url: "https://example.com/".into(),
+                display_text: "example.com".into(),
+                embed_id: 0,
+            },
+            HitboxKind::Emoji {
+                emoji: "🙂".into()
+            },
+            HitboxKind::EmbedPreview {
+                url: "https://example.com/".into(),
+                embed_id: 0,
+                is_expanded: false,
+            },
+            HitboxKind::MediaInspector {
+                source_url: "https://example.com/a.png".into(),
+                url: "https://example.com/".into(),
+                embed_id: 0,
+            },
+            HitboxKind::ReplyIndicator {
+                parent_msg_id: "m1".into(),
+                parent_display_name: "Someone".into(),
+                parent_preview: Some("hello".into()),
+            },
+        ];
+        for kind in &shown {
+            assert!(hitbox_has_tooltip(kind), "{kind:?}");
+            assert!(
+                render_tooltip_content_for_hitbox(kind).is_some(),
                 "{kind:?}"
             );
         }

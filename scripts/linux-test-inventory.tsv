@@ -610,10 +610,11 @@ root_test	src/components/chat/canvas_renderer/text_shaping.rs	text_after_unicode
 root_test	src/components/chat/canvas_renderer/text_shaping.rs	whitespace_at_a_wrap_point_stays_in_source_text
 root_test	src/components/chat/canvas_renderer/text_shaping.rs	zero_width_overlay_reserves_layered_box_before_following_text
 root_test	src/components/chat/canvas_renderer/tooltip.rs	a_localized_display_name_and_an_emoji_have_tooltips
+root_test	src/components/chat/canvas_renderer/tooltip.rs	every_hitbox_with_a_tooltip_renders_one
 root_test	src/components/chat/canvas_renderer/tooltip.rs	hitboxes_without_tooltip_content_count_as_no_tooltip
 root_test	src/components/overlays/global_tooltip.rs	a_new_target_or_source_shows_the_tooltip
 root_test	src/components/overlays/global_tooltip.rs	poisoned_transient_state_is_reset_and_unpoisoned
-root_test	src/components/overlays/global_tooltip.rs	the_same_target_moves_only_where_the_root_does_not_follow_the_pointer
+root_test	src/components/overlays/global_tooltip.rs	the_same_target_is_not_shown_again
 root_test	src/components/overlays/hotkey_cheat_sheet.rs	test_category_actions
 root_test	src/components/settings/editor_state.rs	authoritative_action_applies_after_poison_recovery
 root_test	src/components/settings/editor_state.rs	event_that_discovers_poison_is_not_replayed
@@ -881,7 +882,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	401
+summary	root_tests	402
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
