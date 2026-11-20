@@ -22,7 +22,7 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is transitive through Zed's reqwest client and has no safe upgrade. Remove when Zed's reqwest client no longer depends on it." },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is transitive through GPUI fontdb/usvg/rustybuzz and has no safe upgrade. Remove when the upstream rendering stack migrates to skrifa." },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is transitive through GPUI's pinned usvg/resvg SVG stack and has no safe upgrade. Remove when GPUI adopts an SVG stack that no longer depends on rustybuzz, after validating SVG emotes and image name paints." },
-    { id = "RUSTSEC-2026-0370", reason = "zvariant 5 is transitive through zbus 5, which GPUI's accesskit/atspi/oo7 Linux stack and notify-rust still use; zbus 6 absorbed it. Remove when those move to zbus 6 and Echo's Linux KWin client follows." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5 is transitive through zbus 5, which GPUI's accesskit/atspi/oo7 Linux stack still uses; zbus 6 absorbed it. Echo holds notify-rust at 4.18 (4.19 uses zbus 6) so it ships one zbus. Remove when GPUI's Linux stack moves to zbus 6 and notify-rust and Echo's KWin client follow." },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names 4 is transitive through zbus 5; same zbus 6 migration as RUSTSEC-2026-0370." },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5 is transitive through zbus 5; same zbus 6 migration as RUSTSEC-2026-0370." },
 ]
