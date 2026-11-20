@@ -102,6 +102,7 @@ core_test	crates/echo-core/src/channel_identity.rs	untrimmed_ascii_variant_is_th
 core_test	crates/echo-core/src/channel_lifecycle.rs	test_no_duplicate_connections
 core_test	crates/echo-core/src/channel_lifecycle.rs	test_priority_ordering
 core_test	crates/echo-core/src/channel_lifecycle.rs	test_state_transitions
+core_test	crates/echo-core/src/chat_snapshot.rs	an_unchanged_day_divider_keeps_its_row_across_publishes
 core_test	crates/echo-core/src/chat_snapshot.rs	append_keeps_rows_without_ids
 core_test	crates/echo-core/src/chat_snapshot.rs	append_skips_rows_a_refresh_already_installed
 core_test	crates/echo-core/src/chat_snapshot.rs	append_snapshot_retains_newest_capacity
@@ -604,6 +605,10 @@ root_test	src/components/chat/canvas_renderer/global_layout_cache.rs	replacement
 root_test	src/components/chat/canvas_renderer/layout.rs	cache_distinguishes_key_and_exact_measurement
 root_test	src/components/chat/canvas_renderer/layout.rs	cache_keeps_recent_keys_for_several_scales
 root_test	src/components/chat/canvas_renderer/layout.rs	poison_discards_partial_probe_and_allows_reuse
+root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	front_drop_reads_only_a_front_drop_with_an_optional_append
+root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	held_arrivals_at_the_cap_take_the_incremental_path
+root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	paced_syncs_match_a_full_rebuild_for_every_publish_sequence
+root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	the_model_refuses_a_front_drop_it_cannot_prove
 root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_page_scroll_ends_on_its_target_within_a_bounded_number_of_frames
 root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_sub_pixel_gap_snaps_at_once_and_a_zero_dt_frame_holds_still
 root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_target_that_keeps_moving_ends_once_it_stops
@@ -904,7 +909,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	413
+summary	root_tests	417
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
@@ -913,7 +918,7 @@ summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
 summary	media_cache_tests	45
-summary	core_tests	247
+summary	core_tests	248
 summary	render_core_tests	46
 summary	text_core_tests	26
 summary	root_doctests_runnable	3

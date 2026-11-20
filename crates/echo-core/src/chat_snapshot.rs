@@ -1,4 +1,4 @@
-use crate::message::{ChatMessage, MessageFlags, day_divider_id};
+use crate::message::{ChatMessage, DAY_DIVIDER_ID_PREFIX, MessageFlags, day_divider_id};
 use crate::message_buffer::{HistoryMergeStrategy, merge_history_by_timestamp};
 use chrono::{Local, NaiveDate, TimeZone};
 use smallvec::SmallVec;
@@ -18,6 +18,10 @@ pub struct ChatSnapshot {
     message_capacity: usize,
     raw_messages: Arc<Vec<Arc<ChatMessage>>>,
     pub messages: Arc<Vec<Arc<ChatMessage>>>,
+    /// The day-divider rows of the last publish, reused by the next one when
+    /// they would come out the same, so an unchanged divider keeps its
+    /// pointer identity like every other unchanged row.
+    day_dividers: SmallVec<[(NaiveDate, Arc<ChatMessage>); 4]>,
 }
 
 impl ChatSnapshot {
@@ -28,6 +32,7 @@ impl ChatSnapshot {
             message_capacity: message_capacity.max(1),
             raw_messages: Arc::clone(&empty),
             messages: empty,
+            day_dividers: SmallVec::new(),
         }
     }
 
@@ -201,6 +206,7 @@ impl ChatSnapshot {
 
     fn publish_display_projection(&mut self) {
         let boundaries = day_divider_boundaries(&self.raw_messages);
+        let previous_dividers = std::mem::take(&mut self.day_dividers);
         if boundaries.is_empty() {
             self.messages = Arc::clone(&self.raw_messages);
             return;
@@ -213,7 +219,15 @@ impl ChatSnapshot {
                 && boundary == idx
             {
                 pending.next();
-                rows.push(Arc::new(day_divider_row(&self.channel, date, message)));
+                let divider = previous_dividers
+                    .iter()
+                    .find(|(divider_date, divider)| {
+                        *divider_date == date && divider_built_for(divider, message)
+                    })
+                    .map(|(_, divider)| Arc::clone(divider))
+                    .unwrap_or_else(|| Arc::new(day_divider_row(&self.channel, date, message)));
+                self.day_dividers.push((date, Arc::clone(&divider)));
+                rows.push(divider);
             }
             rows.push(Arc::clone(message));
         }
@@ -327,6 +341,20 @@ fn day_divider_row(channel: &str, date: NaiveDate, next: &ChatMessage) -> ChatMe
         },
         ..Default::default()
     }
+}
+
+/// Whether `divider`, which this snapshot built for the same channel and
+/// date, is the row [`day_divider_row`] would build before `next`: the next
+/// id in its id and the fields it copies from `next` agree.
+fn divider_built_for(divider: &ChatMessage, next: &ChatMessage) -> bool {
+    divider.timestamp == next.timestamp
+        && divider.channel == next.channel
+        && divider
+            .id
+            .strip_prefix(DAY_DIVIDER_ID_PREFIX)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|rest| rest.splitn(3, ':').nth(2))
+            == Some(next.id.as_ref())
 }
 
 fn messages_equivalent_for_snapshot(left: &ChatMessage, right: &ChatMessage) -> bool {
@@ -536,6 +564,61 @@ mod tests {
         assert_eq!(state.messages.len(), 3);
         assert!(state.set_message_capacity(1));
         assert_eq!(row_ids(&state.messages), ["2"]);
+    }
+
+    #[test]
+    fn an_unchanged_day_divider_keeps_its_row_across_publishes() {
+        let mut state = state();
+        state.set_message_capacity(4);
+        state.append_messages_to_snapshot(vec![
+            make_message("1", BASE_MS),
+            make_message("2", BASE_MS + DAY_MS),
+        ]);
+        let divider = Arc::clone(&state.messages[1]);
+        assert!(divider.day_divider_date().is_some());
+
+        state.append_messages_to_snapshot(vec![make_message("3", BASE_MS + DAY_MS + 1)]);
+        assert_eq!(state.messages.len(), 4);
+        assert!(Arc::ptr_eq(&state.messages[1], &divider), "append");
+
+        // A backfilled row that becomes the new day's first gets its own
+        // divider; the old one is not reused for it.
+        state.merge_history_into_snapshot(&[
+            make_message("1", BASE_MS),
+            make_message("1b", BASE_MS + DAY_MS - 1),
+            make_message("2", BASE_MS + DAY_MS),
+            make_message("3", BASE_MS + DAY_MS + 1),
+        ]);
+        assert_eq!(row_ids(&state.raw_messages), ["1", "1b", "2", "3"]);
+        let moved = Arc::clone(&state.messages[1]);
+        assert!(!Arc::ptr_eq(&moved, &divider));
+        assert!(moved.id.ends_with(":1b"));
+        assert_eq!(moved.timestamp, BASE_MS + DAY_MS - 1);
+
+        // Its next row is retimed: the divider copies the timestamp, so it is
+        // rebuilt rather than reused.
+        let mut retimed = (*state.raw_messages[1]).clone();
+        retimed.timestamp += 1;
+        let rows: Vec<ChatMessage> = state
+            .raw_messages
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                if idx == 1 {
+                    retimed.clone()
+                } else {
+                    (**row).clone()
+                }
+            })
+            .collect();
+        state.replace_snapshot_from_backend(rows);
+        assert!(!Arc::ptr_eq(&state.messages[1], &moved));
+        assert_eq!(state.messages[1].timestamp, BASE_MS + DAY_MS);
+
+        // Evicting the earlier date drops the divider, and the memo with it.
+        state.append_messages_to_snapshot(vec![make_message("4", BASE_MS + DAY_MS + 2)]);
+        assert_eq!(row_ids(&state.messages), ["1b", "2", "3", "4"]);
+        assert!(state.day_dividers.is_empty());
     }
 
     /// The by-value merge this module used before `merge_history_into_snapshot`

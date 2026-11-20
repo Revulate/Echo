@@ -224,7 +224,11 @@ impl ChatBackend {
         let mut drained_events = 0usize;
         let mut oldest_wait = std::time::Duration::ZERO;
         for (channel, observer) in &channels_with_events {
-            let channel_entity = self.get_or_create_channel(channel, cx);
+            // Observer keys are the lowercase channel names `channels` uses.
+            let channel_entity = match self.channels.get(channel) {
+                Some(entity) => entity.clone(),
+                None => self.get_or_create_channel(channel, cx),
+            };
             let mut result = ObserverProcessResult::default();
 
             channel_entity.update(cx, |state, cx| {
@@ -289,18 +293,15 @@ impl ChatBackend {
             self.last_seen_global_emote_version = current_global_version;
             self.last_seen_user_emote_version = current_user_version;
         } else {
-            let channels_to_check: Vec<String> = self.channels.keys().cloned().collect();
-            for channel in channels_to_check {
-                let current_channel_version = VersionRegistry::channel_emote_version(&channel);
+            for (channel, channel_entity) in &self.channels {
+                let current_channel_version = VersionRegistry::channel_emote_version(channel);
                 let last_seen = self
                     .last_seen_channel_versions
-                    .get(&channel)
+                    .get(channel)
                     .copied()
                     .unwrap_or(0);
 
-                if current_channel_version > last_seen
-                    && let Some(channel_entity) = self.channels.get(&channel)
-                {
+                if current_channel_version > last_seen {
                     crate::log_emotes!(
                         info,
                         "Missed retokenization event for '{}' - refreshing (version {} -> {})",

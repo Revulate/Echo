@@ -177,8 +177,16 @@ flowchart TD
   (bounded at 4,096 events; overflow forces a snapshot refresh). The polling
   coordinator drains every dirty channel on the UI thread through
   `ChatBackend::process_observer_events`, which coalesces `NewMessage`s into
-  `ChatState`'s shared snapshot (`crates/echo-core/src/chat_snapshot.rs`).
-  Each split's `ChatView` then syncs its `CanvasMessageList`.
+  `ChatState`'s shared snapshot (`crates/echo-core/src/chat_snapshot.rs`),
+  whose unchanged rows, day dividers included, keep their `Arc` from one
+  publish to the next. Each split's `ChatView` then syncs its
+  `CanvasMessageList`. While a split follows live chat, paced reveal
+  (`echo_core::reveal_pacer`) holds the newest rows back; a sync whose
+  visible rows are the shown ones, row for row by pointer, keeps the list the
+  canvas has. The canvas applies an append, a history prepend, and a drop of
+  rows from the front with or without an append (a rotation at the buffer
+  cap, or front rows removed) incrementally (`painter/message_delta.rs`);
+  any other shape rebuilds its model.
 - **Duplicate-channel splits** share one `ChatState`. Each split owns its own
   `CanvasMessageList` (scroll, selection, width-dependent layout) keyed by a
   stable `SplitId`. Split-specific actions carry the source `SplitId`

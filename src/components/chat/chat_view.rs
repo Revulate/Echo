@@ -99,6 +99,19 @@ struct RevealedPrefix {
     prefix: Arc<Vec<Arc<ChatMessage>>>,
 }
 
+/// Whether the rows a split shows are exactly `visible`, row for row by
+/// pointer, so a paced sync can keep showing them unchanged.
+pub(crate) fn shown_rows_are_current(
+    shown: &[Arc<ChatMessage>],
+    visible: &[Arc<ChatMessage>],
+) -> bool {
+    shown.len() == visible.len()
+        && shown
+            .iter()
+            .zip(visible)
+            .all(|(shown, visible)| Arc::ptr_eq(shown, visible))
+}
+
 /// Entity for rendering a single chat pane with messages, input, and header
 pub struct ChatView {
     /// Channel name for this chat view
@@ -543,6 +556,19 @@ impl ChatView {
             && revealed.visible == visible
         {
             return revealed.prefix.clone();
+        }
+        // A new arrival that the pacer holds leaves the shown rows as they
+        // were: keep the list the canvas already has, so nothing is rebuilt
+        // or redrawn. Any row replaced in place (deleted, retokenized,
+        // restriped) is a new Arc and fails the check.
+        let shown = self.canvas_list.read(cx).source_messages().clone();
+        if shown_rows_are_current(&shown, &messages[..visible]) {
+            self.reveal_prefix = Some(RevealedPrefix {
+                source: messages,
+                visible,
+                prefix: shown.clone(),
+            });
+            return shown;
         }
         let prefix = Arc::new(messages[..visible].to_vec());
         self.reveal_prefix = Some(RevealedPrefix {

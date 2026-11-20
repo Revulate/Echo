@@ -93,6 +93,85 @@ impl MessageListModel {
         self.advance_message_index_base(removed);
     }
 
+    /// After a plain append the new ids join the order only in the next
+    /// `update_layouts` append pass. When a sync comes first, and the order
+    /// is exactly the rows' prefix with every height present and none
+    /// pending, add the missing ids now as rows waiting for their heights,
+    /// which is what that pass would do. Returns how many were added; the
+    /// caller adds them to its pending count.
+    pub(super) fn complete_lagging_order(&mut self, pending_heights: usize) -> usize {
+        let have = self.message_order.len();
+        if have == 0
+            || have >= self.messages.len()
+            || pending_heights != 0
+            || self.height_tree.len() != have
+            || !super::message_delta::ids_align(&self.message_order, &self.messages)
+        {
+            return 0;
+        }
+        let messages = Arc::clone(&self.messages);
+        for (index, message) in messages.iter().enumerate().skip(have) {
+            if self.get_message_index(&message.id) != Some(index) {
+                // Not indexed as the append path leaves it: undo and let the
+                // caller rebuild.
+                self.message_order.truncate(have);
+                return 0;
+            }
+            self.message_order
+                .push(SharedString::from(message.id.clone()));
+        }
+        messages.len() - have
+    }
+
+    /// Remove the first `dropped` rows (possibly none) and add `appended`
+    /// after the rest, as
+    /// [`super::message_delta::front_drop`] found for the next snapshot. The
+    /// dropped heights go now; the appended rows get theirs from the
+    /// pending-row pass of `update_layouts`, like any appended row, so the
+    /// caller adds `appended.len()` to its pending count.
+    ///
+    /// Returns false, changing nothing, unless the result provably equals a
+    /// rebuild from the new rows: the order holds one id per current row, the
+    /// heights cover the order except the `pending_heights` newest rows, no
+    /// dropped row is still pending, each dropped id is indexed at its own
+    /// row (so no later row repeats it), and no appended id is indexed yet.
+    pub(super) fn drop_front_and_append(
+        &mut self,
+        dropped: usize,
+        appended: &[Arc<ChatMessage>],
+        pending_heights: usize,
+    ) -> bool {
+        let len = self.message_order.len();
+        if len != self.messages.len()
+            || (dropped == 0 && appended.is_empty())
+            || dropped >= len
+            || self.height_tree.len() + pending_heights != len
+            || dropped > self.height_tree.len()
+            || self.message_order[..dropped]
+                .iter()
+                .enumerate()
+                .any(|(index, id)| self.get_message_index(id) != Some(index))
+            || appended
+                .iter()
+                .any(|message| self.get_message_index(&message.id).is_some())
+        {
+            return false;
+        }
+        self.remove_rotated_front_indices(dropped);
+        for _ in 0..dropped {
+            self.height_tree.remove_first();
+        }
+        let base = self.message_order.len();
+        self.message_order.reserve(appended.len());
+        for (offset, message) in appended.iter().enumerate() {
+            let id = SharedString::from(message.id.clone());
+            self.message_order.push(id.clone());
+            self.insert_message_index(id, base + offset);
+        }
+        self.sync_total_height();
+        true
+    }
+
     #[inline]
     pub(super) fn get_message_index(&self, msg_id: &str) -> Option<usize> {
         let absolute = *self.message_index.get(msg_id)?;

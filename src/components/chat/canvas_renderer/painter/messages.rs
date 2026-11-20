@@ -1,6 +1,6 @@
 //! Message-buffer lifecycle and split activity handling.
 
-use super::message_delta::{MessageDeltaPlan, ids_align, same_count_rotation};
+use super::message_delta::{FrontDrop, MessageDeltaPlan, front_drop, ids_align};
 use super::*;
 
 /// Rows on each side of the last viewport whose layouts a split keeps while
@@ -243,6 +243,70 @@ impl CanvasMessageList {
         self.interaction_state.hitbox_manager.invalidate_cache();
     }
 
+    /// How `messages` drops rows from the front of the current ones, when the
+    /// split's order is complete enough to tell (one id per current row).
+    fn front_drop_shape(&mut self, messages: &[Arc<ChatMessage>]) -> Option<FrontDrop> {
+        self.message_state.pending_new_message_count += self
+            .message_model
+            .complete_lagging_order(self.message_state.pending_new_message_count);
+        let order = &self.message_model.message_order;
+        (order.len() == self.message_model.messages.len())
+            .then(|| front_drop(order, messages))
+            .flatten()
+    }
+
+    /// Apply `messages`, which `front` says drops rows from the front of the
+    /// current ones and appends others, without rebuilding the model. At the
+    /// buffer cap every sync has this shape, and so does an append that comes
+    /// before the previous one reached the order. Uses the same size limit as
+    /// other incremental rotations. Returns false, changing nothing, when the
+    /// caller must rebuild instead.
+    fn apply_front_drop(&mut self, messages: &[Arc<ChatMessage>], front: FrontDrop) -> bool {
+        let limit = Self::incremental_rotation_limit(messages.len());
+        if front.dropped > limit && front.dropped.saturating_mul(2) > messages.len() {
+            return false;
+        }
+        let kept = messages.len() - front.appended;
+        let retained_changed = self
+            .message_model
+            .messages
+            .get(front.dropped..)
+            .unwrap_or_default()
+            .iter()
+            .zip(&messages[..kept])
+            .any(|(old, new)| !Arc::ptr_eq(old, new));
+        if !self.message_model.drop_front_and_append(
+            front.dropped,
+            &messages[kept..],
+            self.message_state.pending_new_message_count,
+        ) {
+            return false;
+        }
+        self.message_state.pending_new_message_count += front.appended;
+        if retained_changed {
+            // A kept row changed in place (retokenized, deleted, restriped):
+            // re-check off-screen layouts as a same-order update does.
+            self.layout_store.runtime.mark_stale();
+            self.layout_store.runtime.last_checked_emote_version = 0;
+            self.layout_store.runtime.last_checked_channel_emote_version = 0;
+        }
+        if front.dropped > 0 {
+            self.viewport_state.cached_visible_render_range = None;
+            self.viewport_state.cached_viewport_paint_rows = None;
+            self.interaction_state.hitbox_manager.invalidate_cache();
+            self.preload_state.last_emote_preload_range = None;
+        }
+        crate::log_perf_render!(
+            debug,
+            channel_id = %self.channel_id,
+            dropped = front.dropped,
+            appended = front.appended,
+            retained_changed,
+            "Applied front drop incrementally"
+        );
+        true
+    }
+
     /// Replace the shared snapshot this split shows, presenting any removed
     /// rows under the split's deleted-message mode.
     pub fn set_messages(&mut self, messages: Arc<Vec<Arc<ChatMessage>>>) {
@@ -282,9 +346,20 @@ impl CanvasMessageList {
             let added_count = delta.added_count;
 
             if delta.old_order_matches_prefix {
+                // Rows still waiting for their heights (after a front drop)
+                // make the next `update_layouts` run only its pending-row
+                // pass, so these rows join them rather than wait a frame for
+                // its append pass.
+                let join_pending = self.message_state.pending_new_message_count > 0;
                 for (idx, msg) in messages.iter().enumerate().skip(old_count) {
                     let shared_id = SharedString::from(msg.id.clone());
+                    if join_pending {
+                        self.message_model.message_order.push(shared_id.clone());
+                    }
                     self.message_model.insert_message_index(shared_id, idx);
+                }
+                if join_pending {
+                    self.message_state.pending_new_message_count += added_count;
                 }
             } else if delta.is_initial_snapshot_fast_path {
                 self.message_model.message_order.clear();
@@ -483,14 +558,22 @@ impl CanvasMessageList {
             } else {
                 retained_viewport_anchor =
                     self.capture_viewport_anchor_before_message_replacement();
-                self.rebuild_message_model_from(&messages);
+                let front = self.front_drop_shape(&messages);
+                if was_scrolled_away && let Some(front) = front {
+                    first_new_message_id = messages
+                        .get(new_count - front.appended)
+                        .map(|message| SharedString::from(message.id.clone()));
+                }
+                if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
+                    self.rebuild_message_model_from(&messages);
 
-                crate::log_perf_render!(
-                    debug,
-                    channel_id = %self.channel_id,
-                    new_count,
-                    "Progressive downgrade for unknown insertion/reorder shape"
-                );
+                    crate::log_perf_render!(
+                        debug,
+                        channel_id = %self.channel_id,
+                        new_count,
+                        "Progressive downgrade for unknown insertion/reorder shape"
+                    );
+                }
             }
         } else if new_count == old_count && content_changed && new_count > 0 {
             let same_message_order = self.message_model.message_order.len() == new_count
@@ -499,7 +582,9 @@ impl CanvasMessageList {
             if same_message_order {
                 had_new_messages = false;
                 self.message_model.rebuild_message_index_from_order();
-                self.message_state.pending_new_message_count = 0;
+                // Rows an earlier front drop or append left waiting for their
+                // heights keep waiting: dropping the count would leave the
+                // height tree short and force a full layout rebuild.
                 self.layout_store.runtime.mark_stale();
                 self.layout_store.runtime.last_checked_emote_version = 0;
                 self.layout_store.runtime.last_checked_channel_emote_version = 0;
@@ -511,61 +596,44 @@ impl CanvasMessageList {
                 self.viewport_state.cached_viewport_paint_rows = None;
                 self.interaction_state.hitbox_manager.invalidate_cache();
 
-                let rotation = (self.message_model.message_order.len() == old_count)
-                    .then(|| same_count_rotation(&self.message_model.message_order, &messages))
-                    .flatten();
-                let looks_like_rotation = rotation.is_some();
-                let rotated_count = rotation.unwrap_or(0);
-                let incremental_rotation_limit = Self::incremental_rotation_limit(new_count);
-                let allow_incremental_rotation = looks_like_rotation
-                    && (rotated_count <= incremental_rotation_limit
-                        || rotated_count.saturating_mul(2) <= new_count);
-
-                if was_scrolled_away && looks_like_rotation {
-                    let new_start = new_count - rotated_count;
+                let front = self.front_drop_shape(&messages);
+                if was_scrolled_away && let Some(front) = front {
                     first_new_message_id = messages
-                        .get(new_start)
+                        .get(new_count - front.appended)
                         .map(|message| SharedString::from(message.id.clone()));
                 }
 
-                if allow_incremental_rotation {
-                    self.message_model
-                        .remove_rotated_front_indices(rotated_count);
-                    for _ in 0..rotated_count {
-                        self.message_model.height_tree.remove_first();
-                    }
-                    let new_start = new_count - rotated_count;
-                    let base_idx = self.message_model.message_order.len();
-                    for (offset, msg) in messages.iter().skip(new_start).enumerate() {
-                        let shared_id = SharedString::from(msg.id.clone());
-                        self.message_model.message_order.push(shared_id.clone());
-                        self.message_model
-                            .insert_message_index(shared_id, base_idx + offset);
-                        self.message_state.pending_new_message_count += 1;
-                    }
-                } else {
+                if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
                     self.rebuild_message_model_from(&messages);
 
                     crate::log_perf_render!(
                         debug,
                         channel_id = %self.channel_id,
                         new_count,
-                        rotated_count,
+                        rotated_count = front.map_or(0, |front| front.dropped),
                         "Progressive downgrade for large rotation/full replacement"
                     );
                 }
             }
         } else if new_count < old_count {
             retained_viewport_anchor = self.capture_viewport_anchor_before_message_replacement();
-            self.rebuild_message_model_from(&messages);
+            let front = self.front_drop_shape(&messages);
+            if was_scrolled_away && let Some(front) = front.filter(|front| front.appended > 0) {
+                first_new_message_id = messages
+                    .get(new_count - front.appended)
+                    .map(|message| SharedString::from(message.id.clone()));
+            }
+            if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
+                self.rebuild_message_model_from(&messages);
 
-            crate::log_perf_render!(
-                debug,
-                channel_id = %self.channel_id,
-                new_count,
-                old_count,
-                "Progressive downgrade for shrink case"
-            );
+                crate::log_perf_render!(
+                    debug,
+                    channel_id = %self.channel_id,
+                    new_count,
+                    old_count,
+                    "Progressive downgrade for shrink case"
+                );
+            }
         }
 
         let retained_boundary_successor = previous_boundary_index.and_then(|boundary_index| {
