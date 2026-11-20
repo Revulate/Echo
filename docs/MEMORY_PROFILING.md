@@ -33,9 +33,16 @@ The line sets what the process holds (`ws_mb`, `private_mb`, allocator commit an
 peaks) against Echo's own caches: decoded static images and animation frames,
 animation sources in RAM and on disk, the hot-frame and RenderImage queues, 7TV
 name-paint composites, the GPUI URI image cache, the layout cache (an estimate
-per entry), buffered chat rows and the emote maps. `accounted_mb` sums decoded
-media, the layout-cache estimate, buffered chat rows, the emote maps and
-name-paint composites; `unaccounted_mb` is the working set minus that sum. A
+per entry), buffered chat rows and the emote maps, the catalogs closed
+channels keep for a quick reopen (`closed_catalogs`, `closed_catalog_emotes`,
+`closed_catalog_kb`; dropped 10 minutes after the close or past 32), the
+message-id deduplicators (`dedup_kb`), and on the UI side the rows in the
+channels' chat snapshots (`ui_snapshot_rows`, a count: those rows are mostly
+shared with the backend buffers) and the events waiting in their observer
+queues (`observer_queued_events`). `accounted_mb` sums decoded media, the
+layout-cache estimate, buffered chat rows, the emote maps, closed catalogs,
+the deduplicators and name-paint composites; `unaccounted_mb` is the working
+set minus that sum. A
 large or growing `unaccounted_mb` means memory that none of Echo's budgets
 track. The implementation is
 `src/backend/memory_report.rs`.

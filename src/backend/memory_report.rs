@@ -43,9 +43,19 @@ pub fn next_breakdown_due_in() -> Option<std::time::Duration> {
     ))
 }
 
-/// Log a breakdown if the configured interval has elapsed. Cheap no-op when the
-/// diagnostic is disabled, so it is safe to call from a periodic slot.
-pub fn maybe_log_memory_breakdown() {
+/// What the UI thread holds that the backend cannot read: rows in the
+/// channels' chat snapshots (mostly shared with the backend buffers, so
+/// counted, not sized) and events waiting in their observer queues.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UiMemoryCounts {
+    pub snapshot_rows: usize,
+    pub observer_queued_events: usize,
+}
+
+/// Log a breakdown if the configured interval has elapsed, asking `ui` for
+/// the UI-side counts only then. Cheap no-op when the diagnostic is disabled,
+/// so it is safe to call from a periodic slot.
+pub fn maybe_log_memory_breakdown(ui: impl FnOnce() -> UiMemoryCounts) {
     let interval = interval_secs();
     if interval == 0 {
         return;
@@ -56,11 +66,11 @@ pub fn maybe_log_memory_breakdown() {
         return;
     }
     LAST_REPORT_MS.store(now, Ordering::Relaxed);
-    log_memory_breakdown();
+    log_memory_breakdown(ui());
 }
 
 /// Log one memory breakdown immediately.
-pub fn log_memory_breakdown() {
+pub fn log_memory_breakdown(ui: UiMemoryCounts) {
     let crate::cache::loader::DecodedMediaResidency {
         static_bytes: static_b,
         frame_bytes: frames_b,
@@ -117,11 +127,19 @@ pub fn log_memory_breakdown() {
 
     let (channels, messages, message_bytes) = message_buffer_bytes();
     let (emote_channels, emote_entries, emote_bytes) = emote_map_bytes();
+    let (closed_catalogs, closed_catalog_emotes, closed_catalog_bytes) =
+        crate::backend::emotes::closed_channel_catalog_stats();
+    let dedup_bytes = crate::backend::irc::message_dedup_bytes();
 
     let (ws_bytes, private_bytes) = process_memory();
     let (_alloc_rss, alloc_peak_rss, alloc_commit, alloc_peak_commit) = allocator_memory();
-    let accounted =
-        decoded_total + layout_est + message_bytes + emote_bytes + name_paint_composite_bytes;
+    let accounted = decoded_total
+        + layout_est
+        + message_bytes
+        + emote_bytes
+        + closed_catalog_bytes
+        + dedup_bytes
+        + name_paint_composite_bytes;
 
     let alloc_retained = alloc_commit.saturating_sub(ws_bytes);
 
@@ -203,6 +221,12 @@ pub fn log_memory_breakdown() {
         messages,
         emote_channels,
         emote_entries,
+        closed_catalogs,
+        closed_catalog_emotes,
+        closed_catalog_kb = closed_catalog_bytes / 1024,
+        dedup_kb = dedup_bytes / 1024,
+        ui_snapshot_rows = ui.snapshot_rows,
+        observer_queued_events = ui.observer_queued_events,
         accounted_mb = accounted / 1_048_576,
         unaccounted_mb = ws_bytes.saturating_sub(accounted) / 1_048_576,
         "memory breakdown"

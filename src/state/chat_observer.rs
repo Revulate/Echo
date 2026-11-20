@@ -61,6 +61,11 @@ impl ChatStateObserver {
         *cb = Some(Arc::new(callback));
     }
 
+    /// Number of queued events, for the memory report.
+    pub fn queued_events(&self) -> usize {
+        self.event_queue.lock_or_recover().len()
+    }
+
     /// Check if there are pending events
     pub fn has_pending_events(&self) -> bool {
         let queue = self.event_queue.lock_or_recover();

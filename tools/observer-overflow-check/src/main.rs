@@ -70,7 +70,9 @@ fn main() {
     }
 
     assert!(observer.has_pending_events());
+    let queued = observer.queued_events();
     let drained = observer.drain_events();
+    assert_eq!(queued, drained.events.len());
     let action = observer_drain_action(drained.dropped_count);
     let retained_id_bytes: usize = drained
         .events

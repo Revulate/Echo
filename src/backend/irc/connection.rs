@@ -129,6 +129,15 @@ async fn wait_while_bounded(mut pending: impl FnMut() -> bool, limit: std::time:
 static MESSAGE_DEDUP: LazyLock<DashMap<String, MessageDeduplicator>> =
     LazyLock::new(|| DashMap::with_capacity(DEDUP_MAX_CHANNELS));
 
+/// Heap bytes held by the per-channel message deduplicators, for the memory
+/// report.
+pub fn message_dedup_bytes() -> usize {
+    MESSAGE_DEDUP
+        .iter()
+        .map(|entry| entry.value().heap_bytes())
+        .sum()
+}
+
 /// Per-channel disconnect state for gap-filling
 /// Tracks when connection was lost and the last message timestamp for each channel
 #[derive(Clone, Debug)]

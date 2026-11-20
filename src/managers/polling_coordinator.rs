@@ -116,6 +116,29 @@ fn notify_live_uptime_rollover(
     });
 }
 
+/// The memory report's UI-side counts: rows in every channel's chat snapshot
+/// and events waiting in the observer queues.
+fn ui_memory_counts(
+    app_state: &Entity<AppState>,
+    cx: &mut AsyncApp,
+) -> backend::memory_report::UiMemoryCounts {
+    app_state.update(cx, |state, cx| {
+        let chat_backend = state.chat_backend.read(cx);
+        backend::memory_report::UiMemoryCounts {
+            snapshot_rows: chat_backend
+                .channels
+                .values()
+                .map(|channel| channel.read(cx).messages.len())
+                .sum(),
+            observer_queued_events: chat_backend
+                .observers
+                .values()
+                .map(|observer| observer.queued_events())
+                .sum(),
+        }
+    })
+}
+
 fn open_external_link(url: &str, mode: backend::ui_actions::LinkOpenMode) {
     match mode {
         backend::ui_actions::LinkOpenMode::Configured => crate::utils::open_url(url),
@@ -524,8 +547,11 @@ impl PollLoop {
     fn idle_housekeeping(&mut self, cx: &mut AsyncApp) {
         if self.image_cleanup.take_due_within(IDLE_LANE_SLACK) {
             image_cache::sweep_idle_decoded_media();
+            backend::emotes::sweep_closed_channel_catalogs();
         }
-        crate::backend::memory_report::maybe_log_memory_breakdown();
+        crate::backend::memory_report::maybe_log_memory_breakdown(|| {
+            ui_memory_counts(&self.app_state, cx)
+        });
         if self.layout_cleanup.take_due_within(IDLE_LANE_SLACK) {
             self.periodic_cleanup(cx);
         }
@@ -736,9 +762,12 @@ impl PollLoop {
 
         if self.image_cleanup.take_due() {
             image_cache::sweep_idle_decoded_media();
+            backend::emotes::sweep_closed_channel_catalogs();
         }
 
-        crate::backend::memory_report::maybe_log_memory_breakdown();
+        crate::backend::memory_report::maybe_log_memory_breakdown(|| {
+            ui_memory_counts(&self.app_state, cx)
+        });
 
         if self.layout_cleanup.take_due() {
             self.periodic_cleanup(cx);

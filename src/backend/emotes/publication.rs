@@ -121,24 +121,106 @@ pub fn remove_channel_emotes(channel: &str) {
 }
 
 const MAX_CLOSED_CHANNEL_CATALOGS: usize = 32;
+/// How long a closed channel keeps its catalog for a quick reopen before
+/// [`sweep_closed_channel_catalogs`] drops it.
+const CLOSED_CHANNEL_CATALOG_GRACE: Duration = Duration::from_secs(10 * 60);
 
-static CLOSED_CHANNEL_CATALOGS: LazyLock<Mutex<std::collections::VecDeque<String>>> =
+/// Closed channels whose catalogs are kept, oldest close first, with the time
+/// each was closed.
+static CLOSED_CHANNEL_CATALOGS: LazyLock<Mutex<std::collections::VecDeque<(String, Instant)>>> =
     LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
 
 fn retain_closed_channel_catalog(cache_key: &str) {
     let evicted: Vec<String> = {
         let mut closed = CLOSED_CHANNEL_CATALOGS.lock_or_recover();
-        closed.retain(|key| key != cache_key && crate::backend::irc::is_channel_closed(key));
-        closed.push_back(cache_key.to_string());
+        closed.retain(|(key, _)| key != cache_key && crate::backend::irc::is_channel_closed(key));
+        closed.push_back((cache_key.to_string(), Instant::now()));
         let excess = closed.len().saturating_sub(MAX_CLOSED_CHANNEL_CATALOGS);
-        closed.drain(..excess).collect()
+        closed.drain(..excess).map(|(key, _)| key).collect()
     };
-    for key in evicted {
+    drop_closed_channel_catalogs(evicted);
+}
+
+/// Drop the catalogs of channels closed more than
+/// [`CLOSED_CHANNEL_CATALOG_GRACE`] ago, as the count limit does for the
+/// oldest. A channel reopened since is left alone; reopening a swept channel
+/// loads its catalog again. Run from the poll loop's 60 s media sweep.
+pub fn sweep_closed_channel_catalogs() {
+    let expired: Vec<String> = {
+        let mut closed = CLOSED_CHANNEL_CATALOGS.lock_or_recover();
+        let expired = expired_closed_catalogs(&closed, Instant::now());
+        closed.drain(..expired).map(|(key, _)| key).collect()
+    };
+    drop_closed_channel_catalogs(expired);
+}
+
+/// How many of `closed` (oldest close first) were closed at least
+/// [`CLOSED_CHANNEL_CATALOG_GRACE`] before `now`.
+fn expired_closed_catalogs(
+    closed: &std::collections::VecDeque<(String, Instant)>,
+    now: Instant,
+) -> usize {
+    closed
+        .iter()
+        .take_while(|(_, closed_at)| {
+            now.saturating_duration_since(*closed_at) >= CLOSED_CHANNEL_CATALOG_GRACE
+        })
+        .count()
+}
+
+fn drop_closed_channel_catalogs(keys: Vec<String>) {
+    for key in keys {
         if crate::backend::irc::is_channel_closed(&key) {
             EMOTE_CACHE.channels.remove(&key);
             EMOTE_CACHE.channel_emote_set_ids.remove(&key);
         }
     }
+}
+
+/// Closed channels' kept catalogs, for the memory report: `(catalogs,
+/// emotes, bytes)`, counting each emote record and the strings behind it.
+/// An emote shared with another catalog is counted here too, so the bytes
+/// are an upper bound.
+pub fn closed_channel_catalog_stats() -> (usize, usize, usize) {
+    let keys: Vec<String> = CLOSED_CHANNEL_CATALOGS
+        .lock_or_recover()
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    let (mut catalogs, mut emotes, mut bytes) = (0, 0, 0);
+    for key in keys {
+        let Some(entry) = EMOTE_CACHE.channels.get(&key) else {
+            continue;
+        };
+        catalogs += 1;
+        for emote in entry.emotes_by_id.values() {
+            emotes += 1;
+            bytes += emote_record_bytes(emote);
+        }
+    }
+    (catalogs, emotes, bytes)
+}
+
+fn emote_record_bytes(emote: &Emote) -> usize {
+    let optional = [
+        &emote.channel,
+        &emote.original_name,
+        &emote.creator_name,
+        &emote.twitch_owner_login,
+        &emote.twitch_owner_id,
+        &emote.twitch_emote_type,
+        &emote.url_1x,
+        &emote.url_2x,
+        &emote.url_4x,
+    ];
+    std::mem::size_of::<Emote>()
+        + emote.id.len()
+        + emote.name.len()
+        + emote.url.len()
+        + optional
+            .iter()
+            .map(|value| value.as_ref().map_or(0, |value| value.len()))
+            .sum::<usize>()
 }
 
 pub(super) fn trigger_open_channel_preload(cache_key: &str) {
@@ -468,5 +550,41 @@ pub async fn rebuild_user_emote_index() {
     if effective_lookup_changed {
         crate::state::VersionRegistry::bump_user_emote_version();
         publish_emote_metadata_change();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn closed_catalogs_expire_oldest_first_after_the_grace_period() {
+        let start = Instant::now();
+        let closed: VecDeque<(String, Instant)> = [
+            ("a", start),
+            ("b", start + Duration::from_secs(60)),
+            ("c", start + Duration::from_secs(300)),
+        ]
+        .into_iter()
+        .map(|(key, at)| (key.to_string(), at))
+        .collect();
+        let grace = CLOSED_CHANNEL_CATALOG_GRACE;
+        assert_eq!(expired_closed_catalogs(&closed, start), 0);
+        assert_eq!(expired_closed_catalogs(&closed, start + grace), 1);
+        assert_eq!(
+            expired_closed_catalogs(&closed, start + grace + Duration::from_secs(60)),
+            2
+        );
+        assert_eq!(
+            expired_closed_catalogs(&closed, start + grace + Duration::from_secs(300)),
+            3
+        );
+        // A clock reading before a close never expires it.
+        assert_eq!(
+            expired_closed_catalogs(&closed, start - Duration::from_secs(1)),
+            0
+        );
     }
 }

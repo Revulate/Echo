@@ -67,6 +67,13 @@ fn canonical_uuid_value(id: &str) -> Option<u128> {
 }
 
 impl MessageDeduplicator {
+    /// Heap bytes the key set and the order queue have allocated, for memory
+    /// reports: their capacity, with one control byte per set slot.
+    pub fn heap_bytes(&self) -> usize {
+        let key = std::mem::size_of::<u128>();
+        self.seen.capacity() * (key + 1) + self.order.capacity() * key
+    }
+
     /// Create a new deduplicator with default prune ratio of 0.8.
     ///
     /// # Arguments

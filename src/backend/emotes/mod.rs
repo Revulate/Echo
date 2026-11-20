@@ -67,6 +67,11 @@ pub(crate) enum DiskCacheParts {
     User,
 }
 
+/// The user part of the emote cache file as startup's Shared load decoded
+/// it, taken by the User load that follows (see
+/// [`EmoteCache::load_from_disk_scoped`]).
+static STARTUP_DISK_USER_PART: Mutex<Option<EmoteCacheFile>> = Mutex::new(None);
+
 /// What [`EmoteCache::load_from_disk_scoped`] hydrated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DiskCacheLoad {
@@ -1903,10 +1908,19 @@ impl EmoteCache {
         let legacy_path = legacy_emote_cache_path(&path);
         let total_start = Instant::now();
 
+        // Startup's User load follows its Shared load, and autosave starts
+        // only after both, so the user part the Shared load decoded is still
+        // what the file holds: take it instead of decoding the file again.
+        let startup_user_part = (parts == DiskCacheParts::User)
+            .then(|| STARTUP_DISK_USER_PART.lock_or_recover().take())
+            .flatten();
         let path_owned = path;
         let legacy_path_owned = legacy_path;
         let blocking_read_start = Instant::now();
-        let cache_result = tokio::task::spawn_blocking(move || -> Result<EmoteCacheFile, &'static str> {
+        let cache_result = if let Some(user_part) = startup_user_part {
+            Ok(Ok(user_part))
+        } else {
+            tokio::task::spawn_blocking(move || -> Result<EmoteCacheFile, &'static str> {
             match read_emote_cache_with_legacy_fallback(&path_owned, &legacy_path_owned) {
                 Ok(EmoteCacheReadSource::Current(cache_file)) => Ok(cache_file),
                 Ok(EmoteCacheReadSource::Legacy(legacy_cache)) => {
@@ -1955,8 +1969,11 @@ impl EmoteCache {
                 }
             }
         })
-        .await;
-        record_emote_stage_timed("emotes.disk.load.blocking_read", blocking_read_start, 0);
+            .await
+            .inspect(|_| {
+                record_emote_stage_timed("emotes.disk.load.blocking_read", blocking_read_start, 0);
+            })
+        };
 
         let cache_file = match cache_result {
             Ok(Ok(cf)) => cf,
@@ -1964,12 +1981,22 @@ impl EmoteCache {
         };
         let disk_user_owner_id = cache_file.user_emote_owner_id.clone();
         let (global_emotes, user_emotes, channel_emotes, mut channel_seventv) = match parts {
-            DiskCacheParts::Shared => (
-                cache_file.global_emotes,
-                None,
-                cache_file.channel_emotes,
-                cache_file.channel_seventv,
-            ),
+            DiskCacheParts::Shared => {
+                *STARTUP_DISK_USER_PART.lock_or_recover() = Some(EmoteCacheFile {
+                    version: cache_file.version,
+                    global_emotes: None,
+                    user_emotes: cache_file.user_emotes,
+                    user_emote_owner_id: cache_file.user_emote_owner_id,
+                    channel_emotes: Default::default(),
+                    channel_seventv: Default::default(),
+                });
+                (
+                    cache_file.global_emotes,
+                    None,
+                    cache_file.channel_emotes,
+                    cache_file.channel_seventv,
+                )
+            }
             DiskCacheParts::User => (
                 None,
                 cache_file.user_emotes,
