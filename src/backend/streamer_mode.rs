@@ -492,7 +492,14 @@ fn cached_auto_detection_active() -> bool {
 }
 
 fn detect_streaming_software_impl() -> DetectionResult {
-    let refresh_kind = RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing());
+    // Names only. `ProcessRefreshKind::nothing()` still lists every thread of
+    // every process as an entry on Linux (`tasks` defaults to on), which costs
+    // a `/proc/<pid>/task` listing and a read per thread; processes are listed
+    // without it. A `System` is built per scan rather than kept: on Windows a
+    // kept one holds an open handle to every process between scans, and on
+    // Linux a refresh rereads each process's `stat` and `status` anyway.
+    let refresh_kind =
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().without_tasks());
     let Ok(sys) = System::new_with_specifics(refresh_kind) else {
         return DetectionResult::default();
     };
@@ -501,7 +508,13 @@ fn detect_streaming_software_impl() -> DetectionResult {
     let mut discord_config_names = Vec::new();
     let mut generic_streaming_process = None;
 
-    for process in sys.processes().values() {
+    // Kernel threads (and any thread entry) carry thread names, not process
+    // names, so they never identify streaming software.
+    for process in sys
+        .processes()
+        .values()
+        .filter(|process| process.thread_kind().is_none())
+    {
         let process_name = process.name().to_string_lossy();
         let normalized = normalize_process_name(&process_name);
 
