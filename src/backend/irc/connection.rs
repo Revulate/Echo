@@ -1084,6 +1084,60 @@ pub fn get_desired_channels() -> Vec<String> {
     DESIRED_CHANNELS.read().iter().cloned().collect()
 }
 
+/// How long the read supervisor waits for startup token validation before it
+/// connects with the stored token. Validation can take up to the auth client's
+/// 30 s timeout while id.twitch.tv is slow or down, and IRC logs in with the
+/// stored token either way: a token Twitch rejects gets a "Login
+/// authentication failed" NOTICE, which refreshes it and reconnects
+/// (`recover_from_irc_auth_failure`).
+const IRC_AUTH_VALIDATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often a waiting supervisor checks for a shutdown request.
+const IRC_AUTH_WAIT_SHUTDOWN_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest the supervisor waits for startup auth: capped, unless the
+/// stored token is known to be expired, when startup refreshes it first and
+/// connecting earlier would only log in with a dead token.
+fn irc_auth_wait_limit(token_expired: bool) -> Option<std::time::Duration> {
+    (!token_expired).then_some(IRC_AUTH_VALIDATION_WAIT)
+}
+
+/// Wait for startup auth for at most [`irc_auth_wait_limit`]. False when a
+/// shutdown was requested meanwhile.
+async fn wait_for_irc_auth() -> bool {
+    let limit = irc_auth_wait_limit(crate::backend::auth::is_token_expired());
+    let started = tokio::time::Instant::now();
+    loop {
+        if READ_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            return false;
+        }
+        let slice = limit.map_or(IRC_AUTH_WAIT_SHUTDOWN_CHECK, |limit| {
+            limit
+                .saturating_sub(started.elapsed())
+                .min(IRC_AUTH_WAIT_SHUTDOWN_CHECK)
+        });
+        match tokio::time::timeout(slice, crate::backend::auth::wait_for_auth_initialization())
+            .await
+        {
+            Ok(()) => {
+                crate::log_irc!(
+                    info,
+                    "Auth initialization complete, proceeding with connection"
+                );
+                return true;
+            }
+            Err(_) if limit.is_some_and(|limit| started.elapsed() >= limit) => {
+                crate::log_irc!(
+                    info,
+                    "Token validation still running after {} ms; connecting with the stored token",
+                    started.elapsed().as_millis()
+                );
+                return true;
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// Run the read connection with automatic reconnection (never gives up)
 /// This is the ONLY supervisor - manages ALL channels from DESIRED_CHANNELS
 /// Only ONE instance should run at a time (enforced by SUPERVISOR_RUNNING flag)
@@ -1091,17 +1145,10 @@ async fn run_supervised_read_connection() {
     crate::log_irc!(info, "Supervisor started");
 
     crate::log_irc!(info, "Waiting for auth initialization...");
-    while !crate::backend::auth::is_auth_initialized() {
-        if READ_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
-            SUPERVISOR_RUNNING.store(false, Ordering::Release);
-            return;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    if !wait_for_irc_auth().await {
+        SUPERVISOR_RUNNING.store(false, Ordering::Release);
+        return;
     }
-    crate::log_irc!(
-        info,
-        "Auth initialization complete, proceeding with connection"
-    );
     wait_for_pending_streamer_detection().await;
 
     loop {
@@ -2017,6 +2064,16 @@ mod tests {
         assert_eq!(pending_message.emote_lookup_source_id, None);
         drop(pending_message);
         super::CHAT_MESSAGES.remove(&channel);
+    }
+
+    #[test]
+    fn irc_waits_for_auth_in_full_only_for_a_known_expired_token() {
+        assert_eq!(
+            super::irc_auth_wait_limit(false),
+            Some(super::IRC_AUTH_VALIDATION_WAIT)
+        );
+        assert!(super::IRC_AUTH_VALIDATION_WAIT <= std::time::Duration::from_secs(2));
+        assert_eq!(super::irc_auth_wait_limit(true), None);
     }
 
     #[tokio::test]

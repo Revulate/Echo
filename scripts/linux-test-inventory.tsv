@@ -413,6 +413,7 @@ text_core_test	crates/echo-text-core/src/timestamp.rs	legacy_patterns_map_to_val
 text_core_test	crates/echo-text-core/src/timestamp.rs	literal_validation_rejects_empty_long_control_and_bidi_text
 text_core_test	crates/echo-text-core/src/timestamp.rs	resolution_buckets_match_rendered_precision
 text_core_test	crates/echo-text-core/src/timestamp.rs	serde_shapes_preserve_legacy_names_and_tagged_minute_token
+root_test	src/backend/auth.rs	a_flag_waiter_wakes_when_the_flag_is_set_and_returns_at_once_after
 root_test	src/backend/auth.rs	retry_delays_back_off_then_go_hourly
 root_test	src/backend/blocked_users.rs	omits_cursor_on_the_initial_page
 root_test	src/backend/blocked_users.rs	preserves_blocked_user_query_order_and_opaque_cursor_value
@@ -533,6 +534,7 @@ root_test	src/backend/irc/connection.rs	canonical_twitch_id_prevents_duplicates_
 root_test	src/backend/irc/connection.rs	confirmed_send_requires_one_positive_result_with_a_real_message_id
 root_test	src/backend/irc/connection.rs	history_readiness_leaves_the_join_catalog_load_to_the_join
 root_test	src/backend/irc/connection.rs	ingest_wait_returns_when_detection_finishes_and_is_bounded
+root_test	src/backend/irc/connection.rs	irc_waits_for_auth_in_full_only_for_a_known_expired_token
 root_test	src/backend/irc/connection.rs	message_dedup_keys_channels_by_lowercase_and_ids_by_value
 root_test	src/backend/irc/connection.rs	resolved_shared_source_updates_scope_without_retokenizing
 root_test	src/backend/irc/connection.rs	restart_aimed_at_the_running_connection_applies
@@ -920,7 +922,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	428
+summary	root_tests	430
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

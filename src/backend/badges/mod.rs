@@ -32,6 +32,17 @@ static LOADING_CHANNELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new)
 /// Longest time a renderer may reserve badge slots for a set that has not
 /// finished its first fetch attempt.
 const BADGE_SET_PENDING_MAX: Duration = Duration::from_secs(30);
+/// How long a badge load waits for startup token validation before it loads
+/// with whatever credentials are current.
+const AUTH_INITIALIZATION_WAIT: Duration = Duration::from_secs(5);
+
+async fn wait_for_auth_initialization_bounded() {
+    let _ = tokio::time::timeout(
+        AUTH_INITIALIZATION_WAIT,
+        crate::backend::auth::wait_for_auth_initialization(),
+    )
+    .await;
+}
 static GLOBAL_BADGES_ATTEMPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static GLOBAL_BADGES_FIRST_QUERY: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -489,11 +500,7 @@ impl TwitchBadgeCache {
             return Ok(());
         }
 
-        let mut wait_count = 0;
-        while !crate::backend::auth::is_auth_initialized() && wait_count < 50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            wait_count += 1;
-        }
+        wait_for_auth_initialization_bounded().await;
 
         let auth = self.current_authenticated_resource().await;
 
@@ -747,11 +754,7 @@ impl TwitchBadgeCache {
             return Ok(());
         }
 
-        let mut wait_count = 0;
-        while !crate::backend::auth::is_auth_initialized() && wait_count < 50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            wait_count += 1;
-        }
+        wait_for_auth_initialization_bounded().await;
 
         let auth = self.current_authenticated_resource().await;
         let badges = if let Some(auth) = auth.as_ref() {

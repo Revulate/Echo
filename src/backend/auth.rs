@@ -168,6 +168,13 @@ static AUTH_INITIALIZE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 
 /// Flag to track if auth initialization has completed (token validated/refreshed)
 static AUTH_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Wakes [`wait_for_auth_initialization`] when [`AUTH_INITIALIZED`] is set.
+static AUTH_INITIALIZED_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn mark_auth_initialized() {
+    AUTH_INITIALIZED.store(true, Ordering::Release);
+    AUTH_INITIALIZED_NOTIFY.notify_waiters();
+}
 
 /// Time before expiry to trigger proactive refresh (10 minutes)
 const PROACTIVE_REFRESH_BUFFER_SECS: i64 = 600;
@@ -2190,7 +2197,7 @@ pub async fn initialize_auth() {
             super::blocked_users::finish_auth_transition_without_session(
                 blocked_users_startup_epoch,
             );
-            AUTH_INITIALIZED.store(true, Ordering::Release);
+            mark_auth_initialized();
             return;
         }
     };
@@ -2212,7 +2219,7 @@ pub async fn initialize_auth() {
                 super::blocked_users::reset_for_auth_change();
             }
         }
-        AUTH_INITIALIZED.store(true, Ordering::Release);
+        mark_auth_initialized();
         return;
     }
 
@@ -2249,7 +2256,7 @@ pub async fn initialize_auth() {
         }
     }
 
-    AUTH_INITIALIZED.store(true, Ordering::Release);
+    mark_auth_initialized();
     crate::log_auth!(debug, "Auth initialization complete");
 }
 
@@ -2266,8 +2273,21 @@ pub fn is_auth_initialized() -> bool {
 
 /// Wait until startup token validation or refresh has finished.
 pub async fn wait_for_auth_initialization() {
-    while !is_auth_initialized() {
-        sleep(Duration::from_millis(50)).await;
+    wait_for_flag(&AUTH_INITIALIZED, &AUTH_INITIALIZED_NOTIFY).await;
+}
+
+/// Wait until `flag` is set by a writer that calls `notify.notify_waiters()`
+/// after setting it. The waiter registers before it checks the flag, so a
+/// store between the check and the await still wakes it.
+async fn wait_for_flag(flag: &AtomicBool, notify: &tokio::sync::Notify) {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -2560,6 +2580,26 @@ pub async fn logout() -> Result<(), String> {
 mod startup_validation_retry_tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[tokio::test]
+    async fn a_flag_waiter_wakes_when_the_flag_is_set_and_returns_at_once_after() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+        let waiter = tokio::spawn(wait_for_flag(&FLAG, &NOTIFY));
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        FLAG.store(true, Ordering::Release);
+        NOTIFY.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter wakes on the notification")
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(100), wait_for_flag(&FLAG, &NOTIFY))
+            .await
+            .expect("a set flag returns without waiting for a notification");
+    }
 
     #[test]
     fn retry_delays_back_off_then_go_hourly() {

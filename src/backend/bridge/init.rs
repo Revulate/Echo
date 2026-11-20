@@ -404,16 +404,14 @@ pub fn initialize() {
             if offline_scenario {
                 return;
             }
-            if let Err(e) = crate::backend::badges::TWITCH_BADGE_CACHE
-                .load_global_badges()
-                .await
-            {
+            let (twitch_badges, external_badges) = tokio::join!(
+                crate::backend::badges::TWITCH_BADGE_CACHE.load_global_badges(),
+                crate::backend::badges::TWITCH_BADGE_CACHE.load_external_global_badges()
+            );
+            if let Err(e) = twitch_badges {
                 crate::log_cache!(warn, "Failed to load global badges: {}", e);
             }
-            if let Err(e) = crate::backend::badges::TWITCH_BADGE_CACHE
-                .load_external_global_badges()
-                .await
-            {
+            if let Err(e) = external_badges {
                 crate::log_cache!(warn, "Failed to load external badges: {}", e);
             }
 
