@@ -480,7 +480,7 @@ impl MemoryLayer {
         let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
         let mut protected = self.picker_visible_canonical_hashes();
         protected.extend(
-            crate::registry::chat_visible_static_media_hashes()
+            crate::registry::chat_visible_media_hashes()
                 .into_iter()
                 .map(|hash| self.canonical_hash(hash)),
         );
@@ -681,7 +681,7 @@ mod tests {
         }
 
         // A chat that has not repainted since still shows `on_screen`.
-        crate::registry::publish_chat_visible_static_media(owner, vec![on_screen]);
+        crate::registry::publish_chat_visible_media(owner, vec![on_screen]);
         assert!(layer.evict_idle(std::time::Duration::from_secs(180)) > 0);
         assert!(
             layer.contains(on_screen),
@@ -692,7 +692,7 @@ mod tests {
             "an unseen static still expires"
         );
 
-        crate::registry::clear_chat_visible_static_media(owner);
+        crate::registry::clear_chat_visible_media(owner);
         assert!(layer.evict_idle(std::time::Duration::from_secs(180)) > 0);
         assert!(
             !layer.contains(on_screen),

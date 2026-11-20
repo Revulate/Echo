@@ -579,7 +579,7 @@ fn render_pause_indicator() -> AnyElement {
 /// registered (animation census, global tooltip) when the split closes.
 impl Drop for CanvasMessageList {
     fn drop(&mut self) {
-        self.clear_visible_static_media();
+        self.clear_visible_media();
         if let Some(owner) = self.wake_state.animation_census_owner {
             crate::emote_renderer::remove_owner(owner);
         }

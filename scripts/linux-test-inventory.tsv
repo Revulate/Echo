@@ -845,6 +845,7 @@ media_cache_test	crates/echo-media-cache/src/frames.rs	byte_pressure_demotes_lar
 media_cache_test	crates/echo-media-cache/src/frames.rs	dense_visible_picker_keeps_two_frame_runways_without_entry_eviction
 media_cache_test	crates/echo-media-cache/src/frames.rs	entry_limit_keeps_displayed_frame_of_visible_chat_animation
 media_cache_test	crates/echo-media-cache/src/frames.rs	full_cycle_picker_animation_keeps_every_frame
+media_cache_test	crates/echo-media-cache/src/frames.rs	idle_cleanup_keeps_the_pose_a_quiet_visible_chat_displays
 media_cache_test	crates/echo-media-cache/src/frames.rs	idle_cleanup_preserves_visible_held_pose_over_future_frame
 media_cache_test	crates/echo-media-cache/src/frames.rs	lookahead_insert_does_not_replace_displayed_fallback
 media_cache_test	crates/echo-media-cache/src/frames.rs	picker_entry_limit_expands_only_while_visible
@@ -908,7 +909,7 @@ summary	chat_render_tests	28
 summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
-summary	media_cache_tests	43
+summary	media_cache_tests	44
 summary	core_tests	247
 summary	render_core_tests	46
 summary	text_core_tests	26

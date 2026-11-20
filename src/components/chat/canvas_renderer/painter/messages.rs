@@ -23,42 +23,56 @@ struct RetainedViewportAnchor {
 }
 
 impl CanvasMessageList {
-    /// Publish the static images this canvas's visible rows show, when that
-    /// set changed. A quiet chat does not repaint, so painting never re-stamps
+    /// Publish the images this canvas's visible rows show, static and
+    /// animated, when that set changed. A quiet chat does not repaint, and an
+    /// animation shown as a still is not ticked, so painting never re-stamps
     /// those images as fresh; this registration keeps the idle decoded-media
-    /// sweep from evicting them while they are still on screen.
-    pub(super) fn publish_visible_static_media(&mut self, owner: u64) {
+    /// sweeps from evicting them, or the displayed pose of an animation,
+    /// while they are on screen. A render whose visible rows are the same
+    /// layouts as last time skips the URL hashing.
+    pub(super) fn publish_visible_media(&mut self, owner: u64) {
         let ViewportFrameState {
             visible_render_rows,
-            published_static_media,
-            static_media_scratch,
+            published_media,
+            published_media_layouts,
+            media_scratch,
             ..
         } = &mut self.viewport_state;
-        static_media_scratch.clear();
+        if visible_render_rows.len() == published_media_layouts.len()
+            && visible_render_rows
+                .iter()
+                .zip(published_media_layouts.iter())
+                .all(|(row, layout)| Arc::ptr_eq(&row.layout, layout))
+        {
+            return;
+        }
+        published_media_layouts.clear();
+        published_media_layouts.extend(visible_render_rows.iter().map(|row| row.layout.clone()));
+        media_scratch.clear();
         for row in visible_render_rows.iter() {
-            static_media_scratch.extend(
+            media_scratch.extend(
                 row.layout
                     .image_paint_commands
                     .iter()
-                    .filter(|command| !command.is_animated)
                     .map(|command| echo_cache_policy::loaded_urls::url_key(command.url.as_ref())),
             );
         }
-        static_media_scratch.sort_unstable();
-        static_media_scratch.dedup();
-        if static_media_scratch != published_static_media {
-            published_static_media.clone_from(static_media_scratch);
-            crate::cache::publish_chat_visible_static_media(owner, published_static_media.clone());
+        media_scratch.sort_unstable();
+        media_scratch.dedup();
+        if media_scratch != published_media {
+            published_media.clone_from(media_scratch);
+            crate::cache::publish_chat_visible_media(owner, published_media.clone());
         }
     }
 
-    /// Withdraw this canvas's visible static images (hidden tab, closed split),
-    /// so they age out of the idle sweep normally.
-    pub(super) fn clear_visible_static_media(&mut self) {
+    /// Withdraw this canvas's visible images (hidden tab, closed split), so
+    /// they age out of the idle sweeps normally.
+    pub(super) fn clear_visible_media(&mut self) {
         if let Some(owner) = self.wake_state.animation_census_owner {
-            crate::cache::clear_chat_visible_static_media(owner);
+            crate::cache::clear_chat_visible_media(owner);
         }
-        self.viewport_state.published_static_media.clear();
+        self.viewport_state.published_media.clear();
+        self.viewport_state.published_media_layouts.clear();
     }
 
     /// Whether this retained split currently belongs to the mounted tab.
@@ -81,7 +95,7 @@ impl CanvasMessageList {
         if visible {
             self.revalidate_on_show();
         } else {
-            self.clear_visible_static_media();
+            self.clear_visible_media();
             self.mark_last_read();
             self.trim_layouts_for_hidden_tab();
             self.clear_chat_pause_for_hidden_tab();

@@ -37,8 +37,8 @@ use echo_cache_policy::stats::CacheStats;
 pub use echo_render_core::animation_timing::AnimationMetadata;
 
 use crate::registry::{
-    cancel_render_image_drop, picker_visible_hashes, queue_render_image_drop,
-    with_picker_visible_hash_sets,
+    cancel_render_image_drop, chat_visible_media_hashes, picker_visible_hashes,
+    queue_render_image_drop, with_picker_visible_hash_sets,
 };
 
 /// `(url, start_frame, animation_frame_count, frame_indices, prefetch_token,
@@ -1930,10 +1930,18 @@ impl FrameLayer {
     /// Idle retention: instead of holding decoded frames at the budget
     /// high-water mark forever, frames for animations that are no longer
     /// playing (scrolled away, channel closed, picker closed) are released and
-    /// refilled on demand from the compressed decoded-source cache.
+    /// refilled on demand from the compressed decoded-source cache. An
+    /// animation a picker viewport or a visible chat canvas shows keeps the
+    /// pose it displays (or its only resident frame).
     pub fn evict_idle_frames(&self, ttl: std::time::Duration) -> usize {
         let _mutation_guard = self.frame_mutation_lock.lock();
         let cutoff = echo_core::unix_now_ms().saturating_sub(ttl.as_millis() as u64);
+        // A visible chat canvas keeps the pose it displays, as a picker does:
+        // an animation shown as a still, or not ticking, never touches it.
+        let chat_visible: std::collections::HashSet<u64> = chat_visible_media_hashes()
+            .into_iter()
+            .map(|hash| self.resolve_hash(hash))
+            .collect();
         let mut remaining_by_url = std::collections::HashMap::new();
         let mut expired = Vec::new();
         for entry in self.frames.iter() {
@@ -1948,7 +1956,8 @@ impl FrameLayer {
         let mut removed = 0usize;
         for key in expired {
             let size_bytes = with_picker_visible_hash_sets(|inline, popout| {
-                let is_visible = self.picker_sets_contain_canonical(inline, popout, key.url_hash);
+                let is_visible = chat_visible.contains(&key.url_hash)
+                    || self.picker_sets_contain_canonical(inline, popout, key.url_hash);
                 let displayed_fallback = self
                     .fallback_frame_indices
                     .get(&key.url_hash)
@@ -2527,6 +2536,58 @@ mod tests {
                 .unwrap()
                 .1,
             5
+        );
+    }
+
+    #[test]
+    fn idle_cleanup_keeps_the_pose_a_quiet_visible_chat_displays() {
+        let layer = FrameLayer::new(
+            Arc::new(BudgetManager::with_budget(1_000_000)),
+            Arc::new(CacheStats::new()),
+        );
+        // URLs and owner unique to this test; the chat registry is process-wide.
+        let shown = "https://chat-visible.example.test/still.webp";
+        let scrolled_away = "https://chat-visible.example.test/gone.webp";
+        let owner = 0x5eed_0000_01ff_u64;
+        for url in [shown, scrolled_away] {
+            layer.register_animation(url, AnimationMetadata::new(vec![100; 4]));
+            layer.insert_frame(url, 0, vec![0, 0, 0, 255], 1, 1);
+            layer.insert_frame(url, 1, vec![1, 0, 0, 255], 1, 1);
+        }
+        // Animation is off, so the canvas paints the still pose, once.
+        let (_, displayed) = layer
+            .probe_fallback_frame_with_index(url_key(shown), 0, 4)
+            .expect("a still pose is resident");
+        for entry in layer.frames.iter() {
+            entry.value().last_accessed_ms.store(0, Ordering::Relaxed);
+        }
+
+        crate::registry::publish_chat_visible_media(owner, vec![url_key(shown)]);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        layer.evict_idle_frames(std::time::Duration::ZERO);
+        assert!(
+            layer.has_frame(shown, displayed),
+            "the displayed still of a visible chat animation survives"
+        );
+        assert!(
+            !layer.has_frame(shown, 1 - displayed),
+            "its other pose expires"
+        );
+        assert!(!layer.has_frame(scrolled_away, 0) && !layer.has_frame(scrolled_away, 1));
+        assert!(
+            layer.get_stable_frame(shown).is_some(),
+            "the next repaint finds the still instead of a placeholder"
+        );
+
+        crate::registry::clear_chat_visible_media(owner);
+        for entry in layer.frames.iter() {
+            entry.value().last_accessed_ms.store(0, Ordering::Relaxed);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        layer.evict_idle_frames(std::time::Duration::ZERO);
+        assert!(
+            !layer.has_frame(shown, displayed),
+            "a hidden canvas no longer protects it"
         );
     }
 
