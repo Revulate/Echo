@@ -44,8 +44,11 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 const PENDING_UI_EMBED_INTERVAL: Duration = Duration::from_millis(100);
-/// Shortest gap between two pending-UI passes started by a queue wake, so a
-/// pass whose work fills a queue again cannot keep the task from yielding.
+/// Shortest gap between the end of one pending-UI pass and the start of the
+/// next when a queue wake starts it. A wake that is already pending when a
+/// pass ends (a pass that filled a queue again) therefore still awaits a
+/// timer, so the task yields between passes instead of running them back to
+/// back.
 const PENDING_UI_WAKE_MIN_SPACING: Duration = Duration::from_millis(4);
 const PENDING_UI_REAUTH_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_UI_SETTINGS_INTERVAL: Duration = Duration::from_millis(250);
@@ -613,13 +616,14 @@ impl EchoApp {
                     _ = backend::ui_actions::pending_ui_wake().notified() => true,
                 };
                 if woken
-                    && let Some(wait) = PENDING_UI_WAKE_MIN_SPACING.checked_sub(last_pass.elapsed())
+                    && let Some(wait) = PENDING_UI_WAKE_MIN_SPACING
+                        .checked_sub(last_pass.elapsed())
+                        .filter(|wait| !wait.is_zero())
                 {
                     cx.background_executor().timer(wait).await;
                 }
 
                 let now = Instant::now();
-                last_pass = now;
                 if this
                     .update(cx, |app, cx| {
                         let mut needs_notify = false;
@@ -673,6 +677,7 @@ impl EchoApp {
                 {
                     break;
                 }
+                last_pass = Instant::now();
             }
         })
     }
@@ -4917,6 +4922,7 @@ impl EchoApp {
             chat_view.update(cx, |view, cx| view.set_deleted_mode(Some(mode), cx));
         }
         self.chat_views.insert(split_id, chat_view.clone());
+        backend::ui_actions::wake_for_new_chat_view();
         chat_view
     }
 

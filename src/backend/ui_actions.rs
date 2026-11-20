@@ -337,6 +337,19 @@ pub fn pending_ui_wake() -> &'static tokio::sync::Notify {
     &PENDING_UI_WAKE
 }
 
+/// Set when a jump was put back to wait for its split's ChatView.
+static JUMP_AWAITS_CHAT_VIEW: AtomicBool = AtomicBool::new(false);
+
+/// Called when EchoApp creates a ChatView: if a jump was put back to wait for
+/// one, wake the pending-UI pass so it retries without waiting for its timer.
+/// The flag clears on the first creation, so this wakes at most once per
+/// requeue, and only a new view, never the retry itself, can set it off.
+pub fn wake_for_new_chat_view() {
+    if JUMP_AWAITS_CHAT_VIEW.swap(false, Ordering::AcqRel) {
+        PENDING_UI_WAKE.notify_one();
+    }
+}
+
 /// Push one value into a queue, recovering the queue if a prior writer panicked.
 fn push_value<T>(queue: &RwLock<Vec<T>>, value: T) {
     queue.write_or_recover().push(value);
@@ -770,9 +783,10 @@ pub fn push_pending_search_jump(channel: String, message_id: String) {
 }
 
 /// Put back a search-result jump that the pending-UI pass could not run yet.
-/// It waits for the next timer tick: a wake would run the pass again before
-/// the frame that can satisfy the jump.
+/// It does not wake the pass, which would only run again before the frame
+/// that can satisfy the jump; the next ChatView creation or timer tick does.
 pub fn requeue_pending_search_jump(channel: String, message_id: String) {
+    JUMP_AWAITS_CHAT_VIEW.store(true, Ordering::Release);
     push_value(
         &PENDING_SEARCH_JUMPS,
         PendingSearchJump {
@@ -803,6 +817,7 @@ pub fn push_pending_split_message_jump(split_id: SplitId, channel: String, messa
 /// Put back a split-local message jump that the pending-UI pass could not run
 /// yet, without waking the pass (see [`requeue_pending_search_jump`]).
 pub fn requeue_pending_split_message_jump(split_id: SplitId, channel: String, message_id: String) {
+    JUMP_AWAITS_CHAT_VIEW.store(true, Ordering::Release);
     push_bounded_value(
         &PENDING_SPLIT_MESSAGE_JUMPS,
         PendingSplitMessageJump {
@@ -911,9 +926,13 @@ pub fn drain_pending_followed_channel_opens() -> Vec<PendingFollowedChannelOpen>
 
 #[cfg(test)]
 mod tests {
-    use super::{drain, enqueue, enqueue_bounded, pending_ui_wake, push_value};
+    use super::{
+        JUMP_AWAITS_CHAT_VIEW, drain, drain_pending_search_jumps, enqueue, enqueue_bounded,
+        pending_ui_wake, push_value, requeue_pending_search_jump, wake_for_new_chat_view,
+    };
     use core::prelude::v1::test;
     use futures_util::FutureExt;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, RwLock};
 
     #[test]
@@ -927,6 +946,23 @@ mod tests {
 
         push_value(&queue, 3);
         assert_eq!(drain(&queue), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_requeued_jump_is_woken_once_by_the_next_chat_view() {
+        requeue_pending_search_jump("#wake-test".into(), "m1".into());
+        assert!(JUMP_AWAITS_CHAT_VIEW.load(Ordering::Acquire));
+
+        wake_for_new_chat_view();
+        assert!(!JUMP_AWAITS_CHAT_VIEW.load(Ordering::Acquire));
+        assert!(pending_ui_wake().notified().now_or_never().is_some());
+
+        let jumps = drain_pending_search_jumps();
+        assert!(
+            jumps
+                .iter()
+                .any(|jump| jump.channel == "#wake-test" && jump.message_id == "m1")
+        );
     }
 
     fn poison(queue: Arc<RwLock<Vec<u8>>>) {
