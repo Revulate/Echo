@@ -164,7 +164,8 @@ const HISTORY_FETCH_LIMIT: u32 = 800;
 
 /// Fetch a channel's recent messages in one request of up to
 /// [`HISTORY_FETCH_LIMIT`], falling back to the local history cache when the
-/// service is unavailable. Fetched messages are saved to that cache.
+/// service is unavailable. The cache is written once the caller has merged
+/// the fetched messages into the channel's buffer.
 pub async fn fetch_recent_messages_streaming(channel: &str) -> Result<HistoryFetchResult, String> {
     match fetch_recent_messages_with_limit(channel, HISTORY_FETCH_LIMIT).await {
         Ok(messages) if !messages.is_empty() => {
@@ -176,12 +177,6 @@ pub async fn fetch_recent_messages_streaming(channel: &str) -> Result<HistoryFet
                 count,
                 channel
             );
-
-            let cache_channel = channel.to_string();
-            let cache_messages = messages.clone();
-            crate::backend::bridge::get_runtime().spawn_blocking(move || {
-                super::history_cache::save_channel_history(&cache_channel, &cache_messages);
-            });
 
             preload_emotes_from_history(&messages, channel);
 

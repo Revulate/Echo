@@ -1297,7 +1297,9 @@ fn handle_session_channel_joined(channel: String, announce: bool) {
                     channel
                 );
 
-                merge_visible_history_messages(&channel, result.messages).await;
+                if merge_visible_history_messages(&channel, result.messages).await > 0 {
+                    crate::backend::history_cache::persist_channel_history_soon(&channel);
+                }
                 record_history_loaded_now(&channel);
 
                 if notify_visible_history_loaded(&channel) {

@@ -402,7 +402,9 @@ pub(super) async fn load_channel_history_async(channel: &str) {
                     channel
                 );
 
-                merge_visible_history_messages(channel, result.messages).await;
+                if merge_visible_history_messages(channel, result.messages).await > 0 {
+                    crate::backend::history_cache::persist_channel_history_soon(channel);
+                }
                 record_history_loaded_now(&channel_lower);
 
                 if notify_visible_history_loaded(channel) {
@@ -524,6 +526,7 @@ pub(super) async fn fill_in_missing_messages(channel: &str) -> Result<usize, Str
         );
         return Ok(0);
     }
+    crate::backend::history_cache::persist_channel_history_soon(&channel_lower);
 
     if notify_visible_history_loaded(&channel_lower) {
         bump_chat_version();

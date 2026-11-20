@@ -123,6 +123,13 @@ impl std::error::Error for HistoryCacheReadError {
 /// New saves after a clear action only persist messages newer than this cutoff.
 static HISTORY_CACHE_CLEAR_AFTER_MS: AtomicI64 = AtomicI64::new(0);
 static HISTORY_CACHE_IO_LOCK: Mutex<()> = Mutex::new(());
+/// The buffer version (`MessageBuffer::version`) whose rows each channel's
+/// cache file holds, recorded after a successful write. Every change to a
+/// buffer's rows gives it a version no other rows ever had, so a channel whose
+/// buffer still has the recorded version needs no write. Cleared by
+/// [`clear_history_cache`].
+static PERSISTED_HISTORY_VERSIONS: LazyLock<Mutex<FxHashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// Lightweight DTO for serialization — no Arc, no complex types
 #[derive(Serialize, Deserialize, Clone)]
@@ -339,6 +346,11 @@ static LIVE_HISTORY_DIRTY_CHANNELS: LazyLock<Arc<DashSet<String>>> =
 static LIVE_HISTORY_TX: OnceLock<crossbeam_channel::Sender<LiveHistoryJob>> = OnceLock::new();
 static LIVE_HISTORY_INTAKE_OPEN: AtomicBool = AtomicBool::new(true);
 static LIVE_HISTORY_SEND_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
+/// Channels [`persist_channel_history_soon`] asked for: the writer persists
+/// these on its next wake instead of at the flush deadline. Other dirty
+/// channels keep waiting for the deadline.
+static LIVE_HISTORY_URGENT_CHANNELS: LazyLock<Arc<DashSet<String>>> =
+    LazyLock::new(|| Arc::new(DashSet::new()));
 
 enum LiveHistoryJob {
     Wake,
@@ -349,6 +361,7 @@ fn live_history_tx() -> &'static crossbeam_channel::Sender<LiveHistoryJob> {
     LIVE_HISTORY_TX.get_or_init(|| {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let dirty_channels = Arc::clone(&LIVE_HISTORY_DIRTY_CHANNELS);
+        let urgent_channels = Arc::clone(&LIVE_HISTORY_URGENT_CHANNELS);
         if let Err(error) = std::thread::Builder::new()
             .name("live-history-cache".into())
             .spawn(move || {
@@ -356,6 +369,7 @@ fn live_history_tx() -> &'static crossbeam_channel::Sender<LiveHistoryJob> {
                     dirty_channels,
                     rx,
                     LIVE_HISTORY_FLUSH_INTERVAL,
+                    urgent_channels,
                     persist_live_history_channels,
                 )
             })
@@ -386,6 +400,7 @@ fn live_history_writer_loop<F>(
     dirty_channels: Arc<DashSet<String>>,
     rx: crossbeam_channel::Receiver<LiveHistoryJob>,
     flush_interval: Duration,
+    urgent_channels: Arc<DashSet<String>>,
     mut persist: F,
 ) where
     F: FnMut(Vec<String>),
@@ -396,21 +411,51 @@ fn live_history_writer_loop<F>(
         match rx.recv_timeout(wait) {
             Ok(LiveHistoryJob::Wake) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Ok(LiveHistoryJob::Shutdown(ack)) => {
+                persist_urgent_live_history_channels(
+                    &urgent_channels,
+                    &dirty_channels,
+                    &mut persist,
+                );
                 persist_dirty_live_history_channels(&dirty_channels, &mut persist);
                 let _ = ack.send(());
                 return;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                persist_urgent_live_history_channels(
+                    &urgent_channels,
+                    &dirty_channels,
+                    &mut persist,
+                );
                 persist_dirty_live_history_channels(&dirty_channels, &mut persist);
                 return;
             }
         }
 
+        persist_urgent_live_history_channels(&urgent_channels, &dirty_channels, &mut persist);
         if Instant::now() >= deadline {
             persist_dirty_live_history_channels(&dirty_channels, &mut persist);
             deadline = Instant::now() + flush_interval;
         }
     }
+}
+
+/// Persist the channels asked for urgently, taking them off the dirty set:
+/// this write covers whatever made them dirty.
+fn persist_urgent_live_history_channels<F>(
+    urgent_channels: &DashSet<String>,
+    dirty_channels: &DashSet<String>,
+    persist: &mut F,
+) where
+    F: FnMut(Vec<String>),
+{
+    let channels = take_dirty_live_history_channels(urgent_channels);
+    if channels.is_empty() {
+        return;
+    }
+    for channel in &channels {
+        dirty_channels.remove(channel);
+    }
+    persist(channels);
 }
 
 fn persist_dirty_live_history_channels<F>(dirty_channels: &DashSet<String>, persist: &mut F)
@@ -424,24 +469,38 @@ where
 }
 
 fn persist_live_history_channels(channels: Vec<String>) {
-    use super::irc::CHAT_MESSAGES;
-
     for channel in channels {
-        let Some(buffer) = CHAT_MESSAGES.get(&channel) else {
-            continue;
-        };
-        let messages: Vec<ChatMessage> = buffer.iter().cloned().collect();
-        drop(buffer);
-        save_channel_history(&channel, &messages);
+        persist_buffered_channel_history(&channel);
     }
 }
 
+/// Mark `channel` for the live writer's next flush (at most
+/// [`LIVE_HISTORY_FLUSH_INTERVAL`] away).
 pub(crate) fn schedule_visible_channel_history_persist(channel: &str) {
+    request_channel_history_persist(channel, false);
+}
+
+/// Mark `channel` and have the live writer flush on its next wake, without
+/// waiting for the flush deadline. For a history merge: its rows reach the
+/// cache file right after they reach the buffer, not with the first flush
+/// after the next live row (or at shutdown, in a quiet channel).
+pub(crate) fn persist_channel_history_soon(channel: &str) {
+    request_channel_history_persist(channel, true);
+}
+
+fn request_channel_history_persist(channel: &str, flush_now: bool) {
     if !LIVE_HISTORY_INTAKE_OPEN.load(Ordering::Acquire)
         || !super::settings::get_persist_history_enabled()
         || super::chat_replay::suppresses_history_persistence()
-        || !mark_live_history_channel_dirty(&LIVE_HISTORY_DIRTY_CHANNELS, channel)
     {
+        return;
+    }
+    let channels = if flush_now {
+        &LIVE_HISTORY_URGENT_CHANNELS
+    } else {
+        &LIVE_HISTORY_DIRTY_CHANNELS
+    };
+    if !mark_live_history_channel_dirty(channels, channel) {
         return;
     }
 
@@ -726,43 +785,77 @@ fn channel_history_path(history_dir: &Path, channel: &str, suffix: &str) -> Opti
     Some(history_dir.join(format!("{channel}{suffix}")))
 }
 
-pub fn save_channel_history(channel: &str, messages: &[ChatMessage]) {
+/// The rows the cache file keeps, oldest first, from `newest_first` (a
+/// buffer's rows, newest first): the newest [`MAX_STORED_MESSAGES`] that are
+/// persisted at all and newer than a clear. Only those rows are cloned.
+fn newest_persisted_history_rows<'a>(
+    newest_first: impl Iterator<Item = &'a ChatMessage>,
+    clear_after_ms: i64,
+) -> Vec<ChatMessage> {
+    let mut rows: Vec<ChatMessage> = newest_first
+        .filter(|m| should_persist_history_message(m))
+        .filter(|m| clear_after_ms == 0 || m.timestamp > clear_after_ms)
+        .take(MAX_STORED_MESSAGES)
+        .cloned()
+        .collect();
+    rows.reverse();
+    rows
+}
+
+/// Write `channel`'s buffered history unless its cache file already holds
+/// this buffer version. Rows are copied out under the buffer's shard guard,
+/// then encoded and written without it. Returns whether a write happened.
+fn persist_buffered_channel_history(channel: &str) -> bool {
+    use super::irc::CHAT_MESSAGES;
+
     if !super::settings::get_persist_history_enabled()
         || super::chat_replay::suppresses_history_persistence()
     {
-        return;
+        return false;
     }
     let _io_guard = history_cache_io_guard();
     let Some(history_dir) = get_history_dir() else {
-        return;
+        return false;
     };
     let clear_after_ms = HISTORY_CACHE_CLEAR_AFTER_MS.load(Ordering::Relaxed);
-
-    let stored: Vec<StoredMessage> = messages
-        .iter()
-        .filter(|m| should_persist_history_message(m))
-        .filter(|m| clear_after_ms == 0 || m.timestamp > clear_after_ms)
-        .rev()
-        .take(MAX_STORED_MESSAGES)
-        .map(StoredMessage::from_chat_message)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-
-    let Some(path) = channel_history_path(&history_dir, channel, ".bin.zst") else {
-        return;
+    let (version, rows) = {
+        let Some(buffer) = CHAT_MESSAGES.get(channel) else {
+            return false;
+        };
+        let version = buffer.version();
+        if PERSISTED_HISTORY_VERSIONS.lock_or_recover().get(channel) == Some(&version) {
+            return false;
+        }
+        let rows = newest_persisted_history_rows(buffer.iter_recent(usize::MAX), clear_after_ms);
+        (version, rows)
     };
-    if stored.is_empty() {
-        remove_channel_history_snapshot(&path, channel);
-        return;
+    let written = write_channel_history(&history_dir, channel, &rows);
+    if written {
+        PERSISTED_HISTORY_VERSIONS
+            .lock_or_recover()
+            .insert(channel.to_string(), version);
     }
+    written
+}
+
+/// Replace `channel`'s cache file with `rows` (oldest first), or remove it
+/// when there are none. The caller holds [`history_cache_io_guard`]. Returns
+/// whether the file now holds `rows`.
+fn write_channel_history(history_dir: &Path, channel: &str, rows: &[ChatMessage]) -> bool {
+    let Some(path) = channel_history_path(history_dir, channel, ".bin.zst") else {
+        return false;
+    };
+    if rows.is_empty() {
+        remove_channel_history_snapshot(&path, channel);
+        return !path.exists();
+    }
+    let stored: Vec<StoredMessage> = rows.iter().map(StoredMessage::from_chat_message).collect();
 
     let encoded = match encode_stored_messages(&stored) {
         Ok(data) => data,
         Err(e) => {
             crate::log_net!(warn, "Failed to encode history for {}: {}", channel, e);
-            return;
+            return false;
         }
     };
 
@@ -770,24 +863,24 @@ pub fn save_channel_history(channel: &str, messages: &[ChatMessage]) {
         Ok(data) => data,
         Err(e) => {
             crate::log_net!(warn, "Failed to compress history for {}: {}", channel, e);
-            return;
+            return false;
         }
     };
 
-    let Some(tmp_path) = channel_history_path(&history_dir, channel, ".bin.zst.tmp") else {
-        return;
+    let Some(tmp_path) = channel_history_path(history_dir, channel, ".bin.zst.tmp") else {
+        return false;
     };
 
     if let Err(e) = std::fs::write(&tmp_path, &compressed) {
         crate::log_net!(warn, "Failed to write history for {}: {}", channel, e);
         let _ = std::fs::remove_file(&tmp_path);
-        return;
+        return false;
     }
 
     if let Err(e) = crate::utils::replace_file(&tmp_path, &path) {
         crate::log_net!(warn, "Failed to replace history for {}: {}", channel, e);
         let _ = std::fs::remove_file(&tmp_path);
-        return;
+        return false;
     }
 
     crate::log_net!(
@@ -797,6 +890,7 @@ pub fn save_channel_history(channel: &str, messages: &[ChatMessage]) {
         channel,
         compressed.len()
     );
+    true
 }
 
 /// Load channel history from local cache file
@@ -861,6 +955,7 @@ pub fn load_channel_history(channel: &str, tokenize: bool) -> Vec<ChatMessage> {
 pub fn clear_history_cache() -> Result<usize, String> {
     let _io_guard = history_cache_io_guard();
     HISTORY_CACHE_CLEAR_AFTER_MS.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    PERSISTED_HISTORY_VERSIONS.lock_or_recover().clear();
 
     let Some(history_dir) = history_dir_path() else {
         return Ok(0);
@@ -896,7 +991,11 @@ pub fn clear_history_cache() -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Save all channels' message history to disk (called on shutdown)
+/// Save every channel whose cache file does not hold its current rows
+/// (called on shutdown, after the live writer drained). A channel whose
+/// buffer has not changed since its last write is skipped: any change to a
+/// buffer's rows (a live row, a history merge, a deletion, retokenization,
+/// a policy prune) gives it a new version.
 pub fn save_all_channels() {
     use super::irc::CHAT_MESSAGES;
 
@@ -905,18 +1004,17 @@ pub fn save_all_channels() {
     }
 
     let channels: Vec<String> = CHAT_MESSAGES.iter().map(|r| r.key().clone()).collect();
+    let written = channels
+        .iter()
+        .filter(|channel| persist_buffered_channel_history(channel))
+        .count();
 
-    for channel in &channels {
-        if let Some(buffer) = CHAT_MESSAGES.get(channel) {
-            let messages: Vec<ChatMessage> = buffer.iter().cloned().collect();
-            // Release the shard before compressing and writing, as the live
-            // writer does, so late IRC producers and UI reads are not blocked.
-            drop(buffer);
-            save_channel_history(channel, &messages);
-        }
-    }
-
-    crate::log_net!(info, "Saved history cache for {} channels", channels.len());
+    crate::log_net!(
+        info,
+        "Saved history cache for {} of {} channels (the rest were current)",
+        written,
+        channels.len()
+    );
 }
 
 #[cfg(test)]
@@ -1067,6 +1165,7 @@ mod tests {
                 worker_dirty_channels,
                 wake_rx,
                 Duration::from_millis(25),
+                Arc::new(DashSet::new()),
                 move |channels| {
                     let _ = persisted_tx.send(channels);
                 },
@@ -1092,6 +1191,96 @@ mod tests {
     }
 
     #[test]
+    fn live_history_urgent_channel_is_persisted_without_waiting_for_the_deadline() {
+        let dirty_channels = Arc::new(DashSet::new());
+        let urgent_channels = Arc::new(DashSet::new());
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        let (persisted_tx, persisted_rx) = crossbeam_channel::unbounded();
+        let worker_dirty_channels = Arc::clone(&dirty_channels);
+        let worker_urgent_channels = Arc::clone(&urgent_channels);
+        let worker = std::thread::spawn(move || {
+            live_history_writer_loop(
+                worker_dirty_channels,
+                wake_rx,
+                Duration::from_secs(60),
+                worker_urgent_channels,
+                move |channels| {
+                    let _ = persisted_tx.send(channels);
+                },
+            );
+        });
+
+        // A dirty channel waits for the deadline.
+        assert!(mark_live_history_channel_dirty(&dirty_channels, "live"));
+        assert!(mark_live_history_channel_dirty(&dirty_channels, "merged"));
+        wake_tx.send(LiveHistoryJob::Wake).unwrap();
+        assert!(
+            persisted_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        // An urgent channel is persisted on the next wake, alone, and leaves
+        // the dirty set; the other dirty channel keeps waiting.
+        assert!(mark_live_history_channel_dirty(&urgent_channels, "#Merged"));
+        wake_tx.send(LiveHistoryJob::Wake).unwrap();
+        assert_eq!(
+            persisted_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an urgent channel should persist before the deadline"),
+            vec!["merged".to_string()]
+        );
+        assert!(urgent_channels.is_empty());
+        assert!(!dirty_channels.contains("merged"));
+        assert!(dirty_channels.contains("live"));
+
+        drop(wake_tx);
+        assert_eq!(
+            persisted_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the writer should flush dirty channels when it stops"),
+            vec!["live".to_string()]
+        );
+        worker.join().expect("history writer should stop");
+    }
+
+    #[test]
+    fn persisted_history_rows_are_the_newest_kept_rows_oldest_first() {
+        let row = |id: &str, timestamp: i64| ChatMessage {
+            id: Arc::from(id),
+            channel: Arc::from("example"),
+            timestamp,
+            ..Default::default()
+        };
+        let mut deleted = row("deleted", 5);
+        deleted.flags.is_deleted = true;
+        let mut system = row("system", 6);
+        system.flags.is_system = true;
+        let mut rows: Vec<ChatMessage> = (0..MAX_STORED_MESSAGES as i64 + 10)
+            .map(|index| row(&format!("m{index}"), 10 + index))
+            .collect();
+        rows.insert(3, deleted);
+        rows.push(system);
+
+        let kept = newest_persisted_history_rows(rows.iter().rev(), 0);
+        assert_eq!(kept.len(), MAX_STORED_MESSAGES);
+        assert_eq!(kept.first().unwrap().id.as_ref(), "m10");
+        assert_eq!(
+            kept.last().unwrap().id.as_ref(),
+            format!("m{}", MAX_STORED_MESSAGES + 9)
+        );
+        assert!(
+            kept.windows(2)
+                .all(|pair| pair[0].timestamp < pair[1].timestamp)
+        );
+
+        // Rows from before a clear are left out.
+        let cleared = newest_persisted_history_rows(rows.iter().rev(), 10 + 205);
+        assert_eq!(cleared.len(), 4);
+        assert_eq!(cleared.first().unwrap().id.as_ref(), "m206");
+    }
+
+    #[test]
     fn live_history_shutdown_flushes_dirty_channels() {
         let dirty_channels = Arc::new(DashSet::new());
         assert!(mark_live_history_channel_dirty(&dirty_channels, "shutdown"));
@@ -1103,6 +1292,7 @@ mod tests {
                 worker_dirty_channels,
                 job_rx,
                 Duration::from_secs(60),
+                Arc::new(DashSet::new()),
                 move |channels| {
                     let _ = persisted_tx.send(channels);
                 },

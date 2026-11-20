@@ -7,7 +7,18 @@ use crate::message::ChatMessage;
 use rustc_hash::FxHashMap;
 use std::borrow::Borrow;
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Source of every buffer's [`MessageBuffer::version`]. Drawing from one
+/// process-wide counter makes a version name one buffer state: a buffer that
+/// replaced another under the same channel, or a clone that changed after
+/// cloning, never repeats a version recorded for different rows.
+static NEXT_BUFFER_VERSION: AtomicU64 = AtomicU64::new(1);
+
+fn next_buffer_version() -> u64 {
+    NEXT_BUFFER_VERSION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Buffer capacity used when the root has not installed its retention sizing.
 ///
@@ -183,7 +194,7 @@ pub struct MessageBuffer {
     messages: VecDeque<ChatMessage>,
     /// Maximum capacity before eviction
     capacity: usize,
-    /// Version counter - increments on every mutation
+    /// Changes on every mutation of `messages`; see [`Self::version`].
     version: u64,
     /// Cached [`Self::snapshot`] result, valid while `version` matches, so
     /// repeat snapshots of an unchanged buffer share one `Arc`. It keeps a
@@ -213,7 +224,7 @@ impl MessageBuffer {
             // channel's scrollback before any messages arrive.
             messages: VecDeque::new(),
             capacity,
-            version: 0,
+            version: next_buffer_version(),
             snapshot: None,
             next_alternate: false,
             id_counts: FxHashMap::default(),
@@ -250,8 +261,17 @@ impl MessageBuffer {
     /// Invalidate the cached snapshot (called on mutation)
     #[inline]
     fn invalidate_cache(&mut self) {
-        self.version = self.version.wrapping_add(1);
+        self.version = next_buffer_version();
         self.snapshot = None;
+    }
+
+    /// Identifies the buffer's current rows: every mutation gives the buffer
+    /// a new version, unique across all buffers in the process, and only a
+    /// clone of these exact rows shares it. A caller that recorded the
+    /// version of the rows it wrote somewhere can tell whether they are still
+    /// current.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Get an `Arc` snapshot of all messages, reusing the cached one when the
@@ -695,6 +715,45 @@ mod tests {
         assert_eq!(buffer.len(), 3);
         assert_eq!(buffer.get(0).unwrap().id.as_ref(), "2");
         assert_eq!(buffer.get(2).unwrap().id.as_ref(), "4");
+    }
+
+    #[test]
+    fn version_changes_on_every_mutation_and_never_repeats_across_buffers() {
+        let mut buffer = MessageBuffer::new(3);
+        let mut seen = HashSet::new();
+        let mut record = |version: u64| assert!(seen.insert(version), "version {version} repeated");
+        record(buffer.version());
+        record(MessageBuffer::new(3).version());
+
+        for id in ["1", "2", "3", "4"] {
+            buffer.push(make_test_message(id));
+            record(buffer.version());
+        }
+        assert!(buffer.update_by_id("4", |row| row.content = Arc::from("edited")));
+        record(buffer.version());
+        assert!(buffer.remove_by_id("3"));
+        record(buffer.version());
+        buffer.merge_history(vec![make_test_message("0")]);
+        record(buffer.version());
+        assert_eq!(buffer.retain(|row| row.id.as_ref() != "0"), 1);
+        record(buffer.version());
+
+        // A clone shares the version only while its rows are identical.
+        let mut copy = buffer.clone();
+        assert_eq!(copy.version(), buffer.version());
+        copy.push(make_test_message("5"));
+        buffer.push(make_test_message("6"));
+        assert_ne!(copy.version(), buffer.version());
+        record(copy.version());
+        record(buffer.version());
+
+        // Calls that change no row keep the version.
+        let unchanged = buffer.version();
+        buffer.merge_history(Vec::new());
+        assert_eq!(buffer.retain(|_| true), 0);
+        assert!(!buffer.set_capacity(10));
+        let _ = buffer.snapshot();
+        assert_eq!(buffer.version(), unchanged);
     }
 
     #[test]

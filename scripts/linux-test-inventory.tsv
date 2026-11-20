@@ -223,6 +223,7 @@ core_test	crates/echo-core/src/message_buffer.rs	id_index_follows_every_mutation
 core_test	crates/echo-core/src/message_buffer.rs	push_stamped_gives_the_broadcast_copy_the_stored_parity
 core_test	crates/echo-core/src/message_buffer.rs	test_latest_id
 core_test	crates/echo-core/src/message_buffer.rs	test_push_and_eviction
+core_test	crates/echo-core/src/message_buffer.rs	version_changes_on_every_mutation_and_never_repeats_across_buffers
 core_test	crates/echo-core/src/notification_text.rs	escape_notification_markup_escapes_only_markup_characters
 core_test	crates/echo-core/src/notification_text.rs	test_truncate_message
 core_test	crates/echo-core/src/oauth_token.rs	normalizes_oauth_token_prefixes
@@ -520,6 +521,8 @@ root_test	src/backend/history_cache.rs	live_history_dirty_channels_are_coalesced
 root_test	src/backend/history_cache.rs	live_history_empty_snapshot_removes_stale_file
 root_test	src/backend/history_cache.rs	live_history_flush_deadline_is_not_postponed_by_continuous_wakes
 root_test	src/backend/history_cache.rs	live_history_shutdown_flushes_dirty_channels
+root_test	src/backend/history_cache.rs	live_history_urgent_channel_is_persisted_without_waiting_for_the_deadline
+root_test	src/backend/history_cache.rs	persisted_history_rows_are_the_newest_kept_rows_oldest_first
 root_test	src/backend/history_cache.rs	readable_day_log_names_match_only_echo_daily_logs
 root_test	src/backend/history_cache.rs	readable_log_channel_name_reads_daily_and_legacy_paths
 root_test	src/backend/history_cache.rs	readable_log_in_place_redaction_keeps_byte_length
@@ -935,7 +938,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	443
+summary	root_tests	445
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
@@ -944,7 +947,7 @@ summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
 summary	media_cache_tests	45
-summary	core_tests	248
+summary	core_tests	249
 summary	render_core_tests	46
 summary	text_core_tests	26
 summary	root_doctests_runnable	3
