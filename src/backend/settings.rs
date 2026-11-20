@@ -9,7 +9,6 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-#[cfg(not(target_os = "windows"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -3439,36 +3438,66 @@ pub fn settings_file_was_missing_at_startup() -> bool {
     SETTINGS_FILE_MISSING_AT_LOAD.load(Ordering::Acquire)
 }
 
-/// The streamer mode settings.json selects, read before [`SETTINGS`] loads
-/// and without loading it (no keyring, no migration, no backup recovery), so
-/// the launch detection can skip its process scan outside Auto. A missing or
-/// unreadable file gives the default, Auto.
+/// The streamer mode the settings load will end with, worked out before
+/// [`SETTINGS`] loads so the launch detection can skip its process scan
+/// outside Auto. See [`launch_streamer_mode`].
 pub(crate) fn streamer_mode_status_before_load() -> super::streamer_mode::StreamerModeStatus {
-    let path = crate::storage_roots::config_root_or_current_dir().join("settings.json");
-    fs::read_to_string(path)
-        .map(|content| streamer_mode_status_in_settings_json(&content))
-        .unwrap_or_default()
+    let primary = crate::storage_roots::config_root_or_current_dir().join("settings.json");
+    launch_streamer_mode(
+        &primary,
+        &crate::utils::backup_generation_paths(&primary),
+        crate::storage_roots::legacy_cwd_file("settings.json").as_deref(),
+    )
 }
 
-/// The streamer mode a settings document selects, reading only that value.
-/// Anything that does not yield it gives the default, Auto.
-fn streamer_mode_status_in_settings_json(
-    content: &str,
+/// The streamer mode `SettingsManager::new` and `load` end with for
+/// `primary`, from the same files in the same order and with the same
+/// parse, but without loading the settings: no keyring, no normalization,
+/// and nothing written, moved, quarantined or reported.
+///
+/// - A missing primary with no backup takes a legacy working-directory file
+///   when one migrates (as `SettingsManager::new` would write it), otherwise
+///   the defaults (a first run).
+/// - A primary that reads is parsed in full, or salvaged key by key as the
+///   load does; one that does not read (not UTF-8, unparseable, a duplicated
+///   key) falls to the backups in recovery order, the first that parses in
+///   full winning.
+/// - With nothing readable the load uses the defaults, and so does this:
+///   Auto.
+fn launch_streamer_mode(
+    primary: &Path,
+    backups: &[PathBuf],
+    legacy: Option<&Path>,
 ) -> super::streamer_mode::StreamerModeStatus {
-    #[derive(Deserialize)]
-    struct Document {
-        #[serde(default)]
-        streamer_mode: Option<StreamerMode>,
+    let mode = |settings: AppSettings| settings.streamer_mode.unwrap_or_default().enabled;
+    let any_backup = backups.iter().any(|path| path.exists());
+    let content = if !primary.exists() && !any_backup {
+        let migrated = legacy
+            .filter(|path| path.exists())
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|json| strip_launch_settings_from_json(&json));
+        match migrated {
+            Some(json) => Ok(json),
+            None => return Default::default(),
+        }
+    } else {
+        fs::read_to_string(primary)
+    };
+    if let Ok(content) = content {
+        match serde_json::from_str::<AppSettings>(&content) {
+            Ok(settings) => return mode(settings),
+            Err(_) => {
+                if let Some((settings, _)) = salvage_settings(&content) {
+                    return mode(settings);
+                }
+            }
+        }
     }
-    #[derive(Deserialize)]
-    struct StreamerMode {
-        #[serde(default)]
-        enabled: super::streamer_mode::StreamerModeStatus,
-    }
-    serde_json::from_str::<Document>(content)
-        .ok()
-        .and_then(|document| document.streamer_mode)
-        .map(|streamer_mode| streamer_mode.enabled)
+    backups
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .find_map(|content| serde_json::from_str::<AppSettings>(&content).ok())
+        .map(mode)
         .unwrap_or_default()
 }
 
@@ -7958,49 +7987,162 @@ mod salvage_tests {
         );
     }
 
+    /// A settings document selecting `mode`, plus whatever `edit` changes.
+    fn settings_json(
+        mode: super::super::streamer_mode::StreamerModeStatus,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> String {
+        let mut settings = AppSettings::default();
+        settings.streamer_mode = Some(super::super::streamer_mode::StreamerModeSettings {
+            enabled: mode,
+            ..Default::default()
+        });
+        let mut document = serde_json::to_value(&settings).unwrap();
+        edit(&mut document);
+        document.to_string()
+    }
+
     #[test]
-    fn the_launch_reads_only_the_streamer_mode_and_defaults_to_auto() {
-        use super::super::streamer_mode::{StreamerModeSettings, StreamerModeStatus};
-        for mode in [
-            StreamerModeStatus::Auto,
-            StreamerModeStatus::AlwaysOn,
-            StreamerModeStatus::Disabled,
-        ] {
-            let mut settings = AppSettings::default();
-            settings.streamer_mode = Some(StreamerModeSettings {
-                enabled: mode,
-                ..Default::default()
-            });
-            let mut document = serde_json::to_value(&settings).unwrap();
-            // A value the full load would reset elsewhere does not matter.
+    fn the_launch_mode_comes_from_the_sources_the_load_reads_in_its_order() {
+        use super::super::streamer_mode::StreamerModeStatus::{AlwaysOn, Auto, Disabled};
+        let root =
+            std::env::temp_dir().join(format!("echo-launch-streamer-mode-{}", std::process::id()));
+        let disabled = settings_json(Disabled, |_| {});
+        let always_on = settings_json(AlwaysOn, |_| {});
+        let auto = settings_json(Auto, |_| {});
+        // Unreadable elsewhere: the full parse fails, salvage keeps the mode.
+        let disabled_salvaged = settings_json(Disabled, |document| {
             document["font_scale"] = serde_json::json!("from a newer build");
-            assert_eq!(
-                streamer_mode_status_in_settings_json(&document.to_string()),
-                mode
-            );
+        });
+        // The same key twice: no salvage, so the load turns to the backups.
+        let duplicated = format!(r#"{}, "theme": "dark"}}"#, auto.trim_end_matches('}')).replacen(
+            '{',
+            r#"{"theme": "light", "#,
+            1,
+        );
+        let truncated = &auto[..auto.len() / 2];
+        let not_utf8: &[u8] = &[0x7b, 0xff, 0xfe, 0x7d];
+        enum File<'a> {
+            Text(&'a str),
+            Bytes(&'a [u8]),
         }
-        let default_document = serde_json::to_string(&AppSettings::default()).unwrap();
-        for (content, why) in [
-            (default_document.as_str(), "no streamer settings saved"),
-            ("{}", "empty document"),
-            (r#"{"streamer_mode":null}"#, "null streamer settings"),
-            (r#"{"streamer_mode":{}}"#, "no mode saved"),
+        use File::{Bytes, Text};
+        let cases: Vec<(&str, Option<File>, [Option<&str>; 3], Option<&str>, _)> = vec![
             (
-                r#"{"streamer_mode":{"enabled":"new_mode"}}"#,
-                "unknown mode",
+                "readable primary",
+                Some(Text(&disabled)),
+                [None; 3],
+                None,
+                Disabled,
             ),
-            (r#"{"streamer_mode":{"enabled":3}}"#, "wrong type"),
-            (r#"{"streamer_mode":"disabled"}"#, "wrong shape"),
-            ("[]", "not an object"),
-            (r#"{"streamer_mode":{"enabled":"disabled""#, "truncated"),
-            ("", "empty file"),
-        ] {
+            (
+                "always on",
+                Some(Text(&always_on)),
+                [None; 3],
+                None,
+                AlwaysOn,
+            ),
+            (
+                "salvaged primary",
+                Some(Text(&disabled_salvaged)),
+                [Some(&auto), None, None],
+                None,
+                Disabled,
+            ),
+            ("first run", None, [None; 3], None, Auto),
+            (
+                "legacy file migrates",
+                None,
+                [None; 3],
+                Some(&disabled),
+                Disabled,
+            ),
+            (
+                "legacy not a settings object",
+                None,
+                [None; 3],
+                Some("[1]"),
+                Auto,
+            ),
+            (
+                "missing primary, backup",
+                None,
+                [Some(&disabled), None, None],
+                Some(&auto),
+                Disabled,
+            ),
+            (
+                "not UTF-8",
+                Some(Bytes(not_utf8)),
+                [Some(&disabled), None, None],
+                None,
+                Disabled,
+            ),
+            (
+                "unparseable",
+                Some(Text(truncated)),
+                [Some(&disabled), None, None],
+                None,
+                Disabled,
+            ),
+            (
+                "duplicated key",
+                Some(Text(&duplicated)),
+                [Some(&disabled), None, None],
+                None,
+                Disabled,
+            ),
+            (
+                "first backup unreadable in full",
+                Some(Text(truncated)),
+                [Some(&disabled_salvaged), Some(&disabled), Some(&auto)],
+                None,
+                Disabled,
+            ),
+            (
+                "later backup",
+                Some(Text(truncated)),
+                [None, None, Some(&disabled)],
+                None,
+                Disabled,
+            ),
+            (
+                "nothing readable",
+                Some(Text(truncated)),
+                [Some(truncated), None, None],
+                None,
+                Auto,
+            ),
+        ];
+        for (index, (why, primary_file, backup_files, legacy_file, expected)) in
+            cases.into_iter().enumerate()
+        {
+            let dir = root.join(index.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let primary = dir.join("settings.json");
+            let backups = crate::utils::backup_generation_paths(&primary);
+            let legacy = dir.join("legacy-settings.json");
+            let write = |path: &Path, file: Option<File>| match file {
+                Some(Text(text)) => std::fs::write(path, text).unwrap(),
+                Some(Bytes(bytes)) => std::fs::write(path, bytes).unwrap(),
+                None => {}
+            };
+            write(&primary, primary_file);
+            for (path, text) in backups.iter().zip(backup_files) {
+                write(path, text.map(Text));
+            }
+            write(&legacy, legacy_file.map(Text));
             assert_eq!(
-                streamer_mode_status_in_settings_json(content),
-                StreamerModeStatus::Auto,
+                launch_streamer_mode(&primary, &backups, Some(&legacy)),
+                expected,
                 "{why}"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+        // The duplicated document really is refused by the full parse and
+        // by salvage, so the load leaves it for the backups too.
+        assert!(serde_json::from_str::<AppSettings>(&duplicated).is_err());
+        assert!(salvage_settings(&duplicated).is_none());
     }
 
     #[test]
