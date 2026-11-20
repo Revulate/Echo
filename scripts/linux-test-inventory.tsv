@@ -581,10 +581,9 @@ root_test	src/backend/twitch_api.rs	missing_or_unparseable_retry_after_pauses_si
 root_test	src/backend/twitch_api.rs	preserves_repeated_login_order_and_query_encoding
 root_test	src/backend/twitch_api.rs	rate_limit_pauses_every_login_until_retry_after
 root_test	src/backend/twitch_api.rs	reuses_a_logins_answer_for_sixty_seconds
-root_test	src/backend/ui_actions.rs	a_requeued_jump_is_woken_once_by_the_next_chat_view
 root_test	src/backend/ui_actions.rs	bounded_enqueue_recovers_a_poisoned_queue_and_keeps_the_newest_values
 root_test	src/backend/ui_actions.rs	enqueue_and_drain_recover_a_poisoned_queue
-root_test	src/backend/ui_actions.rs	filling_a_pending_queue_wakes_the_pending_ui_task
+root_test	src/backend/ui_actions.rs	filled_queues_and_requeued_jumps_wake_the_pending_ui_task
 root_test	src/bench/mod.rs	lightweight_offline_mode_requires_an_isolated_profile
 root_test	src/bench/mod.rs	offline_and_live_benchmarks_reject_outbound_user_actions
 root_test	src/cache/animation_source.rs	frame_reads_reuse_a_context_and_match_bulk_decompress
@@ -901,7 +900,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	411
+summary	root_tests	410
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

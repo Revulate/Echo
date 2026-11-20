@@ -935,8 +935,11 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, RwLock};
 
+    /// One test, because every case consumes the same process-wide wake
+    /// permit: `Notify` holds at most one, so a parallel test taking it
+    /// between another's wake and check would fail that check.
     #[test]
-    fn filling_a_pending_queue_wakes_the_pending_ui_task() {
+    fn filled_queues_and_requeued_jumps_wake_the_pending_ui_task() {
         let queue = RwLock::new(Vec::new());
         enqueue(&queue, 1);
         assert!(pending_ui_wake().notified().now_or_never().is_some());
@@ -946,10 +949,8 @@ mod tests {
 
         push_value(&queue, 3);
         assert_eq!(drain(&queue), vec![1, 2, 3]);
-    }
 
-    #[test]
-    fn a_requeued_jump_is_woken_once_by_the_next_chat_view() {
+        // A requeued jump is woken once by the next chat view.
         requeue_pending_search_jump("#wake-test".into(), "m1".into());
         assert!(JUMP_AWAITS_CHAT_VIEW.load(Ordering::Acquire));
 
