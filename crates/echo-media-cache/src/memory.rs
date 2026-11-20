@@ -472,16 +472,23 @@ impl MemoryLayer {
     /// The budget-pressure LRU only runs when allocating, so without this sweep a
     /// busy channel's emote textures stay resident at the high-water mark after
     /// the emotes scroll away. Flushes pending accesses first so visible emotes
-    /// keep a fresh touch and are not evicted.
+    /// keep a fresh touch and are not evicted. Images a picker viewport or a
+    /// visible chat canvas currently shows are kept whatever their touch time,
+    /// since a canvas that does not repaint never touches them.
     pub fn evict_idle(&self, ttl: std::time::Duration) -> usize {
         self.flush_access_buffer();
         let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
-        let picker_visible = self.picker_visible_canonical_hashes();
+        let mut protected = self.picker_visible_canonical_hashes();
+        protected.extend(
+            crate::registry::chat_visible_static_media_hashes()
+                .into_iter()
+                .map(|hash| self.canonical_hash(hash)),
+        );
         let expired: Vec<u64> = self
             .cache
             .iter()
             .filter(|entry| {
-                !picker_visible.contains(entry.key())
+                !protected.contains(entry.key())
                     && entry.value().last_touch_ms.load(Ordering::Relaxed) < cutoff
             })
             .map(|entry| *entry.key())
@@ -650,6 +657,46 @@ mod tests {
             stats.freshness_blocked_evictions.load(Ordering::Relaxed),
             0,
             "a stale entry was available, so no over-budget force was needed"
+        );
+    }
+
+    #[test]
+    fn idle_sweep_keeps_statics_a_quiet_visible_chat_shows() {
+        let budget = Arc::new(BudgetManager::with_budget(1_000_000));
+        let stats = Arc::new(CacheStats::new());
+        let layer = MemoryLayer::new(Arc::clone(&budget), Arc::clone(&stats));
+        // Hashes unique to this test; the chat registry is process-wide.
+        let (on_screen, scrolled_away) = (0x5eed_0000_0001_u64, 0x5eed_0000_0002_u64);
+        let owner = 0x5eed_0000_00ff_u64;
+        assert!(layer.insert(on_screen, create_test_image(8, 8)));
+        assert!(layer.insert(scrolled_away, create_test_image(8, 8)));
+        let painted_long_ago = now_ms().saturating_sub(10 * 60 * 1000);
+        for hash in [on_screen, scrolled_away] {
+            layer
+                .cache
+                .get(&hash)
+                .expect("inserted")
+                .last_touch_ms
+                .store(painted_long_ago, Ordering::Relaxed);
+        }
+
+        // A chat that has not repainted since still shows `on_screen`.
+        crate::registry::publish_chat_visible_static_media(owner, vec![on_screen]);
+        assert!(layer.evict_idle(std::time::Duration::from_secs(180)) > 0);
+        assert!(
+            layer.contains(on_screen),
+            "a visible chat static must survive"
+        );
+        assert!(
+            !layer.contains(scrolled_away),
+            "an unseen static still expires"
+        );
+
+        crate::registry::clear_chat_visible_static_media(owner);
+        assert!(layer.evict_idle(std::time::Duration::from_secs(180)) > 0);
+        assert!(
+            !layer.contains(on_screen),
+            "a hidden canvas no longer protects it"
         );
     }
 

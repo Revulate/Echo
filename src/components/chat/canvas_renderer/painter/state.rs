@@ -352,6 +352,11 @@ pub(super) struct ViewportFrameState {
     /// A visible row painted as GPUI elements (not the viewport canvas) shows
     /// animated content, which only a repaint can advance.
     pub(super) fallback_rows_animate: bool,
+    /// Sorted static image URL hashes last published as this canvas's visible
+    /// set (`image_cache::publish_chat_visible_static_media`).
+    pub(super) published_static_media: Vec<u64>,
+    /// Reused buffer for building the next visible static set.
+    pub(super) static_media_scratch: Vec<u64>,
 }
 
 /// An animated image showed its static stand-in; the bit is shifted by its
@@ -406,6 +411,8 @@ impl ViewportFrameState {
             relayout_geometry: None,
             painted_animation_slots: Rc::default(),
             fallback_rows_animate: false,
+            published_static_media: Vec::new(),
+            static_media_scratch: Vec::new(),
         }
     }
 }

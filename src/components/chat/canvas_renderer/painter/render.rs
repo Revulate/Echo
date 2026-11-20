@@ -269,6 +269,8 @@ impl Render for CanvasMessageList {
             needs_notify |= self.refresh_hover_after_content_move(window);
         }
 
+        self.publish_visible_static_media(animation_census_owner);
+
         self.viewport_state.render_element_buffer.clear();
         let visible_row_count = self.viewport_state.visible_render_rows.len();
         if self.viewport_state.render_element_buffer.capacity() < visible_row_count {

@@ -831,6 +831,7 @@ media_cache_test	crates/echo-media-cache/src/frames.rs	stable_frame_reports_the_
 media_cache_test	crates/echo-media-cache/src/frames.rs	test_animation_time
 media_cache_test	crates/echo-media-cache/src/frames.rs	test_frame_layer_basic
 media_cache_test	crates/echo-media-cache/src/frames.rs	two_frame_seam_probe_never_jumps_to_early_frame_zero
+media_cache_test	crates/echo-media-cache/src/memory.rs	idle_sweep_keeps_statics_a_quiet_visible_chat_shows
 media_cache_test	crates/echo-media-cache/src/memory.rs	test_access_buffer
 media_cache_test	crates/echo-media-cache/src/memory.rs	test_hash_consistency
 media_cache_test	crates/echo-media-cache/src/memory.rs	test_memory_layer_basic

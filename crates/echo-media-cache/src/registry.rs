@@ -176,6 +176,39 @@ static PICKER_VISIBILITY_CHANGES: LazyLock<watch::Sender<u64>> = LazyLock::new(|
     sender
 });
 
+/// Static images (URL hashes) each visible chat canvas showed in its last
+/// render, keyed by canvas owner. A quiet chat does not repaint, so painting
+/// never re-stamps its on-screen statics as fresh; the idle TTL sweep must
+/// not evict them, or the next repaint misses and redecodes every one.
+static CHAT_VISIBLE_STATIC_MEDIA: LazyLock<RwLock<HashMap<u64, Vec<u64>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Record the static images a visible chat canvas shows, replacing what that
+/// owner published before; an empty list clears it.
+pub fn publish_chat_visible_static_media(owner: u64, url_hashes: Vec<u64>) {
+    let mut visible = CHAT_VISIBLE_STATIC_MEDIA.write();
+    if url_hashes.is_empty() {
+        visible.remove(&owner);
+    } else {
+        visible.insert(owner, url_hashes);
+    }
+}
+
+/// Forget a chat canvas's visible statics (hidden tab or closed split).
+pub fn clear_chat_visible_static_media(owner: u64) {
+    CHAT_VISIBLE_STATIC_MEDIA.write().remove(&owner);
+}
+
+/// Union of the static images every visible chat canvas shows.
+pub fn chat_visible_static_media_hashes() -> HashSet<u64> {
+    CHAT_VISIBLE_STATIC_MEDIA
+        .read()
+        .values()
+        .flatten()
+        .copied()
+        .collect()
+}
+
 /// Publish a visibility mutation to picker decode tasks waiting for a scarce
 /// full-decode permit. The write lock remains held by each caller while this is
 /// sent, so a woken task's next snapshot cannot observe the new generation with
