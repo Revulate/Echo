@@ -142,6 +142,11 @@ const STREAMING_PROCESS_ALIASES: &[&str] =
     &["streamlabs", "xsplit", "twitchstudio", "twitch studio"];
 
 const DETECTION_INTERVAL: Duration = Duration::from_secs(2);
+/// How old a completed detection may be and still be trusted. Auto keeps
+/// scanning every [`DETECTION_INTERVAL`], so an older result means scans
+/// stopped (another mode was selected, or the system slept); it then counts as
+/// active until a new scan completes.
+const DETECTION_TRUST_WINDOW: Duration = Duration::from_secs(6);
 const MAX_ACTIVITY_LOG_WINDOW: u64 = 16 * 1024 * 1024;
 
 #[derive(Default)]
@@ -182,9 +187,10 @@ struct DetectionCache {
     last_result: bool,
     last_source: Option<String>,
     refresh_in_flight: bool,
-    /// A detection has finished at least once. `last_check` alone cannot tell,
-    /// because [`refresh_detection`] clears it to force a rescan.
-    completed: bool,
+    /// When the last detection finished; `None` before the first one and
+    /// after switching into Auto. Kept apart from `last_check`, which
+    /// [`refresh_detection`] clears to force a rescan.
+    completed_at: Option<Instant>,
 }
 
 static DETECTION_CACHE: LazyLock<RwLock<DetectionCache>> = LazyLock::new(|| {
@@ -193,7 +199,7 @@ static DETECTION_CACHE: LazyLock<RwLock<DetectionCache>> = LazyLock::new(|| {
         last_result: false,
         last_source: None,
         refresh_in_flight: false,
-        completed: false,
+        completed_at: None,
     })
 });
 
@@ -203,35 +209,78 @@ fn detection_cache_is_fresh(cache: &DetectionCache) -> bool {
         .is_some_and(|last_check| last_check.elapsed() < DETECTION_INTERVAL)
 }
 
-/// Whether Auto mode treats streaming software as running. Until the first
-/// detection has completed this is true, so a user in Auto who is already
-/// streaming never sees redacted content shown before the scan finishes.
-fn auto_detection_active(cache: &DetectionCache) -> bool {
-    !cache.completed || cache.last_result
+/// Whether the last completed detection is recent enough to trust at `now`.
+fn detection_trusted(cache: &DetectionCache, now: Instant) -> bool {
+    cache.completed_at.is_some_and(|completed_at| {
+        now.saturating_duration_since(completed_at) <= DETECTION_TRUST_WINDOW
+    })
 }
 
-/// Whether recording `active`/`source` changes what streamer mode shows. The
-/// first completed detection always counts, because Auto was treated as active
-/// until then.
-fn detection_result_changed(cache: &DetectionCache, active: bool, source: &Option<String>) -> bool {
-    !cache.completed || cache.last_result != active || cache.last_source != *source
+/// Whether Auto mode treats streaming software as running. Without a trusted
+/// detection (none yet, just switched into Auto, or too old) this is true, so
+/// a user in Auto who is streaming never sees unredacted content before a
+/// scan confirms they are not.
+fn auto_detection_active(cache: &DetectionCache, now: Instant) -> bool {
+    !detection_trusted(cache, now) || cache.last_result
+}
+
+/// Whether recording `active`/`source` changes what streamer mode shows. A
+/// result that replaces an untrusted one always counts, because Auto was
+/// treated as active until then.
+fn detection_result_changed(
+    cache: &DetectionCache,
+    now: Instant,
+    active: bool,
+    source: &Option<String>,
+) -> bool {
+    !detection_trusted(cache, now) || cache.last_result != active || cache.last_source != *source
+}
+
+/// Store a finished detection. Returns `(changed, was_untrusted)`.
+fn record_detection_into(cache: &mut DetectionCache, detection: DetectionResult) -> (bool, bool) {
+    let now = Instant::now();
+    let was_untrusted = !detection_trusted(cache, now);
+    let changed = detection_result_changed(cache, now, detection.active, &detection.source);
+    cache.last_check = Some(now);
+    cache.last_result = detection.active;
+    cache.last_source = detection.source;
+    cache.refresh_in_flight = false;
+    cache.completed_at = Some(now);
+    (changed, was_untrusted)
 }
 
 fn record_detection(detection: DetectionResult) {
-    let is_running = detection.active;
-    let result_changed = {
-        let mut cache = DETECTION_CACHE.write_or_recover();
-        let result_changed = detection_result_changed(&cache, is_running, &detection.source);
-        cache.last_check = Some(Instant::now());
-        cache.last_result = is_running;
-        cache.last_source = detection.source;
-        cache.refresh_in_flight = false;
-        cache.completed = true;
-        result_changed
-    };
-
-    if result_changed {
+    let (changed, was_untrusted) =
+        record_detection_into(&mut DETECTION_CACHE.write_or_recover(), detection);
+    if was_untrusted {
+        // Gates flipped to redacted while the result was untrusted without a
+        // broadcast, so layouts built meanwhile must be rebuilt whatever the
+        // last broadcast layout state was.
+        super::settings::forget_streamer_layout_state();
+    }
+    if changed {
         super::settings::broadcast_streamer_mode_changed();
+    }
+}
+
+/// Drop the completed detection so Auto fails closed until a new scan
+/// finishes. Called when the mode switches into Auto: scans stop outside
+/// Auto, so the cached result can be arbitrarily old.
+fn reset_detection_for_auto(cache: &mut DetectionCache) {
+    cache.completed_at = None;
+    cache.last_check = None;
+}
+
+fn enter_auto_mode() {
+    reset_detection_for_auto(&mut DETECTION_CACHE.write_or_recover());
+    schedule_detection_refresh();
+}
+
+/// Streaming may have started while the system slept, so Auto fails closed
+/// until a scan after the wake completes.
+pub fn note_system_wake() {
+    if get_streamer_mode_settings().enabled == StreamerModeStatus::Auto {
+        enter_auto_mode();
     }
 }
 
@@ -266,7 +315,10 @@ fn cached_auto_detection_active() -> bool {
     let (active, should_schedule) = {
         let mut cache = DETECTION_CACHE.write_or_recover();
         let should_schedule = claim_detection_refresh(&mut cache);
-        (auto_detection_active(&cache), should_schedule)
+        (
+            auto_detection_active(&cache, Instant::now()),
+            should_schedule,
+        )
     };
     if should_schedule {
         spawn_detection_refresh();
@@ -675,6 +727,9 @@ pub fn set_streamer_mode_status(status: StreamerModeStatus) {
         true
     };
     if changed {
+        if status == StreamerModeStatus::Auto {
+            enter_auto_mode();
+        }
         super::settings::save_settings();
         super::settings::broadcast_streamer_mode_changed();
         crate::state::ui_invalidation::request(
@@ -695,6 +750,11 @@ where
             .get_or_insert_with(StreamerModeSettings::default);
         let before = streamer_mode.clone();
         update_fn(streamer_mode);
+        if before.enabled != StreamerModeStatus::Auto
+            && streamer_mode.enabled == StreamerModeStatus::Auto
+        {
+            enter_auto_mode();
+        }
         before != *streamer_mode
     };
     if changed {
@@ -726,37 +786,101 @@ mod tests {
     use core::prelude::v1::test;
 
     fn cache(completed: bool, last_result: bool) -> DetectionCache {
+        let now = Instant::now();
         DetectionCache {
-            last_check: completed.then(Instant::now),
+            last_check: completed.then_some(now),
             last_result,
             last_source: None,
             refresh_in_flight: false,
-            completed,
+            completed_at: completed.then_some(now),
         }
     }
 
     #[test]
     fn auto_counts_as_active_until_the_first_detection_completes() {
-        assert!(auto_detection_active(&cache(false, false)));
-        assert!(!auto_detection_active(&cache(true, false)));
-        assert!(auto_detection_active(&cache(true, true)));
+        let now = Instant::now();
+        assert!(auto_detection_active(&cache(false, false), now));
+        assert!(!auto_detection_active(&cache(true, false), now));
+        assert!(auto_detection_active(&cache(true, true), now));
 
         // A forced rescan clears last_check but must not reopen the window.
         let mut forced = cache(true, false);
         forced.last_check = None;
-        assert!(!auto_detection_active(&forced));
+        assert!(!auto_detection_active(&forced, now));
     }
 
     #[test]
     fn first_detection_always_broadcasts_and_later_ones_only_on_change() {
-        assert!(detection_result_changed(&cache(false, false), false, &None));
-        assert!(!detection_result_changed(&cache(true, false), false, &None));
-        assert!(detection_result_changed(&cache(true, false), true, &None));
+        let now = Instant::now();
+        assert!(detection_result_changed(
+            &cache(false, false),
+            now,
+            false,
+            &None
+        ));
+        assert!(!detection_result_changed(
+            &cache(true, false),
+            now,
+            false,
+            &None
+        ));
         assert!(detection_result_changed(
             &cache(true, false),
+            now,
+            true,
+            &None
+        ));
+        assert!(detection_result_changed(
+            &cache(true, false),
+            now,
             false,
             &Some("OBS is streaming".to_string())
         ));
+    }
+
+    #[test]
+    fn a_detection_too_old_to_trust_counts_as_active_until_a_new_scan() {
+        let not_streaming = cache(true, false);
+        let completed_at = not_streaming.completed_at.unwrap();
+        assert!(!auto_detection_active(
+            &not_streaming,
+            completed_at + DETECTION_TRUST_WINDOW
+        ));
+        // After a sleep, or with scans stalled, the old result is not trusted.
+        let later = completed_at + DETECTION_TRUST_WINDOW + Duration::from_millis(1);
+        assert!(auto_detection_active(&not_streaming, later));
+        assert!(
+            detection_result_changed(&not_streaming, later, false, &None),
+            "the scan that replaces an untrusted result broadcasts"
+        );
+
+        // Refresh clears last_check only, so it does not distrust the result.
+        let mut refreshed = cache(true, false);
+        refreshed.last_check = None;
+        assert!(!auto_detection_active(&refreshed, completed_at));
+    }
+
+    #[test]
+    fn switching_into_auto_fails_closed_until_a_new_scan_completes() {
+        let mut cache = cache(true, false);
+        let now = cache.completed_at.unwrap();
+        assert!(!auto_detection_active(&cache, now));
+
+        reset_detection_for_auto(&mut cache);
+        assert!(
+            auto_detection_active(&cache, now),
+            "an old not-streaming result must not unredact a switch into Auto"
+        );
+        assert!(
+            claim_detection_refresh(&mut cache),
+            "the reset makes a scan due"
+        );
+
+        let (changed, was_untrusted) =
+            record_detection_into(&mut cache, DetectionResult::default());
+        assert!(changed && was_untrusted);
+        assert!(!auto_detection_active(&cache, Instant::now()));
+        assert!(!cache.refresh_in_flight);
     }
 
     #[test]

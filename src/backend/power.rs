@@ -29,6 +29,7 @@ pub fn handle_system_sleep() {
 }
 
 pub fn handle_system_wake() {
+    crate::backend::streamer_mode::note_system_wake();
     if crate::bench::network_lanes_suppressed() || crate::backend::is_shutdown_started() {
         return;
     }

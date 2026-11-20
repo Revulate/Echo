@@ -53,6 +53,8 @@ mod settings {
     pub fn save_settings() {}
 
     pub fn broadcast_streamer_mode_changed() {}
+
+    pub fn forget_streamer_layout_state() {}
 }
 
 // The production detector consults the profile-aware external config root for

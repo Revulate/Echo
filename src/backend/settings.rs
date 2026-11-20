@@ -1024,6 +1024,13 @@ fn streamer_layout_state() -> u8 {
         | (u8::from(crate::backend::streamer_mode::should_hide_link_thumbnails()) << 1)
 }
 
+/// Make the next [`broadcast_streamer_mode_changed`] rebuild layouts whatever
+/// the last broadcast state was. Streamer-mode detection calls it when gates
+/// changed without a broadcast (while a detection result was untrusted).
+pub fn forget_streamer_layout_state() {
+    LAST_STREAMER_LAYOUT_STATE.store(STREAMER_LAYOUT_UNKNOWN, Ordering::Release);
+}
+
 pub fn broadcast_streamer_mode_changed() {
     let state = streamer_layout_state();
     if LAST_STREAMER_LAYOUT_STATE.swap(state, Ordering::AcqRel) != state {
