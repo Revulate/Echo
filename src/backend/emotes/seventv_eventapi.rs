@@ -26,7 +26,7 @@
 //!   34 = RESUME     (client → server: reconnect with session)
 
 use crate::backend::lock_utils::MutexExt;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -246,6 +246,11 @@ static GLOBAL_SET_OWNER: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mute
 /// Channel_login -> 7TV user/update subscription state
 static CHANNEL_DETAILS: LazyLock<DashMap<String, SevenTvChannelSubscription>> =
     LazyLock::new(DashMap::new);
+
+/// Channels whose 7TV lookup completed in this open session and found no
+/// 7TV user or no active emote set, so there is nothing for the EventAPI to
+/// own. Closing the channel clears the entry.
+static CHANNELS_WITHOUT_SET: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
 /// Channel login -> Twitch channel id, for channel-scoped entitlement
 /// subscriptions. 7TV pushes `entitlement.create` for chatters present in the
@@ -1174,6 +1179,7 @@ pub fn unsubscribe_channel(channel_login: &str) {
     if let Some((_, twitch_channel_id)) = CHANNEL_ENTITLEMENT_IDS.remove(&channel) {
         unsubscribe_entitlements_if_unused(&twitch_channel_id);
     }
+    CHANNELS_WITHOUT_SET.remove(&channel);
 
     crate::log_emotes!(
         debug,
@@ -1205,6 +1211,23 @@ pub(crate) fn diagnostics() -> EventApiDiagnostics {
 pub(crate) fn channel_has_subscription_owner(channel_login: &str) -> bool {
     let channel = super::normalize_channel_key(channel_login);
     CHANNEL_TO_SET.contains_key(&channel) || CHANNEL_DETAILS.contains_key(&channel)
+}
+
+/// Record that a completed 7TV lookup found no 7TV user or no active emote set
+/// for an open channel. Only a lookup that completed may call this; a failed
+/// or timed-out one says nothing about the channel.
+pub(crate) fn note_channel_without_set(channel_login: &str) {
+    if crate::backend::irc::is_channel_closed(channel_login) {
+        return;
+    }
+    CHANNELS_WITHOUT_SET.insert(super::normalize_channel_key(channel_login));
+}
+
+/// Whether this open session already knows the channel's 7TV state: the
+/// EventAPI owns it, or a completed lookup found it has no set to own.
+pub(crate) fn channel_seventv_state_settled(channel_login: &str) -> bool {
+    channel_has_subscription_owner(channel_login)
+        || CHANNELS_WITHOUT_SET.contains(&super::normalize_channel_key(channel_login))
 }
 
 /// Whether a channel's registered 7TV set is covered by the live EventAPI stream.

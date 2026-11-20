@@ -434,6 +434,7 @@ root_test	src/backend/emotes/cache_codec.rs	old_placeholder_dimensions_become_un
 root_test	src/backend/emotes/cache_codec.rs	postcard_cache_has_explicit_header_and_exact_payload_consumption
 root_test	src/backend/emotes/cache_codec.rs	postcard_cache_rejects_unknown_codec_generation
 root_test	src/backend/emotes/cache_codec.rs	previous_postcard_schema_is_migrated_without_discarding_the_snapshot
+root_test	src/backend/emotes/mod.rs	a_completed_lookup_without_a_7tv_set_settles_the_join_refresh_until_close
 root_test	src/backend/emotes/mod.rs	a_fresh_catalog_without_eventapi_ownership_refreshes_at_join
 root_test	src/backend/emotes/mod.rs	a_global_load_clears_the_disk_time_only_when_every_provider_loaded
 root_test	src/backend/emotes/mod.rs	a_hydrated_global_set_keeps_its_disk_time_until_a_global_load
@@ -899,7 +900,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	410
+summary	root_tests	411
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

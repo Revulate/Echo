@@ -88,6 +88,10 @@ impl SevenTvExactSetFetchOutcome {
 pub(super) struct SevenTvChannelFetch {
     pub(super) outcome: SevenTvExactSetFetchOutcome,
     pub(super) subscription: Option<seventv_eventapi::SevenTvChannelSubscription>,
+    /// The lookup completed and found that the channel has no 7TV user or no
+    /// active emote set, so the EventAPI has nothing to own for it. False for
+    /// a failed lookup, even one that returned an empty set.
+    pub(super) settled_without_set: bool,
 }
 pub(super) type SevenTvChannelFetchResult = Arc<SevenTvChannelFetch>;
 
@@ -575,6 +579,13 @@ pub(super) async fn fetch_seventv_channel(
     }
 }
 
+/// Whether a non-success 7TV user lookup means the channel has no 7TV account
+/// (404), as opposed to a failure such as a rate limit or a server error, which
+/// says nothing about the channel.
+pub(super) fn channel_lookup_status_settles_without_set(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+}
+
 async fn fetch_seventv_channel_raw(
     channel_id: &str,
     channel_login: &str,
@@ -607,6 +618,7 @@ async fn fetch_seventv_channel_raw(
                 emote_set_id: None,
             },
             subscription: None,
+            settled_without_set: channel_lookup_status_settles_without_set(resp.status()),
         });
     }
 
@@ -630,6 +642,7 @@ async fn fetch_seventv_channel_raw(
                 return Ok(SevenTvChannelFetch {
                     outcome,
                     subscription,
+                    settled_without_set: false,
                 });
             }
 
@@ -647,6 +660,7 @@ async fn fetch_seventv_channel_raw(
                     emote_set_id,
                 },
                 subscription,
+                settled_without_set: false,
             })
         }
         Some(SevenTvEmoteSetRefOrObject::Id(set_id)) => {
@@ -662,6 +676,7 @@ async fn fetch_seventv_channel_raw(
             Ok(SevenTvChannelFetch {
                 outcome,
                 subscription,
+                settled_without_set: false,
             })
         }
         None => {
@@ -678,6 +693,7 @@ async fn fetch_seventv_channel_raw(
                 Ok(SevenTvChannelFetch {
                     outcome,
                     subscription,
+                    settled_without_set: false,
                 })
             } else {
                 crate::log_emotes!(
@@ -691,6 +707,7 @@ async fn fetch_seventv_channel_raw(
                         emote_set_id: None,
                     },
                     subscription: None,
+                    settled_without_set: true,
                 })
             }
         }

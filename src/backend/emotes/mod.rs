@@ -3434,6 +3434,7 @@ impl EmoteCache {
                                 emote_set_id,
                             },
                         subscription,
+                        settled_without_set,
                     } => {
                         if emotes.is_empty()
                             && emote_set_id.is_none()
@@ -3493,6 +3494,9 @@ impl EmoteCache {
                                     seventv_eventapi::subscribe_channel_set(&cache_key, new_set_id);
                                 }
                             }
+                            if *settled_without_set {
+                                seventv_eventapi::note_channel_without_set(&cache_key);
+                            }
                             for emote in emotes.iter().cloned() {
                                 insert_emote(emote);
                             }
@@ -3501,6 +3505,7 @@ impl EmoteCache {
                     SevenTvChannelFetch {
                         outcome: SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
                         subscription,
+                        ..
                     } => {
                         if seventv_eventapi::retire_terminal_channel_fetch(
                             &cache_key,
@@ -3676,6 +3681,7 @@ impl EmoteCache {
                             emote_set_id,
                         },
                         subscription,
+                        settled_without_set,
                     } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         let fetched_count = emotes.len();
@@ -3700,6 +3706,9 @@ impl EmoteCache {
                                 subscription,
                             );
                         }
+                        if *settled_without_set {
+                            seventv_eventapi::note_channel_without_set(&deferred_cache_key);
+                        }
                         record_emote_stage_timed(
                             "emotes.channel.apply.7tv.deferred",
                             apply_start,
@@ -3710,6 +3719,7 @@ impl EmoteCache {
                     SevenTvChannelFetch {
                         outcome: SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
                         subscription,
+                        ..
                     } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         record_emote_stage_timed(
@@ -3824,6 +3834,7 @@ impl EmoteCache {
                             emote_set_id,
                         },
                         subscription,
+                        settled_without_set,
                     } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         let fetched_count = emotes.len();
@@ -3848,6 +3859,9 @@ impl EmoteCache {
                                 subscription,
                             );
                         }
+                        if *settled_without_set {
+                            seventv_eventapi::note_channel_without_set(&deferred_cache_key);
+                        }
                         record_emote_stage_timed(
                             "emotes.channel.apply.7tv.deferred",
                             apply_start,
@@ -3858,6 +3872,7 @@ impl EmoteCache {
                     SevenTvChannelFetch {
                         outcome: SevenTvExactSetFetchOutcome::TerminallyAbsent { emote_set_id },
                         subscription,
+                        ..
                     } => {
                         SEVENTV_CHANNEL_SYNC_TIMEOUT_LAST_AT.remove(&deferred_timeout_key);
                         record_emote_stage_timed(
@@ -3944,17 +3959,18 @@ impl EmoteCache {
 
     /// Whether a join whose channel already has resident emotes must still
     /// force a provider refresh: the set came from a stale disk cache (this
-    /// call consumes that mark), its TTL has expired, or the 7TV EventAPI does
-    /// not own the channel. Only a 7TV channel fetch registers that ownership,
-    /// and neither a disk hydrate nor a catalog kept across close and reopen
-    /// has it, so skipping the fetch would leave the channel without live 7TV
-    /// updates. A fresh, owned entry is served as is; the non-forced load still
-    /// hydrates FFZ room badges.
+    /// call consumes that mark), its TTL has expired, or this open session has
+    /// not settled the channel's 7TV state. Only a completed 7TV channel fetch
+    /// settles it, by registering EventAPI ownership or by finding no 7TV
+    /// user or active set; neither a disk hydrate nor a catalog kept across
+    /// close and reopen does, so skipping the fetch would leave the channel
+    /// without live 7TV updates. A fresh, settled entry is served as is; the
+    /// non-forced load still hydrates FFZ room badges.
     pub fn channel_join_needs_forced_refresh(&self, channel_login: &str) -> bool {
         let cache_key = normalize_channel_key(channel_login);
         let stale_disk = STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key).is_some();
         stale_disk
-            || !seventv_eventapi::channel_has_subscription_owner(&cache_key)
+            || !seventv_eventapi::channel_seventv_state_settled(&cache_key)
             || self.channel_emotes_need_refresh(&cache_key)
     }
 
@@ -4320,6 +4336,7 @@ pub(crate) async fn manual_reload_channel_emotes(
                     emote_set_id,
                 },
             subscription,
+            settled_without_set,
         } = shared.as_ref()
     {
         EMOTE_CACHE
@@ -4333,6 +4350,9 @@ pub(crate) async fn manual_reload_channel_emotes(
             .await;
         if let Some(subscription) = subscription.clone() {
             seventv_eventapi::subscribe_channel_details(&cache_key, subscription);
+        }
+        if *settled_without_set {
+            seventv_eventapi::note_channel_without_set(&cache_key);
         }
     }
     seventv_eventapi::resubscribe_channel(&cache_key);
@@ -4981,6 +5001,53 @@ mod provider_index_tests {
     }
 
     #[test]
+    fn a_completed_lookup_without_a_7tv_set_settles_the_join_refresh_until_close() {
+        let channel = "join_refresh_no_7tv_set_test".to_string();
+        let _cleanup = ChannelTestCleanup(channel.clone());
+        struct SettledCleanup(String);
+        impl Drop for SettledCleanup {
+            fn drop(&mut self) {
+                seventv_eventapi::unsubscribe_channel(&self.0);
+            }
+        }
+        let _settled_cleanup = SettledCleanup(channel.clone());
+
+        // A 404 means no 7TV account; anything else is a failed lookup.
+        assert!(seventv::channel_lookup_status_settles_without_set(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        for failed in [403u16, 429, 500, 502, 503] {
+            assert!(!seventv::channel_lookup_status_settles_without_set(
+                reqwest::StatusCode::from_u16(failed).unwrap()
+            ));
+        }
+
+        EMOTE_CACHE.channels.insert(
+            channel.clone(),
+            entry([emote(EmoteProvider::BTTV, "noset-1", "noSetEmote")]),
+        );
+        assert!(
+            EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "before a lookup completes (or after one failed or timed out) the join fetches"
+        );
+
+        seventv_eventapi::note_channel_without_set(&channel);
+        assert!(!seventv_eventapi::channel_has_subscription_owner(&channel));
+        for _ in 0..3 {
+            assert!(
+                !EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+                "a channel known to have no 7TV set is not refetched on every join"
+            );
+        }
+
+        seventv_eventapi::unsubscribe_channel(&channel);
+        assert!(
+            EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "closing the channel forgets the lookup, so a reopen fetches again"
+        );
+    }
+
+    #[test]
     fn a_fresh_catalog_without_eventapi_ownership_refreshes_at_join() {
         // A quick relaunch hydrates a fresh catalog from disk, and a channel
         // reopened within its TTL keeps its catalog, but closing removed the
@@ -5592,6 +5659,7 @@ mod provider_index_tests {
                         emote_set_id: Some("set-id".to_string()),
                     },
                     subscription: None,
+                    settled_without_set: false,
                 }),
             },
         );
