@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until};
 use tokio_tungstenite::tungstenite::Message;
 
 const EVENTAPI_URL: &str = "wss://events.7tv.io/v3";
@@ -550,14 +550,16 @@ fn flush_needed(
     flushed_generation != Some(generation) || state_before != state_after
 }
 
-/// How long the connection loop may sleep before it must check for an
-/// expired ACK, never longer than [`SUBSCRIPTION_FLUSH_BACKSTOP`].
-fn subscription_tick_wait(
+/// When the connection loop must next wake without a message or a change
+/// signal: the earliest command or RESUME ACK deadline, or `backstop_at`.
+/// `backstop_at` is kept across loop iterations, so traffic cannot keep
+/// pushing the backstop flush back.
+fn subscription_tick_deadline(
     resume_pending: bool,
     resume_sent_at: Option<Instant>,
     pending: &[PendingSubscriptionCommand],
-    now: Instant,
-) -> Duration {
+    backstop_at: Instant,
+) -> Instant {
     let resume_deadline = resume_sent_at
         .filter(|_| resume_pending)
         .map(|sent_at| sent_at + COMMAND_ACK_TIMEOUT);
@@ -565,12 +567,7 @@ fn subscription_tick_wait(
         .iter()
         .map(|pending| pending.sent_at + COMMAND_ACK_TIMEOUT)
         .chain(resume_deadline)
-        .min()
-        .map_or(SUBSCRIPTION_FLUSH_BACKSTOP, |deadline| {
-            deadline
-                .saturating_duration_since(now)
-                .min(SUBSCRIPTION_FLUSH_BACKSTOP)
-        })
+        .fold(backstop_at, Instant::min)
 }
 
 fn in_flight_command_count(resume_pending: bool, pending_count: usize) -> usize {
@@ -1919,6 +1916,8 @@ async fn run_connection() -> Result<&'static str, String> {
     let mut health = ConnectionHealth::new();
     // Generation of the last flush; `None` makes the first chance flush.
     let mut flushed_generation = None;
+    // Next unconditional flush; moved only by a flush, never by traffic.
+    let mut backstop_at = Instant::now() + SUBSCRIPTION_FLUSH_BACKSTOP;
 
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
@@ -1927,11 +1926,11 @@ async fn run_connection() -> Result<&'static str, String> {
         }
 
         let heartbeat_wait = health.timeout_remaining();
-        let tick_wait = subscription_tick_wait(
+        let tick_deadline = subscription_tick_deadline(
             subscriptions.resume_pending,
             subscriptions.resume_sent_at,
             &subscriptions.pending,
-            Instant::now(),
+            backstop_at,
         );
         tokio::select! {
             _ = SUBSCRIPTION_WAKE.notified() => {
@@ -1944,10 +1943,11 @@ async fn run_connection() -> Result<&'static str, String> {
                 if flush_needed(flushed_generation, generation, state, state) {
                     flushed_generation = Some(generation);
                     flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
+                    backstop_at = Instant::now() + SUBSCRIPTION_FLUSH_BACKSTOP;
                 }
             }
 
-            _ = sleep(tick_wait) => {
+            _ = sleep_until(tick_deadline) => {
                 if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                     let _ = ws_sink.send(Message::Close(None)).await;
                     return Ok("shutdown");
@@ -1963,6 +1963,7 @@ async fn run_connection() -> Result<&'static str, String> {
                 // Backstop: flush even without a signalled change.
                 flushed_generation = Some(SUBSCRIPTION_GENERATION.load(Ordering::SeqCst));
                 flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
+                backstop_at = Instant::now() + SUBSCRIPTION_FLUSH_BACKSTOP;
             }
 
             _ = sleep(heartbeat_wait) => {
@@ -2003,6 +2004,7 @@ async fn run_connection() -> Result<&'static str, String> {
                         ) {
                             flushed_generation = Some(generation);
                             flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
+                            backstop_at = Instant::now() + SUBSCRIPTION_FLUSH_BACKSTOP;
                         }
                     }
                     Some(Ok(Message::Close(_))) => {
@@ -4030,18 +4032,64 @@ mod tests {
     }
 
     #[test]
-    fn noting_a_change_bumps_the_generation() {
-        let before = SUBSCRIPTION_GENERATION.load(Ordering::SeqCst);
-        note_subscriptions_changed();
-        assert!(SUBSCRIPTION_GENERATION.load(Ordering::SeqCst) > before);
+    fn every_desired_set_mutator_moves_the_generation() {
+        let channel = "generation_bump_test_channel";
+        struct Cleanup(&'static str);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsubscribe_channel(self.0);
+            }
+        }
+        let _cleanup = Cleanup(channel);
+        let moves = |label: &str, mutate: &dyn Fn()| {
+            let before = SUBSCRIPTION_GENERATION.load(Ordering::SeqCst);
+            mutate();
+            assert!(
+                SUBSCRIPTION_GENERATION.load(Ordering::SeqCst) > before,
+                "{label} must bump the subscription generation"
+            );
+        };
+
+        moves("subscribe_channel_set", &|| {
+            subscribe_channel_set(channel, "generation-bump-set-a")
+        });
+        assert!(
+            desired_subscriptions().contains(&SubscriptionKey::emote_set(
+                "generation-bump-set-a".to_string()
+            ))
+        );
+        moves("subscribe_channel_details", &|| {
+            subscribe_channel_details(
+                channel,
+                SevenTvChannelSubscription {
+                    user_id: "generation-bump-user".to_string(),
+                    emote_set_id: "generation-bump-set-b".to_string(),
+                    connection_index: 0,
+                },
+            )
+        });
+        assert!(
+            desired_subscriptions()
+                .contains(&SubscriptionKey::user("generation-bump-user".to_string()))
+        );
+        moves("subscribe_channel_entitlements", &|| {
+            subscribe_channel_entitlements(channel, "424242")
+        });
+        moves("clear_channel_set_subscription", &|| {
+            clear_channel_set_subscription(channel)
+        });
+        moves("unsubscribe_channel", &|| unsubscribe_channel(channel));
+        assert!(!channel_has_subscription_owner(channel));
     }
 
     #[test]
-    fn tick_waits_for_the_earliest_ack_deadline_within_the_backstop() {
+    fn tick_deadline_is_the_earliest_ack_deadline_or_the_kept_backstop() {
         let now = Instant::now();
+        let backstop_at = now + SUBSCRIPTION_FLUSH_BACKSTOP;
         assert_eq!(
-            subscription_tick_wait(false, None, &[], now),
-            SUBSCRIPTION_FLUSH_BACKSTOP
+            subscription_tick_deadline(false, None, &[], backstop_at),
+            backstop_at,
+            "traffic recomputes the deadline but cannot move the backstop"
         );
 
         let pending = |sent_ago: Duration| PendingSubscriptionCommand {
@@ -4050,23 +4098,20 @@ mod tests {
         };
         let near = [pending(COMMAND_ACK_TIMEOUT - Duration::from_secs(2))];
         assert_eq!(
-            subscription_tick_wait(false, None, &near, now),
-            Duration::from_secs(2)
+            subscription_tick_deadline(false, None, &near, backstop_at),
+            now + Duration::from_secs(2)
         );
         let overdue = [pending(COMMAND_ACK_TIMEOUT + Duration::from_secs(1))];
-        assert_eq!(
-            subscription_tick_wait(false, None, &overdue, now),
-            Duration::ZERO
-        );
+        assert!(subscription_tick_deadline(false, None, &overdue, backstop_at) < now);
 
         let resume_sent = now - (COMMAND_ACK_TIMEOUT - Duration::from_secs(1));
         assert_eq!(
-            subscription_tick_wait(true, Some(resume_sent), &[], now),
-            Duration::from_secs(1)
+            subscription_tick_deadline(true, Some(resume_sent), &[], backstop_at),
+            now + Duration::from_secs(1)
         );
         assert_eq!(
-            subscription_tick_wait(false, Some(resume_sent), &[], now),
-            SUBSCRIPTION_FLUSH_BACKSTOP,
+            subscription_tick_deadline(false, Some(resume_sent), &[], backstop_at),
+            backstop_at,
             "an answered RESUME has no deadline"
         );
     }
