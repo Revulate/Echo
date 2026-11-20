@@ -88,9 +88,10 @@ const LOW_CANVAS_CPU_FAST_IDLE_THRESHOLD_MS: u64 = 1000;
 pub enum RenderMode {
     /// Full speed rendering (16ms/60fps) - user actively interacting
     Interactive,
-    /// Animation speed (33ms/30fps) - emotes animating but no user input
+    /// Visible animated emotes and no user input. Animation runs on the
+    /// canvases' own wakers, so this polls at the FocusedIdle cadence.
     Animating,
-    /// Reduced polling (50ms/20fps) - focused but idle, animations may be present
+    /// Reduced polling (100ms) - recently active but idle
     FocusedIdle,
     /// Deep idle (200ms/5fps) - no activity for 5+ seconds, near-zero CPU
     DeepIdle,
@@ -118,8 +119,7 @@ impl RenderMode {
     pub fn poll_interval(&self) -> Duration {
         match self {
             RenderMode::Interactive => Duration::from_millis(16),
-            RenderMode::Animating => Duration::from_millis(33),
-            RenderMode::FocusedIdle => Duration::from_millis(100),
+            RenderMode::Animating | RenderMode::FocusedIdle => Duration::from_millis(100),
             RenderMode::DeepIdle => Duration::from_millis(500),
             RenderMode::TrueIdle => Duration::from_millis(1000),
         }
@@ -129,8 +129,8 @@ impl RenderMode {
     /// It never needs frame cadence, so its fastest rate is 50 ms.
     pub fn pending_ui_interval(&self) -> Duration {
         match self {
-            RenderMode::Interactive | RenderMode::Animating => Duration::from_millis(50),
-            RenderMode::FocusedIdle => Duration::from_millis(100),
+            RenderMode::Interactive => Duration::from_millis(50),
+            RenderMode::Animating | RenderMode::FocusedIdle => Duration::from_millis(100),
             RenderMode::DeepIdle => Duration::from_millis(250),
             RenderMode::TrueIdle => Duration::from_millis(500),
         }

@@ -11,8 +11,7 @@
 //! - Observer event processing (bridging background IRC to UI thread)
 //! - Twitch events (250ms), UI actions (on wake)
 //! - Connection status, auth state (1s)
-//! - Stream info refresh (30s)
-//! - Animation ticks (33ms adaptive via FrameRateController)
+//! - Stream info refresh (30s), live uptime labels (1s)
 //! - Layout cleanup (30s)
 //! - Image cleanup
 //!
@@ -20,8 +19,9 @@
 //!
 //! Uses FrameRateController for adaptive polling:
 //! - Interactive: 16ms (60fps) - user actively scrolling/dragging/typing
-//! - Animating: 33ms (30fps) - emotes animating but no user input
-//! - FocusedIdle: 100ms (10fps) - recently active but idle
+//! - Animating and FocusedIdle: 100ms - no user input; animated emotes run on
+//!   the canvases' own wakers, and messages and UI actions wake the loop
+//!   directly
 //! - DeepIdle/TrueIdle: low-frequency or event-driven idle based on real activity
 //!
 //! Window focus is not part of polling cadence. Losing OS focus must not delay
@@ -437,6 +437,7 @@ struct PollLoop {
     status: Cadence,
     emotes: Cadence,
     stream_info: Cadence,
+    live_uptime: Cadence,
     image_cleanup: Cadence,
     layout_cleanup: Cadence,
     sidebar_refresh: Cadence,
@@ -467,6 +468,7 @@ impl PollLoop {
             status: Cadence::after(config::status_poll_interval()),
             emotes: Cadence::after(Duration::from_millis(250)),
             stream_info: Cadence::immediate(config::stream_info_interval()),
+            live_uptime: Cadence::immediate(Duration::from_secs(1)),
             image_cleanup: Cadence::after(Duration::from_secs(60)),
             layout_cleanup: Cadence::after(Duration::from_secs(30)),
             sidebar_refresh: Cadence::after(Duration::from_secs(2)),
@@ -694,15 +696,9 @@ impl PollLoop {
         this: &WeakEntity<PollingCoordinator>,
         cx: &mut AsyncApp,
     ) {
-        let timer_interval = render_mode.poll_interval();
-        let timer_sleep = if render_mode == frame_rate_controller::RenderMode::Animating {
-            dynamic_tick_scheduler::aligned_tick_delay(timer_interval.as_millis() as u64)
-        } else {
-            timer_interval
-        };
         let wakeup = frame_rate_controller::get_wakeup_notify();
         let woke_by_activity = tokio::select! {
-            _ = cx.background_executor().timer(timer_sleep) => false,
+            _ = cx.background_executor().timer(render_mode.poll_interval()) => false,
             _ = wakeup.notified() => true,
         };
 
@@ -1029,17 +1025,24 @@ impl PollLoop {
                 self.stream_info.mark();
             }
         }
+        let mut applied_any = false;
         if let Some(updates) = backend::drain_pending_stream_info() {
             self.app_state.update(cx, |state, state_cx| {
                 let applied = state.apply_stream_info_updates(updates);
                 if applied > 0 {
+                    applied_any = true;
                     crate::log_ui!(debug, "stream info applied: {} channels", applied);
                     crate::backend::metrics::record_ui_notify_source("polling.stream_info");
                     state_cx.notify();
                 }
             });
         }
-        notify_live_uptime_rollover(&self.app_state, &mut self.last_uptime_fingerprint, cx);
+        // Labels count whole minutes, so a check a second is enough; a pass
+        // that applied stream info checks at once, folding a changed live
+        // set into the notify it already made.
+        if self.live_uptime.take_due() || applied_any {
+            notify_live_uptime_rollover(&self.app_state, &mut self.last_uptime_fingerprint, cx);
+        }
     }
 
     fn refresh_sidebar_caches(&mut self, cx: &mut AsyncApp) {
