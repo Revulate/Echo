@@ -687,26 +687,29 @@ impl<S: PickerShell> RowContext<S> {
             })
             .on_hover({
                 let hover_repaint = style.hover_repaint;
+                let repaint = move |source: &'static str, window: &mut Window, app: &mut App| {
+                    match hover_repaint {
+                        HoverRepaint::NotifyPicker => {
+                            hover_picker
+                                .update(app, |_, cx| {
+                                    crate::backend::metrics::record_ui_notify_source(source);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                        HoverRepaint::RefreshWindow => window.refresh(),
+                    }
+                };
                 move |hovered, window, app| {
                     if animation_mode == EmotePickerAnimationMode::Hover
                         && signals.signal_hovered_emote(emote_idx, is_animated, *hovered)
                     {
-                        match hover_repaint {
-                            HoverRepaint::NotifyPicker => {
-                                hover_picker
-                                    .update(app, |_, cx| {
-                                        crate::backend::metrics::record_ui_notify_source(
-                                            "picker.hover_animation",
-                                        );
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            }
-                            HoverRepaint::RefreshWindow => window.refresh(),
-                        }
+                        repaint("picker.hover_animation", window, app);
                     }
                     if *hovered {
-                        window.refresh();
+                        // The tooltip is drawn by an ancestor of the picker,
+                        // which a picker notify re-renders too.
+                        repaint("picker.hover_tooltip", window, app);
                         show_text_tooltip(
                             window.window_handle(),
                             tooltip_source.clone(),
