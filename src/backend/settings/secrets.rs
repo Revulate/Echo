@@ -377,14 +377,63 @@ fn keyring_delete_secret(key: &str) {
 }
 
 pub(super) fn clear_account_secrets(username: &str) {
+    // Held across the deletes so a concurrent save cannot record the old
+    // secrets as stored in between.
+    let mut persisted = PERSISTED_SECRETS.lock_or_recover();
+    *persisted = None;
     keyring_delete_secret(&account_token_key(username));
     keyring_delete_secret(&account_refresh_token_key(username));
 }
 
+/// Fingerprint of the secrets the last fully successful
+/// [`persist_tokens_to_keyring`] stored, so a settings save that changed no
+/// secret skips the keyring and token-file writes. Cleared before a write and
+/// by every other change to stored secrets; a failed write leaves it clear,
+/// so the next save retries.
+static PERSISTED_SECRETS: Mutex<Option<u64>> = Mutex::new(None);
+
+fn secrets_fingerprint(settings: &AppSettings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    settings.token.hash(&mut hasher);
+    settings.refresh_token.hash(&mut hasher);
+    settings.accounts.len().hash(&mut hasher);
+    for account in &settings.accounts {
+        account.username.hash(&mut hasher);
+        account.token.hash(&mut hasher);
+        account.refresh_token.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Run `store` unless `persisted` says these exact secrets are already stored.
+fn persist_unless_unchanged(
+    persisted: &Mutex<Option<u64>>,
+    settings: &AppSettings,
+    store: impl FnOnce(&AppSettings) -> Result<(), Vec<String>>,
+) -> Result<(), Vec<String>> {
+    let fingerprint = secrets_fingerprint(settings);
+    let mut persisted = persisted.lock_or_recover();
+    if *persisted == Some(fingerprint) {
+        return Ok(());
+    }
+    *persisted = None;
+    let result = store(settings);
+    if result.is_ok() {
+        *persisted = Some(fingerprint);
+    }
+    result
+}
+
 /// Store every runtime token in the keyring (or the fallback file). Returns
 /// the keys that could be stored in neither, so the caller can warn that
-/// those sign-ins will not survive a restart.
+/// those sign-ins will not survive a restart. Skipped when the same secrets
+/// were stored by the last call that fully succeeded.
 pub(super) fn persist_tokens_to_keyring(settings: &AppSettings) -> Result<(), Vec<String>> {
+    persist_unless_unchanged(&PERSISTED_SECRETS, settings, store_tokens)
+}
+
+fn store_tokens(settings: &AppSettings) -> Result<(), Vec<String>> {
     let mut failed = Vec::new();
     let mut store = |key: String, value: &str| {
         if !keyring_set_secret(&key, value) {
@@ -461,10 +510,76 @@ pub(super) fn hydrate_tokens_from_keyring(settings: &mut AppSettings) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_keyring_availability, open_token_store, seal_token_store};
+    use super::{
+        cached_keyring_availability, open_token_store, persist_unless_unchanged, seal_token_store,
+    };
     use core::prelude::v1::test;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn unchanged_secrets_are_stored_once_and_a_failure_is_retried() {
+        let persisted = Mutex::new(None);
+        let writes = AtomicUsize::new(0);
+        let ok = |_: &super::AppSettings| {
+            writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        let mut settings = super::AppSettings::default();
+        settings.token = Some("access".to_string());
+
+        assert_eq!(persist_unless_unchanged(&persisted, &settings, ok), Ok(()));
+        assert_eq!(persist_unless_unchanged(&persisted, &settings, ok), Ok(()));
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+
+        // A setting that is not a secret changes nothing.
+        settings.font_scale += 0.5;
+        assert_eq!(persist_unless_unchanged(&persisted, &settings, ok), Ok(()));
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+
+        // A failed write is retried by the next save with the same secrets.
+        settings.refresh_token = Some("refresh".to_string());
+        let failed = |_: &super::AppSettings| Err(vec!["active_refresh_token".to_string()]);
+        assert!(persist_unless_unchanged(&persisted, &settings, failed).is_err());
+        assert_eq!(persist_unless_unchanged(&persisted, &settings, ok), Ok(()));
+        assert_eq!(writes.load(Ordering::Relaxed), 2);
+
+        // Clearing the record (as an account removal does) forces a write.
+        *persisted.lock().unwrap() = None;
+        assert_eq!(persist_unless_unchanged(&persisted, &settings, ok), Ok(()));
+        assert_eq!(writes.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn every_secret_is_part_of_the_fingerprint() {
+        use super::secrets_fingerprint;
+        let mut settings = super::AppSettings::default();
+        settings.accounts.push(super::super::Account {
+            username: "viewer".to_string(),
+            display_name: None,
+            profile_image_url: None,
+            token: "account".to_string(),
+            refresh_token: None,
+            client_id: String::new(),
+            is_active: true,
+            token_expires_at: None,
+        });
+        let base = secrets_fingerprint(&settings);
+        let changed = |edit: &dyn Fn(&mut super::AppSettings)| {
+            let mut copy = settings.clone();
+            edit(&mut copy);
+            secrets_fingerprint(&copy) != base
+        };
+        assert!(changed(&|s| s.token = Some("t".to_string())));
+        assert!(changed(&|s| s.refresh_token = Some("r".to_string())));
+        assert!(changed(&|s| s.accounts[0].token = "other".to_string()));
+        assert!(changed(
+            &|s| s.accounts[0].refresh_token = Some("r".to_string())
+        ));
+        assert!(changed(&|s| s.accounts[0].username = "renamed".to_string()));
+        assert!(changed(&|s| s.accounts.clear()));
+        assert!(!changed(&|s| s.font_scale += 0.5));
+    }
 
     #[test]
     fn keyring_availability_probe_is_cached_when_unavailable() {

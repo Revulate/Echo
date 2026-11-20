@@ -2848,6 +2848,23 @@ static SETTINGS_PRIMARY_STATE: AtomicU8 = AtomicU8::new(PRIMARY_GOOD);
 static SETTINGS_SAVE_REFUSED_WARNED: AtomicBool = AtomicBool::new(false);
 /// Set when startup found neither settings.json nor a backup of it.
 static SETTINGS_FILE_MISSING_AT_LOAD: AtomicBool = AtomicBool::new(false);
+/// When this session last copied settings.json into its known-good backups.
+static SETTINGS_BACKUPS_ROTATED_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// Minimum time between two backup refreshes within a session, so the newest
+/// backup is at most this much older than the settings.json it backs up.
+const SETTINGS_BACKUP_ROTATION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Whether a save should copy the current settings.json into the backups:
+/// the session's first save (the file the last session left), then once the
+/// last refresh is [`SETTINGS_BACKUP_ROTATION_INTERVAL`] old.
+fn settings_backup_rotation_due(
+    last_rotation: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    last_rotation
+        .is_none_or(|last| now.saturating_duration_since(last) >= SETTINGS_BACKUP_ROTATION_INTERVAL)
+}
 
 pub struct SettingsManager {
     file_path: PathBuf,
@@ -3196,15 +3213,26 @@ impl SettingsManager {
         fs::write(&temp_path, content).map_err(|e| e.to_string())?;
         // Only a settings.json that loaded (or that this process wrote) may
         // become the backup; copying one that failed to parse would destroy
-        // the last good copy.
-        if primary_state == PRIMARY_GOOD && self.file_path.exists() {
-            // A failed backup refresh must not cost the user this save.
-            if let Err(error) = crate::utils::rotate_known_good_backups(&self.file_path, |bytes| {
+        // the last good copy. The backups are refreshed by the first save of
+        // a session and then at most once per interval, not on every toggle.
+        let mut last_rotation = SETTINGS_BACKUPS_ROTATED_AT.lock_or_recover();
+        let now = std::time::Instant::now();
+        if primary_state == PRIMARY_GOOD
+            && settings_backup_rotation_due(*last_rotation, now)
+            && self.file_path.exists()
+        {
+            // A failed backup refresh must not cost the user this save; the
+            // next save tries again.
+            match crate::utils::rotate_known_good_backups(&self.file_path, |bytes| {
                 serde_json::from_slice::<AppSettings>(bytes).is_ok()
             }) {
-                crate::log_persist!(warn, "Failed to refresh settings backups: {}", error);
+                Ok(()) => *last_rotation = Some(now),
+                Err(error) => {
+                    crate::log_persist!(warn, "Failed to refresh settings backups: {}", error)
+                }
             }
         }
+        drop(last_rotation);
 
         if let Err(error) = crate::utils::replace_file(&temp_path, &self.file_path) {
             let _ = fs::remove_file(&temp_path);
@@ -7913,6 +7941,21 @@ pub fn set_deleted_message_mode(mode: DeletedMessageMode) {
 mod salvage_tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[test]
+    fn settings_backups_rotate_on_the_first_save_then_once_per_interval() {
+        let start = std::time::Instant::now();
+        assert!(settings_backup_rotation_due(None, start));
+        assert!(!settings_backup_rotation_due(Some(start), start));
+        assert!(!settings_backup_rotation_due(
+            Some(start),
+            start + SETTINGS_BACKUP_ROTATION_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        assert!(settings_backup_rotation_due(
+            Some(start),
+            start + SETTINGS_BACKUP_ROTATION_INTERVAL
+        ));
+    }
 
     #[test]
     fn an_unreadable_value_resets_only_its_own_setting() {
