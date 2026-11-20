@@ -93,13 +93,18 @@ tokio = { workspace = true, features = [
 futures-util = "0.3"
 
 # Twitch IRC (used for connection management)
-twitch-irc = { workspace = true, features = ["transport-tcp-rustls-native-roots"] }
+# Plain TCP transport only: Echo makes the TLS stream itself
+# (backend::irc::proxy_transport, with Echo's rustls config and proxy routing),
+# so twitch-irc's own TLS transport, which would enable aws-lc-rs, stays off.
+twitch-irc = { workspace = true, features = ["transport-tcp"] }
 
 # WebSocket (for 7TV EventSub)
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-native-roots"] }
 async-trait = "0.1"
 tokio-socks = "0.5"
-tokio-rustls = "0.26"
+# ring only: Echo installs the ring provider (backend::http). The default
+# features would also enable rustls's aws-lc-rs provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-native-certs = "0.8"
 
 # Audio (sounds for mentions)

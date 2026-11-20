@@ -53,6 +53,15 @@ its HTML/CSS stack (`html5ever`, `markup5ever`, `selectors`, `cssparser`,
 `tendril`, `string_cache`, `phf` 0.14) are not in the lockfile;
 `cargo tree --locked --target all -i html5ever` is empty.
 
+Echo installs rustls's ring provider (`backend::http::ensure_rustls_crypto_provider`)
+and enables no crate feature that pulls in AWS-LC: its own `rustls` and
+`tokio-rustls` use `ring`, and `twitch-irc` is built with `transport-tcp`
+only, because Echo makes the IRC TLS stream itself
+(`src/backend/irc/proxy_transport.rs`). The one remaining path to `aws-lc-rs`
+is the GPUI fork's `http_client_tls` (rustls default features);
+`cargo tree --locked -e features --target all -i rustls` shows which features
+enable `rustls feature "aws_lc_rs"`.
+
 ## Git sources
 
 Echo uses only crates.io plus the small allow-list of upstream Git repositories
