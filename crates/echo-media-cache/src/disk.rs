@@ -132,22 +132,66 @@ pub struct DiskLayer {
     pub saving_sources: DashMap<String, ()>,
     /// True while a disk eviction pass is running (single-flight guard).
     eviction_in_progress: AtomicBool,
-    /// Number of unsaved insert operations since the last index flush.
-    index_dirty_writes: AtomicU64,
-    /// Last time index was flushed to disk (unix seconds).
-    last_index_save_ts: AtomicU64,
-    /// Number of unsaved source-index operations since last flush.
-    source_index_dirty_writes: AtomicU64,
-    /// Last time source index was flushed to disk (unix seconds).
-    last_source_index_save_ts: AtomicU64,
-    /// Serializes index file saves to avoid temp-file rename races.
-    index_save_lock: Mutex<()>,
-    /// Serializes source-index saves to avoid temp-file rename races.
-    source_index_save_lock: Mutex<()>,
+    /// Save bookkeeping for the legacy index.
+    index_save: Arc<IndexSaveState>,
+    /// Save bookkeeping for the source blob index.
+    source_index_save: Arc<IndexSaveState>,
     /// Budget manager reference
     _budget: Arc<BudgetManager>,
     /// Statistics
     stats: Arc<CacheStats>,
+}
+
+/// Save bookkeeping for one persisted index. It is shared through an `Arc`
+/// with the save an autosave spawns, so the write that triggered the save
+/// does not wait for it.
+struct IndexSaveState {
+    /// Serializes saves of this index to avoid temp-file rename races.
+    lock: Mutex<()>,
+    /// Index writes the last completed save's snapshot did not cover.
+    dirty_writes: AtomicU64,
+    /// Last time the index was saved (unix seconds).
+    last_save_ts: AtomicU64,
+}
+
+impl IndexSaveState {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            dirty_writes: AtomicU64::new(0),
+            last_save_ts: AtomicU64::new(current_timestamp()),
+        }
+    }
+
+    /// Count one index write. Returns `(writes, seconds since the last save,
+    /// due by count)` when the autosave policy wants a save.
+    fn record_write(&self) -> Option<(u64, u64, bool)> {
+        // Release: a save that sees this count also sees the index write
+        // made before it.
+        let writes = self.dirty_writes.fetch_add(1, Ordering::AcqRel) + 1;
+        let elapsed = current_timestamp().saturating_sub(self.last_save_ts.load(Ordering::Relaxed));
+        let due_by_count = writes >= INDEX_AUTOSAVE_EVERY_INSERTS;
+        let due_by_time = elapsed >= INDEX_AUTOSAVE_MAX_DELAY_SECS;
+        let count_save_ok = due_by_count && elapsed >= INDEX_AUTOSAVE_MIN_INTERVAL_SECS;
+        (count_save_ok || due_by_time).then_some((writes, elapsed, due_by_count))
+    }
+
+    /// Writes counted so far; read under [`Self::lock`] before the snapshot.
+    fn writes_before_snapshot(&self) -> u64 {
+        self.dirty_writes.load(Ordering::Acquire)
+    }
+
+    /// Record a completed save whose snapshot was taken after `saved_writes`
+    /// writes were counted. Writes counted since stay for the next save.
+    fn mark_saved(&self, saved_writes: u64) {
+        let _ = self
+            .dirty_writes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |writes| {
+                Some(writes.saturating_sub(saved_writes))
+            });
+        self.last_save_ts
+            .store(current_timestamp(), Ordering::Relaxed);
+    }
 }
 
 /// Clears the in-flight `saving_sources` marker on drop so a panic or
@@ -190,12 +234,8 @@ impl DiskLayer {
             index_loading: watch::Sender::new(None),
             saving_sources: DashMap::new(),
             eviction_in_progress: AtomicBool::new(false),
-            index_dirty_writes: AtomicU64::new(0),
-            last_index_save_ts: AtomicU64::new(current_timestamp()),
-            source_index_dirty_writes: AtomicU64::new(0),
-            last_source_index_save_ts: AtomicU64::new(current_timestamp()),
-            index_save_lock: Mutex::new(()),
-            source_index_save_lock: Mutex::new(()),
+            index_save: Arc::new(IndexSaveState::new()),
+            source_index_save: Arc::new(IndexSaveState::new()),
             _budget: budget,
             stats,
         }
@@ -823,12 +863,11 @@ impl DiskLayer {
     pub async fn save_index_result(&self) -> Result<(), std::io::Error> {
         // Saving mid-load would write the still-empty index over the file.
         self.wait_for_index_load(true).await;
-        let _save_guard = self.index_save_lock.lock().await;
+        let _save_guard = self.index_save.lock.lock().await;
 
+        let saved_writes = self.index_save.writes_before_snapshot();
         save_index_snapshot(&self.index_path(), Arc::clone(&self.index)).await?;
-        self.index_dirty_writes.store(0, Ordering::Relaxed);
-        self.last_index_save_ts
-            .store(current_timestamp(), Ordering::Relaxed);
+        self.index_save.mark_saved(saved_writes);
         Ok(())
     }
 
@@ -841,13 +880,12 @@ impl DiskLayer {
 
     async fn save_source_index_result(&self) -> Result<(), std::io::Error> {
         self.wait_for_index_load(true).await;
-        let _save_guard = self.source_index_save_lock.lock().await;
+        let _save_guard = self.source_index_save.lock.lock().await;
 
+        let saved_writes = self.source_index_save.writes_before_snapshot();
         save_source_index_snapshot(&self.source_index_path(), Arc::clone(&self.source_index))
             .await?;
-        self.source_index_dirty_writes.store(0, Ordering::Relaxed);
-        self.last_source_index_save_ts
-            .store(current_timestamp(), Ordering::Relaxed);
+        self.source_index_save.mark_saved(saved_writes);
         Ok(())
     }
 
@@ -859,46 +897,74 @@ impl DiskLayer {
     }
 
     async fn maybe_autosave_index(&self) {
-        let writes = self.index_dirty_writes.fetch_add(1, Ordering::Relaxed) + 1;
-        let now = current_timestamp();
-        let last_saved = self.last_index_save_ts.load(Ordering::Relaxed);
-        let due_by_count = writes >= INDEX_AUTOSAVE_EVERY_INSERTS;
-        let due_by_time = now.saturating_sub(last_saved) >= INDEX_AUTOSAVE_MAX_DELAY_SECS;
-        let count_save_ok =
-            due_by_count && now.saturating_sub(last_saved) >= INDEX_AUTOSAVE_MIN_INTERVAL_SECS;
-        if count_save_ok || due_by_time {
-            crate::log_cache!(
-                debug,
-                writes,
-                elapsed_since_last_save_secs = now.saturating_sub(last_saved),
-                reason = if due_by_count { "count" } else { "time" },
-                "Autosaving disk cache index"
-            );
-            self.save_index().await;
-        }
+        let Some((writes, elapsed, due_by_count)) = self.index_save.record_write() else {
+            return;
+        };
+        crate::log_cache!(
+            debug,
+            writes,
+            elapsed_since_last_save_secs = elapsed,
+            reason = if due_by_count { "count" } else { "time" },
+            "Autosaving disk cache index"
+        );
+        self.spawn_autosave(&self.index_save, "Failed to save disk cache index", {
+            let path = self.index_path();
+            let index = Arc::clone(&self.index);
+            async move { save_index_snapshot(&path, index).await }
+        });
     }
 
     async fn maybe_autosave_source_index(&self) {
-        let writes = self
-            .source_index_dirty_writes
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        let now = current_timestamp();
-        let last_saved = self.last_source_index_save_ts.load(Ordering::Relaxed);
-        let due_by_count = writes >= INDEX_AUTOSAVE_EVERY_INSERTS;
-        let due_by_time = now.saturating_sub(last_saved) >= INDEX_AUTOSAVE_MAX_DELAY_SECS;
-        let count_save_ok =
-            due_by_count && now.saturating_sub(last_saved) >= INDEX_AUTOSAVE_MIN_INTERVAL_SECS;
-        if count_save_ok || due_by_time {
-            crate::log_cache!(
-                debug,
-                writes,
-                elapsed_since_last_save_secs = now.saturating_sub(last_saved),
-                reason = if due_by_count { "count" } else { "time" },
-                "Autosaving source blob cache index"
-            );
-            self.save_source_index().await;
-        }
+        let Some((writes, elapsed, due_by_count)) = self.source_index_save.record_write() else {
+            return;
+        };
+        crate::log_cache!(
+            debug,
+            writes,
+            elapsed_since_last_save_secs = elapsed,
+            reason = if due_by_count { "count" } else { "time" },
+            "Autosaving source blob cache index"
+        );
+        self.spawn_autosave(
+            &self.source_index_save,
+            "Failed to save source blob index",
+            {
+                let path = self.source_index_path();
+                let index = Arc::clone(&self.source_index);
+                async move { save_source_index_snapshot(&path, index).await }
+            },
+        );
+    }
+
+    /// Run an autosave without making the write that triggered it wait.
+    ///
+    /// Like [`Self::save_index_result`] it first waits for an index load to
+    /// end, so it never writes the index the load is about to replace. It is
+    /// skipped while another save of the same index holds the lock: during a
+    /// burst of inserts that save, or a later one, covers the writes made
+    /// meanwhile, instead of one full serialize, compress and fsync per
+    /// insert. Writes its snapshot missed stay counted.
+    fn spawn_autosave(
+        &self,
+        state: &Arc<IndexSaveState>,
+        failure: &'static str,
+        save: impl std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
+    ) {
+        let state = Arc::clone(state);
+        let mut loading = self.index_loading.subscribe();
+        tokio::spawn(async move {
+            let _ = loading.wait_for(Option::is_none).await;
+            let Ok(_save_guard) = state.lock.try_lock() else {
+                crate::log_cache!(trace, "Skipping index autosave: a save is running");
+                return;
+            };
+            let saved_writes = state.writes_before_snapshot();
+            if let Err(e) = save.await {
+                crate::log_cache!(warn, error = %e, "{failure}");
+                return;
+            }
+            state.mark_saved(saved_writes);
+        });
     }
 
     // ========================================================================
@@ -2169,5 +2235,137 @@ mod tests {
         let second = std::time::Instant::now();
         assert!(layer.get_entry(missing).await.is_none());
         assert!(second.elapsed() < INDEX_LOAD_LOOKUP_WAIT / 2);
+    }
+
+    async fn saved_source_blobs(layer: &DiskLayer) -> Vec<String> {
+        let saved = load_source_index(
+            &layer.source_index_path(),
+            &layer.legacy_source_index_path(),
+        )
+        .await
+        .unwrap();
+        let mut hashes: Vec<String> = saved.blobs.keys().cloned().collect();
+        hashes.sort();
+        hashes
+    }
+
+    /// Lets spawned autosaves run until `done` holds, or fails after 5 s.
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_autosave_neither_blocks_the_insert_nor_repeats_a_running_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = DiskLayer::new(
+            temp.path().join("cache"),
+            Arc::new(BudgetManager::new()),
+            Arc::new(CacheStats::new()),
+        );
+        // Every write is due by time, as in a burst long after the last save.
+        layer
+            .source_index_save
+            .last_save_ts
+            .store(0, Ordering::Relaxed);
+
+        // Another save holds the lock for the whole burst.
+        let running_save = layer.source_index_save.lock.lock().await;
+        for hash in ["a", "b", "c"] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                layer.insert_source_blob(
+                    None,
+                    format!("https://example.test/{hash}.webp"),
+                    test_blob(hash, 10),
+                ),
+            )
+            .await
+            .expect("the insert does not wait for the save");
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !layer.source_index_path().exists(),
+            "autosaves skip while a save is running"
+        );
+        assert_eq!(
+            layer.source_index_save.dirty_writes.load(Ordering::Relaxed),
+            3,
+            "the skipped writes stay counted"
+        );
+        drop(running_save);
+
+        layer
+            .insert_source_blob(
+                None,
+                "https://example.test/d.webp".to_string(),
+                test_blob("d", 10),
+            )
+            .await;
+        wait_until(|| layer.source_index_save.dirty_writes.load(Ordering::Relaxed) == 0).await;
+        assert_ne!(
+            layer.source_index_save.last_save_ts.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(saved_source_blobs(&layer).await, ["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn an_autosave_during_the_index_load_saves_the_installed_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("cache");
+        {
+            let previous_run = DiskLayer::new(
+                base.clone(),
+                Arc::new(BudgetManager::new()),
+                Arc::new(CacheStats::new()),
+            );
+            previous_run
+                .insert_source_blob(
+                    None,
+                    "https://example.test/persisted.webp".to_string(),
+                    test_blob("persisted", 40),
+                )
+                .await;
+            previous_run.save_source_index_result().await.unwrap();
+        }
+
+        let layer = DiskLayer::new(
+            base,
+            Arc::new(BudgetManager::new()),
+            Arc::new(CacheStats::new()),
+        );
+        layer
+            .source_index_save
+            .last_save_ts
+            .store(0, Ordering::Relaxed);
+        layer
+            .index_loading
+            .send_replace(Some(tokio::time::Instant::now() + INDEX_LOAD_LOOKUP_WAIT));
+        // A touch before the load installs the index triggers an autosave of
+        // the still-empty index.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            layer.maybe_autosave_source_index(),
+        )
+        .await
+        .expect("the autosave does not wait for the load");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            saved_source_blobs(&layer).await,
+            ["persisted"],
+            "nothing is saved while the load runs"
+        );
+
+        layer.initialize().await.unwrap();
+        wait_until(|| layer.source_index_save.last_save_ts.load(Ordering::Relaxed) != 0).await;
+        assert_eq!(saved_source_blobs(&layer).await, ["persisted"]);
     }
 }
