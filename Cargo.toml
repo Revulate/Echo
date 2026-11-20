@@ -105,8 +105,9 @@ rustls-native-certs = "0.8"
 # Audio (sounds for mentions)
 rodio = { version = "0.23", default-features = false, features = ["playback", "vorbis", "mp3", "wav"] }
 
-# Desktop notifications
-notify-rust = "4"
+# Desktop notifications. Held below 4.19, which moves to zbus 6 while GPUI's
+# Linux stack still uses zbus 5 (docs/DEPENDENCY_POLICY.md, RUSTSEC-2026-0370).
+notify-rust = "~4.18"
 
 # Retry logic
 backon = "1.6"
