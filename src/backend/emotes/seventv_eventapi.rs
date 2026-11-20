@@ -253,6 +253,13 @@ static CHANNEL_DETAILS: LazyLock<DashMap<String, SevenTvChannelSubscription>> =
 /// own. Closing the channel clears the entry.
 static CHANNELS_WITHOUT_SET: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
+/// Channels whose 7TV rows may not match their registered set: a set refresh
+/// is queued, being applied or waiting to retry, or it gave up, or an active
+/// set switch was followed without its rows. Set when such a refresh is
+/// queued, cleared when an exact apply for the channel succeeds with nothing
+/// else queued for it. Their state is not saved with the catalog.
+static CHANNELS_ROWS_UNRECONCILED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
 /// Channel login -> unix time of the completed 7TV lookup that the channel's
 /// registered state descends from (a lookup in this session, or one restored
 /// from the disk cache with its original time). Closing the channel clears it.
@@ -1201,6 +1208,7 @@ pub fn unsubscribe_channel(channel_login: &str) {
     CHANNELS_WITHOUT_SET.remove(&channel);
     CHANNEL_LOOKED_UP_AT.remove(&channel);
     DISK_CHANNEL_STATES.remove(&channel);
+    CHANNELS_ROWS_UNRECONCILED.remove(&channel);
 
     crate::log_emotes!(
         debug,
@@ -1260,17 +1268,40 @@ pub(crate) fn note_channel_lookup_completed(channel_login: &str) {
     }
     let channel = super::normalize_channel_key(channel_login);
     DISK_CHANNEL_STATES.remove(&channel);
-    CHANNEL_LOOKED_UP_AT.insert(channel, crate::utils::unix_now_secs());
+    CHANNEL_LOOKED_UP_AT.insert(channel.clone(), crate::utils::unix_now_secs());
+    note_channel_rows_reconciled(&channel);
+}
+
+/// Mark the channel's 7TV rows as possibly not matching its registered set.
+fn mark_channel_rows_unreconciled(channel: &str) {
+    if !channel.is_empty() && channel != GLOBAL_SET_CHANNEL {
+        CHANNELS_ROWS_UNRECONCILED.insert(super::normalize_channel_key(channel));
+    }
+}
+
+/// An exact apply for the channel succeeded: its rows match the set it
+/// fetched, unless another refresh for the channel is already queued.
+fn note_channel_rows_reconciled(channel: &str) {
+    let channel = super::normalize_channel_key(channel);
+    let still_queued = PENDING_REFRESHES
+        .lock_or_recover()
+        .values()
+        .any(|refresh| !refresh.is_global && refresh.channel == channel);
+    if !still_queued {
+        CHANNELS_ROWS_UNRECONCILED.remove(&channel);
+    }
 }
 
 /// The channel's registered 7TV state to save with its catalog, or `None`
-/// when no completed lookup stands behind it or it is mid-change: an active
-/// set switch is being applied, or a set refresh is still queued, so the
-/// saved rows may not match the registered set.
+/// when no completed lookup stands behind it or the saved rows may not match
+/// the registered set: an active set switch is being applied, a set refresh
+/// is queued, in flight, retrying or gave up, or a switch was followed
+/// without its rows.
 pub(super) fn persisted_channel_state(channel_login: &str) -> Option<CachedSevenTvChannel> {
     let channel = super::normalize_channel_key(channel_login);
     let looked_up_at = *CHANNEL_LOOKED_UP_AT.get(&channel)?;
     if ACTIVE_SET_REFRESH_TARGETS.contains_key(&channel)
+        || CHANNELS_ROWS_UNRECONCILED.contains(&channel)
         || PENDING_REFRESHES
             .lock_or_recover()
             .values()
@@ -1313,6 +1344,18 @@ pub(super) fn stash_disk_channel_state(channel_login: &str, state: CachedSevenTv
         return;
     }
     DISK_CHANNEL_STATES.insert(channel, state);
+}
+
+/// Whether a 7TV state read from disk is consistent with the catalog it was
+/// saved with: the catalog was saved no later than `now` and the lookup no
+/// later than that save. A clock set back would otherwise let an old state
+/// pass the age check.
+pub(super) fn disk_channel_state_matches_save(
+    state: &CachedSevenTvChannel,
+    saved_at: u64,
+    now: u64,
+) -> bool {
+    saved_at <= now && state.looked_up_at <= saved_at
 }
 
 /// Whether a disk-cached 7TV state is recent enough to register without a
@@ -3144,6 +3187,7 @@ async fn run_active_set_refresh(
             details.emote_set_id = applied_set_id.clone();
             subscribe_channel_details(&channel, details);
             clear_active_set_refresh_target(&channel, &new_set_id);
+            note_channel_rows_reconciled(&channel);
             crate::backend::metrics::record_emote_event("7tv.user_update.active_set.applied");
             crate::log_emotes!(
                 info,
@@ -3227,11 +3271,10 @@ async fn run_active_set_refresh(
             if followed {
                 details.emote_set_id = new_set_id.clone();
                 subscribe_channel_details(&channel, details);
-            }
-            clear_active_set_refresh_target(&channel, &new_set_id);
-            if followed {
                 // The rows are still the old set's: keep retrying the exact
-                // new set through the reconcile backoff.
+                // new set through the reconcile backoff. Queued (which marks
+                // the rows unreconciled) before the switch target is cleared,
+                // so no save sees the new set without either.
                 queue_pending_refresh(PendingRefresh {
                     set_id: new_set_id.clone(),
                     channel: channel.clone(),
@@ -3245,6 +3288,7 @@ async fn run_active_set_refresh(
                     fetch_attempt: 0,
                 });
             }
+            clear_active_set_refresh_target(&channel, &new_set_id);
             crate::backend::metrics::record_emote_event("7tv.user_update.active_set.failed");
             crate::log_emotes!(
                 warn,
@@ -3308,6 +3352,7 @@ async fn run_active_set_clear(
         .await
         .unwrap_or(0);
     clear_active_set_refresh_target(&channel, "");
+    note_channel_rows_reconciled(&channel);
     crate::backend::metrics::record_emote_event("7tv.user_update.active_set.cleared");
     crate::log_emotes!(
         info,
@@ -3636,6 +3681,9 @@ fn schedule_refresh_after_dispatch(
 }
 
 fn queue_pending_refresh(refresh: PendingRefresh) {
+    if !refresh.is_global {
+        mark_channel_rows_unreconciled(&refresh.channel);
+    }
     let key = pending_refresh_key(&refresh.set_id, &refresh.channel);
     {
         let mut pending = PENDING_REFRESHES.lock_or_recover();
@@ -3814,6 +3862,9 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                             refresh.updated
                         );
                         emit_applied_emote_set_notifications(&refresh);
+                        if !refresh.is_global {
+                            note_channel_rows_reconciled(&refresh.channel);
+                        }
                         crate::managers::frame_rate_controller::record_activity();
                         crate::managers::frame_rate_controller::wakeup();
                         continue;
@@ -3893,6 +3944,9 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                         )
                         .await
                     };
+                    if !refresh.is_global {
+                        note_channel_rows_reconciled(&refresh.channel);
+                    }
                     crate::backend::metrics::record_emote_event(
                         "7tv.patch.exact_set_reconcile.applied",
                     );
@@ -3934,6 +3988,9 @@ fn run_refresh_batch(runtime: &tokio::runtime::Runtime, batch: Vec<PendingRefres
                         .await
                     };
                     if let Some(removed) = removed {
+                        if !refresh.is_global {
+                            note_channel_rows_reconciled(&refresh.channel);
+                        }
                         crate::backend::metrics::record_emote_event(
                             "7tv.patch.exact_set_reconcile.terminal_cleared",
                         );
@@ -4166,6 +4223,82 @@ fn push_emote_notification(channel: &str, text: &str) {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[test]
+    fn a_channel_whose_rows_are_not_reconciled_saves_no_7tv_state() {
+        let channel = "persist_unreconciled_test".to_string();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                PENDING_REFRESHES
+                    .lock_or_recover()
+                    .remove(&pending_refresh_key("unreconciled-set", &self.0));
+                unsubscribe_channel(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(channel.clone());
+        subscribe_channel_set(&channel, "unreconciled-set");
+        note_channel_lookup_completed(&channel);
+        assert!(persisted_channel_state(&channel).is_some());
+
+        // A followed switch, or a reconcile waiting to retry or given up:
+        // nothing is queued, the target is clear, the rows are still behind.
+        mark_channel_rows_unreconciled(&channel);
+        assert_eq!(persisted_channel_state(&channel), None);
+
+        // An exact apply with another refresh for the channel queued keeps
+        // the mark; with none queued it clears it.
+        PENDING_REFRESHES.lock_or_recover().insert(
+            pending_refresh_key("unreconciled-set", &channel),
+            PendingRefresh {
+                set_id: "unreconciled-set".to_string(),
+                channel: channel.clone(),
+                is_global: false,
+                added: 0,
+                removed: 0,
+                updated: 0,
+                requires_full_refresh: true,
+                patch: Default::default(),
+                notifications: Vec::new(),
+                fetch_attempt: 1,
+            },
+        );
+        note_channel_rows_reconciled(&channel);
+        PENDING_REFRESHES
+            .lock_or_recover()
+            .remove(&pending_refresh_key("unreconciled-set", &channel));
+        assert_eq!(persisted_channel_state(&channel), None);
+        note_channel_rows_reconciled(&channel);
+        assert!(persisted_channel_state(&channel).is_some());
+
+        // A completed lookup also reconciles; closing forgets the mark.
+        mark_channel_rows_unreconciled(&channel);
+        note_channel_lookup_completed(&channel);
+        assert!(persisted_channel_state(&channel).is_some());
+        mark_channel_rows_unreconciled(&channel);
+        unsubscribe_channel(&channel);
+        assert!(!CHANNELS_ROWS_UNRECONCILED.contains(&channel));
+    }
+
+    #[test]
+    fn a_disk_state_must_predate_its_save_and_the_save_now() {
+        let state = CachedSevenTvChannel {
+            looked_up_at: 1_000,
+            user_id: String::new(),
+            connection_index: 0,
+            emote_set_id: "s".to_string(),
+        };
+        assert!(disk_channel_state_matches_save(&state, 1_000, 1_000));
+        assert!(disk_channel_state_matches_save(&state, 1_200, 1_500));
+        assert!(
+            !disk_channel_state_matches_save(&state, 900, 1_500),
+            "a lookup after its save"
+        );
+        assert!(
+            !disk_channel_state_matches_save(&state, 2_000, 1_500),
+            "a save in the future"
+        );
+    }
 
     #[test]
     fn a_channel_mid_set_change_saves_no_7tv_state() {

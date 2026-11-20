@@ -465,6 +465,8 @@ root_test	src/backend/emotes/mod.rs	small_provider_diff_matches_full_rebuild_loo
 root_test	src/backend/emotes/mod.rs	stale_fallback_cannot_resurrect_closed_channel_tombstone
 root_test	src/backend/emotes/mod.rs	stale_publication_fallback_rebuilds_all_authoritative_providers
 root_test	src/backend/emotes/seventv_eventapi.rs	a_channel_mid_set_change_saves_no_7tv_state
+root_test	src/backend/emotes/seventv_eventapi.rs	a_channel_whose_rows_are_not_reconciled_saves_no_7tv_state
+root_test	src/backend/emotes/seventv_eventapi.rs	a_disk_state_must_predate_its_save_and_the_save_now
 root_test	src/backend/emotes/seventv_eventapi.rs	ack_requires_command_and_echoed_subscription_data
 root_test	src/backend/emotes/seventv_eventapi.rs	active_subscriptions_change_only_after_matching_ack
 root_test	src/backend/emotes/seventv_eventapi.rs	command_error_with_in_flight_mutation_forces_fresh_reconnect
@@ -926,7 +928,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	434
+summary	root_tests	436
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

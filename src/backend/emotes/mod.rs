@@ -2000,7 +2000,13 @@ impl EmoteCache {
                     STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key);
                     // A stale catalog refreshes at join anyway; only a fresh
                     // one may register its saved 7TV state instead.
-                    if let Some(state) = channel_seventv.remove(&channel) {
+                    if let Some(state) = channel_seventv.remove(&channel)
+                        && seventv_eventapi::disk_channel_state_matches_save(
+                            &state,
+                            cached.saved_at,
+                            crate::utils::unix_now_secs(),
+                        )
+                    {
                         seventv_eventapi::stash_disk_channel_state(&cache_key, state);
                     }
                 } else {
