@@ -72,6 +72,10 @@ pub(crate) enum DiskCacheParts {
 pub(crate) struct DiskCacheLoad {
     /// The global sets were loaded.
     pub(crate) global: bool,
+    /// The loaded global sets are old enough that startup must refresh them
+    /// now. Tracked apart from the entry's `fetched_at`, which cannot be
+    /// backdated past the monotonic clock's origin shortly after boot.
+    pub(crate) global_stale: bool,
     /// The signed-in account's user emotes were loaded.
     pub(crate) user: bool,
     /// Number of channel sets loaded.
@@ -172,7 +176,11 @@ static FFZ_ROOM_BADGE_HYDRATIONS: LazyLock<DashSet<String>> = LazyLock::new(Dash
 
 /// TTL for cached emotes on disk (in seconds)
 const USER_EMOTES_DISK_TTL_SECS: u64 = 24 * 60 * 60;
-const GLOBAL_EMOTES_DISK_TTL_SECS: u64 = 6 * 60 * 60;
+/// Maximum age a global disk cache may have and still be served at startup.
+/// Cached history waits for the catalogs to be ready, so a disk global set
+/// that is stale but present lets history show at once; startup refreshes it
+/// immediately and retokenizes resident rows if the refreshed set differs.
+const GLOBAL_EMOTES_DISK_STALE_SERVE_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 /// Maximum age a channel disk cache may have and still be served at startup.
 /// Channel emote sets change rarely; serving a stale set immediately and
 /// refreshing in the background beats blocking message tokenization on a
@@ -556,6 +564,15 @@ use cache_codec::{
     EmoteCacheReadSource, legacy_emote_cache_path, read_emote_cache_with_legacy_fallback,
     write_current_emote_cache_atomic,
 };
+
+/// Whether startup serves a disk global set, and if it does, whether that set
+/// is stale (`Some(true)`: refresh at once) or fresh (`Some(false)`).
+fn global_disk_set_hydration(cached: &CachedEmoteSet) -> Option<bool> {
+    if cached.is_expired(GLOBAL_EMOTES_DISK_STALE_SERVE_MAX_SECS) {
+        return None;
+    }
+    Some(!cached.is_fresh_enough_to_delay())
+}
 
 fn channel_disk_cache_fetched_at(is_fresh: bool, ttl: Duration) -> Instant {
     if is_fresh {
@@ -1772,6 +1789,7 @@ impl EmoteCache {
         };
 
         let mut global_loaded = false;
+        let mut global_stale = false;
         let mut user_loaded = false;
         let mut channels_loaded = 0;
         let mut global_emote_count = 0usize;
@@ -1797,8 +1815,8 @@ impl EmoteCache {
 
         let hydrate_global_start = Instant::now();
         if let Some(cached) = global_emotes {
-            if !cached.is_expired(GLOBAL_EMOTES_DISK_TTL_SECS) {
-                let is_fresh = cached.is_fresh_enough_to_delay();
+            if let Some(stale) = global_disk_set_hydration(&cached) {
+                let is_fresh = !stale;
                 let fetched_at = calculate_fetched_at(is_fresh);
                 crate::log_emotes!(
                     info,
@@ -1821,6 +1839,7 @@ impl EmoteCache {
                 });
                 global_emote_count = global.as_ref().map(|e| e.emotes_by_id.len()).unwrap_or(0);
                 global_loaded = true;
+                global_stale = stale;
             } else {
                 crate::log_emotes!(info, "Global emotes cache expired");
             }
@@ -2024,6 +2043,7 @@ impl EmoteCache {
 
         DiskCacheLoad {
             global: global_loaded,
+            global_stale,
             user: user_loaded,
             channels: channels_loaded,
         }
@@ -4846,6 +4866,31 @@ mod provider_index_tests {
         };
         EmoteCache::rebuild_name_map_from_identities(&mut entry);
         entry
+    }
+
+    #[test]
+    fn global_disk_set_is_served_stale_for_a_week_and_refreshes_at_once() {
+        let now = crate::utils::unix_now_secs();
+        let saved = |age_secs: u64| CachedEmoteSet {
+            saved_at: now.saturating_sub(age_secs),
+            emotes: HashMap::new(),
+        };
+
+        assert_eq!(global_disk_set_hydration(&saved(0)), Some(false));
+        assert_eq!(
+            global_disk_set_hydration(&saved(DISK_CACHE_REFRESH_DELAY_SECS + 1)),
+            Some(true)
+        );
+        // An overnight gap used to drop the set and gate history on the network.
+        assert_eq!(global_disk_set_hydration(&saved(12 * 60 * 60)), Some(true));
+        assert_eq!(
+            global_disk_set_hydration(&saved(GLOBAL_EMOTES_DISK_STALE_SERVE_MAX_SECS - 60)),
+            Some(true)
+        );
+        assert_eq!(
+            global_disk_set_hydration(&saved(GLOBAL_EMOTES_DISK_STALE_SERVE_MAX_SECS + 60)),
+            None
+        );
     }
 
     #[test]

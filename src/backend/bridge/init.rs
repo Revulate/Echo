@@ -343,6 +343,7 @@ pub fn initialize() {
                 set_emote_cache_path().await;
                 let crate::backend::emotes::DiskCacheLoad {
                     global,
+                    global_stale,
                     channels: channel_count,
                     ..
                 } = crate::backend::emotes::EMOTE_CACHE
@@ -362,20 +363,23 @@ pub fn initialize() {
                     crate::diagnostics::startup_metrics::record(
                         crate::diagnostics::startup_metrics::StartupMarker::InitialCatalogsReady,
                     );
-                    Some(crate::backend::emotes::get_global_emote_version())
+                    (
+                        Some(crate::backend::emotes::get_global_emote_version()),
+                        global_stale,
+                    )
                 } else {
-                    None
+                    (None, false)
                 }
             }
         };
-        let global_version_at_ready = if offline_scenario {
+        let (global_version_at_ready, disk_global_stale) = if offline_scenario {
             hydrate_shared_catalogs.await
         } else {
-            let (version, ()) = tokio::join!(
+            let (hydrated, ()) = tokio::join!(
                 hydrate_shared_catalogs,
                 crate::backend::auth::initialize_auth()
             );
-            version
+            hydrated
         };
 
         let eventapi_replay_only = !offline_scenario
@@ -435,7 +439,9 @@ pub fn initialize() {
 
             crate::backend::chat_replay::start_chat_replay_from_env();
 
-            if !offline_scenario && crate::backend::emotes::EMOTE_CACHE.global_needs_refresh() {
+            if !offline_scenario
+                && (disk_global_stale || crate::backend::emotes::EMOTE_CACHE.global_needs_refresh())
+            {
                 crate::log_emotes!(info, "Loading global emotes...");
                 if let Err(e) = crate::backend::emotes::EMOTE_CACHE
                     .load_global_emotes()
