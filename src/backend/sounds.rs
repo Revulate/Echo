@@ -33,12 +33,49 @@ static SOUND_PLAYBACK_TX: OnceLock<mpsc::Sender<SoundPlaybackRequest>> = OnceLoc
 
 const SOUND_DEVICE_RETRY_MAX: Duration = Duration::from_secs(30);
 const SOUND_DEVICE_STABLE_WINDOW: Duration = Duration::from_secs(2);
+/// An open output stream keeps the audio device and its mixing thread
+/// running even while silent, so the worker closes it this long after the
+/// last sound started, once nothing is playing. The next sound reopens it.
+const SOUND_OUTPUT_IDLE_CLOSE: Duration = Duration::from_secs(45);
 
 struct SoundPlaybackOutput {
     stream: rodio::MixerDeviceSink,
     current: Option<rodio::Player>,
     stream_failed: Arc<AtomicBool>,
     recovery_check_at: Option<Instant>,
+    idle_close_at: Option<Instant>,
+}
+
+/// What the idle deadline does to an open output stream.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleClose {
+    /// The deadline has not passed.
+    Keep,
+    /// A sound is still playing; check again at this instant.
+    Extend(Instant),
+    /// Nothing is playing: close the stream.
+    Close,
+}
+
+fn idle_close_decision(idle_close_at: Option<Instant>, now: Instant, playing: bool) -> IdleClose {
+    match idle_close_at {
+        Some(deadline) if now >= deadline => {
+            if playing {
+                IdleClose::Extend(now + SOUND_OUTPUT_IDLE_CLOSE)
+            } else {
+                IdleClose::Close
+            }
+        }
+        _ => IdleClose::Keep,
+    }
+}
+
+/// The earlier of two optional deadlines.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 impl SoundPlaybackOutput {
@@ -72,7 +109,25 @@ impl SoundPlaybackOutput {
             current: None,
             stream_failed,
             recovery_check_at: Some(Instant::now() + SOUND_DEVICE_STABLE_WINDOW),
+            idle_close_at: None,
         })
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        earliest(self.recovery_check_at, self.idle_close_at)
+    }
+
+    /// Apply the idle deadline; true when the stream should be closed.
+    fn take_idle_close(&mut self, now: Instant) -> bool {
+        let playing = self.current.as_ref().is_some_and(|player| !player.empty());
+        match idle_close_decision(self.idle_close_at, now, playing) {
+            IdleClose::Keep => false,
+            IdleClose::Extend(deadline) => {
+                self.idle_close_at = Some(deadline);
+                false
+            }
+            IdleClose::Close => true,
+        }
     }
 
     fn has_failed(&self) -> bool {
@@ -83,6 +138,7 @@ impl SoundPlaybackOutput {
         use rodio::{Decoder, Player};
 
         self.current.take();
+        self.idle_close_at = Some(Instant::now() + SOUND_OUTPUT_IDLE_CLOSE);
 
         let player = Player::connect_new(self.stream.mixer());
         match request {
@@ -192,7 +248,7 @@ fn sound_playback_tx() -> &'static mpsc::Sender<SoundPlaybackRequest> {
                 device_warning_shown: false,
             };
             loop {
-                let request = match output.as_ref().and_then(|output| output.recovery_check_at) {
+                let request = match output.as_ref().and_then(SoundPlaybackOutput::next_deadline) {
                     Some(deadline) => {
                         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                             Ok(request) => Some(request),
@@ -216,6 +272,15 @@ fn sound_playback_tx() -> &'static mpsc::Sender<SoundPlaybackRequest> {
                 {
                     output.recovery_check_at = None;
                     health.note_device_recovered();
+                }
+                // A request that raced the deadline reuses the open stream.
+                if request.is_none()
+                    && output
+                        .as_mut()
+                        .is_some_and(|output| output.take_idle_close(Instant::now()))
+                {
+                    crate::log_ui!(debug, "Closing idle audio output stream");
+                    output = None;
                 }
 
                 let Some(mut request) = request else {
@@ -901,8 +966,38 @@ pub static SOUND_STORE: LazyLock<SoundStore> = LazyLock::new(SoundStore::new);
 
 #[cfg(test)]
 mod tests {
-    use super::{SoundSettings, normalize_sound_settings};
+    use super::{
+        IdleClose, SOUND_OUTPUT_IDLE_CLOSE, SoundSettings, earliest, idle_close_decision,
+        normalize_sound_settings,
+    };
     use core::prelude::v1::test;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_output_closes_only_after_the_deadline_and_once_silent() {
+        let now = Instant::now();
+        assert_eq!(idle_close_decision(None, now, false), IdleClose::Keep);
+        assert_eq!(
+            idle_close_decision(Some(now + Duration::from_secs(1)), now, false),
+            IdleClose::Keep
+        );
+        assert_eq!(idle_close_decision(Some(now), now, false), IdleClose::Close);
+        assert_eq!(
+            idle_close_decision(Some(now), now, true),
+            IdleClose::Extend(now + SOUND_OUTPUT_IDLE_CLOSE)
+        );
+    }
+
+    #[test]
+    fn worker_wakes_for_the_earlier_deadline() {
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(2);
+        let later = now + SOUND_OUTPUT_IDLE_CLOSE;
+        assert_eq!(earliest(None, None), None);
+        assert_eq!(earliest(Some(later), None), Some(later));
+        assert_eq!(earliest(None, Some(soon)), Some(soon));
+        assert_eq!(earliest(Some(later), Some(soon)), Some(soon));
+    }
 
     #[test]
     fn legacy_sound_mutes_do_not_silently_mute_desktop_notifications() {
