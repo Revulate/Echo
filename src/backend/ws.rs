@@ -12,7 +12,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::tungstenite::handshake::client::Response;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 use url::Url;
 
 const MAX_PROXY_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
@@ -77,7 +77,11 @@ pub async fn connect_websocket(url: &str) -> Result<(ProxyAwareWebSocket, Respon
     let parsed = Url::parse(url).map_err(|error| format!("Invalid WebSocket URL: {error}"))?;
     let connect = async {
         let socket = connect_socket(&parsed).await?;
-        client_async_tls_with_config(url, socket, None, None)
+        // Without a connector, tokio-tungstenite reloads and parses the native
+        // root store on every connect; this is the same native-roots config,
+        // loaded once. A ws:// URL still connects in plain mode.
+        let connector = Connector::Rustls(native_roots_tls_config());
+        client_async_tls_with_config(url, socket, None, Some(connector))
             .await
             .map_err(|error| format!("WebSocket connect: {error}"))
     };
@@ -345,7 +349,8 @@ async fn resolve_first_socket_addr(host: &str, port: u16) -> Result<std::net::So
         .ok_or_else(|| format!("No resolved addresses for {host}:{port}"))
 }
 
-/// Native-roots TLS config shared by the HTTPS proxy and IRC proxy transports.
+/// Native-roots TLS config shared by WebSocket connects and the HTTPS proxy and
+/// IRC proxy transports.
 /// The root store is loaded once per process; a load that found no usable
 /// roots is not cached, so the next connect retries instead of failing forever.
 pub(crate) fn native_roots_tls_config() -> Arc<ClientConfig> {
@@ -362,7 +367,7 @@ pub(crate) fn native_roots_tls_config() -> Arc<ClientConfig> {
     if error_count > 0 || invalid_count > 0 || valid_count == 0 {
         crate::log_net!(
             warn,
-            "Loaded {} native TLS roots for proxy transport ({} load errors, {} invalid certs)",
+            "Loaded {} native TLS roots for WebSocket and proxy TLS ({} load errors, {} invalid certs)",
             valid_count,
             error_count,
             invalid_count
