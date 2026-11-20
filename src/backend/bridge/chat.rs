@@ -1369,41 +1369,85 @@ async fn poll_stream_infos(channels: &[String]) -> Option<Vec<(String, StreamInf
     logins.sort_unstable();
     logins.dedup();
     let states = crate::backend::twitch_api::poll_stream_states_helix(&logins, |offline| {
-        let now = Instant::now();
-        let due = offline_metadata_due(offline, &OFFLINE_METADATA_FETCHED_AT, now);
-        if due {
-            for login in offline {
-                OFFLINE_METADATA_FETCHED_AT.insert(login.clone(), now);
-            }
-        }
-        due
+        offline_metadata_due(offline, &OFFLINE_METADATA_FETCHED_AT, Instant::now())
     })
     .await?;
-    let mut states = match states {
+    let states = match states {
         Ok(states) => states,
         Err(error) => {
             crate::log_net!(debug, "stream refresh batch failed: {error}");
             return None;
         }
     };
-    let mut infos = Vec::with_capacity(channels.len());
-    for channel in channels {
-        let key = normalize_stream_status_channel(channel);
-        let info = match states.remove(&key) {
-            Some(crate::backend::twitch_api::PolledStreamState::Live(result)) => {
+    let poll = stream_infos_from_poll(channels, states, |key| {
+        LAST_STREAM_INFO.get(key).map(|info| info.clone())
+    });
+    let now = Instant::now();
+    for login in poll.metadata_fetched {
+        OFFLINE_METADATA_FETCHED_AT.insert(login, now);
+    }
+    for (key, info) in poll.by_login {
+        set_cached_channel_live_status(&key, info.is_live);
+        LAST_STREAM_INFO.insert(key, info);
+    }
+    Some(poll.by_channel)
+}
+
+/// What one batched poll found, before it is published.
+struct PolledStreamInfos {
+    /// Each polled channel's info, keyed like the channels passed in.
+    by_channel: Vec<(String, StreamInfo)>,
+    /// The same infos by normalized login.
+    by_login: HashMap<String, StreamInfo>,
+    /// Offline logins whose title and category this poll fetched. Only these
+    /// count as refreshed, so a failed or partial `/channels` answer is asked
+    /// again on the next poll.
+    metadata_fetched: Vec<String>,
+}
+
+/// Turn a poll's states (by normalized login) into infos for `channels`.
+/// Spellings of one login that normalize alike all get its info. `previous`
+/// gives a login's last known info, for an offline channel whose title was
+/// not fetched this time.
+fn stream_infos_from_poll(
+    channels: &[String],
+    states: HashMap<String, crate::backend::twitch_api::PolledStreamState>,
+    previous: impl Fn(&str) -> Option<StreamInfo>,
+) -> PolledStreamInfos {
+    let mut by_login = HashMap::with_capacity(states.len());
+    let mut metadata_fetched = Vec::new();
+    for (login, state) in states {
+        let info = match state {
+            crate::backend::twitch_api::PolledStreamState::Live(result) => {
                 stream_info_from_result(result)
             }
-            Some(crate::backend::twitch_api::PolledStreamState::Offline(metadata)) => {
-                let previous = LAST_STREAM_INFO.get(&key).map(|info| info.clone());
-                offline_stream_info(previous.as_ref(), metadata)
+            crate::backend::twitch_api::PolledStreamState::Offline(metadata) => {
+                if metadata.is_some() {
+                    metadata_fetched.push(login.clone());
+                }
+                offline_stream_info(previous(&login).as_ref(), metadata)
             }
-            None => continue,
         };
-        set_cached_channel_live_status(&key, info.is_live);
-        LAST_STREAM_INFO.insert(key, info.clone());
-        infos.push((channel.clone(), info));
+        by_login.insert(login, info);
     }
-    Some(infos)
+    let by_channel = channels
+        .iter()
+        .filter_map(|channel| {
+            by_login
+                .get(&normalize_stream_status_channel(channel))
+                .map(|info| (channel.clone(), info.clone()))
+        })
+        .collect();
+    PolledStreamInfos {
+        by_channel,
+        by_login,
+        metadata_fetched,
+    }
+}
+
+/// Forget a closed channel's offline-metadata refresh time.
+pub fn forget_channel_stream_metadata(channel: &str) {
+    OFFLINE_METADATA_FETCHED_AT.remove(&normalize_stream_status_channel(channel));
 }
 
 pub fn stage_eventsub_stream_info(channel: &str, is_live: bool, started_at: Option<i64>) -> u64 {
@@ -1771,6 +1815,55 @@ mod stream_poll_tests {
         assert!(
             offline_metadata_due(&with_new_channel, &fetched_at, now),
             "a newly opened offline channel gets its title on the next poll"
+        );
+    }
+
+    #[test]
+    fn a_poll_serves_every_spelling_and_counts_only_fetched_metadata() {
+        use crate::backend::twitch_api::PolledStreamState;
+        let live = StreamInfoResult {
+            title: "live title".to_string(),
+            game_name: None,
+            viewer_count: 5,
+            started_at: 1_900_000_000,
+            is_live: true,
+            thumbnail_url: None,
+        };
+        let states = HashMap::from([
+            ("livechan".to_string(), PolledStreamState::Live(live)),
+            (
+                "fetched".to_string(),
+                PolledStreamState::Offline(Some(metadata("configured", Some("Chess")))),
+            ),
+            ("unfetched".to_string(), PolledStreamState::Offline(None)),
+        ]);
+        let channels = vec![
+            "LiveChan".to_string(),
+            "livechan".to_string(),
+            "fetched".to_string(),
+            "#Unfetched".to_string(),
+        ];
+        let poll = stream_infos_from_poll(&channels, states, |login| {
+            (login == "unfetched").then(|| StreamInfo {
+                title: "kept title".to_string(),
+                game_name: None,
+                viewer_count: 0,
+                started_at: 0,
+                is_live: false,
+            })
+        });
+
+        let by_channel: HashMap<_, _> = poll.by_channel.into_iter().collect();
+        assert_eq!(by_channel.len(), 4, "both spellings of livechan are served");
+        assert!(by_channel["LiveChan"].is_live);
+        assert_eq!(by_channel["livechan"], by_channel["LiveChan"]);
+        assert_eq!(by_channel["fetched"].title, "configured");
+        assert_eq!(by_channel["#Unfetched"].title, "kept title");
+        assert_eq!(poll.by_login.len(), 3);
+        assert_eq!(
+            poll.metadata_fetched,
+            ["fetched"],
+            "a login whose metadata did not come back is asked again next poll"
         );
     }
 

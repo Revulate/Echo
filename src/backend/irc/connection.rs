@@ -1010,6 +1010,7 @@ fn clear_channel_runtime_state(channel: &str) {
     EMOTE_LOADED_CHANNELS.lock().remove(&channel_norm);
     CHANNEL_DISCONNECT_STATES.write().remove(&channel_norm);
     crate::backend::twitch_api::clear_channel_lookup_state(&channel_norm);
+    crate::backend::bridge::forget_channel_stream_metadata(&channel_norm);
     crate::backend::channel_lifecycle::get_lifecycle_manager().remove_channel(&channel_norm);
     crate::backend::irc::room_state::clear_room_state(&channel_norm);
 

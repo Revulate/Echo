@@ -417,6 +417,7 @@ root_test	src/backend/auth.rs	a_flag_waiter_wakes_when_the_flag_is_set_and_retur
 root_test	src/backend/auth.rs	retry_delays_back_off_then_go_hourly
 root_test	src/backend/blocked_users.rs	omits_cursor_on_the_initial_page
 root_test	src/backend/blocked_users.rs	preserves_blocked_user_query_order_and_opaque_cursor_value
+root_test	src/backend/bridge/chat.rs	a_poll_serves_every_spelling_and_counts_only_fetched_metadata
 root_test	src/backend/bridge/chat.rs	offline_info_keeps_the_last_title_between_metadata_refreshes
 root_test	src/backend/bridge/chat.rs	offline_metadata_is_refreshed_for_all_when_any_is_due
 root_test	src/backend/browser_watching.rs	extension_selection_notifies_only_for_channel_or_source_changes
@@ -930,7 +931,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	438
+summary	root_tests	439
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
