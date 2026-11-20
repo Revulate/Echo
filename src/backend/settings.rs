@@ -2855,6 +2855,31 @@ static SETTINGS_BACKUPS_ROTATED_AT: Mutex<Option<std::time::Instant>> = Mutex::n
 const SETTINGS_BACKUP_ROTATION_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
 
+/// Fingerprint of the privacy settings (streamer mode, anonymous mode, chat
+/// logging and history persistence) in the settings file last written or
+/// loaded. `None` until the first load or save.
+static SAVED_PRIVACY_SETTINGS: Mutex<Option<u64>> = Mutex::new(None);
+
+fn privacy_settings_fingerprint(settings: &AppSettings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    serde_json::to_string(&settings.streamer_mode)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    settings.anonymous_mode.hash(&mut hasher);
+    settings.chat_logging_enabled.hash(&mut hasher);
+    settings.log_deleted_messages.hash(&mut hasher);
+    settings.persist_history_enabled.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether the settings just written changed a privacy setting from the last
+/// file written or loaded (a failed backup refresh leaves `last` as it was, so
+/// the next save tries again).
+fn privacy_settings_changed(last: Option<u64>, written: u64) -> bool {
+    last.is_some_and(|last| last != written)
+}
+
 /// Whether a save should copy the current settings.json into the backups:
 /// the session's first save (the file the last session left), then once the
 /// last refresh is [`SETTINGS_BACKUP_ROTATION_INTERVAL`] old.
@@ -3240,6 +3265,28 @@ impl SettingsManager {
         }
         SETTINGS_PRIMARY_STATE.store(PRIMARY_GOOD, Ordering::Release);
         SETTINGS_SAVE_REFUSED_WARNED.store(false, Ordering::Release);
+
+        // A save that changed a privacy setting copies the file it just wrote
+        // into the backups at once, so recovering from a later corrupt
+        // primary cannot bring back the setting as it was before the change.
+        let privacy = privacy_settings_fingerprint(settings);
+        let mut last_privacy = SAVED_PRIVACY_SETTINGS.lock_or_recover();
+        if privacy_settings_changed(*last_privacy, privacy) {
+            match crate::utils::rotate_known_good_backups(&self.file_path, |bytes| {
+                serde_json::from_slice::<AppSettings>(bytes).is_ok()
+            }) {
+                Ok(()) => {
+                    *SETTINGS_BACKUPS_ROTATED_AT.lock_or_recover() =
+                        Some(std::time::Instant::now());
+                    *last_privacy = Some(privacy);
+                }
+                Err(error) => {
+                    crate::log_persist!(warn, "Failed to refresh settings backups: {}", error)
+                }
+            }
+        } else {
+            *last_privacy = Some(privacy);
+        }
         Ok(())
     }
 
@@ -3337,6 +3384,9 @@ pub static SETTINGS: LazyLock<Mutex<AppSettings>> = LazyLock::new(|| {
     let loaded = manager.load();
     crate::emote_renderer::set_animation_enabled(loaded.animate_emotes);
     publish_cached_settings_snapshot(&loaded);
+    SAVED_PRIVACY_SETTINGS
+        .lock_or_recover()
+        .get_or_insert(privacy_settings_fingerprint(&loaded));
     Mutex::new(loaded)
 });
 
@@ -7942,6 +7992,36 @@ pub fn set_deleted_message_mode(mode: DeletedMessageMode) {
 mod salvage_tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[test]
+    fn a_privacy_change_refreshes_the_backups_at_once() {
+        let mut settings = AppSettings::default();
+        let base = privacy_settings_fingerprint(&settings);
+        assert!(!privacy_settings_changed(None, base));
+        assert!(!privacy_settings_changed(Some(base), base));
+
+        settings.font_scale += 0.5;
+        assert_eq!(privacy_settings_fingerprint(&settings), base);
+
+        for edit in [
+            |s: &mut AppSettings| s.anonymous_mode = !s.anonymous_mode,
+            |s: &mut AppSettings| s.chat_logging_enabled = !s.chat_logging_enabled,
+            |s: &mut AppSettings| s.log_deleted_messages = !s.log_deleted_messages,
+            |s: &mut AppSettings| s.persist_history_enabled = !s.persist_history_enabled,
+            |s: &mut AppSettings| {
+                let mut mode = s.streamer_mode.clone().unwrap_or_default();
+                mode.hide_link_urls = !mode.hide_link_urls;
+                s.streamer_mode = Some(mode);
+            },
+        ] {
+            let mut changed = settings.clone();
+            edit(&mut changed);
+            assert!(privacy_settings_changed(
+                Some(base),
+                privacy_settings_fingerprint(&changed)
+            ));
+        }
+    }
 
     #[test]
     fn settings_backups_rotate_on_the_first_save_then_once_per_interval() {

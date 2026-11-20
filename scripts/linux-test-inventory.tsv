@@ -569,6 +569,7 @@ root_test	src/backend/retry.rs	retryable_statuses
 root_test	src/backend/retry.rs	server_wait_delay_jitters_within_cap
 root_test	src/backend/retry.rs	timed_client_view_sets_its_timeout_on_every_request
 root_test	src/backend/settings.rs	a_list_with_no_readable_entry_resets_to_its_default
+root_test	src/backend/settings.rs	a_privacy_change_refreshes_the_backups_at_once
 root_test	src/backend/settings.rs	an_unreadable_list_entry_is_dropped_without_resetting_the_list
 root_test	src/backend/settings.rs	an_unreadable_value_resets_only_its_own_setting
 root_test	src/backend/settings.rs	broken_json_is_left_to_backup_recovery
@@ -586,6 +587,8 @@ root_test	src/backend/settings.rs	switch_on_style_defaults_to_neutral_for_older_
 root_test	src/backend/settings.rs	switch_on_style_serializes_with_stable_values
 root_test	src/backend/settings.rs	the_launch_mode_comes_from_the_sources_the_load_reads_in_its_order
 root_test	src/backend/settings.rs	uploader_config_validates_mapping_edits_and_enable_transitions_only
+root_test	src/backend/settings/secrets.rs	a_failed_delete_at_logout_is_retried_by_the_next_save
+root_test	src/backend/settings/secrets.rs	a_removed_account_whose_delete_failed_is_retried_by_the_next_save
 root_test	src/backend/settings/secrets.rs	every_secret_is_part_of_the_fingerprint
 root_test	src/backend/settings/secrets.rs	keyring_availability_probe_is_cached_when_available
 root_test	src/backend/settings/secrets.rs	keyring_availability_probe_is_cached_when_unavailable
@@ -948,7 +951,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	453
+summary	root_tests	456
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

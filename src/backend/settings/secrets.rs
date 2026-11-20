@@ -321,33 +321,46 @@ fn token_store_get_secret(key: &str) -> Option<String> {
         .filter(|secret| !secret.trim().is_empty())
 }
 
-fn token_store_delete_secret(key: &str) {
+/// Returns whether the fallback file no longer holds `key` (true when it
+/// never did).
+fn token_store_delete_secret(key: &str) -> bool {
     let _guard = TOKEN_STORE_LOCK.lock_or_recover();
     let Ok(mut tokens) = read_token_store() else {
-        return;
+        return false;
     };
-    if tokens.remove(key).is_some() {
-        write_token_store(&tokens);
-    }
+    tokens.remove(key).is_none() || write_token_store(&tokens)
 }
 
-/// Returns whether the secret is now stored in the keyring or the fallback file.
-fn keyring_set_secret(key: &str, value: &str) -> bool {
+/// What storing one secret did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SetOutcome {
+    /// The secret is now stored in the keyring or the fallback file.
+    stored: bool,
+    /// An older copy in the fallback file could not be removed after the
+    /// keyring took the secret.
+    stale_copy_left: bool,
+}
+
+fn keyring_set_secret(key: &str, value: &str) -> SetOutcome {
+    let fallback = |stored| SetOutcome {
+        stored,
+        stale_copy_left: false,
+    };
     if value.is_empty() {
-        return true;
+        return fallback(true);
     }
     match keyring_entry(key) {
         Some(entry) => match entry.set_password(value) {
             Err(e) => {
                 tracing::warn!("Failed to store secret '{}' in keyring: {}", key, e);
-                token_store_set_secret(key, value)
+                fallback(token_store_set_secret(key, value))
             }
-            _ => {
-                token_store_delete_secret(key);
-                true
-            }
+            _ => SetOutcome {
+                stored: true,
+                stale_copy_left: !token_store_delete_secret(key),
+            },
         },
-        None => token_store_set_secret(key, value),
+        None => fallback(token_store_set_secret(key, value)),
     }
 }
 
@@ -366,23 +379,77 @@ fn keyring_get_secret(key: &str) -> Option<String> {
     }
 }
 
-fn keyring_delete_secret(key: &str) {
-    if let Some(entry) = keyring_entry(key) {
-        match entry.delete_credential() {
-            Ok(_) | Err(keyring_core::Error::NoEntry) => {}
-            Err(e) => tracing::warn!("Failed to delete secret '{}' in keyring: {}", key, e),
-        }
-    }
-    token_store_delete_secret(key);
+/// Returns whether neither the keyring nor the fallback file holds `key`
+/// any more. A secret that was not there counts as deleted.
+fn keyring_delete_secret(key: &str) -> bool {
+    let keyring_clear = match keyring_entry(key) {
+        Some(entry) => match entry.delete_credential() {
+            Ok(_) | Err(keyring_core::Error::NoEntry) => true,
+            Err(e) => {
+                tracing::warn!("Failed to delete secret '{}' in keyring: {}", key, e);
+                false
+            }
+        },
+        None => true,
+    };
+    let file_clear = token_store_delete_secret(key);
+    keyring_clear && file_clear
 }
 
+/// Where secrets are written and deleted. The keyring (with its fallback
+/// file) in the app; a double in tests.
+trait SecretBackend {
+    fn set(&self, key: &str, value: &str) -> SetOutcome;
+    /// Whether the secret is gone afterwards (absent counts as gone).
+    fn delete(&self, key: &str) -> bool;
+}
+
+struct SystemSecrets;
+
+impl SecretBackend for SystemSecrets {
+    fn set(&self, key: &str, value: &str) -> SetOutcome {
+        keyring_set_secret(key, value)
+    }
+
+    fn delete(&self, key: &str) -> bool {
+        keyring_delete_secret(key)
+    }
+}
+
+/// Keys whose delete failed when their account was removed. The next save
+/// retries them (see [`store_tokens_with`]) until they are gone.
+static PENDING_SECRET_DELETES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 pub(super) fn clear_account_secrets(username: &str) {
+    clear_account_secrets_with(
+        &SystemSecrets,
+        &PERSISTED_SECRETS,
+        &PENDING_SECRET_DELETES,
+        username,
+    );
+}
+
+fn clear_account_secrets_with(
+    backend: &impl SecretBackend,
+    persisted: &Mutex<Option<u64>>,
+    pending: &Mutex<Vec<String>>,
+    username: &str,
+) {
     // Held across the deletes so a concurrent save cannot record the old
     // secrets as stored in between.
-    let mut persisted = PERSISTED_SECRETS.lock_or_recover();
+    let mut persisted = persisted.lock_or_recover();
     *persisted = None;
-    keyring_delete_secret(&account_token_key(username));
-    keyring_delete_secret(&account_refresh_token_key(username));
+    for key in [
+        account_token_key(username),
+        account_refresh_token_key(username),
+    ] {
+        if !backend.delete(&key) {
+            let mut pending = pending.lock_or_recover();
+            if !pending.contains(&key) {
+                pending.push(key);
+            }
+        }
+    }
 }
 
 /// Fingerprint of the secrets the last fully successful
@@ -406,11 +473,24 @@ fn secrets_fingerprint(settings: &AppSettings) -> u64 {
     hasher.finish()
 }
 
-/// Run `store` unless `persisted` says these exact secrets are already stored.
+/// What one run of [`store_tokens_with`] left undone.
+#[derive(Debug, Default, PartialEq)]
+struct StoreOutcome {
+    /// Secrets stored in neither the keyring nor the fallback file.
+    failed_stores: Vec<String>,
+    /// A delete (of a signed-out token, a removed account's token, or a stale
+    /// fallback copy) failed, so the next save must try again.
+    deletes_pending: bool,
+}
+
+/// Run `store` unless `persisted` says these exact secrets are already
+/// stored. The record is set only when everything was stored and deleted; a
+/// failed delete is retried by the next save without warning the user, who is
+/// warned only about secrets that could not be stored.
 fn persist_unless_unchanged(
     persisted: &Mutex<Option<u64>>,
     settings: &AppSettings,
-    store: impl FnOnce(&AppSettings) -> Result<(), Vec<String>>,
+    store: impl FnOnce(&AppSettings) -> StoreOutcome,
 ) -> Result<(), Vec<String>> {
     let fingerprint = secrets_fingerprint(settings);
     let mut persisted = persisted.lock_or_recover();
@@ -418,11 +498,15 @@ fn persist_unless_unchanged(
         return Ok(());
     }
     *persisted = None;
-    let result = store(settings);
-    if result.is_ok() {
-        *persisted = Some(fingerprint);
+    let outcome = store(settings);
+    if outcome.failed_stores.is_empty() {
+        if !outcome.deletes_pending {
+            *persisted = Some(fingerprint);
+        }
+        Ok(())
+    } else {
+        Err(outcome.failed_stores)
     }
-    result
 }
 
 /// Store every runtime token in the keyring (or the fallback file). Returns
@@ -430,27 +514,56 @@ fn persist_unless_unchanged(
 /// those sign-ins will not survive a restart. Skipped when the same secrets
 /// were stored by the last call that fully succeeded.
 pub(super) fn persist_tokens_to_keyring(settings: &AppSettings) -> Result<(), Vec<String>> {
-    persist_unless_unchanged(&PERSISTED_SECRETS, settings, store_tokens)
+    persist_unless_unchanged(&PERSISTED_SECRETS, settings, |settings| {
+        store_tokens_with(&SystemSecrets, &PENDING_SECRET_DELETES, settings)
+    })
 }
 
-fn store_tokens(settings: &AppSettings) -> Result<(), Vec<String>> {
-    let mut failed = Vec::new();
+fn store_tokens_with(
+    backend: &impl SecretBackend,
+    pending: &Mutex<Vec<String>>,
+    settings: &AppSettings,
+) -> StoreOutcome {
+    let mut outcome = StoreOutcome::default();
+
+    // Retry the deletes a removed account left behind, except for keys this
+    // save stores anyway (the account was added back).
+    let stored_now = |key: &str| {
+        settings.accounts.iter().any(|account| {
+            (!account.token.is_empty() && key == account_token_key(&account.username))
+                || (account.refresh_token.is_some()
+                    && key == account_refresh_token_key(&account.username))
+        })
+    };
+    {
+        let mut pending = pending.lock_or_recover();
+        pending.retain(|key| !stored_now(key) && !backend.delete(key));
+        outcome.deletes_pending |= !pending.is_empty();
+    }
+
+    // A signed-out session's active keys must go.
+    for (key, present) in [
+        (KEY_ACTIVE_TOKEN, settings.token.is_some()),
+        (KEY_ACTIVE_REFRESH_TOKEN, settings.refresh_token.is_some()),
+    ] {
+        if !present && !backend.delete(key) {
+            outcome.deletes_pending = true;
+        }
+    }
+
     let mut store = |key: String, value: &str| {
-        if !keyring_set_secret(&key, value) {
-            failed.push(key);
+        let result = backend.set(&key, value);
+        outcome.deletes_pending |= result.stale_copy_left;
+        if !result.stored {
+            outcome.failed_stores.push(key);
         }
     };
 
     if let Some(token) = settings.token.as_deref() {
         store(KEY_ACTIVE_TOKEN.to_string(), token);
-    } else {
-        keyring_delete_secret(KEY_ACTIVE_TOKEN);
     }
-
     if let Some(refresh) = settings.refresh_token.as_deref() {
         store(KEY_ACTIVE_REFRESH_TOKEN.to_string(), refresh);
-    } else {
-        keyring_delete_secret(KEY_ACTIVE_REFRESH_TOKEN);
     }
 
     for account in &settings.accounts {
@@ -462,11 +575,7 @@ fn store_tokens(settings: &AppSettings) -> Result<(), Vec<String>> {
         }
     }
 
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(failed)
-    }
+    outcome
 }
 
 pub(super) fn has_plaintext_runtime_tokens(settings: &AppSettings) -> bool {
@@ -511,8 +620,143 @@ pub(super) fn hydrate_tokens_from_keyring(settings: &mut AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_keyring_availability, open_token_store, persist_unless_unchanged, seal_token_store,
+        SecretBackend, SetOutcome, StoreOutcome, cached_keyring_availability,
+        clear_account_secrets_with, open_token_store, persist_unless_unchanged, seal_token_store,
+        store_tokens_with,
     };
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    /// An in-memory keyring whose deletes can be made to fail.
+    #[derive(Default)]
+    struct FakeKeyring {
+        secrets: RefCell<HashMap<String, String>>,
+        fail_deletes: Cell<bool>,
+        operations: Cell<usize>,
+    }
+
+    impl SecretBackend for FakeKeyring {
+        fn set(&self, key: &str, value: &str) -> SetOutcome {
+            self.operations.set(self.operations.get() + 1);
+            self.secrets
+                .borrow_mut()
+                .insert(key.to_string(), value.to_string());
+            SetOutcome {
+                stored: true,
+                stale_copy_left: false,
+            }
+        }
+
+        fn delete(&self, key: &str) -> bool {
+            self.operations.set(self.operations.get() + 1);
+            if self.fail_deletes.get() && self.secrets.borrow().contains_key(key) {
+                return false;
+            }
+            self.secrets.borrow_mut().remove(key);
+            true
+        }
+    }
+
+    #[test]
+    fn a_failed_delete_at_logout_is_retried_by_the_next_save() {
+        let keyring = FakeKeyring::default();
+        let persisted = Mutex::new(None);
+        let pending = Mutex::new(Vec::new());
+        let save = |settings: &super::AppSettings| {
+            persist_unless_unchanged(&persisted, settings, |settings| {
+                store_tokens_with(&keyring, &pending, settings)
+            })
+        };
+
+        let mut settings = super::AppSettings::default();
+        settings.token = Some("access".to_string());
+        settings.refresh_token = Some("refresh".to_string());
+        assert_eq!(save(&settings), Ok(()));
+        assert!(keyring.secrets.borrow().contains_key("active_access_token"));
+
+        // Logout while the keyring refuses deletes: no warning (nothing failed
+        // to store), but the signed-out state is not recorded as stored.
+        settings.token = None;
+        settings.refresh_token = None;
+        keyring.fail_deletes.set(true);
+        assert_eq!(save(&settings), Ok(()));
+        assert!(persisted.lock().unwrap().is_none());
+        assert!(keyring.secrets.borrow().contains_key("active_access_token"));
+
+        // Later saves retry until the deletes go through, then stop.
+        assert_eq!(save(&settings), Ok(()));
+        assert!(keyring.secrets.borrow().contains_key("active_access_token"));
+        keyring.fail_deletes.set(false);
+        assert_eq!(save(&settings), Ok(()));
+        assert!(keyring.secrets.borrow().is_empty());
+        assert!(persisted.lock().unwrap().is_some());
+        let operations = keyring.operations.get();
+        assert_eq!(save(&settings), Ok(()));
+        assert_eq!(keyring.operations.get(), operations);
+    }
+
+    #[test]
+    fn a_removed_account_whose_delete_failed_is_retried_by_the_next_save() {
+        let keyring = FakeKeyring::default();
+        let persisted = Mutex::new(None);
+        let pending = Mutex::new(Vec::new());
+        let save = |settings: &super::AppSettings| {
+            persist_unless_unchanged(&persisted, settings, |settings| {
+                store_tokens_with(&keyring, &pending, settings)
+            })
+        };
+        let mut settings = super::AppSettings::default();
+        settings.accounts.push(super::super::Account {
+            username: "viewer".to_string(),
+            display_name: None,
+            profile_image_url: None,
+            token: "account".to_string(),
+            refresh_token: Some("account-refresh".to_string()),
+            client_id: String::new(),
+            is_active: false,
+            token_expires_at: None,
+        });
+        assert_eq!(save(&settings), Ok(()));
+        assert_eq!(keyring.secrets.borrow().len(), 2);
+
+        keyring.fail_deletes.set(true);
+        clear_account_secrets_with(&keyring, &persisted, &pending, "viewer");
+        settings.accounts.clear();
+        assert_eq!(pending.lock().unwrap().len(), 2);
+        assert_eq!(save(&settings), Ok(()));
+        assert_eq!(keyring.secrets.borrow().len(), 2);
+        assert!(persisted.lock().unwrap().is_none());
+
+        keyring.fail_deletes.set(false);
+        assert_eq!(save(&settings), Ok(()));
+        assert!(keyring.secrets.borrow().is_empty());
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(persisted.lock().unwrap().is_some());
+
+        // An account added back before the retry keeps its new secrets.
+        let mut pending_keys = pending.lock().unwrap();
+        pending_keys.push(super::account_token_key("again"));
+        drop(pending_keys);
+        settings.accounts.push(super::super::Account {
+            username: "again".to_string(),
+            display_name: None,
+            profile_image_url: None,
+            token: "new".to_string(),
+            refresh_token: None,
+            client_id: String::new(),
+            is_active: false,
+            token_expires_at: None,
+        });
+        assert_eq!(save(&settings), Ok(()));
+        assert_eq!(
+            keyring
+                .secrets
+                .borrow()
+                .get(&super::account_token_key("again")),
+            Some(&"new".to_string())
+        );
+        assert!(pending.lock().unwrap().is_empty());
+    }
     use core::prelude::v1::test;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -523,7 +767,7 @@ mod tests {
         let writes = AtomicUsize::new(0);
         let ok = |_: &super::AppSettings| {
             writes.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            StoreOutcome::default()
         };
         let mut settings = super::AppSettings::default();
         settings.token = Some("access".to_string());
@@ -539,7 +783,10 @@ mod tests {
 
         // A failed write is retried by the next save with the same secrets.
         settings.refresh_token = Some("refresh".to_string());
-        let failed = |_: &super::AppSettings| Err(vec!["active_refresh_token".to_string()]);
+        let failed = |_: &super::AppSettings| StoreOutcome {
+            failed_stores: vec!["active_refresh_token".to_string()],
+            deletes_pending: false,
+        };
         assert!(persist_unless_unchanged(&persisted, &settings, failed).is_err());
         assert_eq!(persist_unless_unchanged(&persisted, &settings, ok), Ok(()));
         assert_eq!(writes.load(Ordering::Relaxed), 2);
