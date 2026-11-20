@@ -954,8 +954,11 @@ impl DiskLayer {
     /// trigger that finds one already waiting leaves its write to it, because
     /// that save snapshots after the running one ends. A burst of inserts
     /// therefore costs one save at a time instead of one full serialize,
-    /// compress and fsync per insert, and its last writes are still saved
-    /// when it ends. Writes a snapshot missed stay counted.
+    /// compress and fsync per insert, and due writes that land while a save
+    /// runs are saved by the one after it. Only a due write (by the autosave
+    /// policy) arms a save, so writes after the last snapshot that are not due
+    /// yet stay counted until the next due write or the shutdown save, as
+    /// they did before autosaves were coalesced.
     fn spawn_autosave(
         &self,
         state: &Arc<IndexSaveState>,
@@ -971,9 +974,12 @@ impl DiskLayer {
         tokio::spawn(async move {
             let _ = loading.wait_for(Option::is_none).await;
             let _save_guard = state.lock.lock().await;
-            // A write counted after this starts its own autosave; every
-            // earlier one is in the snapshot below.
-            state.autosave_pending.store(false, Ordering::Release);
+            // A due write whose swap of the flag comes after this one sees
+            // false and arms the next autosave. One whose swap came before
+            // is ordered before this read-modify-write (it read the release
+            // of that swap), so its count and its index write are visible to
+            // the count read and the snapshot below.
+            state.autosave_pending.swap(false, Ordering::AcqRel);
             let saved_writes = state.writes_before_snapshot();
             if saved_writes == 0 {
                 return;
