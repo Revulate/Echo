@@ -8,15 +8,39 @@ use crate::backend::ChatMessage;
 /// Minimum first snapshot size where estimated-height seeding is cheaper than a full rebuild.
 const INITIAL_SNAPSHOT_FAST_PATH_MIN_MESSAGES: usize = 32;
 
+/// The model update `apply_messages` makes for the next snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UpdateKind {
+    /// The same list, or a same-length one with nothing to apply.
+    Unchanged,
+    /// The same ids in the same order, some rows replaced in place.
+    SameOrder,
+    /// The current rows followed by new ones.
+    Append,
+    /// The first snapshot of a split, large enough to seed with estimates.
+    InitialSnapshot,
+    /// The current rows, contiguous, from `existing_start` on, with rows
+    /// before them and possibly after them (a history merge).
+    InsertAround { existing_start: usize },
+    /// Any other shape: a front drop with or without an append when the
+    /// model can apply one, otherwise a rebuild.
+    Reshape(Reshape),
+}
+
+/// Which kind of change led to [`UpdateKind::Reshape`], for its log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reshape {
+    Grew,
+    SameCount,
+    Shrank,
+}
+
 pub(super) struct MessageDeltaPlan {
+    pub(super) kind: UpdateKind,
     pub(super) content_changed: bool,
     pub(super) count_increased: bool,
     pub(super) had_new_messages: bool,
-    pub(super) added_count: usize,
     pub(super) old_order_matches_prefix: bool,
-    pub(super) old_order_matches_suffix: bool,
-    pub(super) old_order_middle_start: Option<usize>,
-    pub(super) is_initial_snapshot_fast_path: bool,
 }
 
 impl MessageDeltaPlan {
@@ -64,15 +88,38 @@ impl MessageDeltaPlan {
             && height_tree_len == 0
             && new_count >= INITIAL_SNAPSHOT_FAST_PATH_MIN_MESSAGES;
 
+        let kind = if count_increased {
+            if old_order_matches_prefix {
+                UpdateKind::Append
+            } else if is_initial_snapshot_fast_path {
+                UpdateKind::InitialSnapshot
+            } else if old_order_matches_suffix {
+                UpdateKind::InsertAround {
+                    existing_start: added_count,
+                }
+            } else if let Some(existing_start) = old_order_middle_start {
+                UpdateKind::InsertAround { existing_start }
+            } else {
+                UpdateKind::Reshape(Reshape::Grew)
+            }
+        } else if new_count == old_count && content_changed && new_count > 0 {
+            if message_order.len() == new_count && ids_align(message_order, next_messages) {
+                UpdateKind::SameOrder
+            } else {
+                UpdateKind::Reshape(Reshape::SameCount)
+            }
+        } else if new_count < old_count {
+            UpdateKind::Reshape(Reshape::Shrank)
+        } else {
+            UpdateKind::Unchanged
+        };
+
         Self {
+            kind,
             content_changed,
             count_increased,
             had_new_messages,
-            added_count,
             old_order_matches_prefix,
-            old_order_matches_suffix,
-            old_order_middle_start,
-            is_initial_snapshot_fast_path,
         }
     }
 }
@@ -140,13 +187,15 @@ pub(super) fn range_after_front_drop(
 
 #[cfg(test)]
 mod tests {
-    use super::super::CanvasMessageList;
     use super::super::model::MessageListModel;
+    use super::super::state::{LayoutRuntimeState, PreloadState};
     use super::*;
     use crate::components::chat::chat_view::shown_rows_are_current;
     use core::prelude::v1::test;
+    use echo_chat_render::layout::message_content_fingerprint;
     use echo_core::chat_snapshot::ChatSnapshot;
     use echo_core::reveal_pacer::RevealPacer;
+    use rustc_hash::FxHashMap;
     use std::time::{Duration, Instant};
 
     type Rows = Arc<Vec<Arc<ChatMessage>>>;
@@ -194,25 +243,24 @@ mod tests {
         assert_eq!(front_drop(&[], &rows(&["a"])), None, "empty order");
     }
 
-    fn height_of(id: &str) -> f32 {
-        let hash = id.bytes().fold(7u32, |hash, byte| {
+    /// The height a row lays out to: it depends on the id and on what layout
+    /// reads from the row, so a row replaced in place can change height.
+    fn true_height(message: &ChatMessage) -> f32 {
+        let hash = message.id.bytes().fold(7u32, |hash, byte| {
             hash.wrapping_mul(31).wrapping_add(u32::from(byte))
         });
         (hash % 40 + 12) as f32
+            + (message.content.len() % 4) as f32 * 7.0
+            + if message.flags.is_deleted { 3.0 } else { 0.0 }
     }
 
-    /// The model `rebuild_message_model_from` produces, with each row's
-    /// height a function of its id.
+    /// A model built from scratch with every row at its true height: what a
+    /// split converges to once nothing is pending or stale.
     fn rebuilt(next: &Rows) -> MessageListModel {
         let mut model = MessageListModel::initial();
-        for (index, message) in next.iter().enumerate() {
-            let id = SharedString::from(message.id.clone());
-            model.message_order.push(id.clone());
-            model.insert_message_index(id, index);
-            model.height_tree.push(height_of(&message.id));
-        }
-        model.sync_total_height();
         model.messages = next.clone();
+        let heights: Vec<f32> = next.iter().map(|message| true_height(message)).collect();
+        model.reset_rows(next, &heights);
         model
     }
 
@@ -230,8 +278,8 @@ mod tests {
         for (index, message) in expected.messages.iter().enumerate() {
             assert_eq!(
                 model.get_message_index(&message.id),
-                Some(index),
-                "{context}"
+                expected.get_message_index(&message.id),
+                "{context}: index of row {index}"
             );
             assert_eq!(
                 model.height_tree.height_at(index),
@@ -251,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_refuses_a_front_drop_it_cannot_prove() {
+    fn the_model_refuses_a_front_drop_outside_its_guards() {
         let base: Rows = Arc::new(rows(&["a", "b", "c", "d"]));
         let fresh = || rebuilt(&base);
 
@@ -260,7 +308,7 @@ mod tests {
         assert!(model.drop_front_and_append(1, &appended, 0));
         let next: Rows = Arc::new(base[1..].iter().cloned().chain(appended).collect());
         for message in &next[3..] {
-            model.height_tree.push(height_of(&message.id));
+            model.height_tree.push(true_height(message));
         }
         model.sync_total_height();
         model.messages = next.clone();
@@ -304,151 +352,392 @@ mod tests {
         refused(lagging, 1, &["e"], 0, "order behind the rows");
     }
 
-    /// One split's model, synced the way `apply_messages` and the
-    /// `update_layouts` passes do it, with heights a function of the id.
+    /// The reviewer's case: two appends in one frame, then a history merge
+    /// that both prepends and appends (a gap fill), before the frame renders.
+    /// The merge must add its appended rows to the rows already waiting for
+    /// heights rather than replace their count.
+    #[test]
+    fn a_history_merge_after_two_appends_in_one_frame_keeps_the_waiting_rows() {
+        let base: Rows = Arc::new(rows(&["a", "b", "c"]));
+        let mut model = rebuilt(&base);
+        let mut pending = 0usize;
+        let classify = |model: &MessageListModel, next: &Rows| {
+            MessageDeltaPlan::classify(
+                &model.messages,
+                &model.message_order,
+                model.height_tree.len(),
+                next,
+            )
+        };
+
+        let a: Rows = Arc::new(rows(&["a", "b", "c", "d"]));
+        assert_eq!(classify(&model, &a).kind, UpdateKind::Append);
+        model.append_rows(&a, &mut pending);
+        model.messages = a.clone();
+
+        let b: Rows = Arc::new(a.iter().cloned().chain(rows(&["e"])).collect());
+        assert_eq!(
+            classify(&model, &b).kind,
+            UpdateKind::Reshape(Reshape::Grew)
+        );
+        let front = model.front_drop_shape(&b, &mut pending).expect("an append");
+        assert_eq!(model.apply_front_drop(&b, front, &mut pending), Some(false));
+        model.messages = b.clone();
+        assert_eq!(pending, 2, "d and e wait for heights");
+
+        let c: Rows = Arc::new(
+            rows(&["h"])
+                .into_iter()
+                .chain(b.iter().cloned())
+                .chain(rows(&["f"]))
+                .collect(),
+        );
+        let UpdateKind::InsertAround { existing_start } = classify(&model, &c).kind else {
+            panic!("a history merge around the rows");
+        };
+        let heights: Vec<f32> = c[..existing_start].iter().map(|m| true_height(m)).collect();
+        model.insert_around(&c, existing_start, &heights, &mut pending);
+        model.messages = c.clone();
+        assert_eq!(pending, 3, "d, e and f wait for heights");
+
+        // update_layouts' pending-row pass.
+        let start = model.message_order.len() - pending;
+        for message in &c[start..] {
+            model.height_tree.push(true_height(message));
+        }
+        model.sync_total_height();
+        assert_same_model(&model, &rebuilt(&c), "after the pending-row pass");
+    }
+
+    /// Row-index state a split keeps beside its model, standing in for the
+    /// prepared paint rows, the preload and layout ranges and the
+    /// stale-layout cursor: each records the row it named when set.
+    #[derive(Default)]
+    struct IndexState {
+        prepared: Vec<(usize, SharedString)>,
+        /// The last row of each range when it was set.
+        range_ends: Vec<SharedString>,
+        stale_cursor_row: Option<SharedString>,
+    }
+
+    /// One split's model, synced through the same `MessageDeltaPlan`
+    /// decision and `MessageListModel` steps `apply_messages` uses, with
+    /// `update_layouts` modelled around a layout cache of true heights.
     struct Split {
         model: MessageListModel,
         pending: usize,
+        needs_layout_rebuild: bool,
+        stale: bool,
+        width_refresh: bool,
+        /// Laid-out rows: id to (content fingerprint, height).
+        layouts: FxHashMap<Arc<str>, (u64, f32)>,
+        /// Rows whose async layout was requested (history priming).
+        primed: Vec<Arc<str>>,
+        preload: PreloadState,
+        runtime: LayoutRuntimeState,
+        index_state: IndexState,
         front_drops: usize,
         rebuilds: usize,
         caught_up: usize,
-        /// Stand-ins for the prepared paint rows (index, id) and the emote
-        /// preload range of the last frame, remapped like the real ones.
-        prepared: Vec<(usize, SharedString)>,
-        preload_range: Option<(usize, usize)>,
+        merges: usize,
     }
+
+    const ESTIMATED_HEIGHT: f32 = 42.0;
 
     impl Split {
         fn new() -> Self {
             Self {
                 model: MessageListModel::initial(),
                 pending: 0,
+                needs_layout_rebuild: false,
+                stale: false,
+                width_refresh: false,
+                layouts: FxHashMap::default(),
+                primed: Vec::new(),
+                preload: PreloadState::initial(),
+                runtime: LayoutRuntimeState::initial(800.0, 1.0),
+                index_state: IndexState::default(),
                 front_drops: 0,
                 rebuilds: 0,
                 caught_up: 0,
-                prepared: Vec::new(),
-                preload_range: None,
+                merges: 0,
             }
         }
 
-        /// `apply_messages`' model work for the shapes it tells apart; the
-        /// prepend paths are folded into the rebuild, which they equal.
+        fn lay_out(&mut self, message: &ChatMessage) -> f32 {
+            let height = true_height(message);
+            self.layouts.insert(
+                Arc::clone(&message.id),
+                (message_content_fingerprint(message), height),
+            );
+            height
+        }
+
+        /// `cached_or_estimated_height`: a cached layout's height whether or
+        /// not it is stale for the row, else the estimate.
+        fn cached_or_estimated(&self, rows: &[Arc<ChatMessage>]) -> Vec<f32> {
+            rows.iter()
+                .map(|message| {
+                    self.layouts
+                        .get(&message.id)
+                        .map_or(ESTIMATED_HEIGHT, |&(_, height)| height)
+                })
+                .collect()
+        }
+
+        fn rebuild(&mut self, next: &Rows) {
+            let heights = self.cached_or_estimated(next);
+            self.model.reset_rows(next, &heights);
+            self.pending = 0;
+            self.needs_layout_rebuild = false;
+            self.stale = true;
+            self.width_refresh = true;
+            self.preload.emote_scan.reset();
+            self.index_state.prepared.clear();
+            self.index_state.stale_cursor_row = None;
+            self.rebuilds += 1;
+        }
+
+        /// `mark_stale`, which restarts the stale-layout scan.
+        fn mark_stale(&mut self) {
+            self.stale = true;
+            self.runtime.reset_stale_scan();
+            self.index_state.stale_cursor_row = None;
+        }
+
+        fn front_dropped(&mut self, dropped: usize) {
+            let state = &mut self.index_state;
+            state.prepared = remap_after_front_drop(&state.prepared, dropped, |row| &mut row.0);
+            if self.runtime.stale_layout_refresh_cursor < dropped {
+                state.stale_cursor_row = None;
+            }
+            self.preload.shift_after_front_drop(dropped);
+            self.runtime.shift_stale_scan_after_front_drop(dropped);
+        }
+
+        /// `apply_messages`' model work.
         fn sync(&mut self, next: &Rows) {
             if Arc::ptr_eq(&self.model.messages, next) {
                 return;
             }
-            let model = &mut self.model;
             let plan = MessageDeltaPlan::classify(
-                &model.messages,
-                &model.message_order,
-                model.height_tree.len(),
+                &self.model.messages,
+                &self.model.message_order,
+                self.model.height_tree.len(),
                 next,
             );
-            let (old, new) = (model.messages.len(), next.len());
-            let lagging_order_ok = !(plan.count_increased && plan.old_order_matches_prefix)
-                && !(new == old
-                    && model.message_order.len() == new
-                    && ids_align(&model.message_order, next));
-            if lagging_order_ok {
-                let added = model.complete_lagging_order(self.pending);
-                self.pending += added;
-                self.caught_up += usize::from(added > 0);
-            }
-            let front = (model.message_order.len() == old)
-                .then(|| front_drop(&model.message_order, next))
-                .flatten()
-                .filter(|front| {
-                    front.dropped <= CanvasMessageList::incremental_rotation_limit(new)
-                        || front.dropped * 2 <= new
-                });
-            if plan.count_increased && plan.old_order_matches_prefix {
-                for (index, message) in next.iter().enumerate().skip(old) {
-                    let id = SharedString::from(message.id.clone());
-                    if self.pending > 0 {
-                        model.message_order.push(id.clone());
+            let (old_count, new_count) = (self.model.messages.len(), next.len());
+            let mut pending = self.pending;
+            match plan.kind {
+                UpdateKind::Unchanged => {}
+                UpdateKind::SameOrder => {
+                    self.model.rebuild_message_index_from_order();
+                    self.mark_stale();
+                }
+                UpdateKind::Append => {
+                    if self.model.kept_rows_changed(0, &next[..old_count]) {
+                        self.mark_stale();
                     }
-                    model.insert_message_index(id, index);
+                    self.model.append_rows(next, &mut pending);
+                    self.preload.note_new_rows(old_count);
                 }
-                if self.pending > 0 {
-                    self.pending += new - old;
+                UpdateKind::InitialSnapshot => {
+                    self.rebuild(next);
+                    pending = 0;
+                    self.primed
+                        .extend(next.iter().rev().take(192).map(|m| Arc::clone(&m.id)));
                 }
-            } else if new == old
-                && model.message_order.len() == new
-                && ids_align(&model.message_order, next)
-            {
-                model.rebuild_message_index_from_order();
-            } else if let Some(front) = front
-                && model.drop_front_and_append(
-                    front.dropped,
-                    &next[new - front.appended..],
-                    self.pending,
-                )
-            {
-                self.pending += front.appended;
-                self.front_drops += 1;
-                self.prepared =
-                    remap_after_front_drop(&self.prepared, front.dropped, |row| &mut row.0);
-                self.preload_range = self
-                    .preload_range
-                    .and_then(|range| range_after_front_drop(range, front.dropped));
-            } else {
-                *model = rebuilt(next);
-                self.pending = 0;
-                self.rebuilds += 1;
-                self.prepared.clear();
-                self.preload_range = None;
+                UpdateKind::InsertAround { existing_start } => {
+                    let heights = self.cached_or_estimated(&next[..existing_start]);
+                    self.model
+                        .insert_around(next, existing_start, &heights, &mut pending);
+                    self.stale = true;
+                    self.preload.emote_scan.reset();
+                    self.index_state.prepared.clear();
+                    self.index_state.stale_cursor_row = None;
+                    self.primed.extend(
+                        next[..existing_start]
+                            .iter()
+                            .rev()
+                            .take(192)
+                            .map(|m| Arc::clone(&m.id)),
+                    );
+                    self.merges += 1;
+                }
+                UpdateKind::Reshape(_) => {
+                    let before = pending;
+                    let front = self.model.front_drop_shape(next, &mut pending);
+                    self.caught_up += usize::from(pending > before);
+                    let applied = front.and_then(|front| {
+                        self.model
+                            .apply_front_drop(next, front, &mut pending)
+                            .map(|kept_changed| (front, kept_changed))
+                    });
+                    match applied {
+                        Some((front, kept_changed)) => {
+                            if kept_changed {
+                                self.mark_stale();
+                            }
+                            if front.dropped > 0 {
+                                self.front_dropped(front.dropped);
+                            }
+                            if front.appended > 0 {
+                                self.preload.note_new_rows(new_count - front.appended);
+                            }
+                            self.front_drops += 1;
+                        }
+                        None => {
+                            self.rebuild(next);
+                            pending = 0;
+                        }
+                    }
+                }
             }
+            self.pending = pending;
             self.model.messages = next.clone();
         }
 
-        /// `update_layouts`' pending-row and append passes, or its rebuild
-        /// when the order no longer matches.
+        /// `queue_layout_rebuild` (a width-bucket change), which drops the
+        /// pending count, or `invalidate_local_layouts`, which keeps it.
+        fn queue_layout_rebuild(&mut self, drop_pending: bool) {
+            self.needs_layout_rebuild = true;
+            self.stale = true;
+            if drop_pending {
+                self.pending = 0;
+            }
+        }
+
+        /// `update_layouts`: the queued-rebuild check, the pending-row pass
+        /// (which returns), the append pass (which returns), the full
+        /// rebuild of a mismatched order, then the stale refresh; async
+        /// layouts land by id.
         fn render(&mut self) {
-            let model = &mut self.model;
-            let messages = model.messages.clone();
+            let messages = self.model.messages.clone();
+            let n = messages.len();
+            if n == 0 {
+                // Nothing left to lay out or refresh.
+                self.model.message_order.clear();
+                self.model.height_tree.clear();
+                self.model.sync_total_height();
+                self.pending = 0;
+                self.stale = false;
+                self.width_refresh = false;
+                return;
+            }
+            if std::mem::take(&mut self.needs_layout_rebuild) {
+                if self.model.order_and_heights_match(self.pending) {
+                    self.width_refresh = true;
+                } else {
+                    self.model.message_order.clear();
+                    self.model.height_tree.clear();
+                    self.pending = 0;
+                }
+            }
+            for id in std::mem::take(&mut self.primed) {
+                if let Some(index) = self.model.get_message_index(&id)
+                    && index < self.model.height_tree.len()
+                {
+                    let height = self.lay_out(&messages[index]);
+                    self.model.height_tree.update(index, height);
+                }
+            }
             if self.pending > 0 {
-                let start = model.message_order.len() - self.pending;
+                let start = self.model.message_order.len() - self.pending;
                 for message in &messages[start..] {
-                    model.height_tree.push(height_of(&message.id));
+                    let height = self.lay_out(message);
+                    self.model.height_tree.push(height);
                 }
                 self.pending = 0;
-                // The real pass returns here; rows a prefix append left out
-                // of the order would wait for the next frame.
-                model.sync_total_height();
-                return;
-            } else if model.message_order.len() < messages.len()
-                && model.message_order.first().map(|id| id.as_ref())
-                    == messages.first().map(|message| message.id.as_ref())
+            } else if !self.model.message_order.is_empty()
+                && self.model.message_order.len() < n
+                && self.model.message_order[0].as_ref() == messages[0].id.as_ref()
             {
-                for message in &messages[model.message_order.len()..] {
-                    model
+                for message in &messages[self.model.message_order.len()..] {
+                    self.model
                         .message_order
                         .push(SharedString::from(message.id.clone()));
-                    model.height_tree.push(height_of(&message.id));
+                    let height = self.lay_out(message);
+                    self.model.height_tree.push(height);
                 }
-            } else if model.message_order.len() != messages.len()
-                || model.height_tree.len() != messages.len()
-            {
-                *model = rebuilt(&messages);
+            } else if self.model.message_order.len() != n || self.model.height_tree.len() != n {
+                let heights: Vec<f32> = messages.iter().map(|m| self.lay_out(m)).collect();
+                self.model.reset_rows(&messages, &heights);
+                self.stale = false;
+                self.width_refresh = false;
+            } else if self.stale || self.width_refresh {
+                for (index, message) in messages.iter().enumerate() {
+                    let fingerprint = message_content_fingerprint(message);
+                    let height = match self.layouts.get(&message.id) {
+                        Some(&(cached, height)) if cached == fingerprint => {
+                            if !self.width_refresh {
+                                continue;
+                            }
+                            height
+                        }
+                        None if !self.width_refresh => continue,
+                        _ => self.lay_out(message),
+                    };
+                    self.model.height_tree.update(index, height);
+                }
+                self.stale = false;
+                self.width_refresh = false;
             }
-            model.sync_total_height();
-            // Every prepared row kept across front drops still names its
-            // own row, and the kept preload range lies within the rows.
-            for (index, id) in &self.prepared {
-                assert_eq!(
-                    model.message_order.get(*index),
-                    Some(id),
-                    "prepared row {index}"
-                );
+            self.model.sync_total_height();
+            // Nothing a render leaves is short of heights for the rows the
+            // order holds.
+            assert_eq!(
+                self.model.height_tree.len(),
+                self.model.message_order.len(),
+                "heights after a render"
+            );
+            self.check_index_state();
+        }
+
+        /// Every piece of index state still names the row it named.
+        fn check_index_state(&mut self) {
+            let order = &self.model.message_order;
+            for (index, id) in &self.index_state.prepared {
+                assert_eq!(order.get(*index), Some(id), "prepared row {index}");
             }
-            if let Some((start, end)) = self.preload_range {
-                assert!(start <= end && end <= model.message_order.len());
+            let ranges = [self.preload.emote_scan.range()];
+            for (range, end_row) in ranges.iter().zip(&self.index_state.range_ends) {
+                if let Some((start, end)) = *range {
+                    assert!(start < end && end <= order.len(), "range {start}..{end}");
+                    assert_eq!(&order[end - 1], end_row, "last row of {start}..{end}");
+                }
             }
-            let len = model.message_order.len();
-            self.prepared = (len.saturating_sub(20)..len)
-                .map(|index| (index, model.message_order[index].clone()))
+            if let Some(row) = &self.index_state.stale_cursor_row {
+                let cursor = self.runtime.stale_layout_refresh_cursor;
+                assert_eq!(order.get(cursor), Some(row), "stale-scan cursor");
+            }
+            // Set them again on the rows this render shows.
+            let len = order.len();
+            self.index_state.prepared = (len.saturating_sub(20)..len)
+                .map(|index| (index, order[index].clone()))
                 .collect();
-            self.preload_range = Some((len.saturating_sub(25), len));
+            let range = (len.saturating_sub(25), len);
+            let now = Instant::now();
+            self.preload
+                .emote_scan
+                .rows_to_scan(range, 0, Duration::ZERO, 64, now);
+            self.index_state.range_ends = if len > 0 {
+                vec![order[len - 1].clone()]
+            } else {
+                Vec::new()
+            };
+            let cursor = len.saturating_sub(30);
+            self.runtime.stale_layout_refresh_cursor = cursor;
+            self.index_state.stale_cursor_row = order.get(cursor).cloned();
+        }
+
+        /// Render until nothing is pending or stale, then compare with a
+        /// model built from scratch.
+        fn settle(&mut self, context: &str) {
+            for _ in 0..4 {
+                self.render();
+            }
+            assert!(self.pending == 0 && !self.stale && !self.width_refresh);
+            assert_same_model(&self.model, &rebuilt(&self.model.messages), context);
         }
     }
 
@@ -481,6 +770,8 @@ mod tests {
         clock_ms: i64,
         next_id: u64,
         reused: usize,
+        /// The split hides deleted rows (its deleted-message mode).
+        hide_deleted: bool,
     }
 
     impl Channel {
@@ -493,14 +784,15 @@ mod tests {
                 clock_ms: 1_700_000_000_000,
                 next_id: 0,
                 reused: 0,
+                hide_deleted: false,
             }
         }
 
-        fn live_row(&mut self) -> ChatMessage {
+        fn live_row(&mut self, prefix: &str) -> ChatMessage {
             self.next_id += 1;
             self.clock_ms += 50;
             ChatMessage {
-                id: Arc::from(format!("m{}", self.next_id)),
+                id: Arc::from(format!("{prefix}{}", self.next_id)),
                 timestamp: self.clock_ms,
                 content: Arc::from("hello"),
                 ..Default::default()
@@ -517,18 +809,12 @@ mod tests {
         }
 
         fn append(&mut self, count: usize) {
-            let batch = (0..count).map(|_| self.live_row()).collect();
+            let batch = (0..count).map(|_| self.live_row("m")).collect();
             self.snapshot.append_messages_to_snapshot(batch);
         }
 
-        /// What `ChatView::paced_messages` hands the canvas: the pacer's
-        /// visible prefix, keeping the shown list when its rows are the same.
-        fn sync(&mut self, render: bool) {
-            self.sync_with(render, true);
-        }
-
-        /// `sync`, or with `paced` false what a split that stopped following
-        /// live (scrolled up, paused) or was hidden gets: every row.
+        /// What `ChatView::paced_messages` and the split's deleted-row
+        /// projection hand the canvas.
         fn sync_with(&mut self, render: bool, paced: bool) {
             let source = self.snapshot.messages.clone();
             let visible = if paced {
@@ -560,11 +846,24 @@ mod tests {
                     .all(|(shown, source)| Arc::ptr_eq(shown, source)),
                 "a split shows exactly the visible rows of the snapshot"
             );
+            let next = if self.hide_deleted && next.iter().any(|m| m.flags.is_deleted) {
+                Arc::new(
+                    next.iter()
+                        .filter(|m| !m.flags.is_deleted)
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                next
+            };
             self.split.sync(&next);
             if render {
                 self.split.render();
-                assert_same_model(&self.split.model, &rebuilt(&next), "after render");
             }
+        }
+
+        fn sync(&mut self, render: bool) {
+            self.sync_with(render, true);
         }
 
         fn tick(&mut self, rng: &mut Rng) {
@@ -581,6 +880,7 @@ mod tests {
             channel.now += Duration::from_millis(100);
             channel.sync(true);
         }
+        channel.split.settle("warmed");
         channel
     }
 
@@ -602,6 +902,7 @@ mod tests {
             }
             channel.now += Duration::from_millis(3_000);
             channel.sync(true);
+            channel.split.settle("cap");
         }
         assert_eq!(channel.split.rebuilds, rebuilds, "no rebuild at the cap");
         assert!(
@@ -626,14 +927,22 @@ mod tests {
 
     #[test]
     fn paced_syncs_match_a_full_rebuild_for_every_publish_sequence() {
-        let mut front_drops = 0;
-        let mut reused = 0;
-        let mut caught_up = 0;
-        for seed in 0..40 {
+        let mut totals = [0usize; 5];
+        for seed in 0..48 {
             let mut rng = Rng(seed);
-            let mut channel = warmed(30 + rng.below(30) as usize);
-            for _ in 0..400 {
-                match rng.below(20) {
+            // Most seeds run at a small cap; some stay below it, where a
+            // history merge keeps its older rows.
+            let capacity = if seed % 4 == 1 {
+                10_000
+            } else {
+                30 + rng.below(30) as usize
+            };
+            let mut channel = warmed(capacity);
+            channel.hide_deleted = seed % 3 == 0;
+            // A hidden split takes many syncs without a frame.
+            let mut hidden_for = 0u32;
+            for step in 0..400 {
+                match rng.below(24) {
                     0..=7 => {
                         let count = 1 + rng.below(4) as usize;
                         channel.append(count);
@@ -647,7 +956,7 @@ mod tests {
                             let change = rng.below(3);
                             let row = &mut backend[index];
                             match change {
-                                0 => row.content = Arc::from(format!("edit {}", rng.next())),
+                                0 => row.content = Arc::from("e".repeat(1 + step % 5)),
                                 1 => row.flags.is_deleted = true,
                                 _ => row.flags.is_alternate_row = !row.flags.is_alternate_row,
                             }
@@ -675,7 +984,8 @@ mod tests {
                         channel.append(1 + rng.below(3) as usize);
                     }
                     14 => {
-                        // History merge: an older row and a gap fill.
+                        // History merge: an older row, a gap fill, and
+                        // sometimes newer rows.
                         let mut backend = channel.backend_rows();
                         let first = backend
                             .first()
@@ -689,7 +999,7 @@ mod tests {
                                 ..Default::default()
                             },
                         );
-                        if backend.len() > 3 {
+                        if backend.len() > 3 && rng.below(2) == 0 {
                             let index = 2 + rng.below(backend.len() as u64 - 2) as usize;
                             channel.next_id += 1;
                             let timestamp = backend[index - 1].timestamp;
@@ -702,29 +1012,102 @@ mod tests {
                                 },
                             );
                         }
+                        for _ in 0..rng.below(3) {
+                            backend.push(channel.live_row("n"));
+                        }
                         channel.snapshot.merge_history_into_snapshot(&backend);
                     }
                     15 if rng.below(10) == 0 => {
                         channel.snapshot.replace_snapshot_from_backend(Vec::new());
                     }
+                    16 => {
+                        // An optimistic local echo, later replaced in place
+                        // by the row with its real id.
+                        let echo = channel.live_row("local-");
+                        channel.snapshot.append_messages_to_snapshot(vec![echo]);
+                    }
+                    17 => {
+                        let mut backend = channel.backend_rows();
+                        if let Some(row) = backend
+                            .iter_mut()
+                            .rev()
+                            .find(|row| row.id.starts_with("local-"))
+                        {
+                            row.id = Arc::from(row.id.replacen("local-", "real-", 1));
+                            channel.snapshot.replace_snapshot_from_backend(backend);
+                        }
+                    }
+                    18 => {
+                        // A duplicated id.
+                        let mut backend = channel.backend_rows();
+                        if let Some(source) =
+                            backend.get(rng.below(backend.len().max(1) as u64) as usize)
+                        {
+                            let mut copy = source.clone();
+                            copy.timestamp = channel.clock_ms;
+                            backend.push(copy);
+                            channel.snapshot.replace_snapshot_from_backend(backend);
+                        }
+                    }
+                    19 => channel.split.queue_layout_rebuild(rng.below(2) == 0),
+                    20 => hidden_for = 10 + rng.below(30) as u32,
+                    21 => {
+                        // Two appends, then a merge with an older and a newer
+                        // row, all before a frame.
+                        for _ in 0..2 {
+                            channel.append(1);
+                            channel.tick(&mut rng);
+                            channel.sync_with(false, false);
+                        }
+                        let mut backend = channel.backend_rows();
+                        let first = backend
+                            .first()
+                            .map_or(channel.clock_ms, |row| row.timestamp);
+                        channel.next_id += 1;
+                        backend.insert(
+                            0,
+                            ChatMessage {
+                                id: Arc::from(format!("h{}", channel.next_id)),
+                                timestamp: first - 1_000,
+                                ..Default::default()
+                            },
+                        );
+                        backend.push(channel.live_row("n"));
+                        channel.snapshot.merge_history_into_snapshot(&backend);
+                    }
                     _ => {}
                 }
                 channel.tick(&mut rng);
+                let render = hidden_for == 0 && rng.below(4) != 0;
+                hidden_for = hidden_for.saturating_sub(1);
                 // Several syncs can land before a frame renders; now and
                 // then the split stops following live for a sync.
-                channel.sync_with(rng.below(4) != 0, rng.below(25) != 0);
-                if rng.below(5) == 0 {
+                channel.sync_with(render, rng.below(25) != 0);
+                if hidden_for == 0 && rng.below(5) == 0 {
                     channel.tick(&mut rng);
                     channel.sync(true);
                 }
+                if hidden_for == 0 && rng.below(8) == 0 {
+                    channel.split.settle(&format!("seed {seed} step {step}"));
+                }
             }
             channel.sync(true);
-            front_drops += channel.split.front_drops;
-            reused += channel.reused;
-            caught_up += channel.split.caught_up;
+            channel.split.settle(&format!("seed {seed} end"));
+            let split = &channel.split;
+            for (total, count) in totals.iter_mut().zip([
+                split.front_drops,
+                channel.reused,
+                split.caught_up,
+                split.merges,
+                split.rebuilds,
+            ]) {
+                *total += count;
+            }
         }
+        let [front_drops, reused, caught_up, merges, _rebuilds] = totals;
         assert!(front_drops > 1_000, "{front_drops}");
         assert!(reused > 100, "{reused}");
         assert!(caught_up > 10, "{caught_up}");
+        assert!(merges > 50, "{merges}");
     }
 }

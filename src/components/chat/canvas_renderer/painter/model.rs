@@ -130,11 +130,13 @@ impl MessageListModel {
     /// pending-row pass of `update_layouts`, like any appended row, so the
     /// caller adds `appended.len()` to its pending count.
     ///
-    /// Returns false, changing nothing, unless the result provably equals a
-    /// rebuild from the new rows: the order holds one id per current row, the
-    /// heights cover the order except the `pending_heights` newest rows, no
-    /// dropped row is still pending, each dropped id is indexed at its own
-    /// row (so no later row repeats it), and no appended id is indexed yet.
+    /// Returns false, changing nothing, unless the result has the order and
+    /// index a rebuild from the new rows would have (the kept rows keep their
+    /// current heights, where a rebuild would take cached or estimated ones):
+    /// the order holds one id per current row, the heights cover the order
+    /// except the `pending_heights` newest rows, no dropped row is still
+    /// pending, each dropped id is indexed at its own row (so no later row
+    /// repeats it), and no appended id is indexed yet.
     pub(super) fn drop_front_and_append(
         &mut self,
         dropped: usize,
@@ -170,6 +172,145 @@ impl MessageListModel {
         }
         self.sync_total_height();
         true
+    }
+
+    /// How `next` drops rows from the front of the current ones, when the
+    /// order is complete enough to tell (one id per current row) after
+    /// completing a lagging order, whose added rows go to `pending_heights`.
+    pub(super) fn front_drop_shape(
+        &mut self,
+        next: &[Arc<ChatMessage>],
+        pending_heights: &mut usize,
+    ) -> Option<super::message_delta::FrontDrop> {
+        *pending_heights += self.complete_lagging_order(*pending_heights);
+        (self.message_order.len() == self.messages.len())
+            .then(|| super::message_delta::front_drop(&self.message_order, next))
+            .flatten()
+    }
+
+    /// Apply the front drop `front` of `next` within the size limit of
+    /// incremental rotations (see [`Self::drop_front_and_append`]), adding
+    /// the appended rows to `pending_heights`. Returns whether a kept row
+    /// changed in place, or `None`, changing nothing, when the caller must
+    /// rebuild.
+    pub(super) fn apply_front_drop(
+        &mut self,
+        next: &[Arc<ChatMessage>],
+        front: super::message_delta::FrontDrop,
+        pending_heights: &mut usize,
+    ) -> Option<bool> {
+        let limit = super::CanvasMessageList::incremental_rotation_limit(next.len());
+        if front.dropped > limit && front.dropped.saturating_mul(2) > next.len() {
+            return None;
+        }
+        let kept = next.len() - front.appended;
+        let kept_changed = self.kept_rows_changed(front.dropped, &next[..kept]);
+        if !self.drop_front_and_append(front.dropped, &next[kept..], *pending_heights) {
+            return None;
+        }
+        *pending_heights += front.appended;
+        Some(kept_changed)
+    }
+
+    /// Whether any of the current rows from `from` on is not, by pointer,
+    /// the row at the same position in `kept` (the rows the next snapshot
+    /// keeps, in order): a row replaced in place whose offscreen layout must
+    /// be checked again.
+    pub(super) fn kept_rows_changed(&self, from: usize, kept: &[Arc<ChatMessage>]) -> bool {
+        self.messages
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .zip(kept)
+            .any(|(old, new)| !Arc::ptr_eq(old, new))
+    }
+
+    /// An append whose current rows are `next`'s first `self.messages.len()`
+    /// rows. The new rows are indexed now; they join the order at the next
+    /// `update_layouts` append pass, or now as rows waiting for their heights
+    /// when rows already wait (that pass then runs only its pending-row
+    /// pass), adding to `pending_heights`.
+    pub(super) fn append_rows(&mut self, next: &[Arc<ChatMessage>], pending_heights: &mut usize) {
+        let old_count = self.messages.len();
+        let join_pending = *pending_heights > 0;
+        for (index, message) in next.iter().enumerate().skip(old_count) {
+            let id = SharedString::from(message.id.clone());
+            if join_pending {
+                self.message_order.push(id.clone());
+            }
+            self.insert_message_index(id, index);
+        }
+        if join_pending {
+            *pending_heights += next.len().saturating_sub(old_count);
+        }
+    }
+
+    /// Replace the order, index and heights with `next`'s rows and `heights`
+    /// (one per row). The caller drops any pending rows.
+    pub(super) fn reset_rows(&mut self, next: &[Arc<ChatMessage>], heights: &[f32]) {
+        debug_assert_eq!(next.len(), heights.len());
+        self.clear_message_index();
+        self.reserve_message_index(next.len());
+        self.message_order.clear();
+        self.height_tree.clear();
+        self.message_order.reserve(next.len());
+        self.height_tree.reserve(next.len());
+        for (index, (message, &height)) in next.iter().zip(heights).enumerate() {
+            let id = SharedString::from(message.id.clone());
+            self.message_order.push(id.clone());
+            self.insert_message_index(id, index);
+            self.height_tree.push(height);
+        }
+        self.sync_total_height();
+    }
+
+    /// A history merge whose current rows sit in `next` from `existing_start`
+    /// on, contiguous: the rows before them are prepended with `heights` (one
+    /// per prepended row) and any rows after them are appended as rows
+    /// waiting for their heights, after the rows already waiting (the waiting
+    /// rows are the order's last rows, so the old ones come first), adding to
+    /// `pending_heights`. Returns the prepended rows' total height.
+    pub(super) fn insert_around(
+        &mut self,
+        next: &[Arc<ChatMessage>],
+        existing_start: usize,
+        heights: &[f32],
+        pending_heights: &mut usize,
+    ) -> f32 {
+        debug_assert_eq!(existing_start, heights.len());
+        let existing_end = existing_start + self.message_order.len();
+        let prepended_height = self.height_tree.prepend_many(heights);
+        let mut order = Vec::with_capacity(next.len());
+        order.extend(
+            next[..existing_start]
+                .iter()
+                .map(|message| SharedString::from(message.id.clone())),
+        );
+        order.append(&mut self.message_order);
+        order.extend(
+            next.get(existing_end..)
+                .unwrap_or_default()
+                .iter()
+                .map(|message| SharedString::from(message.id.clone())),
+        );
+        self.message_order = order;
+        self.rebuild_message_index_from_order();
+        *pending_heights += next.len().saturating_sub(existing_end);
+        self.sync_total_height();
+        prepended_height
+    }
+
+    /// The `needs_layout_rebuild` shortcut of `update_layouts`: the order is
+    /// the rows' ids and the heights cover them, rows waiting for their
+    /// heights included, so a progressive refresh can replace the rebuild.
+    pub(super) fn order_and_heights_match(&self, pending_heights: usize) -> bool {
+        self.message_order.len() == self.messages.len()
+            && self.height_tree.len() + pending_heights == self.messages.len()
+            && self
+                .message_order
+                .iter()
+                .zip(self.messages.iter())
+                .all(|(id, message)| id.as_ref() == message.id.as_ref())
     }
 
     #[inline]

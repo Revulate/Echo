@@ -1,8 +1,7 @@
 //! Message-buffer lifecycle and split activity handling.
 
 use super::message_delta::{
-    FrontDrop, MessageDeltaPlan, front_drop, ids_align, range_after_front_drop,
-    remap_after_front_drop,
+    FrontDrop, MessageDeltaPlan, Reshape, UpdateKind, remap_after_front_drop,
 };
 use super::*;
 
@@ -215,83 +214,38 @@ impl CanvasMessageList {
             .unwrap_or_else(|| self.message_model.estimated_row_height())
     }
 
+    /// Each row's cached layout height, or the running estimate.
+    fn cached_or_estimated_heights(&mut self, messages: &[Arc<ChatMessage>]) -> Vec<f32> {
+        messages
+            .iter()
+            .map(|message| self.cached_or_estimated_height(SharedString::from(message.id.clone())))
+            .collect()
+    }
+
     /// Rebuild the message index, order, and height tree from `messages`
     /// using cached-or-estimated heights, then restart progressive layout.
+    /// The caller drops any pending rows.
     fn rebuild_message_model_from(&mut self, messages: &[Arc<ChatMessage>]) {
-        let new_count = messages.len();
-        self.message_model.clear_message_index();
-        self.message_model.reserve_message_index(new_count);
-        for (idx, msg) in messages.iter().enumerate() {
-            let shared_id = SharedString::from(msg.id.clone());
-            self.message_model.insert_message_index(shared_id, idx);
-        }
-
-        self.message_model.message_order.clear();
-        self.message_model.height_tree.clear();
-        self.message_model.message_order.reserve(new_count);
-        self.message_model.height_tree.reserve(new_count);
-
-        for msg in messages.iter() {
-            let shared_id = SharedString::from(msg.id.clone());
-            let height = self.cached_or_estimated_height(shared_id.clone());
-            self.message_model.message_order.push(shared_id);
-            self.message_model.height_tree.push(height);
-        }
-
-        self.message_model.total_height = self.message_model.height_tree.total_height();
-        self.message_state.pending_new_message_count = 0;
+        let heights = self.cached_or_estimated_heights(messages);
+        self.message_model.reset_rows(messages, &heights);
         self.message_state.needs_layout_rebuild = false;
         self.layout_store.runtime.restart_width_refresh();
-        self.preload_state.last_emote_preload_range = None;
+        self.preload_state.emote_scan.reset();
         self.interaction_state.hitbox_manager.invalidate_cache();
     }
 
-    /// How `messages` drops rows from the front of the current ones, when the
-    /// split's order is complete enough to tell (one id per current row).
-    fn front_drop_shape(&mut self, messages: &[Arc<ChatMessage>]) -> Option<FrontDrop> {
-        self.message_state.pending_new_message_count += self
-            .message_model
-            .complete_lagging_order(self.message_state.pending_new_message_count);
-        let order = &self.message_model.message_order;
-        (order.len() == self.message_model.messages.len())
-            .then(|| front_drop(order, messages))
-            .flatten()
+    /// A kept row was replaced in place (retokenized, deleted, restriped):
+    /// check offscreen layouts again, as a same-order update does.
+    fn note_kept_rows_changed(&mut self) {
+        self.layout_store.runtime.mark_stale();
+        self.layout_store.runtime.last_checked_emote_version = 0;
+        self.layout_store.runtime.last_checked_channel_emote_version = 0;
     }
 
-    /// Apply `messages`, which `front` says drops rows from the front of the
-    /// current ones and appends others, without rebuilding the model. At the
-    /// buffer cap every sync has this shape, and so does an append that comes
-    /// before the previous one reached the order. Uses the same size limit as
-    /// other incremental rotations. Returns false, changing nothing, when the
-    /// caller must rebuild instead.
-    fn apply_front_drop(&mut self, messages: &[Arc<ChatMessage>], front: FrontDrop) -> bool {
-        let limit = Self::incremental_rotation_limit(messages.len());
-        if front.dropped > limit && front.dropped.saturating_mul(2) > messages.len() {
-            return false;
-        }
-        let kept = messages.len() - front.appended;
-        let retained_changed = self
-            .message_model
-            .messages
-            .get(front.dropped..)
-            .unwrap_or_default()
-            .iter()
-            .zip(&messages[..kept])
-            .any(|(old, new)| !Arc::ptr_eq(old, new));
-        if !self.message_model.drop_front_and_append(
-            front.dropped,
-            &messages[kept..],
-            self.message_state.pending_new_message_count,
-        ) {
-            return false;
-        }
-        self.message_state.pending_new_message_count += front.appended;
-        if retained_changed {
-            // A kept row changed in place (retokenized, deleted, restriped):
-            // re-check off-screen layouts as a same-order update does.
-            self.layout_store.runtime.mark_stale();
-            self.layout_store.runtime.last_checked_emote_version = 0;
-            self.layout_store.runtime.last_checked_channel_emote_version = 0;
+    /// The canvas side of a front drop the model applied.
+    fn after_front_drop(&mut self, new_count: usize, front: FrontDrop, kept_changed: bool) {
+        if kept_changed {
+            self.note_kept_rows_changed();
         }
         if front.dropped > 0 {
             self.viewport_state.cached_visible_render_range = None;
@@ -299,23 +253,22 @@ impl CanvasMessageList {
             self.remap_index_state_after_front_drop(front.dropped);
         }
         if front.appended > 0 {
-            self.note_new_rows_for_preload(messages.len() - front.appended);
+            self.preload_state.note_new_rows(new_count - front.appended);
         }
         crate::log_perf_render!(
             debug,
             channel_id = %self.channel_id,
             dropped = front.dropped,
             appended = front.appended,
-            retained_changed,
+            retained_changed = kept_changed,
             "Applied front drop incrementally"
         );
-        true
     }
 
-    /// Keep the prepared paint rows and the emote preload range across a drop
-    /// of `dropped` front rows by shifting them to the rows' new indices: the
-    /// rows still shown are the same, so the next frame reuses their prepared
-    /// paint and the preload pass scans only the rows that are new.
+    /// Keep the index-keyed state across a drop of `dropped` front rows by
+    /// shifting it to the rows' new indices: the prepared paint rows (the
+    /// rows still shown are the same, so the next frame reuses them), the
+    /// emote preload range and the stale-layout scan cursor.
     fn remap_index_state_after_front_drop(&mut self, dropped: usize) {
         if let Some(rows) = self.viewport_state.cached_viewport_paint_rows.take() {
             let kept = remap_after_front_drop(&rows, dropped, |row| &mut row.message_index);
@@ -325,20 +278,50 @@ impl CanvasMessageList {
                 self.viewport_state.cached_viewport_paint_rows = Some(kept);
             }
         }
-        let preload = &mut self.preload_state;
-        preload.last_emote_preload_range = preload
-            .last_emote_preload_range
-            .and_then(|range| range_after_front_drop(range, dropped));
-        preload.emote_preload_new_rows_from = preload
-            .emote_preload_new_rows_from
-            .map(|from| from.saturating_sub(dropped));
+        self.preload_state.shift_after_front_drop(dropped);
+        self.layout_store
+            .runtime
+            .shift_stale_scan_after_front_drop(dropped);
     }
 
-    /// Rows from `from` on were just added; the next emote preload pass scans
-    /// them first.
-    fn note_new_rows_for_preload(&mut self, from: usize) {
-        let new_rows_from = &mut self.preload_state.emote_preload_new_rows_from;
-        *new_rows_from = Some(new_rows_from.map_or(from, |current| current.min(from)));
+    /// Prime async layouts for the newest of `prepended` history rows on the
+    /// active split, and log the prepend.
+    fn after_history_insert(
+        &mut self,
+        prepended: &[Arc<ChatMessage>],
+        appended: usize,
+        scroll_compensation: f32,
+    ) {
+        let primed_async_layouts = if self.is_active_split {
+            let mut primed = 0usize;
+            for msg in prepended
+                .iter()
+                .rev()
+                .take(HISTORY_PREPEND_ASYNC_PRIME_LIMIT)
+            {
+                self.request_primed_async_layout(msg);
+                primed += 1;
+            }
+            primed
+        } else {
+            crate::log_perf_render!(
+                trace,
+                channel_id = %self.channel_id,
+                prepended = prepended.len(),
+                appended,
+                "Skipped inactive split history-prepend async priming"
+            );
+            0
+        };
+        crate::log_perf_render!(
+            debug,
+            channel_id = %self.channel_id,
+            prepended = prepended.len(),
+            appended,
+            scroll_compensation,
+            primed_async_layouts,
+            "Preserved viewport across history prepend"
+        );
     }
 
     /// Replace the shared snapshot this split shows, presenting any removed
@@ -376,48 +359,31 @@ impl CanvasMessageList {
             };
         let mut retained_viewport_anchor = None;
 
-        if delta.count_increased {
-            let added_count = delta.added_count;
-
-            if delta.old_order_matches_prefix {
-                // Rows still waiting for their heights (after a front drop)
-                // make the next `update_layouts` run only its pending-row
-                // pass, so these rows join them rather than wait a frame for
-                // its append pass.
-                let join_pending = self.message_state.pending_new_message_count > 0;
-                for (idx, msg) in messages.iter().enumerate().skip(old_count) {
-                    let shared_id = SharedString::from(msg.id.clone());
-                    if join_pending {
-                        self.message_model.message_order.push(shared_id.clone());
-                    }
-                    self.message_model.insert_message_index(shared_id, idx);
-                }
-                if join_pending {
-                    self.message_state.pending_new_message_count += added_count;
-                }
-                self.note_new_rows_for_preload(old_count);
-            } else if delta.is_initial_snapshot_fast_path {
-                self.message_model.message_order.clear();
-                self.message_model.height_tree.clear();
-                self.message_model.clear_message_index();
-                self.message_model.message_order.reserve(new_count);
-                self.message_model.height_tree.reserve(new_count);
-                self.message_model.reserve_message_index(new_count);
-
-                for (idx, msg) in messages.iter().enumerate() {
-                    let shared_id = SharedString::from(msg.id.clone());
-                    let height = self.cached_or_estimated_height(shared_id.clone());
-                    self.message_model.message_order.push(shared_id.clone());
-                    self.message_model.insert_message_index(shared_id, idx);
-                    self.message_model.height_tree.push(height);
-                }
-
-                self.message_model.total_height = self.message_model.height_tree.total_height();
-                self.message_state.pending_new_message_count = 0;
-                self.message_state.needs_layout_rebuild = false;
-                self.layout_store.runtime.restart_width_refresh();
-                self.preload_state.last_emote_preload_range = None;
+        let mut pending = self.message_state.pending_new_message_count;
+        match delta.kind {
+            UpdateKind::Unchanged => {}
+            UpdateKind::SameOrder => {
+                had_new_messages = false;
+                self.message_model.rebuild_message_index_from_order();
+                // Rows an earlier front drop or append left waiting for their
+                // heights keep waiting: dropping the count would leave the
+                // height tree short and force a full layout rebuild.
+                self.note_kept_rows_changed();
                 self.interaction_state.hitbox_manager.invalidate_cache();
+            }
+            UpdateKind::Append => {
+                let kept_changed = self
+                    .message_model
+                    .kept_rows_changed(0, &messages[..old_count]);
+                self.message_model.append_rows(&messages, &mut pending);
+                if kept_changed {
+                    self.note_kept_rows_changed();
+                }
+                self.preload_state.note_new_rows(old_count);
+            }
+            UpdateKind::InitialSnapshot => {
+                self.rebuild_message_model_from(&messages);
+                pending = 0;
 
                 let primed_async_layouts = if self.is_active_split {
                     let mut primed = 0usize;
@@ -431,17 +397,14 @@ impl CanvasMessageList {
                     }
                     primed
                 } else {
-                    0
-                };
-
-                if !self.is_active_split {
                     crate::log_perf_render!(
                         trace,
                         channel_id = %self.channel_id,
                         initialized = new_count,
                         "Skipped inactive split initial-history async priming"
                     );
-                }
+                    0
+                };
 
                 crate::log_perf_render!(
                     debug,
@@ -451,71 +414,8 @@ impl CanvasMessageList {
                     primed_async_layouts,
                     "Initialized viewport-preserving history snapshot"
                 );
-            } else if delta.old_order_matches_suffix {
-                let mut prepended_order = Vec::with_capacity(added_count);
-                let mut prepended_heights = Vec::with_capacity(added_count);
-
-                for msg in messages.iter().take(added_count) {
-                    let shared_id = SharedString::from(msg.id.clone());
-                    let height = self.cached_or_estimated_height(shared_id.clone());
-                    prepended_order.push(shared_id);
-                    prepended_heights.push(height);
-                }
-
-                let prepended_total_height = self
-                    .message_model
-                    .height_tree
-                    .prepend_many(&prepended_heights);
-                self.scroll_controller.offset += prepended_total_height;
-                self.scroll_controller.state.scroll_desired += prepended_total_height;
-
-                let mut new_order = Vec::with_capacity(new_count);
-                new_order.extend(prepended_order);
-                new_order.extend(self.message_model.message_order.iter().cloned());
-                self.message_model.message_order = new_order;
-
-                self.message_model.rebuild_message_index_from_order();
-
-                self.message_model.total_height = self.message_model.height_tree.total_height();
-                self.message_state.pending_new_message_count = 0;
-                self.preload_state.last_emote_preload_range = None;
-                self.interaction_state.hitbox_manager.invalidate_cache();
-
-                let primed_async_layouts = if self.is_active_split {
-                    let mut primed = 0usize;
-                    for msg in messages
-                        .iter()
-                        .take(added_count)
-                        .rev()
-                        .take(HISTORY_PREPEND_ASYNC_PRIME_LIMIT)
-                    {
-                        self.request_primed_async_layout(msg);
-                        primed += 1;
-                    }
-                    primed
-                } else {
-                    0
-                };
-
-                if !self.is_active_split {
-                    crate::log_perf_render!(
-                        trace,
-                        channel_id = %self.channel_id,
-                        prepended = added_count,
-                        "Skipped inactive split history-prepend async priming"
-                    );
-                }
-
-                crate::log_perf_render!(
-                    debug,
-                    channel_id = %self.channel_id,
-                    prepended = added_count,
-                    scroll_compensation = prepended_total_height,
-                    primed_async_layouts,
-                    "Preserved viewport across history prepend"
-                );
-            } else if let Some(existing_start) = delta.old_order_middle_start {
-                let prepended_count = existing_start;
+            }
+            UpdateKind::InsertAround { existing_start } => {
                 let existing_end = existing_start + old_count;
                 let appended_count = new_count.saturating_sub(existing_end);
                 if was_scrolled_away && appended_count > 0 {
@@ -523,153 +423,73 @@ impl CanvasMessageList {
                         .get(existing_end)
                         .map(|message| SharedString::from(message.id.clone()));
                 }
-                let mut prepended_order = Vec::with_capacity(prepended_count);
-                let mut prepended_heights = Vec::with_capacity(prepended_count);
-
-                for msg in messages.iter().take(prepended_count) {
-                    let shared_id = SharedString::from(msg.id.clone());
-                    let height = self.cached_or_estimated_height(shared_id.clone());
-                    prepended_order.push(shared_id);
-                    prepended_heights.push(height);
-                }
-
-                let prepended_total_height = self
-                    .message_model
-                    .height_tree
-                    .prepend_many(&prepended_heights);
+                let heights = self.cached_or_estimated_heights(&messages[..existing_start]);
+                let prepended_total_height = self.message_model.insert_around(
+                    &messages,
+                    existing_start,
+                    &heights,
+                    &mut pending,
+                );
                 self.scroll_controller.offset += prepended_total_height;
                 self.scroll_controller.state.scroll_desired += prepended_total_height;
-
-                let mut new_order = Vec::with_capacity(new_count);
-                new_order.extend(prepended_order);
-                new_order.extend(self.message_model.message_order.iter().cloned());
-                for msg in messages.iter().skip(existing_end) {
-                    new_order.push(SharedString::from(msg.id.clone()));
-                }
-                self.message_model.message_order = new_order;
-
-                self.message_model.rebuild_message_index_from_order();
-
-                self.message_model.total_height = self.message_model.height_tree.total_height();
-                self.message_state.pending_new_message_count = appended_count;
-                self.preload_state.last_emote_preload_range = None;
-                self.interaction_state.hitbox_manager.invalidate_cache();
-
-                let primed_async_layouts = if self.is_active_split {
-                    let mut primed = 0usize;
-                    for msg in messages
-                        .iter()
-                        .take(prepended_count)
-                        .rev()
-                        .take(HISTORY_PREPEND_ASYNC_PRIME_LIMIT)
-                    {
-                        self.request_primed_async_layout(msg);
-                        primed += 1;
-                    }
-                    primed
-                } else {
-                    0
-                };
-
-                if !self.is_active_split {
-                    crate::log_perf_render!(
-                        trace,
-                        channel_id = %self.channel_id,
-                        prepended = prepended_count,
-                        appended = appended_count,
-                        "Skipped inactive split history-prepend async priming"
-                    );
-                }
-
-                crate::log_perf_render!(
-                    debug,
-                    channel_id = %self.channel_id,
-                    prepended = prepended_count,
-                    appended = appended_count,
-                    scroll_compensation = prepended_total_height,
-                    primed_async_layouts,
-                    "Preserved viewport across history prepend"
-                );
-            } else {
-                retained_viewport_anchor =
-                    self.capture_viewport_anchor_before_message_replacement();
-                let front = self.front_drop_shape(&messages);
-                if was_scrolled_away && let Some(front) = front {
-                    first_new_message_id = messages
-                        .get(new_count - front.appended)
-                        .map(|message| SharedString::from(message.id.clone()));
-                }
-                if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
-                    self.rebuild_message_model_from(&messages);
-
-                    crate::log_perf_render!(
-                        debug,
-                        channel_id = %self.channel_id,
-                        new_count,
-                        "Progressive downgrade for unknown insertion/reorder shape"
-                    );
-                }
-            }
-        } else if new_count == old_count && content_changed && new_count > 0 {
-            let same_message_order = self.message_model.message_order.len() == new_count
-                && ids_align(&self.message_model.message_order, &messages);
-
-            if same_message_order {
-                had_new_messages = false;
-                self.message_model.rebuild_message_index_from_order();
-                // Rows an earlier front drop or append left waiting for their
-                // heights keep waiting: dropping the count would leave the
-                // height tree short and force a full layout rebuild.
+                // Prepended rows took cached heights, which can be stale, and
+                // a merge restripes the rows it keeps: check offscreen
+                // layouts again.
                 self.layout_store.runtime.mark_stale();
-                self.layout_store.runtime.last_checked_emote_version = 0;
-                self.layout_store.runtime.last_checked_channel_emote_version = 0;
+                self.preload_state.emote_scan.reset();
                 self.interaction_state.hitbox_manager.invalidate_cache();
-            } else {
+                self.after_history_insert(
+                    &messages[..existing_start],
+                    appended_count,
+                    prepended_total_height,
+                );
+            }
+            UpdateKind::Reshape(reshape) => {
                 retained_viewport_anchor =
                     self.capture_viewport_anchor_before_message_replacement();
-                self.viewport_state.cached_visible_render_range = None;
-                self.interaction_state.hitbox_manager.invalidate_cache();
-
-                let front = self.front_drop_shape(&messages);
-                if was_scrolled_away && let Some(front) = front {
+                if reshape == Reshape::SameCount {
+                    self.viewport_state.cached_visible_render_range = None;
+                    self.interaction_state.hitbox_manager.invalidate_cache();
+                }
+                let front = self.message_model.front_drop_shape(&messages, &mut pending);
+                if was_scrolled_away && let Some(front) = front.filter(|front| front.appended > 0) {
                     first_new_message_id = messages
                         .get(new_count - front.appended)
                         .map(|message| SharedString::from(message.id.clone()));
                 }
-
-                if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
-                    self.viewport_state.cached_viewport_paint_rows = None;
-                    self.rebuild_message_model_from(&messages);
-
-                    crate::log_perf_render!(
-                        debug,
-                        channel_id = %self.channel_id,
-                        new_count,
-                        rotated_count = front.map_or(0, |front| front.dropped),
-                        "Progressive downgrade for large rotation/full replacement"
-                    );
+                let applied = front.and_then(|front| {
+                    self.message_model
+                        .apply_front_drop(&messages, front, &mut pending)
+                        .map(|kept_changed| (front, kept_changed))
+                });
+                match applied {
+                    Some((front, kept_changed)) => {
+                        self.after_front_drop(new_count, front, kept_changed);
+                    }
+                    None => {
+                        self.viewport_state.cached_viewport_paint_rows = None;
+                        self.rebuild_message_model_from(&messages);
+                        pending = 0;
+                        crate::log_perf_render!(
+                            debug,
+                            channel_id = %self.channel_id,
+                            new_count,
+                            old_count,
+                            rotated_count = front.map_or(0, |front| front.dropped),
+                            "{}",
+                            match reshape {
+                                Reshape::Grew =>
+                                    "Progressive downgrade for unknown insertion/reorder shape",
+                                Reshape::SameCount =>
+                                    "Progressive downgrade for large rotation/full replacement",
+                                Reshape::Shrank => "Progressive downgrade for shrink case",
+                            }
+                        );
+                    }
                 }
-            }
-        } else if new_count < old_count {
-            retained_viewport_anchor = self.capture_viewport_anchor_before_message_replacement();
-            let front = self.front_drop_shape(&messages);
-            if was_scrolled_away && let Some(front) = front.filter(|front| front.appended > 0) {
-                first_new_message_id = messages
-                    .get(new_count - front.appended)
-                    .map(|message| SharedString::from(message.id.clone()));
-            }
-            if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
-                self.rebuild_message_model_from(&messages);
-
-                crate::log_perf_render!(
-                    debug,
-                    channel_id = %self.channel_id,
-                    new_count,
-                    old_count,
-                    "Progressive downgrade for shrink case"
-                );
             }
         }
+        self.message_state.pending_new_message_count = pending;
 
         let retained_boundary_successor = previous_boundary_index.and_then(|boundary_index| {
             self.message_model
@@ -741,8 +561,8 @@ impl CanvasMessageList {
 
         // An append or front drop noted its new rows and kept the preload
         // range in step; any other change of rows scans the range again.
-        if had_new_messages && self.preload_state.emote_preload_new_rows_from.is_none() {
-            self.preload_state.last_emote_preload_range = None;
+        if had_new_messages && !self.preload_state.emote_scan.has_new_rows() {
+            self.preload_state.emote_scan.reset();
         }
 
         if self.scroll_controller.state.auto_scroll

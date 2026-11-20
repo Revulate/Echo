@@ -269,54 +269,22 @@ impl CanvasMessageList {
             (end_idx + margin_ahead).min(self.message_model.message_order.len()),
         );
 
-        let current_range = (preload_start, preload_end);
-        let previous_range = self.preload_state.last_emote_preload_range;
-        let new_rows_from = self.preload_state.emote_preload_new_rows_from.take();
-        // Rows added since the last pass (an append, or a rotation at the cap
-        // that kept the indices) are scanned now when they are all that
-        // entered the range; the round-robin rescan keeps its interval.
-        let only_new_rows_entered = previous_range
-            .is_some_and(|previous| only_new_rows_entered(previous, current_range, new_rows_from));
-        let new_rows = new_rows_from
-            .filter(|_| only_new_rows_entered)
-            .map_or(0..0, |from| from.max(preload_start)..preload_end);
-        let range_changed = previous_range != Some(current_range) && !only_new_rows_entered;
-        let rescan_due = range_changed
-            || self.preload_state.last_emote_preload_time.elapsed() >= EMOTE_PRELOAD_INTERVAL;
-        if !rescan_due && new_rows.is_empty() {
-            self.preload_state.last_emote_preload_range = Some(current_range);
-            return;
-        }
-        if range_changed {
-            // Start at the viewport, not the margin behind it: new messages land
-            // in the bottom rows, which a scan from `preload_start` misses once
-            // the visible rows plus that margin exceed the per-pass budget.
-            self.preload_state.emote_preload_scan_cursor = start_idx.saturating_sub(preload_start);
-        }
-
-        self.preload_state.last_emote_preload_range = Some(current_range);
-        let mut scan: Vec<usize> = new_rows
-            .clone()
-            .take(EMOTE_PRELOAD_MESSAGE_BUDGET)
-            .collect();
-        let range_len = preload_end.saturating_sub(preload_start);
-        if rescan_due {
-            self.preload_state.last_emote_preload_time = std::time::Instant::now();
-            if range_len > 0 {
-                let scan_count = range_len.min(EMOTE_PRELOAD_MESSAGE_BUDGET);
-                let start_offset = self.preload_state.emote_preload_scan_cursor % range_len;
-                self.preload_state.emote_preload_scan_cursor =
-                    (start_offset + scan_count) % range_len;
-                scan.extend(
-                    (0..scan_count)
-                        .map(|step| preload_start + ((start_offset + step) % range_len))
-                        .filter(|idx| !new_rows.contains(idx)),
-                );
-            }
-        }
+        // A changed range starts at the viewport, not the margin behind it:
+        // new messages land in the bottom rows, which a scan from
+        // `preload_start` misses once the visible rows plus that margin exceed
+        // the per-pass budget. Rows added since the last pass (an append, or a
+        // rotation at the cap that kept the indices) are scanned at once.
+        let scan = self.preload_state.emote_scan.rows_to_scan(
+            (preload_start, preload_end),
+            start_idx.saturating_sub(preload_start),
+            EMOTE_PRELOAD_INTERVAL,
+            EMOTE_PRELOAD_MESSAGE_BUDGET,
+            std::time::Instant::now(),
+        );
         if scan.is_empty() {
             return;
         }
+        let range_len = preload_end.saturating_sub(preload_start);
         let scan_count = scan.len();
 
         let estimated_emotes = scan_count * 3;
@@ -1137,7 +1105,7 @@ impl CanvasMessageList {
 /// Whether every row in `current` that was not in `previous` (row-index
 /// ranges, end exclusive) is a row added since: at or after `new_rows_from`.
 /// True as well when no row entered.
-fn only_new_rows_entered(
+pub(super) fn only_new_rows_entered(
     (previous_start, previous_end): (usize, usize),
     (start, end): (usize, usize),
     new_rows_from: Option<usize>,
@@ -1151,8 +1119,52 @@ fn only_new_rows_entered(
 
 #[cfg(test)]
 mod tests {
+    use super::super::state::RangeScan;
     use super::only_new_rows_entered;
     use core::prelude::v1::test;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_range_scan_covers_new_rows_at_once_and_the_rest_on_its_interval() {
+        const INTERVAL: Duration = Duration::from_millis(120);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut scan = RangeScan::initial();
+        let first = scan.rows_to_scan((70, 100), 20, INTERVAL, 64, at(0));
+        assert_eq!(first.len(), 30, "a new range is scanned whole");
+        assert_eq!(first[0], 90, "from the restart offset");
+
+        // A rotation at the cap: one row left the front, one arrived.
+        scan.shift_after_front_drop(1);
+        scan.note_new_rows(99);
+        assert_eq!(scan.rows_to_scan((70, 100), 20, INTERVAL, 64, at(10)), [99]);
+        assert!(
+            scan.rows_to_scan((70, 100), 20, INTERVAL, 64, at(20))
+                .is_empty()
+        );
+
+        // The round robin on its interval, budgeted.
+        assert_eq!(
+            scan.rows_to_scan((70, 100), 20, INTERVAL, 8, at(130)).len(),
+            8
+        );
+
+        // Scrolled to older rows: the range changed for another reason.
+        scan.note_new_rows(99);
+        let scrolled = scan.rows_to_scan((60, 90), 5, INTERVAL, 64, at(140));
+        assert_eq!(scrolled.len(), 30);
+        assert_eq!(scrolled[0], 65);
+        assert!(!scan.has_new_rows());
+
+        // Every scanned row is listed once when new rows fall in the round robin.
+        scan.note_new_rows(88);
+        let both = scan.rows_to_scan((60, 90), 0, INTERVAL, 64, at(400));
+        let mut unique = both.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), both.len());
+        assert_eq!(both[..2], [88, 89]);
+    }
 
     #[test]
     fn only_rows_added_since_the_last_pass_skip_the_full_rescan() {

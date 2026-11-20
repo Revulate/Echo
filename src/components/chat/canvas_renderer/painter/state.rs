@@ -40,15 +40,103 @@ impl MessageLifecycleState {
     }
 }
 
+/// A budgeted round-robin scan over a row-index range (emote preload, embed
+/// discovery): the range it last covered, its cursor (an offset into that
+/// range), when it last ran, and the first row added since, so a pass can
+/// scan just the new rows instead of the whole range.
+pub(super) struct RangeScan {
+    range: Option<(usize, usize)>,
+    new_rows_from: Option<usize>,
+    cursor: usize,
+    last_scan: std::time::Instant,
+}
+
+impl RangeScan {
+    pub(super) fn initial() -> Self {
+        Self {
+            range: None,
+            new_rows_from: None,
+            cursor: 0,
+            last_scan: instant_minus_secs(10),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn range(&self) -> Option<(usize, usize)> {
+        self.range
+    }
+
+    /// Forget the range, so the next pass scans it afresh.
+    pub(super) fn reset(&mut self) {
+        self.range = None;
+    }
+
+    /// Rows from `from` on were just added.
+    pub(super) fn note_new_rows(&mut self, from: usize) {
+        self.new_rows_from = Some(self.new_rows_from.map_or(from, |current| current.min(from)));
+    }
+
+    pub(super) fn has_new_rows(&self) -> bool {
+        self.new_rows_from.is_some()
+    }
+
+    /// Keep naming the same rows after the first `dropped` rows left.
+    pub(super) fn shift_after_front_drop(&mut self, dropped: usize) {
+        self.range = self
+            .range
+            .and_then(|range| super::message_delta::range_after_front_drop(range, dropped));
+        self.new_rows_from = self.new_rows_from.map(|from| from.saturating_sub(dropped));
+    }
+
+    /// The rows to scan now for the range `current`. Rows added since the
+    /// last pass are scanned at once when they are all that entered the
+    /// range; the round robin of `budget` rows runs when the range changed
+    /// otherwise (restarting `restart_at` rows into it) or `interval` passed.
+    /// Rows in both are listed once.
+    pub(super) fn rows_to_scan(
+        &mut self,
+        current: (usize, usize),
+        restart_at: usize,
+        interval: std::time::Duration,
+        budget: usize,
+        now: std::time::Instant,
+    ) -> Vec<usize> {
+        let previous = self.range;
+        let new_rows_from = self.new_rows_from.take();
+        let only_new_rows_entered = previous.is_some_and(|previous| {
+            super::preload::only_new_rows_entered(previous, current, new_rows_from)
+        });
+        let new_rows = new_rows_from
+            .filter(|_| only_new_rows_entered)
+            .map_or(0..0, |from| from.max(current.0)..current.1);
+        let range_changed = previous != Some(current) && !only_new_rows_entered;
+        self.range = Some(current);
+        let mut scan: Vec<usize> = new_rows.clone().take(budget).collect();
+        if !range_changed && now.saturating_duration_since(self.last_scan) < interval {
+            return scan;
+        }
+        if range_changed {
+            self.cursor = restart_at;
+        }
+        self.last_scan = now;
+        let range_len = current.1.saturating_sub(current.0);
+        if range_len > 0 {
+            let scan_count = range_len.min(budget);
+            let start_offset = self.cursor % range_len;
+            self.cursor = (start_offset + scan_count) % range_len;
+            scan.extend(
+                (0..scan_count)
+                    .map(|step| current.0 + ((start_offset + step) % range_len))
+                    .filter(|idx| !new_rows.contains(idx)),
+            );
+        }
+        scan
+    }
+}
+
 pub(super) struct PreloadState {
     pub(super) pending_embed_fetches: rustc_hash::FxHashSet<(Arc<str>, u32)>,
-    pub(super) last_emote_preload_range: Option<(usize, usize)>,
-    /// Index of the first row added since the last emote preload pass, kept
-    /// with `last_emote_preload_range` across front drops, so that pass can
-    /// scan just the new rows instead of the whole range.
-    pub(super) emote_preload_new_rows_from: Option<usize>,
-    pub(super) emote_preload_scan_cursor: usize,
-    pub(super) last_emote_preload_time: std::time::Instant,
+    pub(super) emote_scan: RangeScan,
     pub(super) last_layout_image_preload_range: Option<(usize, usize)>,
     pub(super) last_layout_image_preload_time: std::time::Instant,
     pub(super) last_embed_fetch_range: Option<(usize, usize)>,
@@ -67,10 +155,7 @@ impl PreloadState {
     pub(super) fn initial() -> Self {
         Self {
             pending_embed_fetches: rustc_hash::FxHashSet::default(),
-            last_emote_preload_range: None,
-            emote_preload_new_rows_from: None,
-            emote_preload_scan_cursor: 0,
-            last_emote_preload_time: instant_minus_secs(10),
+            emote_scan: RangeScan::initial(),
             last_layout_image_preload_range: None,
             last_layout_image_preload_time: instant_minus_secs(10),
             last_embed_fetch_range: None,
@@ -80,6 +165,18 @@ impl PreloadState {
             last_layout_lookahead_range: None,
             last_layout_landing_range: None,
         }
+    }
+
+    /// Rows from `from` on were just added; the next emote preload pass
+    /// scans them first.
+    pub(super) fn note_new_rows(&mut self, from: usize) {
+        self.emote_scan.note_new_rows(from);
+    }
+
+    /// Keep the emote preload range naming the same rows after the first
+    /// `dropped` rows left.
+    pub(super) fn shift_after_front_drop(&mut self, dropped: usize) {
+        self.emote_scan.shift_after_front_drop(dropped);
     }
 }
 
@@ -296,6 +393,14 @@ impl LayoutRuntimeState {
         self.pending_layout_quantized_width = None;
         self.pending_layout_quantized_since = None;
         self.pending_layout_quantized_run_since = None;
+    }
+
+    /// Keep the stale-layout scan on the row it would scan next after the
+    /// first `dropped` rows left, so the pass neither skips the rows that
+    /// moved behind it nor ends early.
+    #[inline]
+    pub(super) fn shift_stale_scan_after_front_drop(&mut self, dropped: usize) {
+        self.stale_layout_refresh_cursor = self.stale_layout_refresh_cursor.saturating_sub(dropped);
     }
 
     /// Restart the progressive stale-layout scan from the first row.

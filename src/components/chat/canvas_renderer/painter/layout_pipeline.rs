@@ -115,16 +115,9 @@ impl CanvasMessageList {
         if self.message_state.needs_layout_rebuild {
             // Rows waiting for their heights get them from the pending-row
             // pass below.
-            let order_matches_messages = self.message_model.message_order.len() == msg_count
-                && self.message_model.height_tree.len()
-                    + self.message_state.pending_new_message_count
-                    == msg_count
-                && self
-                    .message_model
-                    .message_order
-                    .iter()
-                    .zip(self.message_model.messages.iter())
-                    .all(|(msg_id, msg)| msg_id.as_ref() == msg.id.as_ref());
+            let order_matches_messages = self
+                .message_model
+                .order_and_heights_match(self.message_state.pending_new_message_count);
 
             if order_matches_messages && !force_layout_refresh {
                 self.message_state.needs_layout_rebuild = false;
