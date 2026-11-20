@@ -30,7 +30,7 @@ bincode = { package = "cu-bincode", version = "2.0.2", features = ["serde"] }
 chrono = "0.4"
 criterion = { version = "0.8", features = ["html_reports"] }
 dashmap = "6"
-dirs = "6.0"
+dirs = "7.0"
 emojis = "0.9"
 image = { version = "0.25", default-features = false }
 lru = "0.19"
