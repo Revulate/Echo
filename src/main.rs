@@ -216,6 +216,14 @@ fn main() {
 
     demo::init_from_args();
 
+    // Auto streamer mode fails closed and chat ingest waits briefly for its
+    // first detection, so run that before the window opens, beside the
+    // prewarm rather than after it. If the thread cannot start, the detection
+    // task scans at backend init as before.
+    let _ = std::thread::Builder::new()
+        .name("echo-streamer-detect".into())
+        .spawn(backend::streamer_mode::run_startup_detection);
+
     let prewarm_handle = std::thread::spawn(|| {
         backend::http::ensure_rustls_crypto_provider();
         let _ = echo_gpui::cache::budget::prewarmed_total_memory_bytes();

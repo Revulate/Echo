@@ -407,7 +407,12 @@ fn start_detection_task() {
     {
         return;
     }
-    DETECTION_SCAN_NOW.notify_one();
+    // Scan at once unless a result exists (the startup detection usually
+    // finished before backend init starts the task); otherwise the first
+    // scan is one period away.
+    if DETECTION_CACHE.read_or_recover().completed_at.is_none() {
+        DETECTION_SCAN_NOW.notify_one();
+    }
     crate::backend::bridge::get_runtime().spawn(async {
         {
             let _running = DetectionTaskRunning(&DETECTION_TASK_RUNNING);
@@ -516,6 +521,49 @@ async fn run_detection_loop(
             last_logged = Some(logged);
         }
         on_outcome(outcome);
+    }
+}
+
+/// Run the first detection on the calling thread, which main.rs spawns before
+/// the window opens, so a result normally exists before chat ingest checks
+/// [`detection_pending`]: cached history reaches that check a few
+/// milliseconds after backend init, sooner than a scan started at init
+/// finishes. Settings are not loaded yet, so this runs whatever the mode;
+/// outside Auto the result is never read, and a switch into Auto resets it.
+/// It claims and records like the detection task, so the task never scans at
+/// the same time and a reset in the meantime discards the result.
+pub fn run_startup_detection() {
+    let Some(generation) = claim_detection_refresh(&mut DETECTION_CACHE.write_or_recover()) else {
+        return;
+    };
+    let started = Instant::now();
+    let detection = run_claimed_detection(&DETECTION_CACHE, detect_streaming_software_impl);
+    let active = detection.active;
+    let outcome = record_detection_into(
+        &mut DETECTION_CACHE.write_or_recover(),
+        detection,
+        generation,
+        Instant::now(),
+    );
+    crate::log_ui!(
+        debug,
+        duration_ms = started.elapsed().as_millis() as u64,
+        active,
+        outcome = ?outcome,
+        "Streamer-mode startup detection completed"
+    );
+    // Normally nothing has read a gate yet, so nothing was built from the
+    // fail-closed answer and there is no one to broadcast to (the broadcast
+    // would also load the settings on this thread). If a gate in Auto did
+    // read it, the outcome says so and is applied like the task's.
+    if matches!(
+        outcome,
+        DetectionOutcome::Recorded {
+            forget_layout_state: true,
+            ..
+        }
+    ) {
+        apply_detection_outcome(outcome);
     }
 }
 
