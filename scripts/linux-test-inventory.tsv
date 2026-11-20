@@ -564,6 +564,7 @@ root_test	src/backend/sounds.rs	legacy_sound_mutes_do_not_silently_mute_desktop_
 root_test	src/backend/sounds.rs	worker_wakes_for_the_earlier_deadline
 root_test	src/backend/streamer_mode.rs	a_panicking_detection_releases_its_claim_without_completing
 root_test	src/backend/streamer_mode.rs	a_scan_in_flight_across_a_reset_is_discarded
+root_test	src/backend/streamer_mode.rs	a_settings_replacement_into_auto_leaves_detection_pending
 root_test	src/backend/streamer_mode.rs	auto_counts_as_active_until_the_first_detection_completes
 root_test	src/backend/streamer_mode.rs	detection_refresh_is_claimed_once_at_a_time
 root_test	src/backend/streamer_mode.rs	detections_broadcast_only_on_change_or_an_observed_untrusted_period
@@ -901,7 +902,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	410
+summary	root_tests	411
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

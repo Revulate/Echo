@@ -300,6 +300,40 @@ fn auto_selected() -> bool {
     get_streamer_mode_settings().enabled == StreamerModeStatus::Auto
 }
 
+/// Reset `cache` when replacement settings select Auto; returns whether they
+/// do. `None` is the default, which is Auto.
+fn reset_detection_for_replacement(
+    cache: &mut DetectionCache,
+    replacement: Option<&StreamerModeSettings>,
+) -> bool {
+    let auto = replacement
+        .map(|settings| settings.enabled)
+        .unwrap_or_default()
+        == StreamerModeStatus::Auto;
+    if auto {
+        reset_detection_for_auto(cache);
+    }
+    auto
+}
+
+/// A settings import or reset to defaults replaces every setting at once and
+/// may select Auto from another mode. Call with the settings lock held, as the
+/// replacement is installed, with the replacement's streamer settings; when
+/// they select Auto, Auto fails closed as on any switch into it. If this
+/// returns true, call [`request_detection_scan_after_replacement`] once the
+/// lock is released.
+pub(crate) fn reset_detection_for_replaced_settings(
+    replacement: Option<&StreamerModeSettings>,
+) -> bool {
+    reset_detection_for_replacement(&mut DETECTION_CACHE.write_or_recover(), replacement)
+}
+
+/// Second half of [`reset_detection_for_replaced_settings`]; the caller must
+/// not hold the settings lock.
+pub(crate) fn request_detection_scan_after_replacement() {
+    request_detection_scan();
+}
+
 /// True while Auto has no completed detection since startup, the last switch
 /// into Auto or the last system wake, so its gates are failing closed.
 pub fn detection_pending() -> bool {
@@ -1053,6 +1087,39 @@ mod tests {
         );
         assert!(!auto_detection_active(&cache, later));
         assert!(!cache.refresh_in_flight);
+    }
+
+    #[test]
+    fn a_settings_replacement_into_auto_leaves_detection_pending() {
+        // Import and reset to defaults call this under the settings lock.
+        let mut cache = cache(true, false);
+        let now = cache.completed_at.unwrap();
+        let always_on = StreamerModeSettings {
+            enabled: StreamerModeStatus::AlwaysOn,
+            ..Default::default()
+        };
+        assert!(!reset_detection_for_replacement(
+            &mut cache,
+            Some(&always_on)
+        ));
+        assert!(
+            cache.completed_at.is_some(),
+            "leaving Auto keeps the result"
+        );
+
+        // Defaults (no streamer settings) select Auto, as an imported Auto does.
+        for replacement in [None, Some(&StreamerModeSettings::default())] {
+            let mut cache = self::cache(true, false);
+            let stale = claim_detection_refresh(&mut cache).unwrap();
+            assert!(reset_detection_for_replacement(&mut cache, replacement));
+            assert!(cache.completed_at.is_none(), "detection is pending");
+            assert!(auto_detection_active(&cache, now));
+            assert_eq!(
+                record_detection_into(&mut cache, not_streaming(), stale, now),
+                DetectionOutcome::Discarded,
+                "a scan from before the replacement is not trusted"
+            );
+        }
     }
 
     #[test]

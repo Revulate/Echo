@@ -3491,7 +3491,7 @@ fn replace_settings_snapshot(
     let backup_path = SettingsManager::new().create_import_backup()?;
 
     let visibility_commit = crate::backend::blocked_users::visibility_commit_guard();
-    {
+    let selects_auto_streamer_mode = {
         let mut settings = SETTINGS.lock_or_recover();
         if keep_sensitive_settings {
             // Re-apply against the live settings under the lock, so a path or
@@ -3506,7 +3506,15 @@ fn replace_settings_snapshot(
         reconcile_active_account_credentials(&mut replacement);
         publish_cached_settings_snapshot(&replacement);
         update_username_cache(replacement.username.as_deref());
+        let selects_auto_streamer_mode =
+            crate::backend::streamer_mode::reset_detection_for_replaced_settings(
+                replacement.streamer_mode.as_ref(),
+            );
         *settings = replacement;
+        selects_auto_streamer_mode
+    };
+    if selects_auto_streamer_mode {
+        crate::backend::streamer_mode::request_detection_scan_after_replacement();
     }
     let (changed_channels, visibility_effects) = if blocked_users_enabled {
         (
