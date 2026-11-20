@@ -465,7 +465,7 @@ impl CanvasMessageList {
         scroll_offset: f32,
         quantized_width: u32,
     ) -> bool {
-        if self.wake_state.has_async_layout_in_flight_last_frame
+        !(self.wake_state.has_async_layout_in_flight_last_frame
             || self
                 .layout_store
                 .runtime
@@ -481,7 +481,8 @@ impl CanvasMessageList {
             || self.viewport_state.cached_visible_render_quantized_width != quantized_width
             || self.viewport_state.cached_visible_render_message_count
                 != self.message_model.messages.len()
-            || (self.viewport_state.cached_visible_render_scroll_offset - scroll_offset).abs() > 0.5
+            || (self.viewport_state.cached_visible_render_scroll_offset - scroll_offset).abs()
+                > 0.5
             || settings::get_layout_settings_version()
                 != self.layout_store.runtime.last_layout_settings_version_seen
             || global_layout_cache::get_invalidation_version()
@@ -491,12 +492,7 @@ impl CanvasMessageList {
             || crate::state::VersionRegistry::channel_emote_version(&self.channel_name)
                 != self.layout_store.runtime.last_checked_channel_emote_version
             || self.layout_mode_outdated()
-            || self.has_pending_scroll_target()
-        {
-            return false;
-        }
-
-        true
+            || self.has_pending_scroll_target())
     }
 
     /// Diagnostic mirror of `can_reuse_visible_rows_for_stable_frame`: one bit
@@ -551,7 +547,7 @@ impl CanvasMessageList {
             return false;
         };
         let ranges_overlap = start_idx < cached_end_idx && cached_start_idx < end_idx;
-        if self.wake_state.has_async_layout_in_flight_last_frame
+        !(self.wake_state.has_async_layout_in_flight_last_frame
             || self
                 .layout_store
                 .runtime
@@ -576,11 +572,6 @@ impl CanvasMessageList {
             || crate::state::VersionRegistry::channel_emote_version(&self.channel_name)
                 != self.layout_store.runtime.last_checked_channel_emote_version
             || self.layout_mode_outdated()
-            || self.has_pending_scroll_target()
-        {
-            return false;
-        }
-
-        true
+            || self.has_pending_scroll_target())
     }
 }

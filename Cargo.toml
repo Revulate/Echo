@@ -9,7 +9,7 @@ resolver = "3"
 [workspace.package]
 version = "0.9.38"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 license = "MIT"
 repository = "https://github.com/Revulate/Echo"
 
@@ -216,12 +216,12 @@ rustls.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Foundation", "Media_Control", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_WinRT", "Win32_Security", "Win32_Security_Cryptography", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
 windows-native-keyring-store = "1"
+# The global allocator only with the `windows-mimalloc` feature.
+mimalloc = { version = "0.1.48", optional = true }
 
-# mimalloc: the Linux allocator, and on Windows behind `windows-mimalloc`. Its
-# FFI also backs the memory report's process counters.
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
-mimalloc = "0.1.48"
-# Raw mimalloc FFI for periodic mi_collect (return freed memory to the OS).
+# Raw mimalloc FFI for periodic mi_collect (return freed memory to the OS) and
+# the memory report's process counters.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 # Clipboard on Windows; Linux uses GPUI's own clipboard (src/utils/clipboard.rs).
@@ -233,10 +233,12 @@ arboard = "3"
 tokio = { workspace = true, features = ["signal"] }
 libc = "0.2"
 
-# Linux: KWin scripting over D-Bus for always-on-top and taskbar attention
-# (src/utils/kwin.rs). notify-rust and GPUI already build this zbus.
 [target.'cfg(target_os = "linux")'.dependencies]
+# KWin scripting over D-Bus for always-on-top and taskbar attention
+# (src/utils/kwin.rs). notify-rust and GPUI already build this zbus.
 zbus = { version = "5", default-features = false, features = ["async-io"] }
+# The Linux global allocator; on Windows behind `windows-mimalloc` (above).
+mimalloc = "0.1.48"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
@@ -355,7 +357,7 @@ dhat-heap = ["dep:dhat"]
 # mimalloc). GPUI's application manifest opts into the segment heap, which in
 # a 100 msg/s replay measurement held 80-100 MB less RAM than mimalloc at the
 # same CPU.
-windows-mimalloc = []
+windows-mimalloc = ["dep:mimalloc"]
 
 # ============================================================================
 # Testing
