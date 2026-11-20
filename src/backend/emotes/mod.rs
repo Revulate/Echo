@@ -1813,9 +1813,19 @@ impl EmoteCache {
             _ => return DiskCacheLoad::default(),
         };
         let disk_user_owner_id = cache_file.user_emote_owner_id.clone();
-        let (global_emotes, user_emotes, channel_emotes) = match parts {
-            DiskCacheParts::Shared => (cache_file.global_emotes, None, cache_file.channel_emotes),
-            DiskCacheParts::User => (None, cache_file.user_emotes, Default::default()),
+        let (global_emotes, user_emotes, channel_emotes, mut channel_seventv) = match parts {
+            DiskCacheParts::Shared => (
+                cache_file.global_emotes,
+                None,
+                cache_file.channel_emotes,
+                cache_file.channel_seventv,
+            ),
+            DiskCacheParts::User => (
+                None,
+                cache_file.user_emotes,
+                Default::default(),
+                Default::default(),
+            ),
         };
 
         let mut global_loaded = false;
@@ -1969,6 +1979,11 @@ impl EmoteCache {
                 let is_fresh = cached.is_fresh_enough_to_delay();
                 if is_fresh {
                     STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key);
+                    // A stale catalog refreshes at join anyway; only a fresh
+                    // one may register its saved 7TV state instead.
+                    if let Some(state) = channel_seventv.remove(&channel) {
+                        seventv_eventapi::stash_disk_channel_state(&cache_key, state);
+                    }
                 } else {
                     STALE_DISK_CHANNEL_HYDRATIONS.insert(cache_key.clone());
                 }
@@ -2135,6 +2150,7 @@ impl EmoteCache {
             .unwrap_or(0);
 
         let mut channel_emotes = HashMap::new();
+        let mut channel_seventv = HashMap::new();
         let mut channel_snapshot_count = 0usize;
         for entry in self.channels.iter() {
             if CHANNEL_CATALOG_PENDING
@@ -2151,6 +2167,9 @@ impl EmoteCache {
                 .map(|(k, v)| (k.to_string(), (**v).clone()))
                 .collect();
             channel_snapshot_count += emotes.len();
+            if let Some(state) = seventv_eventapi::persisted_channel_state(entry.key()) {
+                channel_seventv.insert(entry.key().clone(), state);
+            }
             channel_emotes.insert(entry.key().clone(), CachedEmoteSet::new(emotes));
         }
 
@@ -2160,6 +2179,7 @@ impl EmoteCache {
             user_emotes,
             user_emote_owner_id,
             channel_emotes,
+            channel_seventv,
         };
         record_emote_stage_timed(
             "emotes.disk.save.snapshot",
@@ -3497,6 +3517,9 @@ impl EmoteCache {
                             if *settled_without_set {
                                 seventv_eventapi::note_channel_without_set(&cache_key);
                             }
+                            if emote_set_id.is_some() || *settled_without_set {
+                                seventv_eventapi::note_channel_lookup_completed(&cache_key);
+                            }
                             for emote in emotes.iter().cloned() {
                                 insert_emote(emote);
                             }
@@ -3709,6 +3732,9 @@ impl EmoteCache {
                         if *settled_without_set {
                             seventv_eventapi::note_channel_without_set(&deferred_cache_key);
                         }
+                        if emote_set_id.is_some() || *settled_without_set {
+                            seventv_eventapi::note_channel_lookup_completed(&deferred_cache_key);
+                        }
                         record_emote_stage_timed(
                             "emotes.channel.apply.7tv.deferred",
                             apply_start,
@@ -3862,6 +3888,9 @@ impl EmoteCache {
                         if *settled_without_set {
                             seventv_eventapi::note_channel_without_set(&deferred_cache_key);
                         }
+                        if emote_set_id.is_some() || *settled_without_set {
+                            seventv_eventapi::note_channel_lookup_completed(&deferred_cache_key);
+                        }
                         record_emote_stage_timed(
                             "emotes.channel.apply.7tv.deferred",
                             apply_start,
@@ -3960,15 +3989,28 @@ impl EmoteCache {
     /// Whether a join whose channel already has resident emotes must still
     /// force a provider refresh: the set came from a stale disk cache (this
     /// call consumes that mark), its TTL has expired, or this open session has
-    /// not settled the channel's 7TV state. Only a completed 7TV channel fetch
+    /// not settled the channel's 7TV state. A completed 7TV channel fetch
     /// settles it, by registering EventAPI ownership or by finding no 7TV
-    /// user or active set; neither a disk hydrate nor a catalog kept across
-    /// close and reopen does, so skipping the fetch would leave the channel
-    /// without live 7TV updates. A fresh, settled entry is served as is; the
-    /// non-forced load still hydrates FFZ room badges.
+    /// user or active set; so does the 7TV state saved with a fresh disk
+    /// catalog, registered here when its lookup is recent enough. A catalog
+    /// kept across close and reopen does not, so skipping the fetch would
+    /// leave the channel without live 7TV updates. A fresh, settled entry is
+    /// served as is; the non-forced load still hydrates FFZ room badges.
     pub fn channel_join_needs_forced_refresh(&self, channel_login: &str) -> bool {
         let cache_key = normalize_channel_key(channel_login);
         let stale_disk = STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key).is_some();
+        if let Some(state) = seventv_eventapi::take_disk_channel_state(&cache_key)
+            && !stale_disk
+            && !seventv_eventapi::channel_seventv_state_settled(&cache_key)
+            && let Some(set_id) = seventv_eventapi::register_disk_channel_state(
+                &cache_key,
+                state,
+                crate::utils::unix_now_secs(),
+            )
+            && !set_id.is_empty()
+        {
+            self.channel_emote_set_ids.insert(cache_key.clone(), set_id);
+        }
         stale_disk
             || !seventv_eventapi::channel_seventv_state_settled(&cache_key)
             || self.channel_emotes_need_refresh(&cache_key)
@@ -4353,6 +4395,9 @@ pub(crate) async fn manual_reload_channel_emotes(
         }
         if *settled_without_set {
             seventv_eventapi::note_channel_without_set(&cache_key);
+        }
+        if emote_set_id.is_some() || *settled_without_set {
+            seventv_eventapi::note_channel_lookup_completed(&cache_key);
         }
     }
     seventv_eventapi::resubscribe_channel(&cache_key);
@@ -5051,7 +5096,7 @@ mod provider_index_tests {
     fn a_fresh_catalog_without_eventapi_ownership_refreshes_at_join() {
         // A quick relaunch hydrates a fresh catalog from disk, and a channel
         // reopened within its TTL keeps its catalog, but closing removed the
-        // EventAPI ownership and the disk cache has no 7TV set id. Only the
+        // EventAPI ownership and no saved 7TV state was registered. Only the
         // forced fetch subscribes the channel to live 7TV updates again.
         let channel = "join_refresh_ownership_test".to_string();
         let _cleanup = ChannelTestCleanup(channel.clone());
@@ -5083,6 +5128,145 @@ mod provider_index_tests {
             EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
             "closing the channel drops ownership, so a reopen fetches again"
         );
+    }
+
+    fn disk_seventv_state(
+        looked_up_at: u64,
+        user_id: &str,
+        emote_set_id: &str,
+    ) -> cache_codec::CachedSevenTvChannel {
+        cache_codec::CachedSevenTvChannel {
+            looked_up_at,
+            user_id: user_id.to_string(),
+            connection_index: 1,
+            emote_set_id: emote_set_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_disk_catalog_with_a_recent_7tv_state_subscribes_without_refetching() {
+        let channel = "join_disk_seventv_state_test".to_string();
+        let _cleanup = ChannelTestCleanup(channel.clone());
+        struct StateCleanup(String);
+        impl Drop for StateCleanup {
+            fn drop(&mut self) {
+                STALE_DISK_CHANNEL_HYDRATIONS.remove(&self.0);
+                EMOTE_CACHE.channel_emote_set_ids.remove(&self.0);
+                seventv_eventapi::unsubscribe_channel(&self.0);
+            }
+        }
+        let _state_cleanup = StateCleanup(channel.clone());
+        EMOTE_CACHE.channels.insert(
+            channel.clone(),
+            entry([emote(EmoteProvider::SevenTV, "disk-1", "diskEmote")]),
+        );
+        let now = crate::utils::unix_now_secs();
+
+        // An owner looked up ten minutes ago: registered from disk, and saved
+        // again with its original lookup time rather than the save time.
+        let owned = disk_seventv_state(now - 600, "disk-7tv-user", "disk-7tv-set");
+        seventv_eventapi::stash_disk_channel_state(&channel, owned.clone());
+        assert!(
+            !EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "a fresh catalog with a recent saved 7TV state skips the provider refetch"
+        );
+        assert!(seventv_eventapi::channel_has_subscription_owner(&channel));
+        assert_eq!(
+            EMOTE_CACHE
+                .channel_emote_set_ids
+                .get(&channel)
+                .map(|set| set.clone()),
+            Some("disk-7tv-set".to_string())
+        );
+        assert_eq!(
+            seventv_eventapi::persisted_channel_state(&channel),
+            Some(owned)
+        );
+
+        // A newer lookup supersedes the restored time.
+        seventv_eventapi::note_channel_lookup_completed(&channel);
+        let relooked = seventv_eventapi::persisted_channel_state(&channel).unwrap();
+        assert!(relooked.looked_up_at >= now);
+        assert_eq!(relooked.emote_set_id, "disk-7tv-set");
+
+        // Closing forgets everything; a state too old to trust, or from the
+        // future, is consumed without registering, so the join looks up.
+        seventv_eventapi::unsubscribe_channel(&channel);
+        assert_eq!(seventv_eventapi::persisted_channel_state(&channel), None);
+        for untrusted in [
+            now - SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS - 1,
+            now + 3_600,
+        ] {
+            seventv_eventapi::stash_disk_channel_state(
+                &channel,
+                disk_seventv_state(untrusted, "disk-7tv-user", "disk-7tv-set"),
+            );
+            assert!(EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
+            assert!(!seventv_eventapi::channel_has_subscription_owner(&channel));
+            assert!(
+                EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+                "the untrusted state was consumed, not kept for a later join"
+            );
+        }
+
+        // A catalog hydrated stale refreshes at join even with a recent state.
+        seventv_eventapi::stash_disk_channel_state(&channel, disk_seventv_state(now, "u", "s"));
+        STALE_DISK_CHANNEL_HYDRATIONS.insert(channel.clone());
+        assert!(EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
+        assert!(
+            EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "the stale join consumed the saved state too"
+        );
+    }
+
+    #[test]
+    fn a_saved_7tv_state_without_a_set_settles_the_join_as_before() {
+        let channel = "join_disk_seventv_without_set_test".to_string();
+        let _cleanup = ChannelTestCleanup(channel.clone());
+        struct StateCleanup(String);
+        impl Drop for StateCleanup {
+            fn drop(&mut self) {
+                seventv_eventapi::unsubscribe_channel(&self.0);
+            }
+        }
+        let _state_cleanup = StateCleanup(channel.clone());
+        EMOTE_CACHE.channels.insert(
+            channel.clone(),
+            entry([emote(EmoteProvider::BTTV, "plain-1", "plainEmote")]),
+        );
+        let now = crate::utils::unix_now_secs();
+
+        // No 7TV user or set: settled without an owner, as a completed lookup
+        // would leave it.
+        let without_set = cache_codec::CachedSevenTvChannel {
+            connection_index: 0,
+            ..disk_seventv_state(now - 60, "", "")
+        };
+        seventv_eventapi::stash_disk_channel_state(&channel, without_set.clone());
+        assert!(!EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
+        assert!(!seventv_eventapi::channel_has_subscription_owner(&channel));
+        assert!(EMOTE_CACHE.channel_emote_set_ids.get(&channel).is_none());
+        assert_eq!(
+            seventv_eventapi::persisted_channel_state(&channel),
+            Some(without_set)
+        );
+
+        // A 7TV user with no active set keeps the user subscription, so a
+        // later active-set switch still reaches the channel.
+        seventv_eventapi::unsubscribe_channel(&channel);
+        let user_only = disk_seventv_state(now - 60, "disk-7tv-user-only", "");
+        seventv_eventapi::stash_disk_channel_state(&channel, user_only.clone());
+        assert!(!EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
+        assert!(seventv_eventapi::channel_has_subscription_owner(&channel));
+        assert_eq!(
+            seventv_eventapi::persisted_channel_state(&channel),
+            Some(user_only)
+        );
+
+        // No saved state (an older cache, or a lookup that never completed)
+        // keeps the forced refetch.
+        seventv_eventapi::unsubscribe_channel(&channel);
+        assert!(EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
     }
 
     #[test]

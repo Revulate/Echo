@@ -25,6 +25,7 @@
 //!   36 = UNSUBSCRIBE (client → server)
 //!   34 = RESUME     (client → server: reconnect with session)
 
+use super::cache_codec::CachedSevenTvChannel;
 use crate::backend::lock_utils::MutexExt;
 use dashmap::{DashMap, DashSet};
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -251,6 +252,24 @@ static CHANNEL_DETAILS: LazyLock<DashMap<String, SevenTvChannelSubscription>> =
 /// 7TV user or no active emote set, so there is nothing for the EventAPI to
 /// own. Closing the channel clears the entry.
 static CHANNELS_WITHOUT_SET: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// Channel login -> unix time of the completed 7TV lookup that the channel's
+/// registered state descends from (a lookup in this session, or one restored
+/// from the disk cache with its original time). Closing the channel clears it.
+static CHANNEL_LOOKED_UP_AT: LazyLock<DashMap<String, u64>> = LazyLock::new(DashMap::new);
+
+/// Channel login -> 7TV state read with a fresh catalog from the disk cache
+/// and not yet registered. The channel's first join registers it (or drops
+/// it when too old); a completed lookup or closing the channel drops it.
+static DISK_CHANNEL_STATES: LazyLock<DashMap<String, CachedSevenTvChannel>> =
+    LazyLock::new(DashMap::new);
+
+/// How old the lookup behind a disk-cached 7TV state may be and still be
+/// registered without a new lookup. It matches how long an EventAPI-covered
+/// channel reuses a 7TV fetch within a session, and bounds how long a set
+/// switched while Echo was closed can stay undetected: past it the join
+/// looks the channel up again.
+const DISK_CHANNEL_STATE_MAX_AGE_SECS: u64 = super::SEVENTV_CHANNEL_EVENTAPI_FETCH_CACHE_TTL_SECS;
 
 /// Channel login -> Twitch channel id, for channel-scoped entitlement
 /// subscriptions. 7TV pushes `entitlement.create` for chatters present in the
@@ -1180,6 +1199,8 @@ pub fn unsubscribe_channel(channel_login: &str) {
         unsubscribe_entitlements_if_unused(&twitch_channel_id);
     }
     CHANNELS_WITHOUT_SET.remove(&channel);
+    CHANNEL_LOOKED_UP_AT.remove(&channel);
+    DISK_CHANNEL_STATES.remove(&channel);
 
     crate::log_emotes!(
         debug,
@@ -1228,6 +1249,129 @@ pub(crate) fn note_channel_without_set(channel_login: &str) {
 pub(crate) fn channel_seventv_state_settled(channel_login: &str) -> bool {
     channel_has_subscription_owner(channel_login)
         || CHANNELS_WITHOUT_SET.contains(&super::normalize_channel_key(channel_login))
+}
+
+/// Record that a completed 7TV channel lookup just registered the channel's
+/// state (an owner, or no set). Its time is saved with the catalog, and any
+/// disk state still waiting for the channel's join is superseded.
+pub(crate) fn note_channel_lookup_completed(channel_login: &str) {
+    if crate::backend::irc::is_channel_closed(channel_login) {
+        return;
+    }
+    let channel = super::normalize_channel_key(channel_login);
+    DISK_CHANNEL_STATES.remove(&channel);
+    CHANNEL_LOOKED_UP_AT.insert(channel, crate::utils::unix_now_secs());
+}
+
+/// The channel's registered 7TV state to save with its catalog, or `None`
+/// when no completed lookup stands behind it or it is mid-change: an active
+/// set switch is being applied, or a set refresh is still queued, so the
+/// saved rows may not match the registered set.
+pub(super) fn persisted_channel_state(channel_login: &str) -> Option<CachedSevenTvChannel> {
+    let channel = super::normalize_channel_key(channel_login);
+    let looked_up_at = *CHANNEL_LOOKED_UP_AT.get(&channel)?;
+    if ACTIVE_SET_REFRESH_TARGETS.contains_key(&channel)
+        || PENDING_REFRESHES
+            .lock_or_recover()
+            .values()
+            .any(|refresh| !refresh.is_global && refresh.channel == channel)
+    {
+        return None;
+    }
+    if let Some(details) = CHANNEL_DETAILS.get(&channel) {
+        return Some(CachedSevenTvChannel {
+            looked_up_at,
+            user_id: details.user_id.clone(),
+            connection_index: u32::try_from(details.connection_index).ok()?,
+            emote_set_id: details.emote_set_id.clone(),
+        });
+    }
+    if let Some(set_id) = CHANNEL_TO_SET.get(&channel) {
+        return Some(CachedSevenTvChannel {
+            looked_up_at,
+            user_id: String::new(),
+            connection_index: 0,
+            emote_set_id: set_id.clone(),
+        });
+    }
+    CHANNELS_WITHOUT_SET
+        .contains(&channel)
+        .then(|| CachedSevenTvChannel {
+            looked_up_at,
+            user_id: String::new(),
+            connection_index: 0,
+            emote_set_id: String::new(),
+        })
+}
+
+/// Keep a 7TV state read from the disk cache with a fresh catalog until the
+/// channel's join decides whether to register it. A channel whose state this
+/// session already settled ignores it.
+pub(super) fn stash_disk_channel_state(channel_login: &str, state: CachedSevenTvChannel) {
+    let channel = super::normalize_channel_key(channel_login);
+    if channel_seventv_state_settled(&channel) {
+        return;
+    }
+    DISK_CHANNEL_STATES.insert(channel, state);
+}
+
+/// Whether a disk-cached 7TV state is recent enough to register without a
+/// new lookup at `now` (unix seconds). A lookup time in the future (a clock
+/// moved back) is not trusted.
+fn disk_channel_state_is_current(state: &CachedSevenTvChannel, now: u64) -> bool {
+    state.looked_up_at <= now && now - state.looked_up_at <= DISK_CHANNEL_STATE_MAX_AGE_SECS
+}
+
+/// Take the channel's disk-cached 7TV state, if one is waiting for its join.
+pub(super) fn take_disk_channel_state(channel_login: &str) -> Option<CachedSevenTvChannel> {
+    DISK_CHANNEL_STATES
+        .remove(&super::normalize_channel_key(channel_login))
+        .map(|(_, state)| state)
+}
+
+/// Register a disk-cached 7TV state when it is recent enough: the user and
+/// set subscriptions it names, or the "no set" mark. Returns the registered
+/// set id (empty when there is none), or `None` when the state was not used
+/// and the join must look the channel up. The restored lookup time is kept,
+/// so the state ages from its real lookup.
+pub(super) fn register_disk_channel_state(
+    channel_login: &str,
+    state: CachedSevenTvChannel,
+    now: u64,
+) -> Option<String> {
+    let channel = super::normalize_channel_key(channel_login);
+    if !disk_channel_state_is_current(&state, now)
+        || crate::backend::irc::is_channel_closed(&channel)
+    {
+        return None;
+    }
+    if !state.user_id.is_empty() {
+        subscribe_channel_details(
+            &channel,
+            SevenTvChannelSubscription {
+                user_id: state.user_id.clone(),
+                emote_set_id: state.emote_set_id.clone(),
+                connection_index: state.connection_index as usize,
+            },
+        );
+    } else if !state.emote_set_id.is_empty() {
+        subscribe_channel_set(&channel, &state.emote_set_id);
+    } else {
+        note_channel_without_set(&channel);
+    }
+    if !channel_seventv_state_settled(&channel) {
+        return None;
+    }
+    CHANNEL_LOOKED_UP_AT.insert(channel.clone(), state.looked_up_at);
+    crate::log_emotes!(
+        debug,
+        "7TV EventAPI: registered #{} from the disk cache (user {:?}, set {:?}, looked up {}s ago)",
+        channel,
+        state.user_id,
+        state.emote_set_id,
+        now - state.looked_up_at
+    );
+    Some(state.emote_set_id)
 }
 
 /// Whether a channel's registered 7TV set is covered by the live EventAPI stream.
@@ -4022,6 +4166,58 @@ fn push_emote_notification(channel: &str, text: &str) {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[test]
+    fn a_channel_mid_set_change_saves_no_7tv_state() {
+        let channel = "persist_mid_change_test".to_string();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                ACTIVE_SET_REFRESH_TARGETS.remove(&self.0);
+                PENDING_REFRESHES
+                    .lock_or_recover()
+                    .remove(&pending_refresh_key("persist-set", &self.0));
+                unsubscribe_channel(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(channel.clone());
+
+        subscribe_channel_set(&channel, "persist-set");
+        assert_eq!(
+            persisted_channel_state(&channel),
+            None,
+            "ownership without a completed lookup behind it is not saved"
+        );
+        note_channel_lookup_completed(&channel);
+        let saved = persisted_channel_state(&channel).expect("a looked-up owner is saved");
+        assert_eq!(saved.emote_set_id, "persist-set");
+        assert!(saved.user_id.is_empty());
+
+        ACTIVE_SET_REFRESH_TARGETS.insert(channel.clone(), "persist-next-set".to_string());
+        assert_eq!(persisted_channel_state(&channel), None);
+        ACTIVE_SET_REFRESH_TARGETS.remove(&channel);
+
+        PENDING_REFRESHES.lock_or_recover().insert(
+            pending_refresh_key("persist-set", &channel),
+            PendingRefresh {
+                set_id: "persist-set".to_string(),
+                channel: channel.clone(),
+                is_global: false,
+                added: 1,
+                removed: 0,
+                updated: 0,
+                requires_full_refresh: false,
+                patch: Default::default(),
+                notifications: Vec::new(),
+                fetch_attempt: 0,
+            },
+        );
+        assert_eq!(persisted_channel_state(&channel), None);
+        PENDING_REFRESHES
+            .lock_or_recover()
+            .remove(&pending_refresh_key("persist-set", &channel));
+        assert!(persisted_channel_state(&channel).is_some());
+    }
 
     fn flush_state(active: usize, pending: usize) -> ConnectionFlushState {
         ConnectionFlushState {

@@ -25,7 +25,7 @@ const LEGACY_BINCODE_CONFIG: bincode::config::Configuration<
 /// Current Postcard cache schema version. Bump it whenever the structure or
 /// the meaning of a persisted field changes. A snapshot of another version is
 /// rejected, and its emotes refetched, unless decoding migrates it.
-pub(super) const EMOTE_CACHE_VERSION: u32 = 13;
+pub(super) const EMOTE_CACHE_VERSION: u32 = 14;
 const LEGACY_BINCODE_EMOTE_CACHE_VERSION: u32 = 9;
 
 /// The on-disk header distinguishes current Postcard snapshots from legacy
@@ -61,6 +61,53 @@ pub(super) struct EmoteCacheFile {
     pub(super) user_emote_owner_id: Option<String>,
     /// Per-channel emotes (channel_login -> emotes)
     pub(super) channel_emotes: HashMap<String, CachedEmoteSet>,
+    /// Per-channel 7TV EventAPI state (channel_login -> state) for channels
+    /// whose catalog was saved while a completed 7TV lookup was registered.
+    /// Added in version 14; versions 12 and 13 decode with an empty map.
+    pub(super) channel_seventv: HashMap<String, CachedSevenTvChannel>,
+}
+
+/// What a channel's last completed 7TV lookup registered with the EventAPI,
+/// as current as the live registry was when the catalog was saved. Empty
+/// `user_id` and `emote_set_id` mean the lookup found no 7TV user or no
+/// active set; an empty `user_id` with a set id means the set's owner
+/// connection was not identified.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CachedSevenTvChannel {
+    /// Unix time of the completed 7TV channel lookup this state descends
+    /// from. Saving carries it over unchanged, so a state restored from disk
+    /// and saved again keeps the age of its last real lookup.
+    pub(crate) looked_up_at: u64,
+    pub(crate) user_id: String,
+    pub(crate) connection_index: u32,
+    pub(crate) emote_set_id: String,
+}
+
+/// The version 12 and 13 Postcard layout: the current file without
+/// `channel_seventv`. Postcard is not self-describing, so a snapshot of that
+/// layout is decoded with this struct (selected by its leading version) and
+/// migrated rather than discarded.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct EmoteCacheFileV13 {
+    version: u32,
+    global_emotes: Option<CachedEmoteSet>,
+    user_emotes: Option<CachedEmoteSet>,
+    user_emote_owner_id: Option<String>,
+    channel_emotes: HashMap<String, CachedEmoteSet>,
+}
+
+impl From<EmoteCacheFileV13> for EmoteCacheFile {
+    fn from(v13: EmoteCacheFileV13) -> Self {
+        Self {
+            version: v13.version,
+            global_emotes: v13.global_emotes,
+            user_emotes: v13.user_emotes,
+            user_emote_owner_id: v13.user_emote_owner_id,
+            channel_emotes: v13.channel_emotes,
+            channel_seventv: HashMap::new(),
+        }
+    }
 }
 
 /// Echo's former Bincode v9 cache schema, retained solely to migrate an
@@ -89,6 +136,7 @@ impl From<LegacyBincodeEmoteCacheFile> for EmoteCacheFile {
                 .into_iter()
                 .map(|(channel, emotes)| (channel, emotes.into()))
                 .collect(),
+            channel_seventv: HashMap::new(),
         }
     }
 }
@@ -431,8 +479,17 @@ fn decode_current_emote_cache(payload: &[u8]) -> Result<EmoteCacheFile, String> 
         ));
     }
 
-    let (mut cache_file, remaining) = postcard::take_from_bytes::<EmoteCacheFile>(postcard_payload)
-        .map_err(|error| format!("failed to deserialize Postcard cache: {error}"))?;
+    // `version` is the first field, so it can be read before choosing the
+    // layout to decode.
+    let (version, _) = postcard::take_from_bytes::<u32>(postcard_payload)
+        .map_err(|error| format!("failed to read Postcard cache version: {error}"))?;
+    let (mut cache_file, remaining) = if matches!(version, 12 | 13) {
+        postcard::take_from_bytes::<EmoteCacheFileV13>(postcard_payload)
+            .map(|(v13, remaining)| (EmoteCacheFile::from(v13), remaining))
+    } else {
+        postcard::take_from_bytes::<EmoteCacheFile>(postcard_payload)
+    }
+    .map_err(|error| format!("failed to deserialize Postcard cache: {error}"))?;
     if !remaining.is_empty() {
         return Err(format!(
             "current cache has {} unexpected trailing bytes",
@@ -453,6 +510,8 @@ fn decode_current_emote_cache(payload: &[u8]) -> Result<EmoteCacheFile, String> 
                     migrate_inferred_dimensions(emote.provider, emote.width, emote.height);
             }
         }
+        cache_file.version = EMOTE_CACHE_VERSION;
+    } else if cache_file.version == 13 {
         cache_file.version = EMOTE_CACHE_VERSION;
     } else if cache_file.version != EMOTE_CACHE_VERSION {
         return Err(format!(
@@ -597,15 +656,78 @@ mod emote_cache_codec_tests {
         );
     }
 
+    fn postcard_payload<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut payload = EMOTE_CACHE_MAGIC.to_vec();
+        payload.push(EMOTE_CACHE_CODEC_GENERATION);
+        payload.extend_from_slice(&postcard::to_stdvec(value).unwrap());
+        payload
+    }
+
+    fn channel_set(saved_at: u64) -> CachedEmoteSet {
+        CachedEmoteSet {
+            saved_at,
+            emotes: HashMap::new(),
+        }
+    }
+
     #[test]
-    fn previous_postcard_schema_is_migrated_without_discarding_the_snapshot() {
+    fn previous_postcard_schemas_are_migrated_without_discarding_the_snapshot() {
+        for version in [12, 13] {
+            let v13 = EmoteCacheFileV13 {
+                version,
+                global_emotes: Some(channel_set(7)),
+                user_emotes: None,
+                user_emote_owner_id: Some("owner".to_string()),
+                channel_emotes: HashMap::from([("chan".to_string(), channel_set(9))]),
+            };
+            let decoded = decode_current_emote_cache(&postcard_payload(&v13)).unwrap();
+            assert_eq!(decoded.version, EMOTE_CACHE_VERSION);
+            assert_eq!(decoded.global_emotes.map(|set| set.saved_at), Some(7));
+            assert_eq!(decoded.user_emote_owner_id.as_deref(), Some("owner"));
+            assert_eq!(decoded.channel_emotes["chan"].saved_at, 9);
+            assert!(decoded.channel_seventv.is_empty());
+        }
+    }
+
+    #[test]
+    fn channel_seventv_state_round_trips_with_the_catalog() {
         let mut cache = empty_current_cache();
-        cache.version = 12;
+        cache
+            .channel_emotes
+            .insert("chan".to_string(), channel_set(11));
+        let owned = CachedSevenTvChannel {
+            looked_up_at: 1_900_000_000,
+            user_id: "7tv-user".to_string(),
+            connection_index: 2,
+            emote_set_id: "7tv-set".to_string(),
+        };
+        let without_set = CachedSevenTvChannel {
+            looked_up_at: 1_900_000_100,
+            user_id: String::new(),
+            connection_index: 0,
+            emote_set_id: String::new(),
+        };
+        cache
+            .channel_seventv
+            .insert("chan".to_string(), owned.clone());
+        cache
+            .channel_seventv
+            .insert("plain".to_string(), without_set.clone());
+
         let payload = serialize_current_emote_cache(&cache).unwrap();
-        assert_eq!(
-            decode_current_emote_cache(&payload).unwrap().version,
-            EMOTE_CACHE_VERSION
-        );
+        let decoded = decode_current_emote_cache(&payload).unwrap();
+        assert_eq!(decoded.channel_seventv.len(), 2);
+        assert_eq!(decoded.channel_seventv["chan"], owned);
+        assert_eq!(decoded.channel_seventv["plain"], without_set);
+        assert_eq!(decoded.channel_emotes["chan"].saved_at, 11);
+
+        // A version-13 reader (the layout without the map) cannot take this
+        // file: it finds the map as trailing bytes and rejects the snapshot
+        // instead of misreading it.
+        let (_, remaining) =
+            postcard::take_from_bytes::<EmoteCacheFileV13>(&payload[EMOTE_CACHE_HEADER_LEN..])
+                .unwrap();
+        assert!(!remaining.is_empty());
     }
 
     fn empty_current_cache() -> EmoteCacheFile {
@@ -615,6 +737,7 @@ mod emote_cache_codec_tests {
             user_emotes: None,
             user_emote_owner_id: None,
             channel_emotes: HashMap::new(),
+            channel_seventv: HashMap::new(),
         }
     }
 
