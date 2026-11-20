@@ -108,6 +108,7 @@ core_test	crates/echo-core/src/chat_snapshot.rs	append_snapshot_retains_newest_c
 core_test	crates/echo-core/src/chat_snapshot.rs	backfilled_history_places_the_divider_chronologically
 core_test	crates/echo-core/src/chat_snapshot.rs	day_divider_precedes_first_message_of_a_new_local_date
 core_test	crates/echo-core/src/chat_snapshot.rs	evicting_the_earlier_date_drops_its_divider
+core_test	crates/echo-core/src/chat_snapshot.rs	history_merge_by_reference_matches_the_by_value_merge
 core_test	crates/echo-core/src/chat_snapshot.rs	history_snapshot_deduplicates_overlap
 core_test	crates/echo-core/src/chat_snapshot.rs	history_snapshot_prepends_and_trims
 core_test	crates/echo-core/src/chat_snapshot.rs	history_snapshot_reports_parity_only_changes
@@ -897,7 +898,7 @@ summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
 summary	media_cache_tests	39
-summary	core_tests	246
+summary	core_tests	247
 summary	render_core_tests	46
 summary	text_core_tests	26
 summary	root_doctests_runnable	3

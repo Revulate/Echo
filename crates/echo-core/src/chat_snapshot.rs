@@ -136,7 +136,11 @@ impl ChatSnapshot {
         new_messages.retain(|message| message.id.is_empty() || !held.contains(message.id.as_ref()));
     }
 
-    pub fn merge_history_into_snapshot(&mut self, incoming: Vec<ChatMessage>) -> bool {
+    /// Merge the backend's history snapshot into the held rows.
+    ///
+    /// `incoming` is borrowed because the backend event shares it with every
+    /// observer; only the rows this merge keeps are copied into new `Arc`s.
+    pub fn merge_history_into_snapshot(&mut self, incoming: &[ChatMessage]) -> bool {
         if incoming.is_empty() {
             if self.raw_messages.is_empty() {
                 return false;
@@ -147,12 +151,8 @@ impl ChatSnapshot {
 
         let mut existing: Vec<Arc<ChatMessage>> = self.raw_messages.iter().cloned().collect();
         if existing.is_empty() {
-            self.set_messages_vec(
-                Self::bounded_newest(incoming, self.message_capacity)
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect(),
-            );
+            let start = incoming.len().saturating_sub(self.message_capacity.max(1));
+            self.set_messages_vec(incoming[start..].iter().cloned().map(Arc::new).collect());
             return !self.raw_messages.is_empty();
         }
 
@@ -173,7 +173,11 @@ impl ChatSnapshot {
             }
         }
 
-        let merge = merge_history_by_timestamp(existing, incoming, Arc::new);
+        let merge = merge_history_by_timestamp(
+            existing,
+            incoming.iter().collect::<Vec<_>>(),
+            |message: &ChatMessage| Arc::new(message.clone()),
+        );
         if merge.strategy == HistoryMergeStrategy::NoNewRows {
             if parity_changed {
                 self.set_messages_vec(merge.rows);
@@ -406,7 +410,7 @@ mod tests {
         let mut state = state();
         state.set_message_capacity(4);
         state.append_messages_to_snapshot(vec![make_message("3", 3), make_message("4", 4)]);
-        state.merge_history_into_snapshot(vec![make_message("1", 1), make_message("2", 2)]);
+        state.merge_history_into_snapshot(&[make_message("1", 1), make_message("2", 2)]);
         assert_eq!(row_ids(&state.messages), ["1", "2", "3", "4"]);
     }
 
@@ -419,7 +423,7 @@ mod tests {
             make_message("3", 3),
             make_message("4", 4),
         ]);
-        state.merge_history_into_snapshot(vec![
+        state.merge_history_into_snapshot(&[
             make_message("1", 1),
             make_message("2", 2),
             make_message("3", 3),
@@ -436,7 +440,7 @@ mod tests {
         state.append_messages_to_snapshot(vec![a.clone(), b.clone()]);
         // The backend buffer after gap-filling "x", re-striped from the newest row.
         a.flags.is_alternate_row = true;
-        state.merge_history_into_snapshot(vec![a, make_message("x", 2), b]);
+        state.merge_history_into_snapshot(&[a, make_message("x", 2), b]);
         let stripes: Vec<(&str, bool)> = state
             .messages
             .iter()
@@ -451,7 +455,7 @@ mod tests {
         state.append_messages_to_snapshot(vec![make_message("a", 1)]);
         let mut restriped = make_message("a", 1);
         restriped.flags.is_alternate_row = true;
-        assert!(state.merge_history_into_snapshot(vec![restriped]));
+        assert!(state.merge_history_into_snapshot(&[restriped]));
         assert!(state.messages[0].flags.is_alternate_row);
     }
 
@@ -515,7 +519,7 @@ mod tests {
         let mut state = state();
         state.append_messages_to_snapshot(vec![make_message("2", BASE_MS + DAY_MS)]);
         assert_eq!(state.messages.len(), 1);
-        state.merge_history_into_snapshot(vec![make_message("1", BASE_MS)]);
+        state.merge_history_into_snapshot(&[make_message("1", BASE_MS)]);
         assert_eq!(state.messages.len(), 3);
         assert_eq!(row_ids(&state.messages)[0], "1");
         assert!(state.messages[1].day_divider_date().is_some());
@@ -532,5 +536,140 @@ mod tests {
         assert_eq!(state.messages.len(), 3);
         assert!(state.set_message_capacity(1));
         assert_eq!(row_ids(&state.messages), ["2"]);
+    }
+
+    /// The by-value merge this module used before `merge_history_into_snapshot`
+    /// took the batch by reference, kept as the reference for its result.
+    fn merge_history_by_value(state: &mut ChatSnapshot, incoming: Vec<ChatMessage>) -> bool {
+        if incoming.is_empty() {
+            if state.raw_messages.is_empty() {
+                return false;
+            }
+            state.set_messages_vec(Vec::new());
+            return true;
+        }
+        let mut existing: Vec<Arc<ChatMessage>> = state.raw_messages.iter().cloned().collect();
+        if existing.is_empty() {
+            state.set_messages_vec(
+                ChatSnapshot::bounded_newest(incoming, state.message_capacity)
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect(),
+            );
+            return !state.raw_messages.is_empty();
+        }
+        let incoming_parity: HashMap<Arc<str>, bool> = incoming
+            .iter()
+            .map(|message| (Arc::clone(&message.id), message.flags.is_alternate_row))
+            .collect();
+        let mut parity_changed = false;
+        for message in &mut existing {
+            if let Some(&parity) = incoming_parity.get(message.id.as_ref())
+                && message.flags.is_alternate_row != parity
+            {
+                Arc::make_mut(message).flags.is_alternate_row = parity;
+                parity_changed = true;
+            }
+        }
+        let merge = merge_history_by_timestamp(existing, incoming, Arc::new);
+        if merge.strategy == HistoryMergeStrategy::NoNewRows {
+            if parity_changed {
+                state.set_messages_vec(merge.rows);
+            }
+            return parity_changed;
+        }
+        state.set_messages_vec(ChatSnapshot::bounded_newest(
+            merge.rows,
+            state.message_capacity,
+        ));
+        true
+    }
+
+    fn row_shape(messages: &[Arc<ChatMessage>]) -> Vec<(String, i64, bool)> {
+        messages
+            .iter()
+            .map(|message| {
+                (
+                    message.id.to_string(),
+                    message.timestamp,
+                    message.flags.is_alternate_row,
+                )
+            })
+            .collect()
+    }
+
+    fn striped(id: &str, timestamp: i64, alternate: bool) -> ChatMessage {
+        let mut message = make_message(id, timestamp);
+        message.flags.is_alternate_row = alternate;
+        message
+    }
+
+    #[test]
+    fn history_merge_by_reference_matches_the_by_value_merge() {
+        let held = vec![
+            striped("h3", BASE_MS + 30, false),
+            striped("h5", BASE_MS + 50, true),
+            striped("h7", BASE_MS + DAY_MS, false),
+        ];
+        let batches: Vec<(&str, Vec<ChatMessage>)> = vec![
+            ("empty", Vec::new()),
+            (
+                "older",
+                vec![
+                    striped("o1", BASE_MS + 10, true),
+                    striped("o2", BASE_MS + 20, false),
+                ],
+            ),
+            ("newer", vec![striped("n1", BASE_MS + 2 * DAY_MS, true)]),
+            (
+                "interleaved with duplicates",
+                vec![
+                    striped("h3", BASE_MS + 30, true),
+                    striped("i4", BASE_MS + 40, false),
+                    striped("i4", BASE_MS + 40, false),
+                    striped("i1", BASE_MS + 5, true),
+                    striped("h7", BASE_MS + DAY_MS, false),
+                ],
+            ),
+            ("parity only", vec![striped("h5", BASE_MS + 50, false)]),
+            ("nothing new", vec![striped("h5", BASE_MS + 50, true)]),
+            (
+                "over capacity",
+                (0..9)
+                    .map(|n| striped(&format!("c{n}"), BASE_MS + 2 * DAY_MS + n, n % 2 == 0))
+                    .collect(),
+            ),
+        ];
+        for start_empty in [false, true] {
+            for (name, batch) in &batches {
+                let mut base = state();
+                base.set_message_capacity(5);
+                if !start_empty {
+                    base.append_messages_to_snapshot(held.clone());
+                }
+                let held_rows = Arc::clone(&base.raw_messages);
+                let mut by_value = base.clone();
+                let mut by_reference = base;
+                let changed_by_value = merge_history_by_value(&mut by_value, batch.clone());
+                let changed_by_reference = by_reference.merge_history_into_snapshot(batch);
+                assert_eq!(
+                    changed_by_reference, changed_by_value,
+                    "{name} {start_empty}"
+                );
+                assert_eq!(
+                    row_shape(&by_reference.messages),
+                    row_shape(&by_value.messages),
+                    "{name} {start_empty}"
+                );
+                // Held rows the merge did not re-stripe are shared, not copied.
+                for row in by_reference.raw_messages.iter() {
+                    if let Some(original) = held_rows.iter().find(|held| held.id == row.id)
+                        && original.flags.is_alternate_row == row.flags.is_alternate_row
+                    {
+                        assert!(Arc::ptr_eq(original, row), "{name} {}", row.id);
+                    }
+                }
+            }
+        }
     }
 }

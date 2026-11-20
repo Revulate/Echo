@@ -165,7 +165,7 @@ impl ChatBackend {
                 channel_lower
             );
             let changed = entity.update(cx, |chat_state, cx| {
-                chat_state.replace_messages_reactive(backend_msgs, cx)
+                chat_state.replace_messages_reactive(&backend_msgs, cx)
             });
             if changed {
                 recovered_channels += 1;
@@ -402,8 +402,7 @@ impl ChatBackend {
                         result.changed |= state
                             .update_messages_reactive(std::mem::take(&mut pending_messages), cx);
                     }
-                    let owned = Arc::try_unwrap(msgs).unwrap_or_else(|arc| (*arc).clone());
-                    result.changed |= state.replace_messages_reactive(owned, cx);
+                    result.changed |= state.replace_messages_reactive(&msgs, cx);
                 }
                 ChannelEvent::MessagesRetokenized => {
                     crate::log_emotes!(

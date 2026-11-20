@@ -30,11 +30,14 @@ pub(super) fn snapshot_channel_messages_for_observers(
     }
     let pending_ids =
         crate::backend::blocked_users::pending_channel_row_ids_commit_held(commit, channel);
+    // Built fresh rather than through `MessageBuffer::snapshot`, whose cache
+    // would keep a second copy of a quiet channel's rows after the observers
+    // have merged and dropped theirs.
     CHAT_MESSAGES
-        .get_mut(channel)
-        .map(|mut buffer| {
+        .get(channel)
+        .map(|buffer| {
             if pending_ids.is_empty() {
-                buffer.snapshot()
+                Arc::new(buffer.iter().cloned().collect())
             } else {
                 Arc::new(
                     buffer

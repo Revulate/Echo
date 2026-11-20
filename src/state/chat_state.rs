@@ -84,7 +84,7 @@ impl ChatState {
 
     pub fn replace_messages_reactive(
         &mut self,
-        messages: Vec<ChatMessage>,
+        messages: &[ChatMessage],
         cx: &mut Context<Self>,
     ) -> bool {
         let changed = self.snapshot.merge_history_into_snapshot(messages);

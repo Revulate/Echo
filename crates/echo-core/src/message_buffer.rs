@@ -185,13 +185,10 @@ pub struct MessageBuffer {
     capacity: usize,
     /// Version counter - increments on every mutation
     version: u64,
-    /// Cached observer snapshot, valid while `version` matches.
-    ///
-    /// Observer events (history load, gap fill, retokenize) each need
-    /// a snapshot; the cached `Arc` makes repeat snapshots of an unchanged
-    /// buffer free instead of deep-cloning up to 10k `ChatMessage`s per
-    /// event. The extra retention is negligible because observers hold the
-    /// latest snapshot `Arc` anyway.
+    /// Cached [`Self::snapshot`] result, valid while `version` matches, so
+    /// repeat snapshots of an unchanged buffer share one `Arc`. It keeps a
+    /// full copy of the rows until the next mutation, which is why Echo's
+    /// history observer event builds its snapshot without it.
     snapshot: Option<(u64, Arc<Vec<ChatMessage>>)>,
     /// Zebra parity for the next pushed message. Stored on the buffer (and
     /// persisted onto each message's flags) so front-pruning at capacity does
