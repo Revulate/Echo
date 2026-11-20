@@ -270,9 +270,21 @@ impl CanvasMessageList {
         );
 
         let current_range = (preload_start, preload_end);
-        let range_changed = self.preload_state.last_emote_preload_range != Some(current_range);
-        let elapsed = self.preload_state.last_emote_preload_time.elapsed();
-        if !range_changed && elapsed < EMOTE_PRELOAD_INTERVAL {
+        let previous_range = self.preload_state.last_emote_preload_range;
+        let new_rows_from = self.preload_state.emote_preload_new_rows_from.take();
+        // Rows added since the last pass (an append, or a rotation at the cap
+        // that kept the indices) are scanned now when they are all that
+        // entered the range; the round-robin rescan keeps its interval.
+        let only_new_rows_entered = previous_range
+            .is_some_and(|previous| only_new_rows_entered(previous, current_range, new_rows_from));
+        let new_rows = new_rows_from
+            .filter(|_| only_new_rows_entered)
+            .map_or(0..0, |from| from.max(preload_start)..preload_end);
+        let range_changed = previous_range != Some(current_range) && !only_new_rows_entered;
+        let rescan_due = range_changed
+            || self.preload_state.last_emote_preload_time.elapsed() >= EMOTE_PRELOAD_INTERVAL;
+        if !rescan_due && new_rows.is_empty() {
+            self.preload_state.last_emote_preload_range = Some(current_range);
             return;
         }
         if range_changed {
@@ -283,27 +295,39 @@ impl CanvasMessageList {
         }
 
         self.preload_state.last_emote_preload_range = Some(current_range);
-        self.preload_state.last_emote_preload_time = std::time::Instant::now();
-
+        let mut scan: Vec<usize> = new_rows
+            .clone()
+            .take(EMOTE_PRELOAD_MESSAGE_BUDGET)
+            .collect();
         let range_len = preload_end.saturating_sub(preload_start);
-        if range_len == 0 {
+        if rescan_due {
+            self.preload_state.last_emote_preload_time = std::time::Instant::now();
+            if range_len > 0 {
+                let scan_count = range_len.min(EMOTE_PRELOAD_MESSAGE_BUDGET);
+                let start_offset = self.preload_state.emote_preload_scan_cursor % range_len;
+                self.preload_state.emote_preload_scan_cursor =
+                    (start_offset + scan_count) % range_len;
+                scan.extend(
+                    (0..scan_count)
+                        .map(|step| preload_start + ((start_offset + step) % range_len))
+                        .filter(|idx| !new_rows.contains(idx)),
+                );
+            }
+        }
+        if scan.is_empty() {
             return;
         }
-        let scan_count = range_len.min(EMOTE_PRELOAD_MESSAGE_BUDGET);
-        let start_offset = self.preload_state.emote_preload_scan_cursor % range_len;
-        self.preload_state.emote_preload_scan_cursor = (start_offset + scan_count) % range_len;
+        let scan_count = scan.len();
 
         let estimated_emotes = scan_count * 3;
         let mut media_plan = VisibleMediaPlan::with_capacity(estimated_emotes, 0, 0);
         let mut visible_users: Vec<(Arc<str>, Arc<str>, Arc<str>)> =
-            Vec::with_capacity(preload_end.saturating_sub(preload_start).min(scan_count));
+            Vec::with_capacity(range_len.min(scan_count));
         let mut visible_user_ids: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         let mut resolver: Option<(Arc<str>, crate::backend::slots::resolver::SlotResolver)> = None;
         let display_rules = crate::backend::settings::emote_display_rules_snapshot();
 
-        for step in 0..scan_count {
-            let idx = preload_start + ((start_offset + step) % range_len);
-
+        for idx in scan {
             let msg_id = &self.message_model.message_order[idx];
             let Some(message) = self.get_message(msg_id) else {
                 continue;
@@ -1107,5 +1131,84 @@ impl CanvasMessageList {
         }
 
         requested
+    }
+}
+
+/// Whether every row in `current` that was not in `previous` (row-index
+/// ranges, end exclusive) is a row added since: at or after `new_rows_from`.
+/// True as well when no row entered.
+fn only_new_rows_entered(
+    (previous_start, previous_end): (usize, usize),
+    (start, end): (usize, usize),
+    new_rows_from: Option<usize>,
+) -> bool {
+    if start < previous_start.min(end) {
+        return false;
+    }
+    let entered_from = previous_end.max(start);
+    end <= entered_from || new_rows_from.is_some_and(|from| from <= entered_from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::only_new_rows_entered;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn only_rows_added_since_the_last_pass_skip_the_full_rescan() {
+        for (previous, current, new_rows_from, expected, why) in [
+            ((70, 100), (70, 100), None, true, "unchanged"),
+            ((69, 99), (70, 100), Some(99), true, "rotation at the cap"),
+            ((69, 98), (69, 98), None, true, "held arrival at the cap"),
+            (
+                (70, 100),
+                (73, 103),
+                Some(100),
+                true,
+                "following three appended rows",
+            ),
+            (
+                (70, 100),
+                (73, 103),
+                Some(101),
+                false,
+                "a row entered that is not new",
+            ),
+            (
+                (70, 100),
+                (73, 103),
+                None,
+                false,
+                "rows entered and none are new",
+            ),
+            (
+                (70, 100),
+                (60, 90),
+                Some(95),
+                false,
+                "scrolled up over old rows",
+            ),
+            ((70, 100), (75, 95), None, true, "range shrank"),
+            (
+                (70, 100),
+                (120, 150),
+                Some(110),
+                true,
+                "jumped down over new rows only",
+            ),
+            (
+                (70, 100),
+                (120, 150),
+                Some(130),
+                false,
+                "jumped over rows not new",
+            ),
+        ] {
+            assert_eq!(
+                only_new_rows_entered(previous, current, new_rows_from),
+                expected,
+                "{why}"
+            );
+        }
     }
 }

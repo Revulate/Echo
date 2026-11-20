@@ -609,6 +609,7 @@ root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	front_dro
 root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	held_arrivals_at_the_cap_take_the_incremental_path
 root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	paced_syncs_match_a_full_rebuild_for_every_publish_sequence
 root_test	src/components/chat/canvas_renderer/painter/message_delta.rs	the_model_refuses_a_front_drop_it_cannot_prove
+root_test	src/components/chat/canvas_renderer/painter/preload.rs	only_rows_added_since_the_last_pass_skip_the_full_rescan
 root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_page_scroll_ends_on_its_target_within_a_bounded_number_of_frames
 root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_sub_pixel_gap_snaps_at_once_and_a_zero_dt_frame_holds_still
 root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_target_that_keeps_moving_ends_once_it_stops
@@ -909,7 +910,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	417
+summary	root_tests	418
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

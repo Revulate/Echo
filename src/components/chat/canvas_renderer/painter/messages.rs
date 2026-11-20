@@ -1,6 +1,9 @@
 //! Message-buffer lifecycle and split activity handling.
 
-use super::message_delta::{FrontDrop, MessageDeltaPlan, front_drop, ids_align};
+use super::message_delta::{
+    FrontDrop, MessageDeltaPlan, front_drop, ids_align, range_after_front_drop,
+    remap_after_front_drop,
+};
 use super::*;
 
 /// Rows on each side of the last viewport whose layouts a split keeps while
@@ -292,9 +295,11 @@ impl CanvasMessageList {
         }
         if front.dropped > 0 {
             self.viewport_state.cached_visible_render_range = None;
-            self.viewport_state.cached_viewport_paint_rows = None;
             self.interaction_state.hitbox_manager.invalidate_cache();
-            self.preload_state.last_emote_preload_range = None;
+            self.remap_index_state_after_front_drop(front.dropped);
+        }
+        if front.appended > 0 {
+            self.note_new_rows_for_preload(messages.len() - front.appended);
         }
         crate::log_perf_render!(
             debug,
@@ -305,6 +310,35 @@ impl CanvasMessageList {
             "Applied front drop incrementally"
         );
         true
+    }
+
+    /// Keep the prepared paint rows and the emote preload range across a drop
+    /// of `dropped` front rows by shifting them to the rows' new indices: the
+    /// rows still shown are the same, so the next frame reuses their prepared
+    /// paint and the preload pass scans only the rows that are new.
+    fn remap_index_state_after_front_drop(&mut self, dropped: usize) {
+        if let Some(rows) = self.viewport_state.cached_viewport_paint_rows.take() {
+            let kept = remap_after_front_drop(&rows, dropped, |row| &mut row.message_index);
+            if !kept.is_empty() {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let kept = Arc::new(kept);
+                self.viewport_state.cached_viewport_paint_rows = Some(kept);
+            }
+        }
+        let preload = &mut self.preload_state;
+        preload.last_emote_preload_range = preload
+            .last_emote_preload_range
+            .and_then(|range| range_after_front_drop(range, dropped));
+        preload.emote_preload_new_rows_from = preload
+            .emote_preload_new_rows_from
+            .map(|from| from.saturating_sub(dropped));
+    }
+
+    /// Rows from `from` on were just added; the next emote preload pass scans
+    /// them first.
+    fn note_new_rows_for_preload(&mut self, from: usize) {
+        let new_rows_from = &mut self.preload_state.emote_preload_new_rows_from;
+        *new_rows_from = Some(new_rows_from.map_or(from, |current| current.min(from)));
     }
 
     /// Replace the shared snapshot this split shows, presenting any removed
@@ -361,6 +395,7 @@ impl CanvasMessageList {
                 if join_pending {
                     self.message_state.pending_new_message_count += added_count;
                 }
+                self.note_new_rows_for_preload(old_count);
             } else if delta.is_initial_snapshot_fast_path {
                 self.message_model.message_order.clear();
                 self.message_model.height_tree.clear();
@@ -593,7 +628,6 @@ impl CanvasMessageList {
                 retained_viewport_anchor =
                     self.capture_viewport_anchor_before_message_replacement();
                 self.viewport_state.cached_visible_render_range = None;
-                self.viewport_state.cached_viewport_paint_rows = None;
                 self.interaction_state.hitbox_manager.invalidate_cache();
 
                 let front = self.front_drop_shape(&messages);
@@ -604,6 +638,7 @@ impl CanvasMessageList {
                 }
 
                 if !front.is_some_and(|front| self.apply_front_drop(&messages, front)) {
+                    self.viewport_state.cached_viewport_paint_rows = None;
                     self.rebuild_message_model_from(&messages);
 
                     crate::log_perf_render!(
@@ -704,7 +739,9 @@ impl CanvasMessageList {
         let message_delta = new_count.abs_diff(old_count) as u64;
         crate::backend::metrics::record_split_update(&self.channel_id, message_delta);
 
-        if had_new_messages {
+        // An append or front drop noted its new rows and kept the preload
+        // range in step; any other change of rows scans the range again.
+        if had_new_messages && self.preload_state.emote_preload_new_rows_from.is_none() {
             self.preload_state.last_emote_preload_range = None;
         }
 

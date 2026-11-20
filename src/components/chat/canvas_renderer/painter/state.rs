@@ -43,6 +43,10 @@ impl MessageLifecycleState {
 pub(super) struct PreloadState {
     pub(super) pending_embed_fetches: rustc_hash::FxHashSet<(Arc<str>, u32)>,
     pub(super) last_emote_preload_range: Option<(usize, usize)>,
+    /// Index of the first row added since the last emote preload pass, kept
+    /// with `last_emote_preload_range` across front drops, so that pass can
+    /// scan just the new rows instead of the whole range.
+    pub(super) emote_preload_new_rows_from: Option<usize>,
     pub(super) emote_preload_scan_cursor: usize,
     pub(super) last_emote_preload_time: std::time::Instant,
     pub(super) last_layout_image_preload_range: Option<(usize, usize)>,
@@ -64,6 +68,7 @@ impl PreloadState {
         Self {
             pending_embed_fetches: rustc_hash::FxHashSet::default(),
             last_emote_preload_range: None,
+            emote_preload_new_rows_from: None,
             emote_preload_scan_cursor: 0,
             last_emote_preload_time: instant_minus_secs(10),
             last_layout_image_preload_range: None,

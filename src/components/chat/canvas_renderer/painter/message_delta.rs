@@ -112,6 +112,32 @@ pub(super) fn front_drop(order: &[SharedString], next: &[Arc<ChatMessage>]) -> O
         })
 }
 
+/// The rows of `rows`, ordered by row index, that survive dropping the first
+/// `dropped` rows of the list, with their indices shifted to match.
+pub(super) fn remap_after_front_drop<T: Clone>(
+    rows: &[T],
+    dropped: usize,
+    index: impl Fn(&mut T) -> &mut usize,
+) -> Vec<T> {
+    rows.iter()
+        .filter_map(|row| {
+            let mut row = row.clone();
+            let shifted = index(&mut row).checked_sub(dropped)?;
+            *index(&mut row) = shifted;
+            Some(row)
+        })
+        .collect()
+}
+
+/// A row-index range after dropping the first `dropped` rows: the part that
+/// survives, shifted to match, or `None` when nothing of it survives.
+pub(super) fn range_after_front_drop(
+    (start, end): (usize, usize),
+    dropped: usize,
+) -> Option<(usize, usize)> {
+    (end > dropped).then(|| (start.saturating_sub(dropped), end - dropped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::CanvasMessageList;
@@ -286,6 +312,10 @@ mod tests {
         front_drops: usize,
         rebuilds: usize,
         caught_up: usize,
+        /// Stand-ins for the prepared paint rows (index, id) and the emote
+        /// preload range of the last frame, remapped like the real ones.
+        prepared: Vec<(usize, SharedString)>,
+        preload_range: Option<(usize, usize)>,
     }
 
     impl Split {
@@ -296,6 +326,8 @@ mod tests {
                 front_drops: 0,
                 rebuilds: 0,
                 caught_up: 0,
+                prepared: Vec::new(),
+                preload_range: None,
             }
         }
 
@@ -354,10 +386,17 @@ mod tests {
             {
                 self.pending += front.appended;
                 self.front_drops += 1;
+                self.prepared =
+                    remap_after_front_drop(&self.prepared, front.dropped, |row| &mut row.0);
+                self.preload_range = self
+                    .preload_range
+                    .and_then(|range| range_after_front_drop(range, front.dropped));
             } else {
                 *model = rebuilt(next);
                 self.pending = 0;
                 self.rebuilds += 1;
+                self.prepared.clear();
+                self.preload_range = None;
             }
             self.model.messages = next.clone();
         }
@@ -393,6 +432,23 @@ mod tests {
                 *model = rebuilt(&messages);
             }
             model.sync_total_height();
+            // Every prepared row kept across front drops still names its
+            // own row, and the kept preload range lies within the rows.
+            for (index, id) in &self.prepared {
+                assert_eq!(
+                    model.message_order.get(*index),
+                    Some(id),
+                    "prepared row {index}"
+                );
+            }
+            if let Some((start, end)) = self.preload_range {
+                assert!(start <= end && end <= model.message_order.len());
+            }
+            let len = model.message_order.len();
+            self.prepared = (len.saturating_sub(20)..len)
+                .map(|index| (index, model.message_order[index].clone()))
+                .collect();
+            self.preload_range = Some((len.saturating_sub(25), len));
         }
     }
 

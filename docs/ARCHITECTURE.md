@@ -185,8 +185,10 @@ flowchart TD
   visible rows are the shown ones, row for row by pointer, keeps the list the
   canvas has. The canvas applies an append, a history prepend, and a drop of
   rows from the front with or without an append (a rotation at the buffer
-  cap, or front rows removed) incrementally (`painter/message_delta.rs`);
-  any other shape rebuilds its model.
+  cap, or front rows removed) incrementally (`painter/message_delta.rs`),
+  shifting its prepared paint rows and emote-preload range to the rows' new
+  indices, so the next frame reuses the rows still shown and scans only the
+  new ones; any other shape rebuilds its model.
 - **Duplicate-channel splits** share one `ChatState`. Each split owns its own
   `CanvasMessageList` (scroll, selection, width-dependent layout) keyed by a
   stable `SplitId`. Split-specific actions carry the source `SplitId`
