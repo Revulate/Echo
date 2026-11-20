@@ -26,6 +26,23 @@ fn interval_secs() -> u64 {
     echo_core::env::parsed("ECHO_MEM_REPORT_SECS").unwrap_or(0)
 }
 
+/// Time until [`maybe_log_memory_breakdown`] next logs, or `None` when the
+/// diagnostic is disabled. Event-driven idle uses it to wake for the report.
+pub fn next_breakdown_due_in() -> Option<std::time::Duration> {
+    let interval_ms = interval_secs().saturating_mul(1000);
+    if interval_ms == 0 {
+        return None;
+    }
+    let last = LAST_REPORT_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return Some(std::time::Duration::ZERO);
+    }
+    let elapsed_ms = crate::utils::unix_now_ms().saturating_sub(last);
+    Some(std::time::Duration::from_millis(
+        interval_ms.saturating_sub(elapsed_ms),
+    ))
+}
+
 /// Log a breakdown if the configured interval has elapsed. Cheap no-op when the
 /// diagnostic is disabled, so it is safe to call from a periodic slot.
 pub fn maybe_log_memory_breakdown() {

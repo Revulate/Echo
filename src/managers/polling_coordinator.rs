@@ -409,6 +409,37 @@ impl Cadence {
         }
         due
     }
+
+    /// Time until the lane is due; zero when it already is.
+    fn until_due(&self) -> Duration {
+        self.last.map_or(Duration::ZERO, |last| {
+            self.every.saturating_sub(last.elapsed())
+        })
+    }
+
+    /// Like [`Self::take_due`], but also runs a lane that falls due within
+    /// `slack`, so lanes with nearby due times share one idle wake.
+    fn take_due_within(&mut self, slack: Duration) -> bool {
+        let due = self.until_due() <= slack;
+        if due {
+            self.mark();
+        }
+        due
+    }
+}
+
+/// Event-driven idle runs a housekeeping lane when it is due within this
+/// window, so lanes whose due times are close share one wake.
+const IDLE_LANE_SLACK: Duration = Duration::from_secs(1);
+
+/// How long event-driven idle may sleep before a housekeeping lane is due:
+/// the nearest lane, but never less than [`IDLE_LANE_SLACK`], because a pass
+/// runs every lane due within that window. `None` when no lane is pending.
+fn idle_lane_wait(until_due: impl IntoIterator<Item = Duration>) -> Option<Duration> {
+    until_due
+        .into_iter()
+        .min()
+        .map(|wait| wait.max(IDLE_LANE_SLACK))
 }
 
 /// Everything the polling loop carries from one pass to the next.
@@ -500,6 +531,20 @@ impl PollLoop {
         }
 
         self.refresh_stream_info(cx);
+        self.idle_housekeeping(cx);
+    }
+
+    /// The timed modes' housekeeping lanes, run here when due so a quiet
+    /// TrueIdle session still sweeps decoded media, reclaims evicted layouts
+    /// and emits the opt-in memory report.
+    fn idle_housekeeping(&mut self, cx: &mut AsyncApp) {
+        if self.image_cleanup.take_due_within(IDLE_LANE_SLACK) {
+            image_cache::sweep_idle_decoded_media();
+        }
+        crate::backend::memory_report::maybe_log_memory_breakdown();
+        if self.layout_cleanup.take_due_within(IDLE_LANE_SLACK) {
+            self.periodic_cleanup(cx);
+        }
     }
 
     async fn sleep_until_activity_or_health_check(
@@ -522,6 +567,14 @@ impl PollLoop {
             health_interval = health_interval.min(self.streamer_detection.every);
         }
         health_interval = health_interval.min(self.stream_info.every);
+        let housekeeping = [
+            Some(self.image_cleanup.until_due()),
+            Some(self.layout_cleanup.until_due()),
+            crate::backend::memory_report::next_breakdown_due_in(),
+        ];
+        if let Some(wait) = idle_lane_wait(housekeeping.into_iter().flatten()) {
+            health_interval = health_interval.min(wait);
+        }
 
         tokio::select! {
             _ = wakeup.notified() => {
@@ -1257,5 +1310,42 @@ mod benchmark_tests {
     fn offline_benchmark_suppresses_polling_coordinator() {
         assert!(!polling_allowed(true));
         assert!(polling_allowed(false));
+    }
+
+    #[test]
+    fn idle_lane_wait_takes_the_nearest_lane_but_never_less_than_the_slack() {
+        assert_eq!(idle_lane_wait([]), None);
+        assert_eq!(
+            idle_lane_wait([Duration::from_secs(45), Duration::from_secs(12)]),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            idle_lane_wait([Duration::ZERO, Duration::from_secs(30)]),
+            Some(IDLE_LANE_SLACK)
+        );
+    }
+
+    #[test]
+    fn idle_lanes_run_when_due_within_the_slack_and_rearm() {
+        let mut lane = Cadence::after(Duration::from_secs(30));
+        assert!(lane.until_due() > Duration::from_secs(29));
+        assert!(!lane.take_due_within(IDLE_LANE_SLACK));
+
+        let mut never_run = Cadence::immediate(Duration::from_secs(30));
+        assert_eq!(never_run.until_due(), Duration::ZERO);
+        assert!(never_run.take_due_within(IDLE_LANE_SLACK));
+        assert!(
+            never_run.until_due() > IDLE_LANE_SLACK,
+            "running re-arms the lane"
+        );
+
+        let mut nearly_due = Cadence {
+            last: Some(Instant::now()),
+            every: IDLE_LANE_SLACK / 2,
+        };
+        assert!(
+            nearly_due.take_due_within(IDLE_LANE_SLACK),
+            "a lane due inside the slack shares the current wake"
+        );
     }
 }
