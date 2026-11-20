@@ -159,6 +159,27 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     apply_proxy_settings(reqwest::Client::builder().user_agent(crate::identity::USER_AGENT))
 }
 
+/// How often an HTTP/2 connection is pinged, and how long a ping may go
+/// unanswered before the connection is dropped. See [`with_http2_keep_alive`].
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HTTP/2 keep-alive for a client whose connections carry many requests (one
+/// shared connection per host): a connection black-holed by sleep and wake or
+/// a network change is found dead within 30 s and dropped, instead of every
+/// request on it running to its own timeout and the connection staying pooled
+/// until the OS gives up. Pings also run while the connection is idle, but
+/// only until the pool's idle timeout (90 s by default, measured from the
+/// last request) closes it, so an idle app sends at most a few pings per host
+/// after its last request and none after that. TCP keep-alive stays at
+/// reqwest's default (first probe after 15 s idle, then every 15 s, 3 probes).
+pub fn with_http2_keep_alive(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .http2_keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
+        .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .http2_keep_alive_while_idle(true)
+}
+
 /// Connect timeout for every client built here, so a black-holed route cannot
 /// hang a request before the TCP/TLS handshake completes.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

@@ -184,7 +184,7 @@ pub(crate) static SEVENTV_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCach
 
 fn build_seventv_http_client() -> reqwest::Client {
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25);
-    match crate::backend::http::client_builder()
+    match crate::backend::http::with_http2_keep_alive(crate::backend::http::client_builder())
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(30))

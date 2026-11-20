@@ -32,7 +32,7 @@ pub fn prewarm_http_client() {
 }
 
 fn build_twitch_http_client() -> reqwest::Client {
-    http::client_builder()
+    http::with_http2_keep_alive(http::client_builder())
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(10))
         .build()

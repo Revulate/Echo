@@ -102,7 +102,7 @@ pub struct SevenTvCosmeticsCache {
 /// full paint catalog over a slow proxy.
 fn build_cosmetics_http_client() -> reqwest::Client {
     const TOTAL: std::time::Duration = std::time::Duration::from_secs(60);
-    http::client_builder()
+    http::with_http2_keep_alive(http::client_builder())
         .timeout(TOTAL)
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(20))
