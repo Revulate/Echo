@@ -1757,12 +1757,12 @@ mod restart_generation_tests {
 mod tests {
     use super::{
         ChatMessage, HelixChatDropReason, HelixChatSendResponse, HelixChatSendResult,
-        HistoryEmoteReadinessGuard, MessageBuffer, SharedChatEmoteLookupSelection,
-        accepted_helix_chat_message_id, active_emote_lookup_channels,
-        apply_pending_message_emote_scope, insert_confirmed_local_row,
-        message_emote_lookup_channel, publish_history_emote_readiness,
-        publish_resolved_message_emote_scope, select_shared_chat_emote_lookup,
-        store_received_chat_row, update_buffered_message_emote_lookup_scope,
+        MessageBuffer, SharedChatEmoteLookupSelection, accepted_helix_chat_message_id,
+        active_emote_lookup_channels, apply_pending_message_emote_scope,
+        ensure_channel_emotes_ready_for_history, insert_confirmed_local_row,
+        message_emote_lookup_channel, publish_resolved_message_emote_scope,
+        select_shared_chat_emote_lookup, store_received_chat_row,
+        update_buffered_message_emote_lookup_scope,
     };
     use core::prelude::v1::test;
 
@@ -2019,21 +2019,29 @@ mod tests {
         super::CHAT_MESSAGES.remove(&channel);
     }
 
-    #[test]
-    fn failed_history_emote_readiness_releases_loaded_marker() {
+    #[tokio::test]
+    async fn history_readiness_leaves_the_join_catalog_load_to_the_join() {
         let channel = format!("history-readiness-{}", std::process::id());
-        publish_history_emote_readiness(&channel, true);
-        assert!(super::EMOTE_LOADED_CHANNELS.lock().contains(&channel));
-        {
-            let _cancelled = HistoryEmoteReadinessGuard::new(&channel);
-            assert!(!super::EMOTE_LOADED_CHANNELS.lock().contains(&channel));
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                super::EMOTE_LOADED_CHANNELS.lock().remove(&self.0);
+                crate::backend::emotes::set_empty_channel_catalog_for_test(&self.0, false);
+            }
         }
+        let _cleanup = Cleanup(channel.clone());
+        crate::backend::emotes::set_empty_channel_catalog_for_test(&channel, true);
+
+        // A resident catalog (as a warm start hydrates from disk) is ready for
+        // history at once, but the join must still run its own catalog load:
+        // that is what refreshes a stale catalog and subscribes the channel
+        // to 7TV live updates.
+        assert!(ensure_channel_emotes_ready_for_history(&channel, None).await);
         assert!(!super::EMOTE_LOADED_CHANNELS.lock().contains(&channel));
-        {
-            let mut completed = HistoryEmoteReadinessGuard::new(&channel);
-            completed.commit();
-        }
+
+        // Nor does it undo a join load that already started.
+        super::EMOTE_LOADED_CHANNELS.lock().insert(channel.clone());
+        assert!(ensure_channel_emotes_ready_for_history(&channel, None).await);
         assert!(super::EMOTE_LOADED_CHANNELS.lock().contains(&channel));
-        publish_history_emote_readiness(&channel, false);
     }
 }

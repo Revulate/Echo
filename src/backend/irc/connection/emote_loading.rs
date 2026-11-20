@@ -423,49 +423,24 @@ pub(super) const INITIAL_GLOBAL_EMOTE_READY_TIMEOUT: std::time::Duration =
 pub(super) const HISTORY_EMOTE_READY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
-pub(super) struct HistoryEmoteReadinessGuard {
-    pub(super) channel: String,
-    pub(super) committed: bool,
-}
-
-impl HistoryEmoteReadinessGuard {
-    pub(super) fn new(channel: &str) -> Self {
-        publish_history_emote_readiness(channel, false);
-        Self {
-            channel: channel.to_string(),
-            committed: false,
-        }
-    }
-
-    pub(super) fn commit(&mut self) {
-        publish_history_emote_readiness(&self.channel, true);
-        self.committed = true;
-    }
-}
-
-impl Drop for HistoryEmoteReadinessGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            publish_history_emote_readiness(&self.channel, false);
-        }
-    }
-}
-
+/// Wait until the channel's catalog can tokenize history, loading it when no
+/// catalog is resident. This only waits for a usable catalog: it leaves the
+/// channel's join-time catalog load (`ensure_channel_emotes_loaded`, gated by
+/// `EMOTE_LOADED_CHANNELS`) to run its own refresh decision, which is what
+/// refreshes a stale disk catalog and registers the channel with the 7TV
+/// EventAPI.
 pub(super) async fn ensure_channel_emotes_ready_for_history(
     channel_login: &str,
     channel_id_hint: Option<&str>,
 ) -> bool {
     let channel_key = channel_login.to_lowercase();
-    let mut readiness = HistoryEmoteReadinessGuard::new(&channel_key);
     if crate::backend::emotes::channel_catalog_ready_for_history(&channel_key) {
-        readiness.commit();
         return true;
     }
 
     if EMOTE_CACHE.channel_emote_count(&channel_key) > 0 {
         crate::backend::emotes::rebuild_emote_indices(&channel_key).await;
         if crate::backend::emotes::channel_catalog_ready_for_history(&channel_key) {
-            readiness.commit();
             return true;
         }
     }
@@ -547,22 +522,8 @@ pub(super) async fn ensure_channel_emotes_ready_for_history(
             channel_key,
             HISTORY_EMOTE_READY_TIMEOUT.as_secs()
         );
-    } else {
-        readiness.commit();
     }
     ready
-}
-
-pub(super) fn publish_history_emote_readiness(channel: &str, ready: bool) {
-    let mut loaded = EMOTE_LOADED_CHANNELS.lock();
-    if ready {
-        if is_channel_closed(channel) {
-            return;
-        }
-        loaded.insert(channel.to_string());
-    } else {
-        loaded.remove(channel);
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

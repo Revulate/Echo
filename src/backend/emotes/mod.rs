@@ -604,6 +604,25 @@ fn global_disk_set_hydration(cached: &CachedEmoteSet) -> Option<bool> {
     Some(!cached.is_fresh_enough_to_delay())
 }
 
+/// Give `channel` an empty catalog, which history counts as ready, or remove
+/// it; for tests outside this module.
+#[cfg(test)]
+pub(crate) fn set_empty_channel_catalog_for_test(channel: &str, present: bool) {
+    let cache_key = normalize_channel_key(channel);
+    if present {
+        EMOTE_CACHE.channels.insert(
+            cache_key,
+            CacheEntry {
+                emotes: HashMap::new(),
+                emotes_by_id: EmoteIdentityMap::default(),
+                fetched_at: Instant::now(),
+            },
+        );
+    } else {
+        EMOTE_CACHE.channels.remove(&cache_key);
+    }
+}
+
 fn channel_disk_cache_fetched_at(is_fresh: bool, ttl: Duration) -> Instant {
     if is_fresh {
         let refresh_delay = Duration::from_secs(DISK_CACHE_REFRESH_DELAY_SECS);
