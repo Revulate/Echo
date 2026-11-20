@@ -1,4 +1,4 @@
-From 9246c5d779846377a629080c15e536265a337692 Mon Sep 17 00:00:00 2001
+From dd38225a6d4fe3b4cdffdbe0f40a66627ab51f5d Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Fri, 10 Jul 2026 20:15:00 -0700
 Subject: [PATCH] gpui: restrict image codecs to referenced formats
@@ -11,10 +11,10 @@ including the AVIF encoder that pulls ravif and paste into the release graph.
  1 file changed, 6 insertions(+), 15 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
-index b612bdf874..a02d13716e 100644
+index b134bf5e86..f4da0424f0 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -656,22 +656,13 @@ idna = "1.0"
+@@ -662,22 +662,13 @@ idna = "1.0"
  ignore = "0.4.22"
  # image's default features minus "avif", which only adds an encoder (rav1e);
  # decoding AVIF would additionally need the non-default "avif-native" feature.
@@ -44,5 +44,5 @@ index b612bdf874..a02d13716e 100644
  imara-diff = { version = "0.2", default-features = false }
  indexmap = { version = "2.7.0", features = ["serde"] }
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

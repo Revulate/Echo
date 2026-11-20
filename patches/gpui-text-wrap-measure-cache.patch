@@ -1,4 +1,4 @@
-From deaf55fe2311405aad7362a7034184fa663d0029 Mon Sep 17 00:00:00 2001
+From 1c599d1962fc69da484bb8f5b0c6a23c5b62a5c8 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:43:20 -0700
 Subject: [PATCH] fix(gpui): don't answer unconstrained text probes with a
@@ -16,10 +16,10 @@ an identical wrap width, matching the existing guard for truncated layouts.
  1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/crates/gpui/src/elements/text.rs b/crates/gpui/src/elements/text.rs
-index ed643841f7..6025d2a3ca 100644
+index 1c9f660dce..dd2c93a801 100644
 --- a/crates/gpui/src/elements/text.rs
 +++ b/crates/gpui/src/elements/text.rs
-@@ -685,7 +685,9 @@ impl TextLayout {
+@@ -653,7 +653,9 @@ impl TextLayout {
  
                  // Only use cached layout if:
                  // 1. We have a cached size
@@ -30,7 +30,7 @@ index ed643841f7..6025d2a3ca 100644
                  // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                  //    because the previous layout may have been computed without truncation)
                  // 4. the cached layout was not truncated (a truncated layout answers an
-@@ -693,7 +695,7 @@ impl TextLayout {
+@@ -661,7 +663,7 @@ impl TextLayout {
                  //    sizing with whatever width some earlier measure pass happened to use)
                  if let Some(text_layout) = element_state.0.borrow().as_ref()
                      && let Some(size) = text_layout.size
@@ -40,5 +40,5 @@ index ed643841f7..6025d2a3ca 100644
                      && text_layout.truncate_width.is_none()
                  {
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

@@ -1,4 +1,4 @@
-From 192f2f67983a3f1989dcae9d7d51a04fc3d34d46 Mon Sep 17 00:00:00 2001
+From 5a0249a729ffd9d189c4860ae45a701d83cb98bc Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 23:27:42 -0700
 Subject: [PATCH] fix(gpui): refresh after an atlas drop only when the scene
@@ -22,10 +22,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 40 insertions(+), 21 deletions(-)
 
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index b9aa64cf99..938313fef3 100644
+index 95f93d48c3..4fae33fb62 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
-@@ -1856,8 +1856,8 @@ pub trait PlatformAtlas {
+@@ -1899,8 +1899,8 @@ pub trait PlatformAtlas {
          key: AtlasKey,
          build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
      ) -> Result<Option<AtlasTile>>;
@@ -36,7 +36,7 @@ index b9aa64cf99..938313fef3 100644
  
      #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
      fn contains(&self, _key: &AtlasKey) -> bool {
-@@ -1929,12 +1929,10 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
+@@ -1972,12 +1972,10 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
          }
      }
  
@@ -52,7 +52,7 @@ index b9aa64cf99..938313fef3 100644
      }
  }
  
-@@ -1987,7 +1985,7 @@ impl PlatformAtlas for HeadlessAtlas {
+@@ -2030,7 +2028,7 @@ impl PlatformAtlas for HeadlessAtlas {
          self.0.lock().get_or_insert_with(key, build)
      }
  
@@ -62,10 +62,10 @@ index b9aa64cf99..938313fef3 100644
      }
  
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 12a5215092..52aca034d0 100644
+index 562f061535..962ae7ae74 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -5923,31 +5923,52 @@ impl Window {
+@@ -6072,31 +6072,52 @@ impl Window {
  
      /// Removes a [`PaintMask`] from the sprite atlas (local Echo extension).
      pub fn drop_paint_mask(&mut self, mask_id: u64) {
@@ -168,5 +168,5 @@ index da34ec19d8..7489790d76 100644
      }
  }
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

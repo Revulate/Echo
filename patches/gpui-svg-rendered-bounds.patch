@@ -1,4 +1,4 @@
-From e75c68a4825cd0fb6244c83ae2dc48bdaf227792 Mon Sep 17 00:00:00 2001
+From 3a6fd269663570b013e970009a9fee9aebdbcf96 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 12 Aug 2026 14:11:30 -0700
 Subject: [PATCH] gpui: bound remote SVG raster allocations
@@ -9,10 +9,10 @@ Subject: [PATCH] gpui: bound remote SVG raster allocations
  2 files changed, 56 insertions(+), 6 deletions(-)
 
 diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
-index 9c9e998a61..2956c1c3c9 100644
+index c94558d55a..b367155e01 100644
 --- a/crates/gpui/src/elements/img.rs
 +++ b/crates/gpui/src/elements/img.rs
-@@ -812,7 +812,11 @@ impl Asset for ImageAssetLoader {
+@@ -804,7 +804,11 @@ impl Asset for ImageAssetLoader {
                  Ok(Arc::new(RenderImage::new(data)))
              } else {
                  svg_renderer
@@ -26,10 +26,10 @@ index 9c9e998a61..2956c1c3c9 100644
              }
          }
 diff --git a/crates/gpui/src/svg_renderer.rs b/crates/gpui/src/svg_renderer.rs
-index 49f77a170d..99c0f0d8da 100644
+index ce0e2b076d..10a7ea1270 100644
 --- a/crates/gpui/src/svg_renderer.rs
 +++ b/crates/gpui/src/svg_renderer.rs
-@@ -196,6 +196,15 @@ impl SvgRenderer {
+@@ -254,6 +254,15 @@ impl SvgRenderer {
          &self,
          svg: &ParsedSvg,
          size: impl Into<SvgSize>,
@@ -45,7 +45,7 @@ index 49f77a170d..99c0f0d8da 100644
      ) -> Result<Arc<RenderImage>, usvg::Error> {
          let (size, image_scale_factor) = match size.into() {
              SvgSize::Size(size) => (SvgSize::Size(size), 1.0),
-@@ -205,7 +214,7 @@ impl SvgRenderer {
+@@ -263,7 +272,7 @@ impl SvgRenderer {
                  SMOOTH_SVG_SCALE_FACTOR,
              ),
          };
@@ -54,7 +54,7 @@ index 49f77a170d..99c0f0d8da 100644
          let mut buffer =
              image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
  
-@@ -223,9 +232,27 @@ impl SvgRenderer {
+@@ -281,9 +290,27 @@ impl SvgRenderer {
          &self,
          bytes: &[u8],
          scale_factor: f32,
@@ -83,7 +83,7 @@ index 49f77a170d..99c0f0d8da 100644
      }
  
      pub(crate) fn render_alpha_mask(
-@@ -263,11 +290,15 @@ impl SvgRenderer {
+@@ -321,11 +348,15 @@ impl SvgRenderer {
  
      fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
          let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
@@ -101,7 +101,7 @@ index 49f77a170d..99c0f0d8da 100644
      // Cap the size of the rendered pixmap to avoid texture allocation panics
      // Related issue: #56466
      const MAX_SIZE: f32 = 8192.0;
-@@ -292,8 +323,23 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
+@@ -350,8 +381,23 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
      width *= scale;
      height *= scale;
  
@@ -127,5 +127,5 @@ index 49f77a170d..99c0f0d8da 100644
  
      let transform = resvg::tiny_skia::Transform::from_scale(
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

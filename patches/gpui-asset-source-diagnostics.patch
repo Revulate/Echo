@@ -1,4 +1,4 @@
-From 572e4e7c6da83176db2241740173b2a3e83b5658 Mon Sep 17 00:00:00 2001
+From afececfc759df20849dc42f4f4595804c102caa4 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 10 Jun 2026 22:12:50 -0700
 Subject: [PATCH] gpui: include source in asset load failure log for Echo
@@ -42,5 +42,5 @@ index 4c7bee1207..9887fdce3b 100644
  }
  
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

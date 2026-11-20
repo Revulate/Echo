@@ -1,4 +1,4 @@
-From 05d3b1455e9712fcaf1933829c5adea51eb3b3ea Mon Sep 17 00:00:00 2001
+From 9eb5f6874249584d34b9a54dae5dd18f84ee8f26 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 12 Aug 2026 12:48:44 -0700
 Subject: [PATCH] Bound image URI response bodies
@@ -8,12 +8,12 @@ Subject: [PATCH] Bound image URI response bodies
  1 file changed, 86 insertions(+), 21 deletions(-)
 
 diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
-index 0956d0c6c8..9a090dde05 100644
+index 40578c9e7f..643423da2b 100644
 --- a/crates/gpui/src/elements/img.rs
 +++ b/crates/gpui/src/elements/img.rs
 @@ -5,7 +5,7 @@ use crate::{
-     SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
-     decode_static_image, decode_webp_image, px,
+     SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image, decode_static_image,
+     decode_webp_image, px,
  };
 -use anyhow::Result;
 +use anyhow::{Result, anyhow};
@@ -40,7 +40,7 @@ index 0956d0c6c8..9a090dde05 100644
  
  fn image_uri_retry_delay(uri: &SharedUri, failed_attempt: u8) -> Duration {
      let exponential_ms = 100u64.saturating_mul(1u64 << failed_attempt.saturating_sub(1));
-@@ -641,50 +654,102 @@ impl Asset for ImageAssetLoader {
+@@ -633,50 +646,102 @@ impl Asset for ImageAssetLoader {
              let bytes = match source.clone() {
                  Resource::Path(uri) => fs::read(uri.as_ref())?,
                  Resource::Uri(uri) => {
@@ -164,5 +164,5 @@ index 0956d0c6c8..9a090dde05 100644
                          if !status.is_success() {
                              let mut body = String::from_utf8_lossy(&body).into_owned();
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

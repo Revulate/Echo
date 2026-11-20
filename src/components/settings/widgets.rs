@@ -352,14 +352,6 @@ pub struct SettingTargetElement {
     selected: bool,
 }
 
-impl IntoElement for SettingTargetElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for SettingTargetElement {
     type RequestLayoutState = ();
     type PrepaintState = ();

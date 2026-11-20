@@ -1,4 +1,4 @@
-From d04b1025f7fb6c513ca6219282fbae2589d3b203 Mon Sep 17 00:00:00 2001
+From ba6e1d329f9237dd704fb3ebe4dc5d2a8b54dcf8 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 17:21:25 -0700
 Subject: [PATCH] fix(gpui_windows): keep repainting after repeated minimize
@@ -26,7 +26,7 @@ The handles are copied out before sending.
  3 files changed, 35 insertions(+), 11 deletions(-)
 
 diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
-index aa55a8e6fc..de7e80292a 100644
+index b33bdc13ec..f6be212fe8 100644
 --- a/crates/gpui_windows/src/events.rs
 +++ b/crates/gpui_windows/src/events.rs
 @@ -226,9 +226,12 @@ impl WindowsWindowInner {
@@ -46,10 +46,10 @@ index aa55a8e6fc..de7e80292a 100644
          }
  
 diff --git a/crates/gpui_windows/src/platform.rs b/crates/gpui_windows/src/platform.rs
-index 5fcbafd203..a26968dc72 100644
+index cfb739139c..b979531be2 100644
 --- a/crates/gpui_windows/src/platform.rs
 +++ b/crates/gpui_windows/src/platform.rs
-@@ -1844,10 +1844,15 @@ fn handle_gpu_device_lost(
+@@ -1845,10 +1845,15 @@ fn handle_gpu_device_lost(
      }
  
      if let Some(all_windows) = all_windows.upgrade() {
@@ -67,7 +67,7 @@ index 5fcbafd203..a26968dc72 100644
                      WM_GPUI_GPU_DEVICE_LOST,
                      Some(WPARAM(validation_number)),
                      Some(lparam),
-@@ -1855,10 +1860,12 @@ fn handle_gpu_device_lost(
+@@ -1856,10 +1861,12 @@ fn handle_gpu_device_lost(
              }
          }
          std::thread::sleep(std::time::Duration::from_millis(200));
@@ -132,5 +132,5 @@ index 5121c41b61..1cadc3ac07 100644
  
  #[cfg(test)]
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

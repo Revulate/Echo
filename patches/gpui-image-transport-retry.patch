@@ -1,4 +1,4 @@
-From e8c574936e681147b05964542e081aa33cbbb88c Mon Sep 17 00:00:00 2001
+From 54a34a15d3e1028d2e6c74b874093934717059ce Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 18 Jul 2026 23:28:47 -0700
 Subject: [PATCH] gpui: retry transient image URI transport failures
@@ -8,7 +8,7 @@ Subject: [PATCH] gpui: retry transient image URI transport failures
  1 file changed, 68 insertions(+), 17 deletions(-)
 
 diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
-index a9878f4f70..0956d0c6c8 100644
+index 6cc5db89ab..40578c9e7f 100644
 --- a/crates/gpui/src/elements/img.rs
 +++ b/crates/gpui/src/elements/img.rs
 @@ -27,6 +27,17 @@ use super::{Stateful, StatefulInteractiveElement};
@@ -29,7 +29,7 @@ index a9878f4f70..0956d0c6c8 100644
  /// A type alias to the resource loader that the `img()` element uses.
  ///
  /// Note: that this is only for Resources, like URLs or file paths.
-@@ -621,6 +632,7 @@ impl Asset for ImageAssetLoader {
+@@ -613,6 +624,7 @@ impl Asset for ImageAssetLoader {
          cx: &mut App,
      ) -> impl Future<Output = Self::Output> + Send + 'static {
          let client = cx.http_client();
@@ -37,7 +37,7 @@ index a9878f4f70..0956d0c6c8 100644
          // TODO: Can we make SVGs always rescale?
          // let scale_factor = cx.scale_factor();
          let svg_renderer = cx.svg_renderer();
-@@ -629,26 +641,65 @@ impl Asset for ImageAssetLoader {
+@@ -621,26 +633,65 @@ impl Asset for ImageAssetLoader {
              let bytes = match source.clone() {
                  Resource::Path(uri) => fs::read(uri.as_ref())?,
                  Resource::Uri(uri) => {
@@ -121,5 +121,5 @@ index a9878f4f70..0956d0c6c8 100644
                  Resource::Embedded(path) => {
                      let data = asset_source.load(&path).ok().flatten();
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

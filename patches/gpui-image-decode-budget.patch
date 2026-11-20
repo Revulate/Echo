@@ -1,4 +1,4 @@
-From ad99f030ad765d7f23da04d86f68da1df656f3d4 Mon Sep 17 00:00:00 2001
+From 569e577ac29245fe4d8de3ef5c4a544fb44b977a Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 12 Aug 2026 14:44:14 -0700
 Subject: [PATCH] gpui: align URI cumulative decode budget
@@ -8,7 +8,7 @@ Subject: [PATCH] gpui: align URI cumulative decode budget
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
-index 2956c1c3c9..da2a301432 100644
+index b367155e01..75dec6e74c 100644
 --- a/crates/gpui/src/elements/img.rs
 +++ b/crates/gpui/src/elements/img.rs
 @@ -49,7 +49,11 @@ enum ImageUriAttemptFailure {
@@ -25,5 +25,5 @@ index 2956c1c3c9..da2a301432 100644
  
  const IMAGE_URI_DECODE_LIMITS: ImageDecodeLimits = ImageDecodeLimits {
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

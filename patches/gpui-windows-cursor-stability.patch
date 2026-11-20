@@ -1,4 +1,4 @@
-From a14a3372cc295f20a7646bd659bb33dede5dbc37 Mon Sep 17 00:00:00 2001
+From bcdbd2965f01b726dccaf93ce8cf4291dea71ccb Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Tue, 8 Sep 2026 23:15:15 -0700
 Subject: [PATCH] fix(gpui_windows): verify native cursor ownership and retain
@@ -16,16 +16,19 @@ read it, but only publishes it with SetCursor when this window is the
 Win32 capture owner or the window under the pointer (or one of their
 children). A hidden cursor stays hidden.
 
+Squashes the original ownership check (90bfa159fd), its delimiter repair
+(f42579812b) and the cache-retention fix (dc8929a0da), rustfmt-clean.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  crates/gpui_windows/src/events.rs | 43 ++++++++++++++++++++++++-------
  1 file changed, 34 insertions(+), 9 deletions(-)
 
 diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
-index f18c070370..ec6e410702 100644
+index 44a9997285..9d53715541 100644
 --- a/crates/gpui_windows/src/events.rs
 +++ b/crates/gpui_windows/src/events.rs
-@@ -1174,22 +1174,47 @@ impl WindowsWindowInner {
+@@ -1182,22 +1182,47 @@ impl WindowsWindowInner {
          None
      }
  
@@ -81,7 +84,7 @@ index f18c070370..ec6e410702 100644
      fn handle_set_cursor(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
          if unsafe { !IsWindowEnabled(handle).as_bool() }
              || matches!(
-@@ -1322,7 +1347,7 @@ impl WindowsWindowInner {
+@@ -1330,7 +1355,7 @@ impl WindowsWindowInner {
              return None;
          }
          match message {
@@ -91,5 +94,5 @@ index f18c070370..ec6e410702 100644
              WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
              _ => unreachable!(),
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

@@ -199,12 +199,6 @@ impl Drop for ScopeGuard {
     }
 }
 
-impl IntoElement for ScopedElement {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
 impl Element for ScopedElement {
     type RequestLayoutState = ();
     type PrepaintState = ();

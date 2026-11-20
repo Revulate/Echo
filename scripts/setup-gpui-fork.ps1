@@ -23,8 +23,8 @@ $ErrorActionPreference = "Stop"
 # scripts/release/verify-release.ps1 reads these two literals. They duplicate
 # Cargo.toml's rev and the manifest's fork-tree, and the checks below fail when
 # either copy drifts.
-$PinnedRev = "9a8ab54db4f9f9af4dc6efb42b304c55c6a62bd3"
-$ExpectedForkTree = "7a802743da3a4ba05833b47153b01f2cf567904f"
+$PinnedRev = "7279c76ef71d45504d7cfea00ee054f852ca0fbf"
+$ExpectedForkTree = "c9d3ad851649bcc588363640248f1850897c9bec"
 $Branch = "echo-paint-fork"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PatchManifest = Join-Path $RepoRoot "scripts/gpui-fork-patches.txt"

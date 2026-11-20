@@ -1,4 +1,4 @@
-From b26df44b7718bcb87ddcf62d0003d2cf4b1c1d8f Mon Sep 17 00:00:00 2001
+From 45e137ca6dcf577493428ff0526b3cab3cde6888 Mon Sep 17 00:00:00 2001
 From: Echo Maintainers <echo@local.invalid>
 Date: Sat, 18 Jul 2026 17:30:00 -0700
 Subject: [PATCH] gpui_windows: own drag-drop window teardown once
@@ -16,7 +16,7 @@ the asynchronous drop path needed to avoid re-entrant GPUI updates.
  2 files changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
-index 4dd0c38c03..f18c070370 100644
+index d308bfa4e5..44a9997285 100644
 --- a/crates/gpui_windows/src/events.rs
 +++ b/crates/gpui_windows/src/events.rs
 @@ -6,7 +6,7 @@ use windows::{
@@ -75,5 +75,5 @@ index 2c1751e05c..07f3d1e96c 100644
                      RevokeDragDrop(handle).log_err();
                      DestroyWindow(handle).log_err();
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

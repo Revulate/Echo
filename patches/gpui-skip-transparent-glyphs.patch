@@ -1,4 +1,4 @@
-From ef3582e0bccf2ccfa7aef66248a565d98d3916e1 Mon Sep 17 00:00:00 2001
+From 95e8be87269cfb2527504565d37e4662c271a500 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:20:44 -0700
 Subject: [PATCH] perf(gpui): skip fully transparent glyphs in paint_glyph
@@ -12,10 +12,10 @@ on glyph sprites.
  1 file changed, 6 insertions(+)
 
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 6fa5825e63..9969390511 100644
+index 0f5a5afa3c..ca913340ca 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -5079,6 +5079,12 @@ impl Window {
+@@ -5255,6 +5255,12 @@ impl Window {
      ) -> Result<()> {
          self.invalidator.debug_assert_paint();
  
@@ -29,5 +29,5 @@ index 6fa5825e63..9969390511 100644
          let scale_factor = self.scale_factor();
          let glyph_origin = origin.scale(scale_factor);
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

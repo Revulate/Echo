@@ -1,4 +1,4 @@
-From de25c6c3b4612870043b25b8445a0b554f4e60f2 Mon Sep 17 00:00:00 2001
+From 141463d77ce07302cea780ba1cc515faf34b5954 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:14:19 -0700
 Subject: [PATCH] fix(gpui): rebuild cached scenes after an image drop retires
@@ -16,6 +16,8 @@ reports whether a tile was present. A refresh bypasses view caching, so
 refreshing every window for every drop kept all windows redrawing
 uncached while dropped images drained.
 
+Squashes 2ac89a6063 and 1c2e31e9e8.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  crates/gpui/src/platform.rs              | 17 ++++++++++-------
@@ -26,10 +28,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 24 insertions(+), 14 deletions(-)
 
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index 9378989ec4..d5d08f8239 100644
+index 57a55065f4..f39d287c58 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
-@@ -1830,7 +1830,8 @@ pub trait PlatformAtlas {
+@@ -1873,7 +1873,8 @@ pub trait PlatformAtlas {
          key: AtlasKey,
          build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
      ) -> Result<Option<AtlasTile>>;
@@ -39,7 +41,7 @@ index 9378989ec4..d5d08f8239 100644
  
      #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
      fn contains(&self, _key: &AtlasKey) -> bool {
-@@ -1902,10 +1903,12 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
+@@ -1945,10 +1946,12 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
          }
      }
  
@@ -56,7 +58,7 @@ index 9378989ec4..d5d08f8239 100644
      }
  }
  
-@@ -1958,8 +1961,8 @@ impl PlatformAtlas for HeadlessAtlas {
+@@ -2001,8 +2004,8 @@ impl PlatformAtlas for HeadlessAtlas {
          self.0.lock().get_or_insert_with(key, build)
      }
  
@@ -68,10 +70,10 @@ index 9378989ec4..d5d08f8239 100644
  
      #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index d9db6c4a7d..6fa5825e63 100644
+index 9eb717e7c1..0f5a5afa3c 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -5584,13 +5584,20 @@ impl Window {
+@@ -5784,13 +5784,20 @@ impl Window {
  
      /// Removes an image from the sprite atlas.
      pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
@@ -82,7 +84,7 @@ index d9db6c4a7d..6fa5825e63 100644
                  frame_index,
              };
  
--            self.sprite_atlas.remove(&params.clone().into());
+-            self.sprite_atlas.remove(&params.into());
 +            removed_any |= self.sprite_atlas.remove(&params.into());
 +        }
 +
@@ -139,5 +141,5 @@ index 622c1cb604..da34ec19d8 100644
  }
  
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

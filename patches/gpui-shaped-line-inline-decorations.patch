@@ -1,4 +1,4 @@
-From 101b6032263f4e66302c728d3adeb0674fde0e7a Mon Sep 17 00:00:00 2001
+From a79c92c56c707d8445f1f5c9d5b57f2aa37cc6ff Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 17:21:25 -0700
 Subject: [PATCH] perf(gpui): store 8 decoration runs inline in ShapedLine
@@ -13,7 +13,7 @@ same behavior.
  2 files changed, 10 insertions(+), 4 deletions(-)
 
 diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
-index 1eea420b3d..46b61f48bf 100644
+index 0b75b980e6..d86e532382 100644
 --- a/crates/gpui/src/text_system.rs
 +++ b/crates/gpui/src/text_system.rs
 @@ -681,7 +681,7 @@ impl WindowTextSystem {
@@ -26,7 +26,7 @@ index 1eea420b3d..46b61f48bf 100644
              if let Some(last_run) = decoration_runs.last_mut()
                  && last_run.color == run.color
 diff --git a/crates/gpui/src/text_system/line.rs b/crates/gpui/src/text_system/line.rs
-index 8c9df4cc6b..437135d35f 100644
+index 9241585aa9..aa3ccd7c35 100644
 --- a/crates/gpui/src/text_system/line.rs
 +++ b/crates/gpui/src/text_system/line.rs
 @@ -38,6 +38,13 @@ pub struct DecorationRun {
@@ -63,5 +63,5 @@ index 8c9df4cc6b..437135d35f 100644
              run_index: 0,
              glyph_index: 0,
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

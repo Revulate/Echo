@@ -1,4 +1,4 @@
-From dac8a261ba7a7f8ae5dc94eecaed8256ef921846 Mon Sep 17 00:00:00 2001
+From f706f2c1bb280f508dcbb15cd983aba350ca2407 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 21 Oct 2026 17:53:36 -0700
 Subject: [PATCH] feat(gpui): activate a window with a token from another
@@ -23,10 +23,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 26 insertions(+)
 
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index 938313fef3..cf0f2e5ede 100644
+index 4fae33fb62..bf8dcdb3c3 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
-@@ -1291,6 +1291,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+@@ -1328,6 +1328,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
          answers: &[PromptButton],
      ) -> Option<oneshot::Receiver<usize>>;
      fn activate(&self);
@@ -42,10 +42,10 @@ index 938313fef3..cf0f2e5ede 100644
      fn request_attention(&self) {}
      fn is_active(&self) -> bool;
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 52aca034d0..f95fa474d8 100644
+index 962ae7ae74..fe1b061cae 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -7455,6 +7455,14 @@ impl Window {
+@@ -7604,6 +7604,14 @@ impl Window {
          self.platform_window.activate();
      }
  
@@ -61,10 +61,10 @@ index 52aca034d0..f95fa474d8 100644
      pub fn request_attention(&self) {
          self.platform_window.request_attention();
 diff --git a/crates/gpui_linux/src/linux/wayland/window.rs b/crates/gpui_linux/src/linux/wayland/window.rs
-index 6647a8ef7f..8f6b2465a1 100644
+index 1f7d22d9a8..fa497b932e 100644
 --- a/crates/gpui_linux/src/linux/wayland/window.rs
 +++ b/crates/gpui_linux/src/linux/wayland/window.rs
-@@ -1886,6 +1886,16 @@ impl PlatformWindow for WaylandWindow {
+@@ -1912,6 +1912,16 @@ impl PlatformWindow for WaylandWindow {
          }
      }
  
@@ -82,5 +82,5 @@ index 6647a8ef7f..8f6b2465a1 100644
  
      fn is_active(&self) -> bool {
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

@@ -1,4 +1,4 @@
-From c816026f86d4e7e2c54c97f56ec6ed6e9ed76903 Mon Sep 17 00:00:00 2001
+From 3c0f046c4a34bfe743b177c8e515b3a8cbd7c60a Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 03:10:45 -0700
 Subject: [PATCH] feat(gpui): platform-backed bidi text geometry and visual
@@ -58,6 +58,15 @@ upstream `ShapedLine` tests in `text_system/line.rs` that build
 `LineLayout` and `ShapedGlyph` literals fill the new geometry fields, so
 gpui's lib tests compile again.
 
+Squashes 0b00bb9239, 8ff7e2b809, df47e512fb, 712e91f7fc, ce3576ed6d
+(without its Cargo.lock hunk), fcd3de273d and 5fd7b007a2.
+
+Rebased onto Zed 7279c76ef7: `LineLayout::split_at` normalizes the
+halves' physical origins only for lines with bidi runs or glyphs out of
+byte order. Other lines split as upstream does, shifting the suffix by
+the boundary glyph's x, so they agree with the `ShapedLineCursor` fast
+path, which takes exactly those lines.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  crates/gpui/Cargo.toml                        |   4 +
@@ -65,20 +74,20 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  crates/gpui/examples/visual_range_spans.rs    |  97 ++
  crates/gpui/src/platform.rs                   |   6 +
  crates/gpui/src/text_system/line.rs           | 138 ++-
- crates/gpui/src/text_system/line_layout.rs    | 471 ++++++++-
+ crates/gpui/src/text_system/line_layout.rs    | 537 ++++++++++-
  crates/gpui_apple/src/text_system.rs          |   8 +
  crates/gpui_wgpu/src/cosmic_text_system.rs    |  12 +
  crates/gpui_windows/Cargo.toml                |   1 +
  crates/gpui_windows/src/direct_write.rs       | 907 +++++++++++++-----
- 10 files changed, 1990 insertions(+), 262 deletions(-)
+ 10 files changed, 2056 insertions(+), 262 deletions(-)
  create mode 100644 crates/gpui/examples/platform_text_geometry.rs
  create mode 100644 crates/gpui/examples/visual_range_spans.rs
 
 diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
-index f215c006fd..ccf95a7640 100644
+index 3300a44505..dcbab71c39 100644
 --- a/crates/gpui/Cargo.toml
 +++ b/crates/gpui/Cargo.toml
-@@ -303,3 +303,7 @@ path = "examples/view_example/view_example_main.rs"
+@@ -304,3 +304,7 @@ path = "examples/view_example/view_example_main.rs"
  [[example]]
  name = "toggle_headless"
  path = "examples/toggle_headless.rs"
@@ -804,10 +813,10 @@ index 0000000000..6468cff91a
 +    println!("visual range span diagnostic passed");
 +}
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index 75f9887bd1..9378989ec4 100644
+index 0daca7bc1f..57a55065f4 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
-@@ -1694,6 +1694,8 @@ impl PlatformTextSystem for NoopTextSystem {
+@@ -1737,6 +1737,8 @@ impl PlatformTextSystem for NoopTextSystem {
                  glyphs.push(ShapedGlyph {
                      id: glyph,
                      position: point(position, px(0.)),
@@ -816,7 +825,7 @@ index 75f9887bd1..9378989ec4 100644
                      index: ix,
                      is_emoji: glyph.0 == 2,
                  });
-@@ -1722,6 +1724,10 @@ impl PlatformTextSystem for NoopTextSystem {
+@@ -1765,6 +1767,10 @@ impl PlatformTextSystem for NoopTextSystem {
              ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
              descent: font_size * (metrics.descent / metrics.units_per_em as f32),
              runs,
@@ -828,7 +837,7 @@ index 75f9887bd1..9378989ec4 100644
          }
      }
 diff --git a/crates/gpui/src/text_system/line.rs b/crates/gpui/src/text_system/line.rs
-index 5691782151..8c9df4cc6b 100644
+index 1b0c8e6df4..9241585aa9 100644
 --- a/crates/gpui/src/text_system/line.rs
 +++ b/crates/gpui/src/text_system/line.rs
 @@ -65,13 +65,17 @@ impl ShapedLine {
@@ -850,7 +859,7 @@ index 5691782151..8c9df4cc6b 100644
          }
      }
  
-@@ -89,16 +93,38 @@ impl ShapedLine {
+@@ -88,16 +92,38 @@ impl ShapedLine {
          self.layout.width
      }
  
@@ -889,7 +898,7 @@ index 5691782151..8c9df4cc6b 100644
              len,
          });
          self
-@@ -183,13 +209,16 @@ impl ShapedLine {
+@@ -185,13 +211,16 @@ impl ShapedLine {
  
      /// Split this shaped line at a byte index, returning `(prefix, suffix)`.
      ///
@@ -908,7 +917,7 @@ index 5691782151..8c9df4cc6b 100644
      pub fn split_at(&self, byte_index: usize) -> (ShapedLine, ShapedLine) {
          let (left_layout, right_layout) = self.layout.split_at(byte_index);
  
-@@ -272,6 +301,7 @@ pub struct ShapedLineCursor<'a> {
+@@ -274,6 +303,7 @@ pub struct ShapedLineCursor<'a> {
      decoration_index: usize,
      decoration_offset: u32,
      x_offset: Pixels,
@@ -916,7 +925,7 @@ index 5691782151..8c9df4cc6b 100644
  }
  
  impl<'a> ShapedLineCursor<'a> {
-@@ -294,6 +324,7 @@ impl<'a> ShapedLineCursor<'a> {
+@@ -296,6 +326,7 @@ impl<'a> ShapedLineCursor<'a> {
          );
          let previous_index = self.byte_index;
          let previous_x = self.x_offset;
@@ -924,7 +933,7 @@ index 5691782151..8c9df4cc6b 100644
          if let Some(remainder) = &mut self.unordered_remainder {
              let (piece, rest) = remainder.split_at(byte_index - previous_index);
              *remainder = rest;
-@@ -303,6 +334,7 @@ impl<'a> ShapedLineCursor<'a> {
+@@ -305,6 +336,7 @@ impl<'a> ShapedLineCursor<'a> {
          }
          let mut runs = Vec::new();
          let mut next_x = self.line.layout.width;
@@ -932,7 +941,7 @@ index 5691782151..8c9df4cc6b 100644
          while let Some(run) = self.line.layout.runs.get(self.run_index) {
              let start = self.glyph_index;
              while let Some(glyph) = run.glyphs.get(self.glyph_index) {
-@@ -320,6 +352,8 @@ impl<'a> ShapedLineCursor<'a> {
+@@ -322,6 +354,8 @@ impl<'a> ShapedLineCursor<'a> {
                          .map(|glyph| crate::ShapedGlyph {
                              id: glyph.id,
                              position: point(glyph.position.x - previous_x, glyph.position.y),
@@ -941,7 +950,7 @@ index 5691782151..8c9df4cc6b 100644
                              index: glyph.index - previous_index,
                              is_emoji: glyph.is_emoji,
                          })
-@@ -328,6 +362,7 @@ impl<'a> ShapedLineCursor<'a> {
+@@ -330,6 +364,7 @@ impl<'a> ShapedLineCursor<'a> {
              }
              if let Some(glyph) = run.glyphs.get(self.glyph_index) {
                  next_x = glyph.position.x;
@@ -949,7 +958,7 @@ index 5691782151..8c9df4cc6b 100644
                  break;
              }
              self.run_index += 1;
-@@ -359,6 +394,7 @@ impl<'a> ShapedLineCursor<'a> {
+@@ -361,6 +396,7 @@ impl<'a> ShapedLineCursor<'a> {
          }
          self.byte_index = byte_index;
          self.x_offset = next_x;
@@ -957,7 +966,7 @@ index 5691782151..8c9df4cc6b 100644
          ShapedLine {
              layout: Arc::new(LineLayout {
                  font_size: self.line.layout.font_size,
-@@ -366,6 +402,10 @@ impl<'a> ShapedLineCursor<'a> {
+@@ -368,6 +404,10 @@ impl<'a> ShapedLineCursor<'a> {
                  ascent: self.line.layout.ascent,
                  descent: self.line.layout.descent,
                  runs,
@@ -968,7 +977,7 @@ index 5691782151..8c9df4cc6b 100644
                  len: byte_index - previous_index,
              }),
              text: SharedString::new(&self.line.text[previous_index..byte_index]),
-@@ -566,14 +606,15 @@ fn paint_line(
+@@ -565,14 +605,15 @@ fn paint_line(
              ),
              origin.y,
          );
@@ -986,7 +995,7 @@ index 5691782151..8c9df4cc6b 100644
                  if glyph_ix == 0 && run_ix == 0 {
                      first_glyph_x = glyph_origin.x;
                  }
-@@ -589,7 +630,7 @@ fn paint_line(
+@@ -588,7 +629,7 @@ fn paint_line(
                          paint_underline(
                              underline_range.clone(),
                              *underline_origin,
@@ -995,7 +1004,7 @@ index 5691782151..8c9df4cc6b 100644
                              underline_style,
                              window,
                          );
-@@ -608,7 +649,7 @@ fn paint_line(
+@@ -607,7 +648,7 @@ fn paint_line(
                          };
                          window.paint_strikethrough(
                              *strikethrough_origin,
@@ -1004,7 +1013,7 @@ index 5691782151..8c9df4cc6b 100644
                              strikethrough_style,
                          );
                          if glyph.index < run_end {
-@@ -622,14 +663,14 @@ fn paint_line(
+@@ -621,14 +662,14 @@ fn paint_line(
                      glyph_origin.x = aligned_origin_x(
                          origin,
                          align_width.unwrap_or(layout.width),
@@ -1021,7 +1030,7 @@ index 5691782151..8c9df4cc6b 100644
  
                  let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> =
                      None;
-@@ -704,7 +745,7 @@ fn paint_line(
+@@ -703,7 +744,7 @@ fn paint_line(
                      paint_underline(
                          underline_range,
                          underline_origin,
@@ -1030,7 +1039,7 @@ index 5691782151..8c9df4cc6b 100644
                          &underline_style,
                          window,
                      );
-@@ -718,7 +759,7 @@ fn paint_line(
+@@ -717,7 +758,7 @@ fn paint_line(
                      };
                      window.paint_strikethrough(
                          strikethrough_origin,
@@ -1039,7 +1048,7 @@ index 5691782151..8c9df4cc6b 100644
                          &strikethrough_style,
                      );
                  }
-@@ -767,7 +808,7 @@ fn paint_line(
+@@ -766,7 +807,7 @@ fn paint_line(
              paint_underline(
                  underline_range,
                  underline_start,
@@ -1048,7 +1057,7 @@ index 5691782151..8c9df4cc6b 100644
                  &underline_style,
                  window,
              );
-@@ -779,7 +820,7 @@ fn paint_line(
+@@ -778,7 +819,7 @@ fn paint_line(
              };
              window.paint_strikethrough(
                  strikethrough_start,
@@ -1057,7 +1066,7 @@ index 5691782151..8c9df4cc6b 100644
                  &strikethrough_style,
              );
          }
-@@ -824,13 +865,14 @@ fn paint_line_background(
+@@ -823,13 +864,14 @@ fn paint_line_background(
              ),
              origin.y,
          );
@@ -1074,7 +1083,7 @@ index 5691782151..8c9df4cc6b 100644
  
                  if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                      wraps.next();
-@@ -842,7 +884,10 @@ fn paint_line_background(
+@@ -841,7 +883,10 @@ fn paint_line_background(
                          window.paint_quad(fill(
                              Bounds {
                                  origin: *background_origin,
@@ -1086,7 +1095,7 @@ index 5691782151..8c9df4cc6b 100644
                              },
                              *background_color,
                          ));
-@@ -857,14 +902,14 @@ fn paint_line_background(
+@@ -856,14 +901,14 @@ fn paint_line_background(
                      glyph_origin.x = aligned_origin_x(
                          origin,
                          align_width.unwrap_or(layout.width),
@@ -1103,7 +1112,7 @@ index 5691782151..8c9df4cc6b 100644
  
                  let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
                  if glyph.index >= run_end {
-@@ -899,7 +944,7 @@ fn paint_line_background(
+@@ -898,7 +943,7 @@ fn paint_line_background(
                  }
  
                  if let Some((mut background_origin, background_color)) = finished_background {
@@ -1112,7 +1121,7 @@ index 5691782151..8c9df4cc6b 100644
                      if background_origin.x == glyph_origin.x {
                          background_origin.x -= max_glyph_size.width.half();
                      };
-@@ -928,7 +973,10 @@ fn paint_line_background(
+@@ -927,7 +972,10 @@ fn paint_line_background(
              window.paint_quad(fill(
                  Bounds {
                      origin: background_origin,
@@ -1124,7 +1133,7 @@ index 5691782151..8c9df4cc6b 100644
                  },
                  background_color,
              ));
-@@ -1006,6 +1054,14 @@ fn aligned_origin_x(
+@@ -960,6 +1008,14 @@ fn aligned_origin_x(
      }
  }
  
@@ -1139,7 +1148,7 @@ index 5691782151..8c9df4cc6b 100644
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -1028,6 +1084,8 @@ mod tests {
+@@ -982,6 +1038,8 @@ mod tests {
              .map(|&(index, x)| ShapedGlyph {
                  id: GlyphId(0),
                  position: point(px(x), px(0.0)),
@@ -1148,7 +1157,7 @@ index 5691782151..8c9df4cc6b 100644
                  index,
                  is_emoji: false,
              })
-@@ -1043,6 +1101,10 @@ mod tests {
+@@ -997,6 +1055,10 @@ mod tests {
                      font_id: FontId(0),
                      glyphs: shaped_glyphs,
                  }],
@@ -1159,7 +1168,7 @@ index 5691782151..8c9df4cc6b 100644
                  len: text.len(),
              }),
              text: SharedString::new(text),
-@@ -1492,18 +1554,24 @@ mod tests {
+@@ -1384,18 +1446,24 @@ mod tests {
                              ShapedGlyph {
                                  id: GlyphId(0),
                                  position: point(px(0.0), px(0.0)),
@@ -1184,7 +1193,7 @@ index 5691782151..8c9df4cc6b 100644
                                  index: 2,
                                  is_emoji: false,
                              },
-@@ -1515,24 +1583,34 @@ mod tests {
+@@ -1407,24 +1475,34 @@ mod tests {
                              ShapedGlyph {
                                  id: GlyphId(0),
                                  position: point(px(30.0), px(0.0)),
@@ -1219,7 +1228,7 @@ index 5691782151..8c9df4cc6b 100644
                  len: 6,
              }),
              text: "abcdef".into(),
-@@ -1697,6 +1775,8 @@ mod tests {
+@@ -1589,6 +1667,8 @@ mod tests {
          let mut width = px(0.);
          for glyph in runs.iter_mut().flat_map(|run| &mut run.glyphs) {
              glyph.position.x = width;
@@ -1228,7 +1237,7 @@ index 5691782151..8c9df4cc6b 100644
              width += advance;
          }
          line.layout = Arc::new(LineLayout {
-@@ -1705,6 +1785,10 @@ mod tests {
+@@ -1597,6 +1677,10 @@ mod tests {
              ascent: layout.ascent,
              descent: layout.descent,
              runs,
@@ -1239,7 +1248,7 @@ index 5691782151..8c9df4cc6b 100644
              len: layout.len,
          });
          line
-@@ -1738,18 +1822,24 @@ mod tests {
+@@ -1630,18 +1714,24 @@ mod tests {
                              ShapedGlyph {
                                  id: GlyphId(11),
                                  position: point(px(0.0), px(1.0)),
@@ -1264,7 +1273,7 @@ index 5691782151..8c9df4cc6b 100644
                                  index: 1,
                                  is_emoji: false,
                              },
-@@ -1761,18 +1851,26 @@ mod tests {
+@@ -1653,18 +1743,26 @@ mod tests {
                              ShapedGlyph {
                                  id: GlyphId(21),
                                  position: point(px(25.0), px(1.0)),
@@ -1292,7 +1301,7 @@ index 5691782151..8c9df4cc6b 100644
              }),
              text: "a😀bcdef".into(),
 diff --git a/crates/gpui/src/text_system/line_layout.rs b/crates/gpui/src/text_system/line_layout.rs
-index bfccb8b704..00d1ce077d 100644
+index 21fadbe58d..3043d93f93 100644
 --- a/crates/gpui/src/text_system/line_layout.rs
 +++ b/crates/gpui/src/text_system/line_layout.rs
 @@ -28,10 +28,56 @@ pub struct LineLayout {
@@ -1698,18 +1707,30 @@ index bfccb8b704..00d1ce077d 100644
      /// The corresponding Font at the given index
      pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
          for run in &self.runs {
-@@ -137,9 +464,8 @@ impl LineLayout {
+@@ -136,10 +463,20 @@ impl LineLayout {
+     /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
      ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
      /// - `font_size`, `ascent`, and `descent` are copied to both halves.
++    /// - A line with bidi runs or glyphs out of byte order is split in logical order instead,
++    ///   and each half's physical glyph origins are normalized to start at x=0.
      pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
 -        let x_offset = self.x_for_index(byte_index);
++        let byte_ordered = self
++            .runs
++            .iter()
++            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
++            .is_sorted();
++        if byte_ordered && !self.has_bidi_runs {
++            return self.split_byte_ordered_at(byte_index);
++        }
++
 +        let logical_x_offset = self.logical_x_for_index(byte_index);
  
 -        // Partition glyph runs. A single run may contribute glyphs to both halves.
          let mut left_runs = Vec::new();
          let mut right_runs = Vec::new();
  
-@@ -158,7 +484,9 @@ impl LineLayout {
+@@ -158,7 +495,9 @@ impl LineLayout {
                      .iter()
                      .map(|g| ShapedGlyph {
                          id: g.id,
@@ -1720,7 +1741,7 @@ index bfccb8b704..00d1ce077d 100644
                          index: g.index - byte_index,
                          is_emoji: g.is_emoji,
                      })
-@@ -170,21 +498,35 @@ impl LineLayout {
+@@ -170,27 +509,96 @@ impl LineLayout {
              }
          }
  
@@ -1758,7 +1779,68 @@ index bfccb8b704..00d1ce077d 100644
              len: self.len - byte_index,
          };
  
-@@ -198,6 +540,13 @@ impl LineLayout {
+         (left, right)
+     }
+ 
++    /// Upstream's split for byte-ordered lines without bidi runs: the suffix is shifted by
++    /// the boundary glyph's physical and logical x, as [`crate::ShapedLineCursor`] does.
++    fn split_byte_ordered_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
++        let boundary_glyph = self
++            .runs
++            .iter()
++            .flat_map(|run| run.glyphs.iter())
++            .find(|glyph| glyph.index >= byte_index);
++        let x_offset = boundary_glyph.map_or(self.width, |glyph| glyph.position.x);
++        let logical_x_offset = boundary_glyph.map_or(self.width, |glyph| glyph.logical_x);
++
++        let mut left_runs = Vec::new();
++        let mut right_runs = Vec::new();
++        for run in &self.runs {
++            let split_pos = run.glyphs.partition_point(|g| g.index < byte_index);
++            if split_pos > 0 {
++                left_runs.push(ShapedRun {
++                    font_id: run.font_id,
++                    glyphs: run.glyphs[..split_pos].to_vec(),
++                });
++            }
++            if split_pos < run.glyphs.len() {
++                right_runs.push(ShapedRun {
++                    font_id: run.font_id,
++                    glyphs: run.glyphs[split_pos..]
++                        .iter()
++                        .map(|g| ShapedGlyph {
++                            position: point(g.position.x - x_offset, g.position.y),
++                            logical_x: g.logical_x - logical_x_offset,
++                            index: g.index - byte_index,
++                            ..*g
++                        })
++                        .collect(),
++                });
++            }
++        }
++
++        let half = |width, runs, len| LineLayout {
++            font_size: self.font_size,
++            width,
++            ascent: self.ascent,
++            descent: self.descent,
++            runs,
++            visual_cells: Vec::new(),
++            carets: Vec::new(),
++            has_bidi_runs: false,
++            bidi_geometry_complete: true,
++            len,
++        };
++        (
++            half(x_offset, left_runs, byte_index),
++            half(self.width - x_offset, right_runs, self.len - byte_index),
++        )
++    }
++
+     fn compute_wrap_boundaries(
+         &self,
+         text: &str,
+@@ -198,6 +606,13 @@ impl LineLayout {
          max_lines: Option<usize>,
          scratch: &mut WrapScratch,
      ) -> SmallVec<[WrapBoundary; 1]> {
@@ -1772,7 +1854,7 @@ index bfccb8b704..00d1ce077d 100644
          let mut boundaries = SmallVec::new();
          let mut current_segment: Option<Range<usize>> = None;
          let mut last_candidate_ix = None;
-@@ -231,7 +580,7 @@ impl LineLayout {
+@@ -231,7 +646,7 @@ impl LineLayout {
                      (
                          WrapBoundary { run_ix, glyph_ix },
                          glyph.index,
@@ -1781,7 +1863,7 @@ index bfccb8b704..00d1ce077d 100644
                      )
                  })
              })
-@@ -292,6 +641,56 @@ impl LineLayout {
+@@ -292,6 +707,56 @@ impl LineLayout {
      }
  }
  
@@ -1838,7 +1920,7 @@ index bfccb8b704..00d1ce077d 100644
  /// A line of text that has been wrapped to fit a given width
  #[derive(Default, Debug)]
  pub struct WrappedLineLayout {
-@@ -323,6 +722,11 @@ impl WrappedLineLayout {
+@@ -322,6 +787,11 @@ impl WrappedLineLayout {
  
      /// The width of this line, in pixels, whether or not it was wrapped.
      pub fn width(&self) -> Pixels {
@@ -1850,7 +1932,7 @@ index bfccb8b704..00d1ce077d 100644
          self.wrap_width
              .unwrap_or(Pixels::MAX)
              .min(self.unwrapped_layout.width)
-@@ -403,7 +807,7 @@ impl WrappedLineLayout {
+@@ -402,7 +872,7 @@ impl WrappedLineLayout {
              let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
              let glyph = &run.glyphs[line_start_boundary.glyph_ix];
              wrapped_line_start_index = glyph.index;
@@ -1859,7 +1941,7 @@ index bfccb8b704..00d1ce077d 100644
          } else {
              wrapped_line_start_index = 0;
              wrapped_line_start_x = Pixels::ZERO;
-@@ -417,7 +821,7 @@ impl WrappedLineLayout {
+@@ -416,7 +886,7 @@ impl WrappedLineLayout {
              let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_ix];
              let glyph = &run.glyphs[next_wrap_boundary.glyph_ix];
              wrapped_line_end_index = glyph.index;
@@ -1868,7 +1950,7 @@ index bfccb8b704..00d1ce077d 100644
          } else {
              wrapped_line_end_index = self.unwrapped_layout.len;
              wrapped_line_end_x = self.unwrapped_layout.width;
-@@ -465,8 +869,8 @@ impl WrappedLineLayout {
+@@ -464,8 +934,8 @@ impl WrappedLineLayout {
                  line_start_ix = line_end_ix;
                  continue;
              } else {
@@ -1879,7 +1961,7 @@ index bfccb8b704..00d1ce077d 100644
                  return Some(point(x, line_y));
              }
          }
-@@ -633,7 +1037,8 @@ impl LineLayoutCache {
+@@ -632,7 +1102,8 @@ impl LineLayoutCache {
          } else {
              drop(state);
              let text = SharedString::from(text);
@@ -1889,7 +1971,7 @@ index bfccb8b704..00d1ce077d 100644
              let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                  unwrapped_layout.compute_wrap_boundaries(
                      text.as_ref(),
-@@ -644,6 +1049,25 @@ impl LineLayoutCache {
+@@ -643,6 +1114,25 @@ impl LineLayoutCache {
              } else {
                  SmallVec::new()
              };
@@ -1915,7 +1997,7 @@ index bfccb8b704..00d1ce077d 100644
              let layout = Arc::new(WrappedLineLayout {
                  unwrapped_layout,
                  wrap_boundaries,
-@@ -751,6 +1175,11 @@ impl LineLayoutCache {
+@@ -750,6 +1240,11 @@ impl LineLayoutCache {
  // otherwise they get displaced into the next cell. We detect them by checking
  // whether shaped x has advanced by at least half a cell beyond the last base.
  fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
@@ -1927,7 +2009,7 @@ index bfccb8b704..00d1ce077d 100644
      let mut glyph_pos: usize = 0;
      // NEG_INFINITY ensures the first glyph is always classified as a base.
      let mut last_base_shaped_x = px(f32::NEG_INFINITY);
-@@ -771,6 +1200,10 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+@@ -770,6 +1265,10 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
              } else {
                  glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
              }
@@ -1938,7 +2020,7 @@ index bfccb8b704..00d1ce077d 100644
          }
      }
  }
-@@ -864,6 +1297,8 @@ mod tests {
+@@ -881,6 +1380,8 @@ mod tests {
          ShapedGlyph {
              id: GlyphId(0),
              position: point(px(x), px(0.)),
@@ -1947,7 +2029,7 @@ index bfccb8b704..00d1ce077d 100644
              index,
              is_emoji: false,
          }
-@@ -879,6 +1314,10 @@ mod tests {
+@@ -896,6 +1397,10 @@ mod tests {
                  font_id: FontId(0),
                  glyphs,
              }],
@@ -1985,10 +2067,10 @@ index 74cd7cc7ce..00af442937 100644
      }
  }
 diff --git a/crates/gpui_wgpu/src/cosmic_text_system.rs b/crates/gpui_wgpu/src/cosmic_text_system.rs
-index 775067518c..528453be33 100644
+index eafe97442b..b8b1bf385b 100644
 --- a/crates/gpui_wgpu/src/cosmic_text_system.rs
 +++ b/crates/gpui_wgpu/src/cosmic_text_system.rs
-@@ -772,6 +772,10 @@ impl CosmicTextSystemState {
+@@ -771,6 +771,10 @@ impl CosmicTextSystemState {
                  ascent: Pixels::ZERO,
                  descent: Pixels::ZERO,
                  runs: Vec::new(),
@@ -1999,16 +2081,16 @@ index 775067518c..528453be33 100644
                  len: text.len(),
              };
          };
-@@ -817,6 +821,8 @@ impl CosmicTextSystemState {
-             let shaped_glyph = ShapedGlyph {
-                 id: GlyphId(glyph.glyph_id as u32),
-                 position: point(glyph.x.into(), glyph.y.into()),
+@@ -819,6 +823,8 @@ impl CosmicTextSystemState {
+                     (glyph.x + glyph.x_offset * f32::from(font_size)).into(),
+                     (glyph.y - glyph.y_offset * f32::from(font_size)).into(),
+                 ),
 +                logical_x: glyph.x.into(),
 +                logical_advance: glyph.w.into(),
                  index: glyph.start,
                  is_emoji,
              };
-@@ -844,6 +850,12 @@ impl CosmicTextSystemState {
+@@ -846,6 +852,12 @@ impl CosmicTextSystemState {
              ascent: layout.max_ascent.into(),
              descent: layout.max_descent.into(),
              runs,
@@ -2022,10 +2104,10 @@ index 775067518c..528453be33 100644
          }
      }
 diff --git a/crates/gpui_windows/Cargo.toml b/crates/gpui_windows/Cargo.toml
-index 37e4a2f7f2..417bdbc100 100644
+index 83e2d2d02d..4a0ed84889 100644
 --- a/crates/gpui_windows/Cargo.toml
 +++ b/crates/gpui_windows/Cargo.toml
-@@ -37,6 +37,7 @@ rand.workspace = true
+@@ -36,6 +36,7 @@ rand.workspace = true
  raw-window-handle.workspace = true
  scheduler.workspace = true
  smallvec.workspace = true
@@ -3117,5 +3199,5 @@ index 82ff963c1d..ae8fb76523 100644
 -    }
  }
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

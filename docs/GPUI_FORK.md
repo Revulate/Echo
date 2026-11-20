@@ -266,6 +266,13 @@ reports the full unwrapped physical extent, not the requested wrap width, so it
 cannot understate or clip retained RTL ink. Ordinary LTR wrapping keeps its
 existing path.
 
+`LineLayout::split_at` splits in logical order and normalizes each half's physical
+glyph origins to start at x=0 only when the line has bidi runs or glyphs out of byte
+order. Every other line splits as upstream does: the prefix keeps its positions and
+the suffix shifts by the boundary glyph's physical and logical x. These are exactly
+the lines that `ShapedLineCursor` advances incrementally, so the cursor and
+successive `split_at` calls produce the same fragments.
+
 DirectWrite's per-cluster range and caret queries run only after the shaper reports
 an odd-bidi-level run. Ordinary LTR chat therefore keeps the glyph path without
 extra COM hit-test calls. UTF-16 cluster positions map through one precomputed
@@ -340,14 +347,6 @@ on it. A return attempt that still lands on a software adapter backs off 1-60 s
 until the enumeration changes. The probe runs only outside a recovery episode, so
 the recovery backoff and 60 s cap are unchanged.
 
-### Lazy path intermediate textures (`gpui-windows-lazy-path-msaa.patch`)
-
-The full-size path intermediate texture and 4x MSAA render target are created on
-the first paths batch at the current window size instead of at window creation and
-on every resize. Echo does not paint GPUI paths, so these are normally never
-allocated. A resize recreates them only if they already exist, and device recovery
-starts without them. Path drawing is otherwise unchanged.
-
 ### Transparent glyphs skipped (`gpui-skip-transparent-glyphs.patch`)
 
 `Window::paint_glyph` returns early when the glyph color has alpha 0, instead of
@@ -362,8 +361,16 @@ Animated content that changes only its frame does not need a window redraw.
 
 - `Window::paint_animated_image` paints an image as a keyed slot and returns
   whether it recorded one (a fully clipped image paints nothing).
-  `reuse_paint` carries slots of replayed views, and `Frame::finish` resolves
-  each key to its sprite in the sorted scene.
+- Slots live in the scene, the way upstream tracks timed sprite animations
+  (`SpriteAnimationId`). `Scene::insert_animated_image` records the slot in the
+  scene's slot table and stores `index + 1` in the primitive: the
+  `PolychromeSprite`'s unused `pad`, or `PaintedText::slot` (0 means no slot;
+  renderers ignore both). Upstream assigns draw orders late (a primitive inside
+  a layer gets its order when the outermost layer closes), so after sorting,
+  `Scene::finish` walks the sorted sprites and painted texts once and records
+  where each slot's primitive landed. `Scene::replay` re-inserts the slots of a
+  reused cached view into the new scene. The window maps each key to its slot
+  and marks a key painted twice as ambiguous.
 - `Window::patch_animated_image` swaps the sprite's atlas tile in the
   presented scene and in the paint operation cached views replay, records the
   sprite bounds as damage and requests a present-only frame. It refuses when
@@ -372,8 +379,14 @@ Animated content that changes only its frame does not need a window redraw.
 - `PlatformWindow::set_present_damage`: the Direct3D 11 renderer presents
   patch-only frames with `IDXGISwapChain1::Present1` dirty rectangles. Every
   frame still redraws the whole back buffer, so the rectangles are only a
-  compositor hint. The first present after a resize or device recovery is
-  full. Other backends ignore the damage.
+  compositor hint. The first present after a resize, a device recovery or a
+  failed draw or present is full, and so is every present while the scene runs
+  upstream's timed scene animations, which move sprites outside the patched
+  regions. Other backends ignore the damage.
+- Unit tests in `crates/gpui/src/window.rs` (`animated_image_patch_tests`) paint
+  slots inside nested layers and in a replayed cached view and assert that they
+  resolve and patch, that a duplicated key is refused, and that scene animations
+  force a full present.
 - `Window::frame_stage_statistics` returns cumulative CPU time per frame
   stage, view render/reuse counts, presents, partial presents, patches and
   refusals; the Direct3D 11 renderer adds upload, encode and present-call
@@ -406,8 +419,8 @@ line); more spill to the heap with the same behavior.
   on a later miss (a window opened afterwards, a lost device), and skips the
   sprite when they cannot be rebuilt. `as_bytes` is `None` for these images;
   `with_pixels` and `byte_len` work for every image.
-- `PaintedText` (scene primitive, 912 bytes, `#[repr(C)]` matching the HLSL
-  struct) draws a 7TV-style name paint: stroke rings and a solid, linear,
+- `PaintedText` (scene primitive, 916 bytes including the `slot` field,
+  `#[repr(C)]` matching the HLSL struct) draws a 7TV-style name paint: stroke rings and a solid, linear,
   radial or image fill through a glyph mask, then drop shadows from
   precomputed weights. `PaintMask` is its 8-bit mask tile
   (`AtlasKey::PaintMask`), stacking the coverage and one block per shadow.
@@ -415,9 +428,16 @@ line); more spill to the heap with the same behavior.
   fill frame `patch_animated_image` swaps; `App::drop_paint_mask` /
   `Window::drop_paint_mask` retire masks; `PlatformWindow::supports_painted_text`
   is true only for the Direct3D 11 renderer, which draws it with the
-  `painted_text` shader (mask `t0`, instances `t1`, fill `t2`). The wgpu and
-  Metal renderers skip the batch, and Echo falls back to CPU-composited name
-  paints there.
+  `painted_text` shader (mask `t0`, instances `t1`, fill `t4`; upstream's
+  path renderer keeps its curve and paint buffers at `t2` and `t3` for the
+  whole frame). The vertex shader clips the quad to the content mask with
+  upstream's `clip_to_mask`, and the fragment shader derives canvas pixels from
+  `SV_Position`, so clipping does not move them. The draw uses the shared
+  depth-stencil state, so opaque quads painted later still occlude it. A
+  painted text never shares a draw order with a painted text it overlaps,
+  because painted texts batch by texture rather than in paint order. The wgpu
+  and Metal renderers skip the batch, and Echo falls back to CPU-composited
+  name paints there.
 
 ### Pointer leave dispatches `MouseExited` on Windows (`gpui-windows-mouse-leave-exit.patch`)
 
@@ -488,7 +508,10 @@ observer (`observe_window_visibility`) and the `on_system_sleep` hook.
    `git rebase --onto <new-rev> <old-rev> echo-paint-fork`. Resolve conflicts
    (`rasterize_shaped_line_mask` follows `paint_glyph`'s internals; compare against
    the upstream `paint_glyph` when it drifts). Build and test the fork's affected
-   crates.
+   crates, including `cargo test -p gpui --lib`: `animated_image_patch_tests`
+   fail if animation patching silently stops resolving its slots. Debug builds
+   compile the HLSL at runtime, so also run `cargo check --release -p gpui_windows`,
+   whose build script compiles the shaders with fxc.
 3. Regenerate each patch file from its rebased commit with
    `git format-patch -1 <commit> --stdout > <echo>/patches/<name>.patch`
    (`gpui-paint-fork.patch` holds two commits:

@@ -1,4 +1,4 @@
-From ecdd8c2bae41c4298767e2978111e195b44b5488 Mon Sep 17 00:00:00 2001
+From 7d2bde083528bd8072008302c8fc0821aac5d316 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 12 Aug 2026 14:44:00 -0700
 Subject: [PATCH] reqwest_client: bind response body polls to runtime
@@ -58,5 +58,5 @@ index 436ec60fe1..0129e9be2e 100644
              builder.body(body).map_err(|e| anyhow!(e))
          }
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

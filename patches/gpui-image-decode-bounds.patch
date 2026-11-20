@@ -1,4 +1,4 @@
-From 6f19494a60cc70695fdd8a7a9e517814938bea7f Mon Sep 17 00:00:00 2001
+From 7741125fcaf32f31474e0668f79bf84519b7a42f Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 12 Aug 2026 12:57:36 -0700
 Subject: [PATCH] Bound image URI decoded rasters
@@ -22,20 +22,20 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 117 insertions(+), 15 deletions(-)
 
 diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
-index 9a090dde05..9c9e998a61 100644
+index 643423da2b..c94558d55a 100644
 --- a/crates/gpui/src/elements/img.rs
 +++ b/crates/gpui/src/elements/img.rs
 @@ -1,19 +1,19 @@
  use crate::{
      AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
 -    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
--    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
--    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
--    decode_static_image, decode_webp_image, px,
+-    Interactivity, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource, SharedString,
+-    SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image, decode_static_image,
+-    decode_webp_image, px,
 +    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageDecodeLimits, InspectorElementId,
-+    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
-+    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
-+    decode_gif_image, decode_static_image, decode_static_image_from_decoder, decode_webp_image, px,
++    InteractiveElement, Interactivity, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
++    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
++    decode_static_image, decode_static_image_from_decoder, decode_webp_image, px,
  };
  use anyhow::{Result, anyhow};
  
@@ -72,7 +72,7 @@ index 9a090dde05..9c9e998a61 100644
  fn image_uri_retry_delay(uri: &SharedUri, failed_attempt: u8) -> Duration {
      let exponential_ms = 100u64.saturating_mul(1u64 << failed_attempt.saturating_sub(1));
      let jitter_ms = crate::hash(uri) % 100;
-@@ -651,6 +665,7 @@ impl Asset for ImageAssetLoader {
+@@ -643,6 +657,7 @@ impl Asset for ImageAssetLoader {
          let svg_renderer = cx.svg_renderer();
          let asset_source = cx.asset_source().clone();
          async move {
@@ -80,7 +80,7 @@ index 9a090dde05..9c9e998a61 100644
              let bytes = match source.clone() {
                  Resource::Path(uri) => fs::read(uri.as_ref())?,
                  Resource::Uri(uri) => {
-@@ -779,9 +794,18 @@ impl Asset for ImageAssetLoader {
+@@ -771,9 +786,18 @@ impl Asset for ImageAssetLoader {
              };
  
              if let Ok(format) = image::guess_format(&bytes) {
@@ -102,7 +102,7 @@ index 9a090dde05..9c9e998a61 100644
                  };
  
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index 02085374ae..75f9887bd1 100644
+index 7b33b60b53..0daca7bc1f 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
 @@ -54,7 +54,7 @@ use futures::channel::oneshot;
@@ -114,7 +114,7 @@ index 02085374ae..75f9887bd1 100644
  use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
  use scheduler::Instant;
  pub use scheduler::RunnableMeta;
-@@ -3410,15 +3410,76 @@ pub(crate) fn decode_static_image_from_decoder(
+@@ -3456,15 +3456,76 @@ pub(crate) fn decode_static_image_from_decoder(
      Ok(SmallVec::from_elem(Frame::new(data), 1))
  }
  
@@ -191,7 +191,7 @@ index 02085374ae..75f9887bd1 100644
                  // Convert from RGBA to BGRA.
                  for pixel in frame.buffer_mut().chunks_exact_mut(4) {
                      pixel.swap(0, 2);
-@@ -3438,17 +3499,34 @@ fn decode_animated_frames<'a>(
+@@ -3484,17 +3545,34 @@ fn decode_animated_frames<'a>(
      Ok(frames)
  }
  
@@ -230,7 +230,7 @@ index 02085374ae..75f9887bd1 100644
      } else {
          decode_static_image_from_decoder(decoder)
      }
-@@ -3517,10 +3595,10 @@ impl Image {
+@@ -3563,10 +3641,10 @@ impl Image {
      /// Convert the clipboard image to an `ImageData` object.
      pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
          let frames = match self.format {
@@ -244,5 +244,5 @@ index 02085374ae..75f9887bd1 100644
              ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
              ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

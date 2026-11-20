@@ -6,7 +6,7 @@
 # fork-tree is the git tree id of the fork after the last patch. It changes
 # whenever the base revision or any patch changes; recompute it with
 # `git -C ../zed-gpui-fork rev-parse 'HEAD^{tree}'` after rebuilding the series.
-fork-tree = 7a802743da3a4ba05833b47153b01f2cf567904f
+fork-tree = c9d3ad851649bcc588363640248f1850897c9bec
 
 patches/gpui-paint-fork.patch
 patches/gpui-image-features.patch
@@ -24,7 +24,6 @@ patches/gpui-bidi-text-geometry.patch
 patches/gpui-windows-atlas-retirement-stability.patch
 patches/gpui-windows-device-lost-retry.patch
 patches/gpui-windows-hardware-adapter-preference.patch
-patches/gpui-windows-lazy-path-msaa.patch
 patches/gpui-skip-transparent-glyphs.patch
 patches/gpui-animated-image-patching.patch
 patches/gpui-windows-minimize-vsync-recovery-fixes.patch

@@ -206,13 +206,6 @@ impl AccessibleChat {
     }
 }
 
-impl IntoElement for AccessibleChat {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for AccessibleChat {
     type RequestLayoutState = <Stateful<Div> as Element>::RequestLayoutState;
     type PrepaintState = (

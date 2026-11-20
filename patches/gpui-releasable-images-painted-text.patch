@@ -1,4 +1,4 @@
-From 0b904fc648ac4625c7e8e3e77e5b8e1ac8368986 Mon Sep 17 00:00:00 2001
+From ed7ec125ce16893105b5a207793a62d3f33352d9 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 19:22:31 -0700
 Subject: [PATCH] perf(gpui): release image pixels after upload; add a
@@ -20,26 +20,35 @@ polychrome atlas, and patch_animated_image swaps that frame without a
 redraw. Window::paint_painted_text, App/Window::drop_paint_mask and
 PlatformWindow::supports_painted_text expose it. The Direct3D 11
 renderer draws it with a new shader (mask at t0, instances at t1, fill
-at t2); other renderers report no support and skip it.
+at t4); other renderers report no support and skip it.
+
+Rebased onto Zed 7279c76ef7: the vertex shader clips the quad to the
+content mask with upstream's `clip_to_mask` instead of clip distances,
+and the draw passes the depth-stencil state. The fill moved from t2 to
+t4, because upstream's path renderer binds its curve and paint buffers
+at t2 and t3 for the whole frame. An animated painted text's slot index
+lives in a new `slot` field (the struct is now 916 bytes). Painted texts
+never share a draw order with a painted text they overlap, because they
+batch by texture rather than in paint order.
 ---
  crates/gpui/src/app.rs                      |  11 +
- crates/gpui/src/assets.rs                   | 162 +++++++++-
+ crates/gpui/src/assets.rs                   | 162 ++++++++-
  crates/gpui/src/platform.rs                 |  11 +
- crates/gpui/src/scene.rs                    | 201 ++++++++++++
- crates/gpui/src/window.rs                   | 325 ++++++++++++++++----
+ crates/gpui/src/scene.rs                    | 294 +++++++++++++++-
+ crates/gpui/src/window.rs                   | 372 +++++++++++++++++---
  crates/gpui_apple/src/metal_renderer.rs     |   2 +
  crates/gpui_wgpu/src/wgpu_renderer.rs       |   2 +
  crates/gpui_windows/build.rs                |   1 +
- crates/gpui_windows/src/directx_renderer.rs | 105 ++++++-
- crates/gpui_windows/src/shaders.hlsl        | 292 ++++++++++++++++++
+ crates/gpui_windows/src/directx_renderer.rs | 105 +++++-
+ crates/gpui_windows/src/shaders.hlsl        | 289 +++++++++++++++
  crates/gpui_windows/src/window.rs           |   4 +
- 11 files changed, 1049 insertions(+), 67 deletions(-)
+ 11 files changed, 1186 insertions(+), 67 deletions(-)
 
 diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
-index 75da2eb6e5..01f6ee61af 100644
+index 9e64eae739..019475b4e7 100644
 --- a/crates/gpui/src/app.rs
 +++ b/crates/gpui/src/app.rs
-@@ -3226,6 +3226,17 @@ impl App {
+@@ -3333,6 +3333,17 @@ impl App {
          }
      }
  
@@ -297,10 +306,10 @@ index cb8b47ed01..48e51f253f 100644
 +    }
  }
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index d2ba1b3f22..b9aa64cf99 100644
+index 7e5330e59a..95f93d48c3 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
-@@ -1432,6 +1432,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+@@ -1475,6 +1475,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
      /// present only the damaged regions; the default ignores it.
      fn set_present_damage(&self, _regions: Option<&[Bounds<ScaledPixels>]>) {}
  
@@ -315,7 +324,7 @@ index d2ba1b3f22..b9aa64cf99 100644
      /// Cumulative CPU time the renderer spent per frame stage.
      ///
      /// Local Echo extension (`echo-paint-fork`). The default returns `None`.
-@@ -1798,6 +1806,8 @@ pub enum AtlasKey {
+@@ -1841,6 +1849,8 @@ pub enum AtlasKey {
      Glyph(RenderGlyphParams),
      Svg(RenderSvgParams),
      Image(RenderImageParams),
@@ -324,7 +333,7 @@ index d2ba1b3f22..b9aa64cf99 100644
  }
  
  impl AtlasKey {
-@@ -1815,6 +1825,7 @@ impl AtlasKey {
+@@ -1858,6 +1868,7 @@ impl AtlasKey {
              }
              AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
              AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
@@ -333,45 +342,112 @@ index d2ba1b3f22..b9aa64cf99 100644
      }
  }
 diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
-index a0397ccf5b..df133e75fa 100644
+index 36cd97c624..e2d2fcab32 100644
 --- a/crates/gpui/src/scene.rs
 +++ b/crates/gpui/src/scene.rs
-@@ -49,6 +49,7 @@ pub struct Scene {
+@@ -59,6 +59,7 @@ pub struct Scene {
      pub monochrome_sprites: Vec<MonochromeSprite>,
      pub subpixel_sprites: Vec<SubpixelSprite>,
      pub polychrome_sprites: Vec<PolychromeSprite>,
 +    pub painted_texts: Vec<PaintedText>,
      pub surfaces: Vec<PaintSurface>,
-     /// Primitives copied from a previous scene by [`Scene::replay`] since the
-     /// last [`Scene::clear`]. Echo frame-stage diagnostics.
-@@ -69,6 +70,7 @@ impl Scene {
+     animations: Vec<SpriteAnimation>,
+     /// Images that `Window::patch_animated_image` can show another frame of,
+@@ -84,6 +85,7 @@ impl Scene {
          self.monochrome_sprites.clear();
          self.subpixel_sprites.clear();
          self.polychrome_sprites.clear();
 +        self.painted_texts.clear();
          self.surfaces.clear();
+         self.animations.clear();
+         self.animated_image_slots.clear();
+@@ -131,21 +133,34 @@ impl Scene {
+         }
      }
  
-@@ -133,6 +135,10 @@ impl Scene {
-                 sprite.order = order;
-                 self.polychrome_sprites.push(*sprite);
-             }
-+            Primitive::PaintedText(text) => {
-+                text.order = order;
-+                self.painted_texts.push(**text);
+-    /// Inserts `sprite` as an animated image slot (local Echo extension).
+-    /// Returns whether it was kept, rather than clipped away.
++    /// Inserts a polychrome sprite or painted text as an animated image slot
++    /// (local Echo extension). Returns whether it was kept, rather than
++    /// clipped away.
+     ///
+-    /// The slot's index is stored in the sprite's `pad`, which renderers ignore,
+-    /// so [`Self::finish`] can find the sprite after sorting and
+-    /// [`Self::replay`] can carry the slot into the next scene.
++    /// The slot's index is stored in the sprite's `pad` or the text's `slot`,
++    /// which renderers ignore, so [`Self::finish`] can find the primitive after
++    /// sorting and [`Self::replay`] can carry the slot into the next scene.
+     pub(crate) fn insert_animated_image(
+         &mut self,
+-        mut sprite: PolychromeSprite,
++        primitive: impl Into<Primitive>,
+         mut slot: AnimatedImageSlot,
+     ) -> bool {
+-        sprite.pad = animated_image_slot_id(self.animated_image_slots.len());
++        let id = animated_image_slot_id(self.animated_image_slots.len());
++        let mut primitive = primitive.into();
++        slot.kind = match &mut primitive {
++            Primitive::PolychromeSprite(sprite) => {
++                sprite.pad = id;
++                AnimatedSlotKind::Sprite
 +            }
-             Primitive::Surface(surface) => {
++            Primitive::PaintedText(text) => {
++                text.slot = id;
++                AnimatedSlotKind::PaintedText
++            }
++            _ => return self.try_insert_primitive(primitive),
++        };
+         slot.op_index = self.paint_operations.len();
+         slot.primitive_index = None;
+-        if self.try_insert_primitive(sprite.into()) {
++        if self.try_insert_primitive(primitive) {
+             self.animated_image_slots.push(slot);
+             true
+         } else {
+@@ -257,6 +272,7 @@ impl Scene {
+             Primitive::PolychromeSprite(sprite) => self
+                 .polychrome_sprites
+                 .push(PolychromeSprite { order, ..sprite }),
++            Primitive::PaintedText(text) => self.painted_texts.push(PaintedText { order, ..*text }),
+             Primitive::Surface(mut surface) => {
                  surface.order = order;
-                 self.surfaces.push(surface.clone());
-@@ -166,6 +172,7 @@ impl Scene {
-             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-         self.polychrome_sprites
-             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+                 self.surfaces.push(surface);
+@@ -281,6 +297,10 @@ impl Scene {
+                         // Slot ids, like animation ids, index the scene they were
+                         // inserted into.
+                         self.insert_animated_image(*sprite, slot);
++                    } else if let Primitive::PaintedText(text) = primitive
++                        && let Some(slot) = prev_scene.animated_image_slot(text.slot)
++                    {
++                        self.insert_animated_image(**text, slot);
+                     } else {
+                         self.insert_primitive(primitive.clone());
+                     }
+@@ -307,6 +327,7 @@ impl Scene {
+         sort_in_place(&mut self.polychrome_sprites, keys, |sprite| {
+             (sprite.order, sprite.tile.texture_id.index)
+         });
 +        self.painted_texts.sort_by_key(PaintedText::sort_key);
          self.surfaces.sort_by_key(|surface| surface.order);
+ 
+         // Sorting moved the sprites, so animations learn where theirs ended up.
+@@ -327,6 +348,15 @@ impl Scene {
+                     slot.primitive_index = Some(index);
+                 }
+             }
++            for (index, text) in self.painted_texts.iter().enumerate() {
++                if let Some(slot) = text
++                    .slot
++                    .checked_sub(1)
++                    .and_then(|slot| self.animated_image_slots.get_mut(slot as usize))
++                {
++                    slot.primitive_index = Some(index);
++                }
++            }
+         }
      }
  
-@@ -192,6 +199,8 @@ impl Scene {
+@@ -353,6 +383,8 @@ impl Scene {
              subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
              polychrome_sprites_start: 0,
              polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
@@ -380,7 +456,39 @@ index a0397ccf5b..df133e75fa 100644
              surfaces_start: 0,
              surfaces_iter: self.surfaces.iter().peekable(),
          }
-@@ -215,6 +224,7 @@ pub(crate) enum PrimitiveKind {
+@@ -410,11 +442,23 @@ pub(crate) struct AnimatedImageSlot {
+     pub(crate) op_index: usize,
+     pub(crate) visible_bounds: Bounds<Pixels>,
+     pub(crate) image_bounds: Bounds<Pixels>,
++    pub(crate) kind: AnimatedSlotKind,
+     /// Index of the slot's primitive in the sorted primitive array, once
+     /// [`Scene::finish`] has run.
+     pub(crate) primitive_index: Option<usize>,
+ }
+ 
++/// The primitive an [`AnimatedImageSlot`] patches.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum AnimatedSlotKind {
++    /// A polychrome sprite showing the image frame, in
++    /// [`Scene::polychrome_sprites`].
++    Sprite,
++    /// A [`PaintedText`] whose fill texture is the image frame, in
++    /// [`Scene::painted_texts`].
++    PaintedText,
++}
++
+ impl AnimatedImageSlot {
+     pub(crate) fn new(
+         key: u64,
+@@ -426,6 +470,7 @@ impl AnimatedImageSlot {
+             op_index: 0,
+             visible_bounds,
+             image_bounds,
++            kind: AnimatedSlotKind::Sprite,
+             primitive_index: None,
+         }
+     }
+@@ -465,6 +510,7 @@ pub(crate) enum PrimitiveKind {
      MonochromeSprite,
      SubpixelSprite,
      PolychromeSprite,
@@ -388,7 +496,17 @@ index a0397ccf5b..df133e75fa 100644
      Surface,
  }
  
-@@ -234,6 +244,7 @@ pub enum Primitive {
+@@ -480,6 +526,9 @@ impl PrimitiveKind {
+             Self::MonochromeSprite => Self::Underline,
+             Self::SubpixelSprite => Self::MonochromeSprite,
+             Self::PolychromeSprite => Self::SubpixelSprite,
++            // Painted texts batch by texture like sprites, so two that overlap
++            // must not share a draw order.
++            Self::PaintedText => Self::PolychromeSprite,
+             kind => kind,
+         }
+     }
+@@ -501,6 +550,7 @@ pub enum Primitive {
      MonochromeSprite(MonochromeSprite),
      SubpixelSprite(SubpixelSprite),
      PolychromeSprite(PolychromeSprite),
@@ -396,7 +514,15 @@ index a0397ccf5b..df133e75fa 100644
      Surface(PaintSurface),
  }
  
-@@ -248,6 +259,7 @@ impl Primitive {
+@@ -515,6 +565,7 @@ impl Primitive {
+             Primitive::MonochromeSprite(_) => PrimitiveKind::MonochromeSprite,
+             Primitive::SubpixelSprite(_) => PrimitiveKind::SubpixelSprite,
+             Primitive::PolychromeSprite(_) => PrimitiveKind::PolychromeSprite,
++            Primitive::PaintedText(_) => PrimitiveKind::PaintedText,
+             Primitive::Surface(_) => PrimitiveKind::Surface,
+         }
+     }
+@@ -528,6 +579,7 @@ impl Primitive {
              Primitive::MonochromeSprite(sprite) => &sprite.bounds,
              Primitive::SubpixelSprite(sprite) => &sprite.bounds,
              Primitive::PolychromeSprite(sprite) => &sprite.bounds,
@@ -404,7 +530,7 @@ index a0397ccf5b..df133e75fa 100644
              Primitive::Surface(surface) => &surface.bounds,
          }
      }
-@@ -261,6 +273,7 @@ impl Primitive {
+@@ -555,6 +607,7 @@ impl Primitive {
              Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
              Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
              Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
@@ -412,7 +538,7 @@ index a0397ccf5b..df133e75fa 100644
              Primitive::Surface(surface) => &surface.content_mask,
          }
      }
-@@ -288,6 +301,8 @@ struct BatchIterator<'a> {
+@@ -582,6 +635,8 @@ struct BatchIterator<'a> {
      subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
      polychrome_sprites_start: usize,
      polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
@@ -421,7 +547,7 @@ index a0397ccf5b..df133e75fa 100644
      surfaces_start: usize,
      surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
  }
-@@ -319,6 +334,10 @@ impl<'a> Iterator for BatchIterator<'a> {
+@@ -616,6 +671,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                  self.polychrome_sprites_iter.peek().map(|s| s.order),
                  PrimitiveKind::PolychromeSprite,
              ),
@@ -432,7 +558,7 @@ index a0397ccf5b..df133e75fa 100644
              (
                  self.surfaces_iter.peek().map(|s| s.order),
                  PrimitiveKind::Surface,
-@@ -454,6 +473,28 @@ impl<'a> Iterator for BatchIterator<'a> {
+@@ -751,6 +810,28 @@ impl<'a> Iterator for BatchIterator<'a> {
                      range: sprites_start..sprites_end,
                  })
              }
@@ -461,7 +587,7 @@ index a0397ccf5b..df133e75fa 100644
              PrimitiveKind::Surface => {
                  let surfaces_start = self.surfaces_start;
                  let mut surfaces_end = surfaces_start + 1;
-@@ -499,6 +540,12 @@ pub enum PrimitiveBatch {
+@@ -796,6 +877,12 @@ pub enum PrimitiveBatch {
          texture_id: AtlasTextureId,
          range: Range<usize>,
      },
@@ -474,7 +600,7 @@ index a0397ccf5b..df133e75fa 100644
      Surfaces(Range<usize>),
  }
  
-@@ -531,6 +578,15 @@ impl PrimitiveBatch {
+@@ -828,6 +915,15 @@ impl PrimitiveBatch {
                      texture_id.index
                  )
              }
@@ -490,7 +616,7 @@ index a0397ccf5b..df133e75fa 100644
              Self::Surfaces(range) => format!("surfaces ({})", range.len()),
          }
      }
-@@ -770,6 +826,151 @@ impl From<PolychromeSprite> for Primitive {
+@@ -1137,6 +1233,155 @@ impl From<PolychromeSprite> for Primitive {
      }
  }
  
@@ -573,11 +699,14 @@ index a0397ccf5b..df133e75fa 100644
 +    pub shadow_colors: [[f32; 4]; PAINTED_TEXT_MAX_SHADOWS],
 +    pub layers: [PaintedTextLayer; PAINTED_TEXT_MAX_LAYERS],
 +    pub stops: [PaintedTextStop; PAINTED_TEXT_MAX_STOPS],
++    /// The scene's animated image slot for this text, `index + 1`, or 0 for
++    /// none. Set by the scene; the shader ignores it.
++    pub slot: u32,
 +}
 +
 +// The HLSL `PaintedText` in gpui_windows/src/shaders.hlsl reads this layout
 +// from a structured buffer, field for field with 4-byte packing.
-+const _: () = assert!(std::mem::size_of::<PaintedText>() == 912);
++const _: () = assert!(std::mem::size_of::<PaintedText>() == 916);
 +
 +impl PaintedText {
 +    fn textures(&self) -> (AtlasTextureId, AtlasTextureId) {
@@ -629,6 +758,7 @@ index a0397ccf5b..df133e75fa 100644
 +            shadow_colors: [[0.0; 4]; PAINTED_TEXT_MAX_SHADOWS],
 +            layers: [PaintedTextLayer::default(); PAINTED_TEXT_MAX_LAYERS],
 +            stops: [PaintedTextStop::default(); PAINTED_TEXT_MAX_STOPS],
++            slot: 0,
 +        }
 +    }
 +}
@@ -642,104 +772,69 @@ index a0397ccf5b..df133e75fa 100644
  #[derive(Clone, Debug)]
  #[allow(missing_docs)]
  pub struct PaintSurface {
+@@ -1364,4 +1609,37 @@ mod tests {
+         scene.pop_layer();
+         assert_eq!(batch_labels(&mut scene), ["underlines (1)", "quads (1)"]);
+     }
++
++    fn painted_text(x: f32, mask_texture: u32) -> PaintedText {
++        let mut text = PaintedText {
++            bounds: square(x),
++            content_mask: ContentMask { bounds: square(x) },
++            ..PaintedText::default()
++        };
++        text.mask_tile.texture_id.index = mask_texture;
++        text.fill_tile = text.mask_tile;
++        text
++    }
++
++    #[test]
++    fn overlapping_painted_texts_are_drawn_in_paint_order() {
++        // Painted texts batch by texture, so the second one must not share the
++        // first one's draw order even though its mask sorts first.
++        let mut scene = Scene::default();
++        scene.insert_primitive(painted_text(0., 2));
++        scene.insert_primitive(painted_text(5., 1));
++        assert_eq!(
++            batch_labels(&mut scene),
++            [
++                "painted texts (1) on atlas 2",
++                "painted texts (1) on atlas 1"
++            ]
++        );
++
++        // Texts that do not overlap still share a draw order and a batch per texture.
++        let mut scene = Scene::default();
++        scene.insert_primitive(painted_text(0., 2));
++        scene.insert_primitive(painted_text(20., 2));
++        assert_eq!(batch_labels(&mut scene), ["painted texts (2) on atlas 2"]);
++    }
+ }
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 701879068a..4dee654e19 100644
+index 79601f3bda..101ba3f64a 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -27,9 +27,10 @@ use crate::{
-     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+@@ -28,9 +28,10 @@ use crate::{
+     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
  };
  
 +use crate::AtlasKey;
  use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
  use crate::interactive::TouchEvent;
--use crate::scene::{PaintOperation, Primitive};
-+use crate::scene::{PaintOperation, PaintedText, Primitive};
+-use crate::scene::{AnimatedImageSlot, PaintOperation, Primitive};
++use crate::scene::{AnimatedImageSlot, AnimatedSlotKind, PaintOperation, PaintedText, Primitive};
  use anyhow::{Context as _, Result, anyhow};
  use collections::{FxHashMap, FxHashSet};
  use derive_more::{Deref, DerefMut};
-@@ -1078,6 +1079,16 @@ struct AnimatedImageSlot {
-     op_index: usize,
-     visible_bounds: Bounds<Pixels>,
-     image_bounds: Bounds<Pixels>,
-+    kind: AnimatedSlotKind,
-+}
-+
-+/// The primitive an [`AnimatedImageSlot`] patches.
-+#[derive(Clone, Copy, PartialEq, Eq)]
-+enum AnimatedSlotKind {
-+    /// A polychrome sprite showing the image frame.
-+    Sprite,
-+    /// A [`PaintedText`] whose fill texture is the image frame.
-+    PaintedText,
- }
- 
- #[derive(Clone, Copy)]
-@@ -1092,7 +1103,8 @@ enum AnimatedImageSlotResolution {
- #[derive(Clone, Copy)]
- struct ResolvedAnimatedImageSlot {
-     slot: AnimatedImageSlot,
--    /// Index of the sprite in the sorted `Scene::polychrome_sprites`.
-+    /// Index of the primitive in the sorted `Scene::polychrome_sprites`, or in
-+    /// `Scene::painted_texts` for a painted-text slot.
-     sprite_index: usize,
- }
- 
-@@ -1261,19 +1273,34 @@ impl Frame {
-     /// Find each animated image slot's sprite in the sorted scene.
-     fn resolve_animated_image_slots(&mut self) {
-         let sprites = &self.scene.polychrome_sprites;
-+        let texts = &self.scene.painted_texts;
-         for slot in &self.animated_image_slots {
--            let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
--                self.scene.paint_operations.get(slot.op_index)
--            else {
--                continue;
-+            let sprite_index = match self.scene.paint_operations.get(slot.op_index) {
-+                Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted)))
-+                    if slot.kind == AnimatedSlotKind::Sprite =>
-+                {
-+                    let key = (painted.order, painted.tile.tile_id);
-+                    let start =
-+                        sprites.partition_point(|sprite| (sprite.order, sprite.tile.tile_id) < key);
-+                    sprites[start..]
-+                        .iter()
-+                        .take_while(|sprite| (sprite.order, sprite.tile.tile_id) == key)
-+                        .position(|sprite| sprite.bounds == painted.bounds)
-+                        .map(|offset| start + offset)
-+                }
-+                Some(PaintOperation::Primitive(Primitive::PaintedText(painted)))
-+                    if slot.kind == AnimatedSlotKind::PaintedText =>
-+                {
-+                    let key = painted.sort_key();
-+                    let start = texts.partition_point(|text| text.sort_key() < key);
-+                    texts[start..]
-+                        .iter()
-+                        .take_while(|text| text.sort_key() == key)
-+                        .position(|text| text.bounds == painted.bounds)
-+                        .map(|offset| start + offset)
-+                }
-+                _ => continue,
-             };
--            let key = (painted.order, painted.tile.tile_id);
--            let start = sprites.partition_point(|sprite| (sprite.order, sprite.tile.tile_id) < key);
--            let sprite_index = sprites[start..]
--                .iter()
--                .take_while(|sprite| (sprite.order, sprite.tile.tile_id) == key)
--                .position(|sprite| sprite.bounds == painted.bounds)
--                .map(|offset| start + offset);
-             let resolution = match sprite_index {
-                 Some(sprite_index) => {
-                     AnimatedImageSlotResolution::Resolved(ResolvedAnimatedImageSlot {
-@@ -1309,6 +1336,7 @@ pub struct Window {
-     is_resizable: bool,
+@@ -1283,6 +1284,7 @@ pub struct Window {
      is_minimizable: bool,
+     last_window_bounds: WindowBounds,
      sprite_atlas: Arc<dyn PlatformAtlas>,
 +    _open_window_count: OpenWindowCount,
      text_system: Rc<WindowTextSystem>,
      text_rendering_mode: Rc<Cell<TextRenderingMode>>,
      rem_size: Pixels,
-@@ -1718,6 +1746,27 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
+@@ -1684,6 +1686,27 @@ fn default_bounds(
      window_bounds_ctor(Bounds::new(final_origin, base_size))
  }
  
@@ -767,16 +862,16 @@ index 701879068a..4dee654e19 100644
  impl Window {
      pub(crate) fn new(
          handle: AnyWindowHandle,
-@@ -2442,6 +2491,7 @@ impl Window {
-             is_resizable,
+@@ -2448,6 +2471,7 @@ impl Window {
              is_minimizable,
+             last_window_bounds: window_bounds,
              sprite_atlas,
 +            _open_window_count: OpenWindowCount::new(),
              text_system,
              text_rendering_mode: cx.text_rendering_mode.clone(),
              rem_size: px(16.),
-@@ -5618,24 +5668,11 @@ impl Window {
-             return Ok(());
+@@ -5796,24 +5820,11 @@ impl Window {
+             return Ok(false);
          }
  
 -        let params = RenderImageParams {
@@ -784,7 +879,7 @@ index 701879068a..4dee654e19 100644
 -            frame_index,
 +        let Some(tile) = image_atlas_tile(&*self.sprite_atlas, &data, frame_index)? else {
 +            // A released image that can no longer rebuild its pixels.
-+            return Ok(());
++            return Ok(false);
          };
  
 -        let tile = self
@@ -803,15 +898,7 @@ index 701879068a..4dee654e19 100644
          let visible_bounds_snapped = self.snap_bounds(visible_bounds);
          let sub_tile = visible_image_tile(tile, visible_bounds, image_bounds);
  
-@@ -5694,6 +5731,7 @@ impl Window {
-                     op_index,
-                     visible_bounds: bounds.intersect(&image_bounds),
-                     image_bounds,
-+                    kind: AnimatedSlotKind::Sprite,
-                 });
-         }
-         Ok(painted)
-@@ -5735,43 +5773,53 @@ impl Window {
+@@ -5912,42 +5923,55 @@ impl Window {
                  return false;
              }
          };
@@ -833,23 +920,21 @@ index 701879068a..4dee654e19 100644
              self.frame_stage_statistics.animated_image_patch_rejections[3] += 1;
              return false;
          };
--        let tile = visible_image_tile(
--            tile,
--            resolved.slot.visible_bounds,
--            resolved.slot.image_bounds,
--        );
+-        let tile = visible_image_tile(tile, resolved.visible_bounds, resolved.image_bounds);
  
          let scene = &mut self.rendered_frame.scene;
--        let Some(sprite) = scene.polychrome_sprites.get_mut(resolved.sprite_index) else {
+-        let Some(sprite) = resolved
+-            .primitive_index
+-            .and_then(|index| scene.polychrome_sprites.get_mut(index))
+-        else {
 -            return false;
-+        let damage = match resolved.slot.kind {
++        let damage = match resolved.kind {
 +            AnimatedSlotKind::Sprite => {
-+                let tile = visible_image_tile(
-+                    tile,
-+                    resolved.slot.visible_bounds,
-+                    resolved.slot.image_bounds,
-+                );
-+                let Some(sprite) = scene.polychrome_sprites.get_mut(resolved.sprite_index) else {
++                let tile = visible_image_tile(tile, resolved.visible_bounds, resolved.image_bounds);
++                let Some(sprite) = resolved
++                    .primitive_index
++                    .and_then(|index| scene.polychrome_sprites.get_mut(index))
++                else {
 +                    return false;
 +                };
 +                if sprite.tile == tile {
@@ -858,14 +943,17 @@ index 701879068a..4dee654e19 100644
 +                sprite.tile = tile;
 +                let damage = sprite.bounds.intersect(&sprite.content_mask.bounds);
 +                if let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
-+                    scene.paint_operations.get_mut(resolved.slot.op_index)
++                    scene.paint_operations.get_mut(resolved.op_index)
 +                {
 +                    painted.tile = tile;
 +                }
 +                damage
 +            }
 +            AnimatedSlotKind::PaintedText => {
-+                let Some(text) = scene.painted_texts.get_mut(resolved.sprite_index) else {
++                let Some(text) = resolved
++                    .primitive_index
++                    .and_then(|index| scene.painted_texts.get_mut(index))
++                else {
 +                    return false;
 +                };
 +                if text.has_fill_texture != 0 && text.fill_tile == tile {
@@ -875,7 +963,7 @@ index 701879068a..4dee654e19 100644
 +                text.has_fill_texture = 1;
 +                let damage = text.bounds.intersect(&text.content_mask.bounds);
 +                if let Some(PaintOperation::Primitive(Primitive::PaintedText(painted))) =
-+                    scene.paint_operations.get_mut(resolved.slot.op_index)
++                    scene.paint_operations.get_mut(resolved.op_index)
 +                {
 +                    painted.fill_tile = tile;
 +                    painted.has_fill_texture = 1;
@@ -889,14 +977,14 @@ index 701879068a..4dee654e19 100644
 -        sprite.tile = tile;
 -        let damage = sprite.bounds.intersect(&sprite.content_mask.bounds);
 -        if let Some(PaintOperation::Primitive(Primitive::PolychromeSprite(painted))) =
--            scene.paint_operations.get_mut(resolved.slot.op_index)
+-            scene.paint_operations.get_mut(resolved.op_index)
 -        {
 -            painted.tile = tile;
 -        }
  
          if let PresentDamage::Regions(regions) = &mut self.present_damage {
              regions.push(damage);
-@@ -5806,6 +5854,81 @@ impl Window {
+@@ -5982,6 +6006,78 @@ impl Window {
          });
      }
  
@@ -949,22 +1037,19 @@ index 701879068a..4dee654e19 100644
 +        text.has_fill_texture = fill_tile.is_some() as u32;
 +        text.fill_tile = fill_tile.unwrap_or(mask_tile);
 +        text.opacity *= self.element_opacity();
++        text.slot = 0;
 +
-+        let op_index = self.next_frame.scene.len();
-+        self.next_frame.scene.insert_primitive(text);
-+        let painted = self.next_frame.scene.len() > op_index;
-+        if painted && let Some(key) = slot_key {
-+            self.next_frame
-+                .animated_image_slots
-+                .push(AnimatedImageSlot {
-+                    key,
-+                    op_index,
-+                    visible_bounds: bounds,
-+                    image_bounds: bounds,
-+                    kind: AnimatedSlotKind::PaintedText,
-+                });
-+        }
-+        Ok(painted)
++        let scene = &mut self.next_frame.scene;
++        Ok(match slot_key {
++            Some(key) => {
++                scene.insert_animated_image(text, AnimatedImageSlot::new(key, bounds, bounds))
++            }
++            None => {
++                let op_count = scene.len();
++                scene.insert_primitive(text);
++                scene.len() > op_count
++            }
++        })
 +    }
 +
 +    /// Removes a [`PaintMask`] from the sprite atlas (local Echo extension).
@@ -978,7 +1063,7 @@ index 701879068a..4dee654e19 100644
      /// Removes an image from the sprite atlas.
      pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
          let mut removed_any = false;
-@@ -11135,6 +11258,88 @@ fn duration_nanos(duration: std::time::Duration) -> u64 {
+@@ -11552,6 +11648,88 @@ fn duration_nanos(duration: std::time::Duration) -> u64 {
      u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
  }
  
@@ -1067,12 +1152,131 @@ index 701879068a..4dee654e19 100644
  /// The part of `tile` that shows `visible_bounds` of an image drawn at `image_bounds`.
  fn visible_image_tile(
      tile: AtlasTile,
+@@ -11600,17 +11778,18 @@ fn visible_image_tile(
+ 
+ #[cfg(test)]
+ mod animated_image_patch_tests {
+-    use std::{sync::Arc, time::Duration};
++    use std::{rc::Rc, sync::Arc, time::Duration};
+ 
+     use image::{Frame, Rgba, RgbaImage};
+     use smallvec::SmallVec;
+ 
+     use super::{AnimatedImageSlotResolution, PresentDamage};
++    use crate::scene::AnimatedSlotKind;
+     use crate::{
+         AnyView, AppContext as _, AtlasTile, Bounds, Context, Corners, Entity, IntoElement,
+-        ParentElement as _, Pixels, Render, RenderImage, RenderImageParams, StyleRefinement,
+-        Styled as _, TestAppContext, TimedTransformation, Transformation, Window, WindowHandle,
+-        canvas, div, fill, point, prelude::FluentBuilder as _, px, red, size, svg,
++        PaintMask, PaintedText, ParentElement as _, Pixels, Render, RenderImage, RenderImageParams,
++        StyleRefinement, Styled as _, TestAppContext, TimedTransformation, Transformation, Window,
++        WindowHandle, canvas, div, fill, point, prelude::FluentBuilder as _, px, red, size, svg,
+     };
+ 
+     const SQUARE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="8" height="16"/></svg>"#;
+@@ -11891,4 +12070,95 @@ mod animated_image_patch_tests {
+         })
+         .unwrap();
+     }
++
++    /// Paints painted text `9`, filled with an animated image, inside nested
++    /// layers after an ordinary painted text.
++    struct PaintedTextView {
++        image: Arc<RenderImage>,
++        mask: Rc<PaintMask>,
++    }
++
++    impl Render for PaintedTextView {
++        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++            let image = self.image.clone();
++            let mask = self.mask.clone();
++            canvas(
++                |_, _, _| {},
++                move |_, _, window, _| {
++                    assert!(
++                        window
++                            .paint_painted_text(
++                                square(60.),
++                                &mask,
++                                None,
++                                PaintedText::default(),
++                                None
++                            )
++                            .unwrap()
++                    );
++                    window.paint_layer(|window| {
++                        window.paint_quad(fill(square(0.), red()));
++                        window.paint_layer(|window| {
++                            assert!(
++                                window
++                                    .paint_painted_text(
++                                        square(5.),
++                                        &mask,
++                                        Some((&image, 0)),
++                                        PaintedText::default(),
++                                        Some(9),
++                                    )
++                                    .unwrap()
++                            );
++                        });
++                    });
++                },
++            )
++            .size_full()
++        }
++    }
++
++    /// The fill tile of key `9`'s painted text in the presented scene.
++    fn painted_text_fill(window: &Window) -> AtlasTile {
++        let Some(AnimatedImageSlotResolution::Resolved(slot)) = window
++            .rendered_frame
++            .animated_image_sprites
++            .get(&9)
++            .copied()
++        else {
++            panic!("the painted text slot did not resolve");
++        };
++        assert_eq!(slot.kind, AnimatedSlotKind::PaintedText);
++        let index = slot.primitive_index.expect("a resolved slot has a text");
++        let text = &window.rendered_frame.scene.painted_texts[index];
++        assert_eq!(text.bounds, square(5.).scale(window.scale_factor()));
++        assert_eq!(text.has_fill_texture, 1);
++        text.fill_tile
++    }
++
++    #[crate::test]
++    fn painted_text_slots_patch_in_layers_and_replayed_views(cx: &mut TestAppContext) {
++        let image = two_frame_image();
++        let mask = Rc::new(PaintMask::new(10, 10, 1, vec![255; 100]).expect("mask size"));
++        let child = cx.new(|_| PaintedTextView {
++            image: image.clone(),
++            mask,
++        });
++        let window = open_view(child.into(), false, cx);
++
++        cx.update_window(window.into(), |_, window, _| {
++            assert_eq!(painted_text_fill(window), frame_tile(window, &image, 0));
++            assert!(window.patch_animated_image(9, &image, 1));
++            assert_eq!(painted_text_fill(window), frame_tile(window, &image, 1));
++        })
++        .unwrap();
++
++        draw_replaying_child(window, cx);
++        cx.update_window(window.into(), |_, window, _| {
++            assert_eq!(painted_text_fill(window), frame_tile(window, &image, 1));
++            assert!(window.patch_animated_image(9, &image, 0));
++            assert_eq!(painted_text_fill(window), frame_tile(window, &image, 0));
++        })
++        .unwrap();
++    }
+ }
 diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
-index 9b98a23a41..06b99d5703 100644
+index 86eff3d48b..c2da32c140 100644
 --- a/crates/gpui_apple/src/metal_renderer.rs
 +++ b/crates/gpui_apple/src/metal_renderer.rs
-@@ -925,6 +925,8 @@ impl MetalRenderer {
-                         viewport_size,
+@@ -837,6 +837,8 @@ impl MetalRenderer {
+                         instance_bindings,
                          &command_encoder,
                      ),
 +                // Never emitted: this renderer reports no painted-text support.
@@ -1081,10 +1285,10 @@ index 9b98a23a41..06b99d5703 100644
                      if let Err(error) = self.draw_surfaces(
                          &scene.surfaces[range.clone()],
 diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
-index 46f9ffdb98..44da053d5e 100644
+index 53af304a9f..9dce3d1bff 100644
 --- a/crates/gpui_wgpu/src/wgpu_renderer.rs
 +++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
-@@ -1636,6 +1636,8 @@ impl WgpuRendererCore {
+@@ -1543,6 +1543,8 @@ impl WgpuRendererCore {
                      // Surfaces are macOS-only for video playback and are not
                      // implemented by the WGPU renderer.
                      PrimitiveBatch::Surfaces(_surfaces) => {}
@@ -1094,7 +1298,7 @@ index 46f9ffdb98..44da053d5e 100644
              }
          }
 diff --git a/crates/gpui_windows/build.rs b/crates/gpui_windows/build.rs
-index a544f6cf90..e201fa0096 100644
+index 4b5c3d66d7..b1f89065df 100644
 --- a/crates/gpui_windows/build.rs
 +++ b/crates/gpui_windows/build.rs
 @@ -40,6 +40,7 @@ mod shader_compilation {
@@ -1106,10 +1310,10 @@ index a544f6cf90..e201fa0096 100644
  
          let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);
 diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
-index a226149f9f..563195a9d0 100644
+index 6c49c49df3..abe5f1771d 100644
 --- a/crates/gpui_windows/src/directx_renderer.rs
 +++ b/crates/gpui_windows/src/directx_renderer.rs
-@@ -302,6 +302,7 @@ struct DirectXRenderPipelines {
+@@ -282,6 +282,7 @@ struct DirectXRenderPipelines {
      mono_sprites: PipelineState<MonochromeSprite>,
      subpixel_sprites: PipelineState<SubpixelSprite>,
      poly_sprites: PipelineState<PolychromeSprite>,
@@ -1117,7 +1321,7 @@ index a226149f9f..563195a9d0 100644
  }
  
  struct DirectXGlobalElements {
-@@ -673,6 +674,16 @@ impl DirectXRenderer {
+@@ -717,12 +718,22 @@ impl DirectXRenderer {
                  PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                      self.draw_polychrome_sprites(texture_id, range.start, range.len())
                  }
@@ -1134,7 +1338,22 @@ index a226149f9f..563195a9d0 100644
                  PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
              }
              .with_context(|| {
-@@ -867,6 +878,14 @@ impl DirectXRenderer {
+                 format!(
+                     "scene too large:\
+-                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
++                    {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} painted texts, {} surfaces",
+                     scene.paths.len(),
+                     scene.shadows.len(),
+                     scene.quads.len(),
+@@ -730,6 +741,7 @@ impl DirectXRenderer {
+                     scene.monochrome_sprites.len(),
+                     scene.subpixel_sprites.len(),
+                     scene.polychrome_sprites.len(),
++                    scene.painted_texts.len(),
+                     scene.surfaces.len(),
+                 )
+             })?;
+@@ -980,6 +992,14 @@ impl DirectXRenderer {
              )?;
          }
  
@@ -1149,7 +1368,7 @@ index a226149f9f..563195a9d0 100644
          Ok(())
      }
  
-@@ -1119,6 +1138,38 @@ impl DirectXRenderer {
+@@ -1125,6 +1145,38 @@ impl DirectXRenderer {
          )
      }
  
@@ -1188,7 +1407,7 @@ index a226149f9f..563195a9d0 100644
      fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
          if surfaces.is_empty() {
              return Ok(());
-@@ -1377,6 +1428,13 @@ impl DirectXRenderPipelines {
+@@ -1384,6 +1436,13 @@ impl DirectXRenderPipelines {
              16,
              create_blend_state(device)?,
          )?;
@@ -1199,10 +1418,10 @@ index a226149f9f..563195a9d0 100644
 +            16,
 +            create_blend_state(device)?,
 +        )?;
+         let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
  
          Ok(Self {
-             shadow_pipeline,
-@@ -1387,6 +1445,7 @@ impl DirectXRenderPipelines {
+@@ -1397,6 +1456,7 @@ impl DirectXRenderPipelines {
              mono_sprites,
              subpixel_sprites,
              poly_sprites,
@@ -1210,12 +1429,12 @@ index a226149f9f..563195a9d0 100644
          })
      }
  }
-@@ -1613,6 +1672,43 @@ impl<T> PipelineState<T> {
+@@ -1600,6 +1660,40 @@ impl<T> PipelineState<T> {
          Ok(())
      }
  
 +    /// Draw painted texts: the mask atlas at `t0`, instances at `t1` and the
-+    /// fill atlas at `t2`.
++    /// fill atlas at `t4` (`t2` and `t3` hold the frame's path buffers).
 +    #[allow(clippy::too_many_arguments)]
 +    fn draw_range_with_textures(
 +        &self,
@@ -1227,26 +1446,23 @@ index a226149f9f..563195a9d0 100644
 +        first_instance: u32,
 +        instance_count: u32,
 +    ) -> Result<()> {
-+        anyhow::ensure!(
-+            first_instance as usize + instance_count as usize <= self.buffer_size,
-+            "DirectX instance range exceeds the {} buffer",
-+            self.label
-+        );
++        self.ensure_range(first_instance, instance_count)?;
 +        update_batch_start(device_context, batch_params_buffer, first_instance)?;
 +        set_pipeline_state(
 +            device_context,
-+            slice::from_ref(&self.view),
++            slice::from_ref(&self.instances.view),
 +            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
 +            &self.vertex,
 +            &self.fragment,
 +            &self.blend_state,
++            &self.depth_stencil_state,
 +        );
 +        unsafe {
 +            device_context.PSSetSamplers(0, Some(sampler));
 +            device_context.PSSetShaderResources(0, Some(mask));
-+            device_context.PSSetShaderResources(2, Some(fill));
++            device_context.PSSetShaderResources(4, Some(fill));
 +            device_context.DrawInstanced(4, instance_count, 0, 0);
-+            device_context.PSSetShaderResources(2, Some(&[None]));
++            device_context.PSSetShaderResources(4, Some(&[None]));
 +        }
 +        Ok(())
 +    }
@@ -1254,7 +1470,7 @@ index a226149f9f..563195a9d0 100644
      fn draw_range_with_texture(
          &self,
          device_context: &ID3D11DeviceContext,
-@@ -2080,6 +2176,7 @@ pub(crate) mod shader_resources {
+@@ -2112,6 +2206,7 @@ pub(crate) mod shader_resources {
          MonochromeSprite,
          SubpixelSprite,
          PolychromeSprite,
@@ -1262,7 +1478,7 @@ index a226149f9f..563195a9d0 100644
      }
  
      #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-@@ -2153,6 +2250,10 @@ pub(crate) mod shader_resources {
+@@ -2185,6 +2280,10 @@ pub(crate) mod shader_resources {
                      ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                      ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
                  },
@@ -1273,7 +1489,7 @@ index a226149f9f..563195a9d0 100644
              };
              Self { inner: bytes }
          }
-@@ -2233,6 +2334,7 @@ pub(crate) mod shader_resources {
+@@ -2265,6 +2364,7 @@ pub(crate) mod shader_resources {
                  ShaderModule::MonochromeSprite => "monochrome_sprite",
                  ShaderModule::SubpixelSprite => "subpixel_sprite",
                  ShaderModule::PolychromeSprite => "polychrome_sprite",
@@ -1281,7 +1497,7 @@ index a226149f9f..563195a9d0 100644
              }
          }
      }
-@@ -2433,7 +2535,8 @@ fn scene_instance_bytes(scene: &Scene) -> u64 {
+@@ -2466,7 +2566,8 @@ fn scene_instance_bytes(scene: &Scene) -> u64 {
          + size_of_val(scene.underlines.as_slice())
          + size_of_val(scene.monochrome_sprites.as_slice())
          + size_of_val(scene.subpixel_sprites.as_slice())
@@ -1292,11 +1508,11 @@ index a226149f9f..563195a9d0 100644
  
  /// `region` as a back-buffer rectangle, grown to whole pixels and clipped to
 diff --git a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
-index 2f9a00c418..0654369af3 100644
+index e849773b10..0b2502b23e 100644
 --- a/crates/gpui_windows/src/shaders.hlsl
 +++ b/crates/gpui_windows/src/shaders.hlsl
-@@ -1266,3 +1266,295 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
-     color.a *= sprite.opacity * saturate(0.5 - distance);
+@@ -1370,3 +1370,292 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
+     color.a *= input.opacity * saturate(0.5 - distance);
      return color;
  }
 +
@@ -1358,12 +1574,7 @@ index 2f9a00c418..0654369af3 100644
 +    float4 shadow_colors[8];
 +    PaintedTextLayer layers[4];
 +    PaintedTextStop stops[16];
-+};
-+
-+struct PaintedTextVertexOutput {
-+    nointerpolation uint text_id: TEXCOORD0;
-+    float4 position: SV_Position;
-+    float4 clip_distance: SV_ClipDistance;
++    uint slot;
 +};
 +
 +struct PaintedTextFragmentInput {
@@ -1372,16 +1583,18 @@ index 2f9a00c418..0654369af3 100644
 +};
 +
 +StructuredBuffer<PaintedText> painted_texts: register(t1);
-+Texture2D<float4> t_paint_fill: register(t2);
++// t2 and t3 hold the path buffers for the whole frame.
++Texture2D<float4> t_paint_fill: register(t4);
 +
-+PaintedTextVertexOutput painted_text_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
++// The quad is clipped to the content mask; the fragment shader derives canvas
++// pixels from SV_Position, so clipping does not move them.
++PaintedTextFragmentInput painted_text_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
 +    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
 +    uint text_id = batch_start_index + instance_id;
-+    Bounds bounds = painted_texts[text_id].bounds;
++    ClippedVertex vertex = clip_to_mask(unit_vertex, painted_texts[text_id].bounds, painted_texts[text_id].content_mask);
 +
-+    PaintedTextVertexOutput output;
-+    output.position = to_device_position(unit_vertex, bounds);
-+    output.clip_distance = distance_from_clip_rect(unit_vertex, bounds, painted_texts[text_id].content_mask);
++    PaintedTextFragmentInput output;
++    output.position = to_device_position_impl(vertex.position);
 +    output.text_id = text_id;
 +    return output;
 +}
@@ -1607,5 +1820,5 @@ index d5b6ebc6ff..f21663eba3 100644
          Some(self.state.renderer.borrow().renderer_cpu_statistics())
      }
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

@@ -1,4 +1,4 @@
-From ac30534d325f459674ee2dfda8b2d985066eff18 Mon Sep 17 00:00:00 2001
+From 686e9d086c75b779ba610d94a0202117fa07b714 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 22:12:20 -0700
 Subject: [PATCH] fix(gpui_windows): place the IME window at the selection's
@@ -14,7 +14,7 @@ the active end: the start of a reversed selection, otherwise its end.
  1 file changed, 9 insertions(+), 2 deletions(-)
 
 diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
-index 5e2444d381..f751f97d10 100644
+index 58f08f8b46..9dca4e44c6 100644
 --- a/crates/gpui_windows/src/events.rs
 +++ b/crates/gpui_windows/src/events.rs
 @@ -697,8 +697,15 @@ impl WindowsWindowInner {
@@ -36,5 +36,5 @@ index 5e2444d381..f751f97d10 100644
                  // logical to physical
                  x: (caret_position.origin.x.as_f32() * scale_factor) as i32,
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

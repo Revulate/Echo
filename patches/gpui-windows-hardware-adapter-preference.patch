@@ -1,4 +1,4 @@
-From bcfe3545dfde3a9be16d4140e07c69723673e258 Mon Sep 17 00:00:00 2001
+From abcb8839f647ce2845ae4407d1a0922b40adbcf0 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:17:33 -0700
 Subject: [PATCH] fix(gpui_windows): prefer hardware adapters and leave WARP
@@ -232,10 +232,10 @@ index 8e65e6e626..f3a2730dd9 100644
  
  #[inline]
 diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
-index 4f6260e05f..52cc8a5180 100644
+index 91c2e11612..aad29d1dad 100644
 --- a/crates/gpui_windows/src/directx_renderer.rs
 +++ b/crates/gpui_windows/src/directx_renderer.rs
-@@ -313,6 +313,7 @@ impl DirectXRendererDevices {
+@@ -311,6 +311,7 @@ impl DirectXRendererDevices {
              dxgi_factory,
              device,
              device_context,
@@ -244,7 +244,7 @@ index 4f6260e05f..52cc8a5180 100644
          let dxgi_device = if disable_direct_composition {
              None
 diff --git a/crates/gpui_windows/src/platform.rs b/crates/gpui_windows/src/platform.rs
-index b15df45081..5fcbafd203 100644
+index cd5750276c..cfb739139c 100644
 --- a/crates/gpui_windows/src/platform.rs
 +++ b/crates/gpui_windows/src/platform.rs
 @@ -446,6 +446,7 @@ impl WindowsPlatform {
@@ -275,5 +275,5 @@ index b15df45081..5fcbafd203 100644
                      let Some(all_windows) = all_windows.upgrade() else {
                          break;
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

@@ -1,4 +1,4 @@
-From 8bee1097549ff10e2413d8fe6de3956f1dcff864 Mon Sep 17 00:00:00 2001
+From 3b7686bc1d4ad08dfcf42cd16ddfe8799ad548ba Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 16:59:00 -0700
 Subject: [PATCH] fix(gpui): keep a reused cached view's accessibility nodes
@@ -58,10 +58,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 426 insertions(+), 2 deletions(-)
 
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index f95fa474d8..064857f8a7 100644
+index fe1b061cae..dbc627246a 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -1124,6 +1124,7 @@ pub(crate) struct PrepaintStateIndex {
+@@ -1105,6 +1105,7 @@ pub(crate) struct PrepaintStateIndex {
      dispatch_tree_index: usize,
      accessed_element_states_index: usize,
      line_layout_index: LineLayoutIndex,
@@ -69,7 +69,7 @@ index f95fa474d8..064857f8a7 100644
  }
  
  #[derive(Clone, Default)]
-@@ -4068,7 +4069,14 @@ impl Window {
+@@ -4145,7 +4146,14 @@ impl Window {
  
          self.a11y.sync_active_flag();
          if self.a11y.is_active() {
@@ -84,7 +84,7 @@ index f95fa474d8..064857f8a7 100644
          }
  
          let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
-@@ -4407,10 +4415,18 @@ impl Window {
+@@ -4484,10 +4492,18 @@ impl Window {
              dispatch_tree_index: self.next_frame.dispatch_tree.len(),
              accessed_element_states_index: self.next_frame.accessed_element_states.len(),
              line_layout_index: self.text_system.layout_index(),
@@ -639,5 +639,5 @@ index 5b63821232..468110736b 100644
 +    }
  }
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 

@@ -1,4 +1,4 @@
-From 6ca6b086a13051003d18e5625c36c87136840d42 Mon Sep 17 00:00:00 2001
+From c04d8b1f19323a24ad347e2185c566a754c42faa Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Tue, 9 Jun 2026 20:59:16 -0700
 Subject: [PATCH 1/2] gpui: add Window::rasterize_shaped_line_mask for Echo
@@ -19,10 +19,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  1 file changed, 177 insertions(+)
 
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 4e2e1a798c..bc28904619 100644
+index 5b8f5deb86..f64f8dbd0e 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -5146,6 +5146,164 @@ impl Window {
+@@ -5322,6 +5322,164 @@ impl Window {
          Ok(())
      }
  
@@ -185,9 +185,9 @@ index 4e2e1a798c..bc28904619 100644
 +    }
 +
      fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
-         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
-             return false;
-@@ -8163,6 +8321,25 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
+         // Checked first because it's cheap, while some platforms lock the window to read its
+         // background appearance, and this runs for every glyph.
+@@ -8361,6 +8519,25 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
      }
  }
  
@@ -214,10 +214,10 @@ index 4e2e1a798c..bc28904619 100644
  mod tests {
      use std::{
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 
 
-From 817d57f28c8a5dd4dfbbaf25d38b09c1714f16d2 Mon Sep 17 00:00:00 2001
+From 373bdac215cfbbed2eec2b0dcfe0abc0fc34511c Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Thu, 11 Jun 2026 18:59:31 -0700
 Subject: [PATCH 2/2] gpui: add Window::present_statistics for Echo metrics
@@ -241,16 +241,16 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  crates/gpui/src/gpui.rs                     | 17 +++++++
  crates/gpui/src/platform.rs                 | 11 +++-
- crates/gpui/src/window.rs                   | 18 ++++++-
+ crates/gpui/src/window.rs                   | 34 +++++++++----
  crates/gpui_windows/src/directx_renderer.rs | 56 +++++++++++++++++++++
  crates/gpui_windows/src/window.rs           |  4 ++
- 5 files changed, 103 insertions(+), 3 deletions(-)
+ 5 files changed, 111 insertions(+), 11 deletions(-)
 
 diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
-index 5b31a3557f..f0defe0d04 100644
+index abd966d750..dc70f54164 100644
 --- a/crates/gpui/src/gpui.rs
 +++ b/crates/gpui/src/gpui.rs
-@@ -351,3 +351,20 @@ pub struct GpuSpecs {
+@@ -353,3 +353,20 @@ pub struct GpuSpecs {
      /// Further information about the driver, as reported by Vulkan.
      pub driver_info: String,
  }
@@ -272,7 +272,7 @@ index 5b31a3557f..f0defe0d04 100644
 +    pub present_latency_ms: f64,
 +}
 diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
-index b84bcc5c09..5a2dd16443 100644
+index 86520ab049..4f70327e55 100644
 --- a/crates/gpui/src/platform.rs
 +++ b/crates/gpui/src/platform.rs
 @@ -40,7 +40,8 @@ use crate::{
@@ -285,7 +285,7 @@ index b84bcc5c09..5a2dd16443 100644
      RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
      ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
      hash, point, px, size,
-@@ -1401,6 +1402,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+@@ -1444,6 +1445,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
      fn set_client_corner_radii(&self, _radii: Corners<Pixels>) {}
      fn gpu_specs(&self) -> Option<GpuSpecs>;
  
@@ -301,20 +301,36 @@ index b84bcc5c09..5a2dd16443 100644
  
      // Mobile platform methods.
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index bc28904619..66a9873346 100644
+index f64f8dbd0e..cafed03fa5 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -16,7 +16,8 @@ use crate::{
+@@ -16,15 +16,16 @@ use crate::{
      Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
--    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-+    PolychromeSprite, PresentStatistics, Priority, PromptButton, PromptLevel, Quad, Render,
-+    RenderGlyphParams,
-     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-     StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
-@@ -5267,7 +5268,9 @@ impl Window {
+     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintedPath, Path,
+     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+-    SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
+-    SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
+-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
+-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
++    Point, PolychromeSprite, PresentStatistics, Priority, PromptButton, PromptLevel, Quad, Render,
++    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
++    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
++    SharedString, Size, SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style,
++    SubpixelSprite, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
++    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
++    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
++    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
++    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
++    prelude::*, px, rems, size, transparent_black,
+ };
+ 
+ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+@@ -5443,7 +5444,9 @@ impl Window {
                          1 => glyph.bytes[pixel_i],
                          3 => {
                              let i = pixel_i * 3;
@@ -325,7 +341,7 @@ index bc28904619..66a9873346 100644
                          }
                          channels => {
                              let i = pixel_i * channels;
-@@ -7377,6 +7380,17 @@ impl Window {
+@@ -7577,6 +7580,17 @@ impl Window {
          self.platform_window.gpu_specs()
      }
  
@@ -344,10 +360,10 @@ index bc28904619..66a9873346 100644
      /// This is macOS specific.
      pub fn titlebar_double_click(&self) {
 diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
-index 4cce3e06cd..5fdf58357c 100644
+index 8573fe4030..70aaf35b55 100644
 --- a/crates/gpui_windows/src/directx_renderer.rs
 +++ b/crates/gpui_windows/src/directx_renderer.rs
-@@ -850,6 +850,62 @@ impl DirectXRenderer {
+@@ -877,6 +877,62 @@ impl DirectXRenderer {
          })
      }
  
@@ -426,5 +442,5 @@ index 5d8415af72..e8ffa413b1 100644
          let scale_factor = self.state.scale_factor.get();
          let caret_position = POINT {
 -- 
-2.55.0.windows.5
+2.56.1.windows.1
 
