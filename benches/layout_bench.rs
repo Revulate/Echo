@@ -14,7 +14,7 @@ use echo_gpui::backend::slots::compute_structure_hash;
 use echo_gpui::backend::slots::parser::{parse_emotes_tag, parse_to_slots};
 use echo_gpui::components::chat::canvas_renderer::layout::{ImageType, LayoutSegment};
 use echo_gpui::components::chat::canvas_renderer::text_shaping::build_message_layout;
-use echo_gpui::components::chat::scroll_map::compute_scroll_markers;
+use echo_gpui::components::chat::scroll_map::ScrollMarkerCache;
 use echo_render_core::height_tree::HeightTree;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -326,14 +326,38 @@ fn bench_scroll_marker_compute(c: &mut Criterion) {
         )));
     }
 
+    let messages = Arc::new(messages);
     c.bench_function("scroll_map_markers_5k_messages", |b| {
         b.iter(|| {
-            black_box(compute_scroll_markers(
-                black_box(&messages),
-                Some("benchuser"),
-                None,
-            ))
+            let mut cache = ScrollMarkerCache::default();
+            black_box(cache.update(black_box(&messages), Some("benchuser"), None, true));
+            black_box(cache.markers())
         });
+    });
+
+    // The common live case: one row appended at the cap rotates the oldest
+    // row out, so only the new row is classified.
+    let mut rotated: Vec<Arc<ChatMessage>> = messages[1..].to_vec();
+    rotated.push(Arc::new(make_chat_message(
+        5_000,
+        "hey BenchUser one more",
+        "whisper",
+        MessageTraits::default(),
+    )));
+    let rotated = Arc::new(rotated);
+    c.bench_function("scroll_map_markers_5k_append_at_cap", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut cache = ScrollMarkerCache::default();
+                cache.update(&messages, Some("benchuser"), None, true);
+                cache
+            },
+            |cache| {
+                black_box(cache.update(black_box(&rotated), Some("benchuser"), None, false));
+                black_box(cache.markers())
+            },
+            BatchSize::SmallInput,
+        );
     });
 }
 
