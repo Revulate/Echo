@@ -3603,6 +3603,7 @@ fn replace_settings_snapshot(
         *settings = replacement;
         selects_auto_streamer_mode
     };
+    bump_filters_version();
     if selects_auto_streamer_mode {
         crate::backend::streamer_mode::request_detection_scan_after_replacement();
     }

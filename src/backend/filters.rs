@@ -9,7 +9,7 @@ pub use echo_core::filter_expression::{FilterContext as TestContext, FilterExpre
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Filter action to take when a rule matches
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -64,10 +64,18 @@ pub struct FilterTestResult {
     pub matched_text: Option<String>,
 }
 
+/// A rule `test_message` evaluates: an enabled, non-empty rule other than
+/// Replace, with its compiled expression (`None` when it does not parse; such
+/// a rule still yields an unmatched result).
+type CompiledRule = (FilterAction, Option<Arc<FilterExpression>>);
+
 #[derive(Debug, Default)]
 struct FilterState {
     filters: Vec<FilterRule>,
     compiled: HashMap<String, Result<FilterExpression, String>>,
+    /// The rules `test_message` evaluates and the
+    /// `settings::filters_version()` they were built from.
+    rules: Option<(u64, Arc<[CompiledRule]>)>,
 }
 
 /// Filter store manager.
@@ -101,40 +109,46 @@ impl FilterStore {
 
     /// Test a message against all enabled filters.
     pub fn test_message(&self, ctx: &TestContext) -> Vec<FilterTestResult> {
-        let filters = self.filters();
-        let mut results = Vec::new();
-
-        for filter in filters {
-            if !filter.enabled || filter.expression.trim().is_empty() {
-                continue;
-            }
-
-            if filter.action == FilterAction::Replace {
-                continue;
-            }
-
-            let mut result = FilterTestResult {
-                matched: false,
-                action: filter.action,
-                matched_text: None,
-            };
-
-            if let Some((matched, text)) = self.evaluate_expression(&filter.expression, ctx) {
-                result.matched = matched;
-                result.matched_text = text;
-            }
-
-            results.push(result);
-        }
-
-        results
+        self.compiled_rules()
+            .iter()
+            .map(|(action, expression)| {
+                let evaluation = expression
+                    .as_ref()
+                    .and_then(|expression| expression.evaluate(ctx).ok());
+                FilterTestResult {
+                    matched: evaluation.as_ref().is_some_and(|e| e.matched),
+                    action: *action,
+                    matched_text: evaluation.and_then(|e| e.matched_text),
+                }
+            })
+            .collect()
     }
 
-    /// Evaluate a single expression against a context.
-    fn evaluate_expression(&self, expr: &str, ctx: &TestContext) -> Option<(bool, Option<String>)> {
-        let compiled = self.compiled_expression(expr).ok()?;
-        let evaluation = compiled.evaluate(ctx).ok()?;
-        Some((evaluation.matched, evaluation.matched_text))
+    /// The rules to evaluate, compiled once per filter-set version instead
+    /// of cloning every rule and expression for each message. Shared
+    /// expressions also keep their regexes' match caches warm.
+    fn compiled_rules(&self) -> Arc<[CompiledRule]> {
+        let version = crate::backend::settings::filters_version();
+        if let Some((built, rules)) = &self.state.read_or_recover().rules
+            && *built == version
+        {
+            return Arc::clone(rules);
+        }
+        let rules: Arc<[CompiledRule]> = self
+            .filters()
+            .into_iter()
+            .filter(|filter| {
+                filter.enabled
+                    && !filter.expression.trim().is_empty()
+                    && filter.action != FilterAction::Replace
+            })
+            .map(|filter| {
+                let compiled = self.compiled_expression(&filter.expression).ok();
+                (filter.action, compiled.map(Arc::new))
+            })
+            .collect();
+        self.state.write_or_recover().rules = Some((version, Arc::clone(&rules)));
+        rules
     }
 
     fn compiled_expression(&self, expr: &str) -> Result<FilterExpression, String> {

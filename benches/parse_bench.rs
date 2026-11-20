@@ -1,10 +1,12 @@
-//! Message-ingest parsing benchmarks: emote tags, slot parsing and structure
-//! hashing.
+//! Message-ingest parsing benchmarks: emote tags, slot parsing, structure
+//! hashing and filter evaluation.
 
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use echo_gpui::backend::emotes::EmoteSender;
+use echo_gpui::backend::filters::{FILTER_STORE, TestContext};
+use echo_gpui::backend::settings::{self, FilterAction, FilterRule};
 use echo_gpui::backend::slots::compute_structure_hash;
 use echo_gpui::backend::slots::parser::{parse_emotes_tag, parse_to_slots};
 use rustc_hash::FxHashMap;
@@ -115,10 +117,58 @@ fn bench_structure_hash(c: &mut Criterion) {
     });
 }
 
+/// Replace the persisted filters with `count` enabled regex Hide rules.
+fn set_regex_filters(count: usize) {
+    for rule in settings::get_filters() {
+        settings::remove_filter(&rule.id);
+    }
+    for index in 0..count {
+        settings::add_filter(FilterRule {
+            id: format!("bench-regex-{index}"),
+            expression: format!(r#"message.content match r"(?i)\bspam{index}[a-z]*\d+""#),
+            action: FilterAction::Hide,
+            enabled: true,
+            replacement: None,
+            pattern_is_regex: false,
+        });
+    }
+}
+
+/// Per-message filter evaluation (`FILTER_STORE.test_message`) with 0, 1 and
+/// 5 regex rules. Filters are settings, so the bench runs on an isolated
+/// profile in the temp directory.
+fn bench_filter_evaluation(c: &mut Criterion) {
+    let profile = std::env::temp_dir().join("echo-parse-bench-profile");
+    // SAFETY: set before any settings access, while criterion runs this
+    // benchmark function on the only thread that reads the environment.
+    unsafe { std::env::set_var("ECHO_BENCH_PROFILE_ROOT", &profile) };
+    let ctx = TestContext {
+        content: "hey chat did you see that play, absolutely wild stuff 123".to_string(),
+        author: "BenchUser".to_string(),
+        author_login: "benchuser".to_string(),
+        channel_name: "benchchannel".to_string(),
+        badges: vec!["subscriber/12".to_string()],
+        ..Default::default()
+    };
+
+    let mut group = c.benchmark_group("filter_test_message");
+    for count in [0usize, 1, 5] {
+        set_regex_filters(count);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{count}_regex")),
+            &ctx,
+            |b, ctx| b.iter(|| black_box(FILTER_STORE.test_message(black_box(ctx)))),
+        );
+    }
+    group.finish();
+    set_regex_filters(0);
+}
+
 criterion_group!(
     benches,
     bench_emote_tag_parsing,
     bench_slot_parsing,
-    bench_structure_hash
+    bench_structure_hash,
+    bench_filter_evaluation
 );
 criterion_main!(benches);

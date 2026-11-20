@@ -8,6 +8,7 @@ mod lock_utils {
 mod backend {
     pub mod settings {
         use serde::{Deserialize, Serialize};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{LazyLock, Mutex};
 
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,6 +29,11 @@ mod backend {
         }
 
         static FILTERS: LazyLock<Mutex<Vec<FilterRule>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+        static FILTERS_VERSION: AtomicU64 = AtomicU64::new(1);
+
+        pub fn filters_version() -> u64 {
+            FILTERS_VERSION.load(Ordering::Acquire)
+        }
 
         pub fn get_filters() -> Vec<FilterRule> {
             FILTERS
@@ -40,6 +46,7 @@ mod backend {
             if let Ok(mut stored) = FILTERS.lock() {
                 *stored = filters;
             }
+            FILTERS_VERSION.fetch_add(1, Ordering::Release);
         }
     }
 }
