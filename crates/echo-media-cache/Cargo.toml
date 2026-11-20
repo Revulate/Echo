@@ -24,7 +24,7 @@ parking_lot.workspace = true
 postcard.workspace = true
 serde = { workspace = true, features = ["rc"] }
 smallvec.workspace = true
-tokio = { workspace = true, features = ["fs", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
 tracing.workspace = true
 zstd.workspace = true
 

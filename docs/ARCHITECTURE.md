@@ -127,8 +127,10 @@ flowchart TD
     and policy and the capped unread-count label (`count_label.rs`).
   - `auth/`, `sidebars/`, `splits/`, `top_bar/`, `debug_popup.rs` and
     `logo.rs`.
-- `src/cache/`: the image and emote pipeline owned by `ImageCacheService`
-  (`service.rs`). `loader.rs` (loading and off-thread decode), `uri_layer.rs`,
+- `src/cache/`: the image and emote pipeline. `service.rs` starts it from
+  backend initialization, before the first window; the disk layer's lookups
+  wait up to 1 s for its persisted index to load, and its index writes wait
+  for the load to finish. `loader.rs` (loading and off-thread decode), `uri_layer.rs`,
   `native_sizes.rs` and `animation_source.rs` are implemented here; the
   memory, disk and frame layers and the warming tracker come from
   `crates/echo-media-cache`, and the budgets, stats and preload plans from

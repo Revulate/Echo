@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bincode::Decode;
 use dashmap::DashMap;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::persist;
 use echo_cache_policy::{BudgetManager, CacheStats};
@@ -86,6 +86,11 @@ const SOURCE_ZSTD_MIN_SAVINGS_DENOMINATOR: usize = 100;
 /// Only try zstd for unknown formats to avoid spending startup CPU proving
 /// PNG/WebP/GIF/JPEG media cannot be compressed meaningfully.
 const SOURCE_ZSTD_UNKNOWN_FORMAT_MAX_BYTES: usize = 256 * 1024;
+/// How long after [`DiskLayer::initialize`] starts loading the persisted
+/// indexes disk lookups wait for them. The window is shared, so a lookup made
+/// later in a slow load, or a second lookup for the same request, does not
+/// wait again; one that gives up misses and downloads, as with no cache.
+const INDEX_LOAD_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 // ============================================================================
 // Types
@@ -119,6 +124,10 @@ pub struct DiskLayer {
     pub total_size: AtomicU64,
     /// Whether initialized
     pub initialized: AtomicBool,
+    /// While [`Self::initialize`] is loading the persisted indexes, the
+    /// instant until which lookups wait for them. Index writes wait until it
+    /// clears, so installing the loaded indexes cannot overwrite them.
+    index_loading: watch::Sender<Option<tokio::time::Instant>>,
     /// Source aliases currently being saved
     pub saving_sources: DashMap<String, ()>,
     /// True while a disk eviction pass is running (single-flight guard).
@@ -178,6 +187,7 @@ impl DiskLayer {
             source_index: Arc::new(RwLock::new(SourceCacheIndex::new())),
             total_size: AtomicU64::new(0),
             initialized: AtomicBool::new(false),
+            index_loading: watch::Sender::new(None),
             saving_sources: DashMap::new(),
             eviction_in_progress: AtomicBool::new(false),
             index_dirty_writes: AtomicU64::new(0),
@@ -228,11 +238,40 @@ impl DiskLayer {
         source_blob_path_for(&self.blobs_dir(), hash, encoding)
     }
 
+    /// Wait while [`Self::initialize`] is loading the persisted indexes: a
+    /// lookup (`until_load_ends == false`) until the shared lookup window
+    /// closes, a write until the load ends. Returns at once when no load is in
+    /// progress, including when none was started.
+    async fn wait_for_index_load(&self, until_load_ends: bool) {
+        let Some(lookup_deadline) = *self.index_loading.borrow() else {
+            return;
+        };
+        let mut loading = self.index_loading.subscribe();
+        let loaded = loading.wait_for(Option::is_none);
+        if until_load_ends {
+            let _ = loaded.await;
+        } else {
+            let _ = tokio::time::timeout_at(lookup_deadline, loaded).await;
+        }
+    }
+
     /// Initialize the disk cache
     pub async fn initialize(&self) -> Result<(), std::io::Error> {
         if self.initialized.load(Ordering::Acquire) {
             return Ok(());
         }
+
+        // Clears the loading flag on every exit, including errors and panics,
+        // so writers waiting on it never hang.
+        struct IndexLoadGuard<'a>(&'a watch::Sender<Option<tokio::time::Instant>>);
+        impl Drop for IndexLoadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.send_replace(None);
+            }
+        }
+        self.index_loading
+            .send_replace(Some(tokio::time::Instant::now() + INDEX_LOAD_LOOKUP_WAIT));
+        let index_load_guard = IndexLoadGuard(&self.index_loading);
 
         crate::log_cache!(info, path = %self.base_path.display(), "Initializing disk cache layer");
 
@@ -360,6 +399,7 @@ impl DiskLayer {
             .store(total_size as usize, Ordering::Relaxed);
 
         self.initialized.store(true, Ordering::Release);
+        drop(index_load_guard);
 
         let mut legacy_index_on_disk = legacy_index_read;
         if !pruned_legacy_entries.is_empty() {
@@ -413,6 +453,7 @@ impl DiskLayer {
         identity: Option<&MediaSourceId>,
         url: &str,
     ) -> Option<CacheEntry> {
+        self.wait_for_index_load(false).await;
         let identity_key = identity.map(MediaSourceId::key_string);
         let mut source_index = self.source_index.write().await;
         let blob_hash = source_index.get_alias_blob_hash(identity_key.as_deref(), url)?;
@@ -496,6 +537,7 @@ impl DiskLayer {
 
     /// Add or update a cache entry
     pub async fn insert(&self, url: String, entry: CacheEntry) {
+        self.wait_for_index_load(true).await;
         let size = entry.size_bytes;
         let mut is_new_entry = true;
 
@@ -528,6 +570,7 @@ impl DiskLayer {
         url: String,
         blob: SourceBlobEntry,
     ) {
+        self.wait_for_index_load(true).await;
         let size = blob.size_bytes;
         let identity_key = identity.map(MediaSourceId::key_string);
         let mut is_new_blob = false;
@@ -560,6 +603,7 @@ impl DiskLayer {
     /// Remove URL and/or identity aliases for a source entry. If the blob no
     /// longer has aliases, remove the blob bytes too.
     pub async fn remove_source_aliases(&self, identity: Option<&MediaSourceId>, url: Option<&str>) {
+        self.wait_for_index_load(true).await;
         let identity_key = identity.map(MediaSourceId::key_string);
         let mut candidate_blobs = Vec::with_capacity(2);
         let mut removed_blobs = Vec::new();
@@ -777,6 +821,8 @@ impl DiskLayer {
     }
 
     pub async fn save_index_result(&self) -> Result<(), std::io::Error> {
+        // Saving mid-load would write the still-empty index over the file.
+        self.wait_for_index_load(true).await;
         let _save_guard = self.index_save_lock.lock().await;
 
         save_index_snapshot(&self.index_path(), Arc::clone(&self.index)).await?;
@@ -794,6 +840,7 @@ impl DiskLayer {
     }
 
     async fn save_source_index_result(&self) -> Result<(), std::io::Error> {
+        self.wait_for_index_load(true).await;
         let _save_guard = self.source_index_save_lock.lock().await;
 
         save_source_index_snapshot(&self.source_index_path(), Arc::clone(&self.source_index))
@@ -1024,6 +1071,7 @@ impl DiskLayer {
         identity: Option<&MediaSourceId>,
         url: &str,
     ) -> Option<Vec<u8>> {
+        self.wait_for_index_load(false).await;
         let identity_key = identity.map(MediaSourceId::key_string);
         let entry = {
             let mut source_index = self.source_index.write().await;
@@ -2019,5 +2067,107 @@ mod tests {
         let source_index = layer.source_index.read().await;
         assert!(source_index.blobs.contains_key("held-blob"));
         assert_eq!(source_index.blob_alias_count("held-blob"), 0);
+    }
+
+    fn test_blob(hash: &str, size: u64) -> SourceBlobEntry {
+        SourceBlobEntry::new(
+            hash.to_string(),
+            SourceBlobEncoding::Raw,
+            size,
+            size,
+            28,
+            28,
+        )
+    }
+
+    #[tokio::test]
+    async fn index_writes_and_lookups_during_the_load_see_the_installed_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("cache");
+        let persisted_url = "https://example.test/persisted.webp";
+        let early_url = "https://example.test/early.webp";
+        {
+            let previous_run = DiskLayer::new(
+                base.clone(),
+                Arc::new(BudgetManager::new()),
+                Arc::new(CacheStats::new()),
+            );
+            previous_run
+                .insert_source_blob(None, persisted_url.to_string(), test_blob("persisted", 40))
+                .await;
+            previous_run.save_source_index_result().await.unwrap();
+        }
+
+        let stats = Arc::new(CacheStats::new());
+        let layer = Arc::new(DiskLayer::new(
+            base,
+            Arc::new(BudgetManager::new()),
+            stats.clone(),
+        ));
+        // Open the load window before initialize runs, as a download that
+        // finishes while the index is still being read would see it.
+        layer
+            .index_loading
+            .send_replace(Some(tokio::time::Instant::now() + INDEX_LOAD_LOOKUP_WAIT));
+        let early_insert = tokio::spawn({
+            let layer = Arc::clone(&layer);
+            async move {
+                layer
+                    .insert_source_blob(None, early_url.to_string(), test_blob("early", 60))
+                    .await;
+            }
+        });
+        let early_lookup = tokio::spawn({
+            let layer = Arc::clone(&layer);
+            async move { layer.get_source_entry(None, persisted_url).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!early_insert.is_finished(), "the insert waits for the load");
+        assert!(!early_lookup.is_finished(), "the lookup waits for the load");
+
+        layer.initialize().await.unwrap();
+        early_insert.await.unwrap();
+        let looked_up = early_lookup.await.unwrap();
+
+        assert_eq!(
+            looked_up.map(|entry| entry.hash),
+            Some("persisted".to_string())
+        );
+        let source_index = layer.source_index.read().await;
+        assert!(source_index.blobs.contains_key("persisted"));
+        assert!(
+            source_index.blobs.contains_key("early"),
+            "installing the loaded index must not drop an insert made during the load"
+        );
+        drop(source_index);
+        assert_eq!(layer.size(), 100);
+        assert_eq!(stats.disk_entries.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn lookups_give_up_on_a_stalled_index_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = DiskLayer::new(
+            temp.path().join("cache"),
+            Arc::new(BudgetManager::new()),
+            Arc::new(CacheStats::new()),
+        );
+        let started = std::time::Instant::now();
+        layer
+            .index_loading
+            .send_replace(Some(tokio::time::Instant::now() + INDEX_LOAD_LOOKUP_WAIT));
+
+        let missing = "https://example.test/missing.webp";
+        assert!(layer.get_source_entry(None, missing).await.is_none());
+        let waited = started.elapsed();
+        assert!(waited >= INDEX_LOAD_LOOKUP_WAIT);
+        assert!(waited < INDEX_LOAD_LOOKUP_WAIT * 5);
+
+        // The window is shared: a second lookup does not wait it out again.
+        let second = std::time::Instant::now();
+        assert!(layer.get_entry(missing).await.is_none());
+        assert!(second.elapsed() < INDEX_LOAD_LOOKUP_WAIT / 2);
     }
 }

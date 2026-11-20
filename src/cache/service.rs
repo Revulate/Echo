@@ -1,50 +1,48 @@
 //! Startup and shutdown of the media cache runtime.
 //!
-//! The GPUI entity loads persisted warming priorities and native sizes, then
-//! initializes the loader; everything else goes through `cache::loader`.
+//! Backend initialization starts the loader (persisted warming priorities,
+//! native sizes and the disk index load together) ahead of the first window;
+//! everything else goes through `cache::loader`.
 
-use gpui::{Context, Task};
+use gpui::Context;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct ImageCacheService {
-    _runtime_task: Task<()>,
+static INITIALIZATION_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start initializing the media cache on the backend runtime, once. Disk
+/// lookups made before the index is installed wait for it briefly, and index
+/// writes wait until it is installed.
+pub fn start_initialization() {
+    if INITIALIZATION_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::backend::bridge::get_runtime().spawn(async {
+        match super::loader::initialize().await {
+            Ok(()) => {
+                let stats = super::loader::stats();
+                crate::log_cache!(
+                    info,
+                    "Cache initialized: memory={}MB, disk_entries={}",
+                    stats.memory_used.load(std::sync::atomic::Ordering::Relaxed) / (1024 * 1024),
+                    stats
+                        .disk_entries
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+            Err(e) => {
+                crate::log_cache!(warn, "Failed to initialize cache: {}", e);
+            }
+        }
+    });
 }
 
+pub struct ImageCacheService;
+
 impl ImageCacheService {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let runtime_task = cx.spawn(async move |_, _| {
-            let init_result = crate::backend::bridge::get_runtime()
-                .spawn(async {
-                    crate::cache::warming::load_priorities().await;
-                    crate::cache::native_sizes::load().await;
-                    super::loader::initialize().await
-                })
-                .await;
-
-            match init_result {
-                Ok(Ok(())) => {
-                    let stats = super::loader::stats();
-                    crate::log_cache!(
-                        info,
-                        "Cache initialized: memory={}MB, disk_entries={}",
-                        stats.memory_used.load(std::sync::atomic::Ordering::Relaxed)
-                            / (1024 * 1024),
-                        stats
-                            .disk_entries
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    );
-                }
-                Ok(Err(e)) => {
-                    crate::log_cache!(warn, "Failed to initialize cache: {}", e);
-                }
-                Err(e) => {
-                    crate::log_cache!(warn, "Cache initialization task failed: {e}");
-                }
-            }
-        });
-
-        Self {
-            _runtime_task: runtime_task,
-        }
+    pub fn new(_cx: &mut Context<Self>) -> Self {
+        // Normally already started by backend initialization.
+        start_initialization();
+        Self
     }
 
     pub async fn shutdown_runtime(reason: &'static str) {

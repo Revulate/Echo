@@ -303,6 +303,9 @@ pub fn initialize() {
     {
         crate::backend::streamer_mode::schedule_detection_refresh();
     }
+    // Load the media disk index alongside the emote hydrate below, so it is
+    // usually installed before the first emotes are looked up.
+    crate::cache::service::start_initialization();
     crate::backend::activity_persistence::start();
     if !offline_scenario {
         crate::backend::browser_watching::initialize();

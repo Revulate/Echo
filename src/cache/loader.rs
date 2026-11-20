@@ -4021,7 +4021,13 @@ fn maybe_trim_process_working_set_for_diagnostic() {}
 
 /// Initialize the cache system (call at startup)
 pub async fn initialize() -> Result<(), std::io::Error> {
-    DISK_LAYER.initialize().await?;
+    // The disk index load does not depend on the warming priorities or native
+    // sizes, so all three load together; warm start below needs priorities.
+    let (disk_result, ()) = tokio::join!(DISK_LAYER.initialize(), async {
+        super::warming::load_priorities().await;
+        super::native_sizes::load().await;
+    });
+    disk_result?;
 
     record_cache_emote_stage_with_source(
         "cache.preload.restore_loaded_urls.skipped",
