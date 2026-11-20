@@ -218,7 +218,11 @@ flowchart TD
   window; a full repaint happens only when visible animated content has no
   patchable slot. The patched frame is presented whole without redrawing any
   view; `ECHO_PRESENT_DIRTY_RECTS=1` presents only its dirty rectangles, which
-  measured dearer. `ECHO_ANIMATION_PATCH=0` turns patching off.
+  measured dearer. `ECHO_ANIMATION_PATCH=0` turns patching off. The top
+  bar's connection-logo pulse (`components/logo.rs`) is a GPUI timed SVG
+  transformation: the window advances its alpha in the presented scene, at
+  most 25 times a second, without rendering a view, and presents those
+  frames whole alongside the patched ones.
 - **Async layout** (`canvas_renderer/async_layout.rs`) is one process-wide
   bounded queue (1,024 jobs, 2-6 workers) shared by all splits, fenced by a
   per-split generation/epoch so stale jobs are discarded rather than

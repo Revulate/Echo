@@ -5,27 +5,16 @@
 //!
 //! Note: GPUI doesn't support SVG gradients, so we use solid colors.
 
-use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::*;
 
 use crate::backend::ConnectionStatus;
-use crate::managers::dynamic_tick_scheduler::aligned_tick_delay;
 use crate::theme::colors;
 
-/// Pulse re-render interval while the window is focused. A multiple of the
-/// 20 ms animation grid, so pulse draws land on the same frames as emote
-/// animation draws instead of adding frames of their own.
-const PULSE_TICK_MS: u64 = 40;
-/// Pulse re-render interval while the window is in the background.
-const PULSE_TICK_INACTIVE_MS: u64 = 100;
-
-thread_local! {
-    /// The pulsing status (`true` = disconnected) and when its pulse began.
-    static PULSE_START: Cell<Option<(bool, Instant)>> = const { Cell::new(None) };
-    static PULSE_WAKE_PENDING: Cell<bool> = const { Cell::new(false) };
-}
+/// Most frames a second the window presents for the pulse alone. Matches the
+/// old timer's 40 ms focused tick (a multiple of the 20 ms animation grid).
+const PULSE_MAX_FPS: f32 = 25.0;
 
 /// Get the color based on connection status
 fn status_color(status: &ConnectionStatus) -> Hsla {
@@ -40,38 +29,29 @@ fn status_color(status: &ConnectionStatus) -> Hsla {
 ///
 /// The logo changes appearance based on connection status:
 /// - Connected: Neutral with fade-in animation on load
-/// - Reconnecting: Orange with pulse animation
-/// - Disconnected: Red with fade animation
+/// - Reconnecting: Orange, pulsing every 2 s down to 40% opacity
+/// - Disconnected: Red, pulsing every 1.5 s down to 30% opacity
 ///
-/// The pulses re-render the owning view from an aligned timer at
-/// [`PULSE_TICK_MS`] rather than GPUI's per-frame animation request, which
-/// redraws the whole window at the display refresh rate.
-pub fn render_logo<V: 'static>(
-    connection_status: &ConnectionStatus,
-    size: f32,
-    window: &Window,
-    cx: &mut Context<V>,
-) -> AnyElement {
+/// The pulse is a timed transformation of the SVG: the window advances its
+/// alpha in the presented scene before each present, at most
+/// [`PULSE_MAX_FPS`] times a second, without re-rendering the owning view,
+/// and holds it at full opacity under reduced motion.
+pub fn render_logo(connection_status: &ConnectionStatus, size: f32) -> AnyElement {
     let color = status_color(connection_status);
-    let logo = |id: &'static str| {
+    let logo = |id: &'static str, svg: Svg| {
         div()
             .id(id)
             .size(px(size))
             .flex()
             .items_center()
             .justify_center()
-            .child(
-                svg()
-                    .path("icons/echo-logo.svg")
-                    .size(px(size))
-                    .text_color(color),
-            )
+            .child(svg.size(px(size)).text_color(color))
     };
+    let svg = svg().path("icons/echo-logo.svg");
 
-    let (id, disconnected, period, min_opacity) = match connection_status {
+    let (id, period, min_opacity) = match connection_status {
         ConnectionStatus::Connected => {
-            PULSE_START.with(|start| start.set(None));
-            return logo("echo-logo")
+            return logo("echo-logo", svg)
                 .with_animation(
                     "logo-fade-in",
                     Animation::new(Duration::from_millis(600)).with_easing(ease_out),
@@ -79,56 +59,23 @@ pub fn render_logo<V: 'static>(
                 )
                 .into_any_element();
         }
-        ConnectionStatus::Reconnecting => (
-            "echo-logo-reconnecting",
-            false,
-            Duration::from_millis(2000),
-            0.4,
-        ),
-        ConnectionStatus::Disconnected => (
-            "echo-logo-disconnected",
-            true,
-            Duration::from_millis(1500),
-            0.3,
-        ),
+        ConnectionStatus::Reconnecting => {
+            ("echo-logo-reconnecting", Duration::from_millis(2000), 0.4)
+        }
+        ConnectionStatus::Disconnected => {
+            ("echo-logo-disconnected", Duration::from_millis(1500), 0.3)
+        }
     };
 
-    let pulse = pulsating_between(min_opacity, 1.0);
-    let phase = if cx.reduce_motion() {
-        0.0
-    } else {
-        let started = PULSE_START.with(|start| match start.get() {
-            Some((status, started)) if status == disconnected => started,
-            _ => {
-                let now = Instant::now();
-                start.set(Some((disconnected, now)));
-                now
-            }
-        });
-        schedule_pulse_wake(window, cx);
-        (started.elapsed().as_secs_f32() / period.as_secs_f32()).fract()
-    };
-    logo(id).opacity(pulse(phase)).into_any_element()
-}
-
-/// Re-render the view that owns the logo on the next pulse tick. At most one
-/// wake is pending, however often the view renders in between.
-fn schedule_pulse_wake<V: 'static>(window: &Window, cx: &mut Context<V>) {
-    if PULSE_WAKE_PENDING.with(|pending| pending.replace(true)) {
-        return;
-    }
-    let interval_ms = if window.is_window_active() {
-        PULSE_TICK_MS
-    } else {
-        PULSE_TICK_INACTIVE_MS
-    };
-    let delay = aligned_tick_delay(interval_ms);
-    cx.spawn(async move |this, cx| {
-        cx.background_executor().timer(delay).await;
-        PULSE_WAKE_PENDING.with(|pending| pending.set(false));
-        this.update(cx, |_, cx| cx.notify()).ok();
-    })
-    .detach();
+    // Full opacity down to the minimum and back once per period. A linear
+    // ramp each way is the closest of the available easings to the old
+    // sine-cubic breath (within 0.054 of its normalized curve).
+    let pulse = TimedTransformation::new(period)
+        .from(Transformation::alpha(1.0))
+        .to(Transformation::alpha(min_opacity))
+        .alternate()
+        .with_max_fps(PULSE_MAX_FPS);
+    logo(id, svg.with_timed_transformation(pulse)).into_any_element()
 }
 
 /// Easing function for smooth ease-out
