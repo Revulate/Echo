@@ -8,7 +8,9 @@
 
 use crate::backend::ChatMessage;
 use crate::backend::scroll_markers::ScrollMarkerPriority as MarkerPriority;
-use crate::backend::scroll_markers::{ScrollMarkerInput, ScrollMarkerKind, classify_scroll_marker};
+use crate::backend::scroll_markers::{
+    ScrollMarkerDecision, ScrollMarkerInput, ScrollMarkerKind, classify_scroll_marker,
+};
 use crate::theme::colors;
 use crate::theme::tokens::{Radii, RadiiPixels};
 use gpui::prelude::FluentBuilder;
@@ -54,7 +56,7 @@ impl Render for ScrollMapDrag {
 }
 
 /// Precomputed marker entry for the scroll map.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScrollMarker {
     pub position: f32,
     pub color: Hsla,
@@ -107,48 +109,120 @@ fn marker_color(kind: ScrollMarkerKind) -> Hsla {
     }
 }
 
-/// Render scroll map as inline element within chat pane
-///
-/// Uses highlight_type from MessageFlags for proper color coding
-pub fn compute_scroll_markers(
-    messages: &[Arc<ChatMessage>],
+/// Whether `msg` gets a scroll-map marker, and which. It depends only on the
+/// row itself, the user's login and the active search results.
+fn classify_row(
+    msg: &ChatMessage,
     our_username: Option<&str>,
     search_result_ids: Option<&FxHashSet<String>>,
+) -> Option<ScrollMarkerDecision> {
+    classify_scroll_marker(ScrollMarkerInput {
+        content: &msg.content,
+        is_system: msg.flags.is_system,
+        is_first_message: msg.flags.is_first_message,
+        highlight_type: msg.flags.highlight_type.as_ref(),
+        our_username,
+        is_search_result: search_result_ids.is_some_and(|ids| ids.contains(msg.id.as_ref())),
+    })
+}
+
+/// The markers for `messages` given each row's decision, at the row's index
+/// over the row count, sorted by ascending priority (stable, so rows of one
+/// priority stay in list order). Colors are resolved here, from the current
+/// theme.
+fn markers_from_decisions(
+    messages: &[Arc<ChatMessage>],
+    decisions: &[Option<ScrollMarkerDecision>],
 ) -> Vec<ScrollMarker> {
     let total = messages.len();
-    if total == 0 {
-        return Vec::new();
-    }
-
     let mut markers: Vec<ScrollMarker> = Vec::with_capacity(32);
-
-    for (idx, msg) in messages.iter().enumerate() {
-        let position = idx as f32 / total as f32;
-
-        let is_search_result = search_result_ids
-            .map(|ids| ids.contains(msg.id.as_ref()))
-            .unwrap_or(false);
-
-        if let Some(decision) = classify_scroll_marker(ScrollMarkerInput {
-            content: &msg.content,
-            is_system: msg.flags.is_system,
-            is_first_message: msg.flags.is_first_message,
-            highlight_type: msg.flags.highlight_type.as_ref(),
-            our_username,
-            is_search_result,
-        }) {
+    for (idx, (msg, decision)) in messages.iter().zip(decisions).enumerate() {
+        if let Some(decision) = decision {
             let color = highlight_marker_color(msg.flags.highlight_type.as_ref())
                 .unwrap_or_else(|| marker_color(decision.kind));
             markers.push(ScrollMarker {
-                position,
+                position: idx as f32 / total as f32,
                 color,
                 priority: decision.priority,
             });
         }
     }
-
     markers.sort_by_key(|a| a.priority);
     markers
+}
+
+/// Where the rows of `old` sit in `new`: `Some(offset)` when `new[i]` lines
+/// up with `old[i + offset]`, found from `new`'s first row inside `old` (rows
+/// dropped from the front) or `old`'s first row inside `new` (rows added in
+/// front). Rows are matched by pointer.
+fn row_offset(old: &[Arc<ChatMessage>], new: &[Arc<ChatMessage>]) -> Option<isize> {
+    let (old_first, new_first) = (old.first()?, new.first()?);
+    if let Some(dropped) = old.iter().position(|row| Arc::ptr_eq(row, new_first)) {
+        return isize::try_from(dropped).ok();
+    }
+    let added = new.iter().position(|row| Arc::ptr_eq(row, old_first))?;
+    isize::try_from(added).ok().map(|added| -added)
+}
+
+/// Scroll-map markers for one split's rows, with each row's marker decision
+/// kept aligned with the list as it changes: a list that keeps rows (an
+/// append, a rotation at the cap, a front drop, a prepend) reuses the
+/// decisions of rows it kept by pointer and classifies only the others, then
+/// recomputes every position.
+#[derive(Default)]
+pub struct ScrollMarkerCache {
+    rows: Arc<Vec<Arc<ChatMessage>>>,
+    decisions: Vec<Option<ScrollMarkerDecision>>,
+    markers: Rc<[ScrollMarker]>,
+}
+
+impl ScrollMarkerCache {
+    /// The list the markers were computed for.
+    pub fn rows(&self) -> &Arc<Vec<Arc<ChatMessage>>> {
+        &self.rows
+    }
+
+    pub fn markers(&self) -> Rc<[ScrollMarker]> {
+        Rc::clone(&self.markers)
+    }
+
+    /// Bring the markers up to date for `messages`. `reclassify_all` when the
+    /// login or the search results changed, which every decision depends
+    /// on. Returns how many rows were classified.
+    pub fn update(
+        &mut self,
+        messages: &Arc<Vec<Arc<ChatMessage>>>,
+        our_username: Option<&str>,
+        search_result_ids: Option<&FxHashSet<String>>,
+        reclassify_all: bool,
+    ) -> usize {
+        let offset = if reclassify_all {
+            None
+        } else {
+            row_offset(&self.rows, messages)
+        };
+        let mut classified = 0usize;
+        let decisions: Vec<Option<ScrollMarkerDecision>> = messages
+            .iter()
+            .enumerate()
+            .map(|(index, msg)| {
+                let kept = offset
+                    .and_then(|offset| usize::try_from(index as isize + offset).ok())
+                    .filter(|&old| self.rows.get(old).is_some_and(|row| Arc::ptr_eq(row, msg)));
+                match kept {
+                    Some(old) => self.decisions[old],
+                    None => {
+                        classified += 1;
+                        classify_row(msg, our_username, search_result_ids)
+                    }
+                }
+            })
+            .collect();
+        self.markers = markers_from_decisions(messages, &decisions).into();
+        self.decisions = decisions;
+        self.rows = Arc::clone(messages);
+        classified
+    }
 }
 
 fn marker_top_px(position: f32, track_height: f32) -> f32 {
@@ -178,13 +252,45 @@ fn bucket_markers_per_row(
     })
 }
 
+/// Paint the markers, one per `MARKER_HEIGHT` track row, into `track`: the
+/// same quads the per-marker divs painted (inset by `SCROLL_MAP_TRACK_INSET`
+/// on both sides, `MARKER_HEIGHT` tall, `Radii::xs` corners), from one
+/// element instead of one per marker.
+fn paint_markers(
+    markers: &[ScrollMarker],
+    track_height: f32,
+    track: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let width = (track.size.width - px(SCROLL_MAP_TRACK_INSET * 2.0)).max(px(0.0));
+    for (top_px, marker) in bucket_markers_per_row(markers, track_height) {
+        let bounds = Bounds::new(
+            point(
+                track.origin.x + px(SCROLL_MAP_TRACK_INSET),
+                track.origin.y + px(top_px),
+            ),
+            size(width, px(MARKER_HEIGHT)),
+        );
+        let mut transparent = marker.color;
+        transparent.a = 0.0;
+        window.paint_quad(quad(
+            bounds,
+            Corners::all(Radii::xs()).clamp_radii_for_quad_size(bounds.size),
+            marker.color,
+            Edges::default(),
+            transparent,
+            BorderStyle::default(),
+        ));
+    }
+}
+
 /// Render scroll map from precomputed markers.
 ///
 /// `on_jump`: optional callback receiving the index-space viewport top (1.0 means
 /// the bottom) plus whether the pointer is actively dragging. Track clicks stay
 /// animated; drag updates are immediate.
 pub fn render_scroll_map_from_markers(
-    markers: &[ScrollMarker],
+    markers: Rc<[ScrollMarker]>,
     messages: &[Arc<ChatMessage>],
     viewport: ScrollMapViewport,
     drag_id: SharedString,
@@ -227,17 +333,15 @@ pub fn render_scroll_map_from_markers(
         .h_full()
         .bg(colors::bg_void().opacity(0.28))
         .relative()
-        .children(
-            bucket_markers_per_row(markers, track_height).map(move |(top_px, marker)| {
-                div()
-                    .absolute()
-                    .left(px(SCROLL_MAP_TRACK_INSET))
-                    .right(px(SCROLL_MAP_TRACK_INSET))
-                    .h(px(MARKER_HEIGHT))
-                    .top(px(top_px))
-                    .bg(marker.color)
-                    .rounded(Radii::xs())
-            }),
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |track, (), window, _| paint_markers(&markers, track_height, track, window),
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
         )
         .when_some(viewport.new_message_boundary_position, |track, position| {
             let top_px = marker_top_px(position, track_height);
@@ -360,4 +464,161 @@ pub fn render_scroll_map_from_markers(
                 }),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::HighlightType;
+    use core::prelude::v1::test;
+
+    /// The markers computed from scratch, as the scroll map did on every
+    /// change of rows.
+    fn reference(
+        messages: &[Arc<ChatMessage>],
+        our_username: Option<&str>,
+        search_result_ids: Option<&FxHashSet<String>>,
+    ) -> Vec<ScrollMarker> {
+        let decisions: Vec<_> = messages
+            .iter()
+            .map(|msg| classify_row(msg, our_username, search_result_ids))
+            .collect();
+        markers_from_decisions(messages, &decisions)
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % bound.max(1)
+        }
+    }
+
+    fn row(rng: &mut Rng, id: u64) -> Arc<ChatMessage> {
+        let mut msg = ChatMessage {
+            id: Arc::from(format!("r{id}")),
+            content: Arc::from(match rng.below(6) {
+                0 => "hey rev, look",
+                1 => "Message from someone was deleted",
+                _ => "plain words",
+            }),
+            ..Default::default()
+        };
+        match rng.below(8) {
+            0 => msg.flags.is_first_message = true,
+            1 => msg.flags.is_system = true,
+            2 => msg.flags.highlight_type = Some(HighlightType::Subscription),
+            3 => msg.flags.highlight_type = Some(HighlightType::Mention),
+            _ => {}
+        }
+        Arc::new(msg)
+    }
+
+    #[test]
+    fn kept_marker_decisions_match_a_full_recompute_for_every_change_of_rows() {
+        let mut classified_incrementally = 0usize;
+        let mut rows_seen = 0usize;
+        for seed in 0..30 {
+            let mut rng = Rng(seed);
+            let mut next_id = 0u64;
+            let mut rows: Vec<Arc<ChatMessage>> = (0..60)
+                .map(|_| {
+                    next_id += 1;
+                    row(&mut rng, next_id)
+                })
+                .collect();
+            let mut cache = ScrollMarkerCache::default();
+            let mut username = Some("rev");
+            let mut search: Option<FxHashSet<String>> = None;
+            for step in 0..300 {
+                let mut reclassify_all = false;
+                match rng.below(12) {
+                    0..=3 => {
+                        // Append, and at the cap of 80 rotate.
+                        for _ in 0..1 + rng.below(4) {
+                            next_id += 1;
+                            rows.push(row(&mut rng, next_id));
+                        }
+                        let excess = rows.len().saturating_sub(80);
+                        rows.drain(..excess);
+                    }
+                    4 => {
+                        let dropped = (1 + rng.below(5) as usize).min(rows.len());
+                        rows.drain(..dropped);
+                    }
+                    5 => {
+                        for _ in 0..1 + rng.below(3) {
+                            next_id += 1;
+                            rows.insert(0, row(&mut rng, next_id));
+                        }
+                    }
+                    6 if !rows.is_empty() => {
+                        let index = rng.below(rows.len() as u64) as usize;
+                        rows.remove(index);
+                    }
+                    7 if !rows.is_empty() => {
+                        // Replaced in place: same id, new row.
+                        let index = rng.below(rows.len() as u64) as usize;
+                        let mut changed = (*rows[index]).clone();
+                        changed.flags.highlight_type = Some(HighlightType::Mention);
+                        rows[index] = Arc::new(changed);
+                    }
+                    8 => {
+                        username = if username.is_some() {
+                            None
+                        } else {
+                            Some("rev")
+                        };
+                        reclassify_all = true;
+                    }
+                    9 => {
+                        search = rows
+                            .first()
+                            .map(|first| std::iter::once(first.id.to_string()).collect());
+                        reclassify_all = true;
+                    }
+                    10 if step % 50 == 0 => rows.clear(),
+                    _ => {}
+                }
+                let list = Arc::new(rows.clone());
+                classified_incrementally +=
+                    cache.update(&list, username, search.as_ref(), reclassify_all);
+                rows_seen += list.len();
+                assert_eq!(
+                    &*cache.markers(),
+                    reference(&list, username, search.as_ref()).as_slice(),
+                    "seed {seed} step {step}"
+                );
+            }
+        }
+        assert!(
+            classified_incrementally * 4 < rows_seen,
+            "{classified_incrementally} of {rows_seen}"
+        );
+    }
+
+    #[test]
+    fn row_offset_lines_up_kept_rows_by_pointer() {
+        let rows: Vec<Arc<ChatMessage>> = (0..5)
+            .map(|id| {
+                Arc::new(ChatMessage {
+                    id: Arc::from(format!("r{id}")),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let fresh = Arc::new(ChatMessage::default());
+        assert_eq!(row_offset(&rows, &rows[2..]), Some(2), "front drop");
+        let mut prepended = vec![Arc::clone(&fresh)];
+        prepended.extend(rows.iter().cloned());
+        assert_eq!(row_offset(&rows, &prepended), Some(-1), "prepend");
+        assert_eq!(row_offset(&rows, &rows), Some(0), "same rows");
+        assert_eq!(row_offset(&rows, &[fresh]), None, "nothing kept");
+        assert_eq!(row_offset(&[], &rows), None);
+        assert_eq!(row_offset(&rows, &[]), None);
+    }
 }

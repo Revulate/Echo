@@ -4,8 +4,7 @@
 use crate::backend::ChatMessage;
 use crate::components::chat::canvas_renderer::CanvasMessageList;
 use crate::components::chat::scroll_map::{
-    SCROLL_MAP_GUTTER_WIDTH, ScrollMapViewport, ScrollMarker, compute_scroll_markers,
-    render_scroll_map_from_markers,
+    SCROLL_MAP_GUTTER_WIDTH, ScrollMapViewport, ScrollMarkerCache, render_scroll_map_from_markers,
 };
 use crate::state::{AppState, ChatState, ChatStateEvent, SplitId};
 use echo_core::reveal_pacer::RevealPacer;
@@ -122,12 +121,11 @@ pub struct ChatView {
     pub chat_state: Entity<ChatState>,
     /// Canvas message list entity for high-performance rendering
     pub canvas_list: Entity<CanvasMessageList>,
-    /// Cached scroll-map markers (recomputed only when messages/user change)
-    cached_scroll_markers: Vec<ScrollMarker>,
+    /// Scroll-map markers, kept aligned with the rows they were computed for
+    /// (recomputed when the rows, the login or the search results change).
+    scroll_markers: ScrollMarkerCache,
     /// Stable identity used to route GPUI drag events to this split's scroll map.
     scroll_map_drag_id: SharedString,
-    /// Last message buffer observed by scroll-map cache
-    last_scroll_map_messages: Arc<Vec<Arc<ChatMessage>>>,
     /// Last username used for mention detection in scroll-map cache
     last_scroll_map_username: Option<String>,
     /// Last active search marker version used for scroll-map cache
@@ -265,9 +263,8 @@ impl ChatView {
             app_state,
             chat_state,
             canvas_list,
-            cached_scroll_markers: Vec::new(),
+            scroll_markers: ScrollMarkerCache::default(),
             scroll_map_drag_id,
-            last_scroll_map_messages: Arc::new(Vec::new()),
             last_scroll_map_username: None,
             last_scroll_map_search_version: 0,
             message_width: container_width,
@@ -713,7 +710,7 @@ impl ChatView {
 
         let our_username = self.app_state.read(cx).username.clone();
         let username_changed = self.last_scroll_map_username != our_username;
-        let messages_changed = !Arc::ptr_eq(&self.last_scroll_map_messages, &messages);
+        let messages_changed = !Arc::ptr_eq(self.scroll_markers.rows(), &messages);
         let search_marker_version = crate::backend::search::active_search_markers_version();
         let search_markers_changed = self.last_scroll_map_search_version != search_marker_version;
 
@@ -725,12 +722,18 @@ impl ChatView {
                 Some(search_result_ids)
             };
 
-            self.cached_scroll_markers = compute_scroll_markers(
-                messages.as_slice(),
+            let started = std::time::Instant::now();
+            let classified = self.scroll_markers.update(
+                &messages,
                 our_username.as_deref(),
                 search_result_ids.as_ref(),
+                username_changed || search_markers_changed,
             );
-            self.last_scroll_map_messages = messages.clone();
+            crate::backend::metrics::record_emote_stage(
+                "scroll_map.markers",
+                started.elapsed(),
+                classified,
+            );
             self.last_scroll_map_username = our_username.clone();
             self.last_scroll_map_search_version = search_marker_version;
         }
@@ -762,7 +765,7 @@ impl ChatView {
         );
 
         let scroll_map = render_scroll_map_from_markers(
-            &self.cached_scroll_markers,
+            self.scroll_markers.markers(),
             messages.as_slice(),
             scroll_map_viewport,
             self.scroll_map_drag_id.clone(),
