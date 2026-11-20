@@ -294,9 +294,39 @@ fn claim_detection_refresh(cache: &mut DetectionCache) -> bool {
     true
 }
 
+/// Clears the in-flight claim when the detection task unwinds before it
+/// records a result, so later scans are not refused forever. It leaves
+/// `completed_at` alone: a scan that panicked proves nothing.
+struct DetectionClaimGuard<'a> {
+    cache: &'a RwLock<DetectionCache>,
+    armed: bool,
+}
+
+impl Drop for DetectionClaimGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cache.write_or_recover().refresh_in_flight = false;
+        }
+    }
+}
+
+/// Run `detect` for a claimed refresh, releasing the claim if it panics.
+fn run_claimed_detection(
+    cache: &RwLock<DetectionCache>,
+    detect: impl FnOnce() -> DetectionResult,
+) -> DetectionResult {
+    let mut guard = DetectionClaimGuard { cache, armed: true };
+    let detection = detect();
+    guard.armed = false;
+    detection
+}
+
 fn spawn_detection_refresh() {
     crate::backend::bridge::get_runtime().spawn_blocking(|| {
-        record_detection(detect_streaming_software_impl());
+        record_detection(run_claimed_detection(
+            &DETECTION_CACHE,
+            detect_streaming_software_impl,
+        ));
     });
 }
 
@@ -858,6 +888,23 @@ mod tests {
         let mut refreshed = cache(true, false);
         refreshed.last_check = None;
         assert!(!auto_detection_active(&refreshed, completed_at));
+    }
+
+    #[test]
+    fn a_panicking_detection_releases_its_claim_without_completing() {
+        let lock = RwLock::new(cache(false, false));
+        assert!(claim_detection_refresh(&mut lock.write().unwrap()));
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_claimed_detection(&lock, || panic!("simulated detection panic"))
+        }));
+        assert!(outcome.is_err());
+
+        let mut cache = lock.write().unwrap();
+        assert!(!cache.refresh_in_flight, "a later scan can be claimed");
+        assert!(cache.completed_at.is_none(), "the panic is not a detection");
+        assert!(auto_detection_active(&cache, Instant::now()));
+        assert!(claim_detection_refresh(&mut cache));
     }
 
     #[test]
