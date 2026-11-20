@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod fetchers;
+mod html_head;
 pub mod seventv;
 pub mod spotify;
 pub mod state;
@@ -66,6 +67,23 @@ async fn read_bounded_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).map_err(|error| {
         crate::log_net!(debug, "Invalid {label} response: {error}");
     })
+}
+
+/// Read at most [`html_head::MAX_SCAN_BYTES`] of an HTML response: all the
+/// head scanner looks at. A read error ends the body where it stopped.
+async fn read_html_prefix(mut response: reqwest::Response) -> Vec<u8> {
+    let max_bytes = html_head::MAX_SCAN_BYTES;
+    let mut body: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while body.len() < max_bytes {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(max_bytes - body.len());
+                body.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {

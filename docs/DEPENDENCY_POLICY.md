@@ -46,6 +46,13 @@ EXR, HDR, QOI, TGA, Rayon, and their transitive graph.
 `cargo tree --locked --target all -i ravif` is empty, and `paste` is no longer
 in the lockfile.
 
+Link previews read only a page's head metadata (OpenGraph, Twitter and
+description `<meta>` tags and the `<title>`), with Echo's own bounded scanner
+(`src/backend/embeds/html_head.rs`) instead of an HTML parser. `scraper` and
+its HTML/CSS stack (`html5ever`, `markup5ever`, `selectors`, `cssparser`,
+`tendril`, `string_cache`, `phf` 0.14) are not in the lockfile;
+`cargo tree --locked --target all -i html5ever` is empty.
+
 ## Git sources
 
 Echo uses only crates.io plus the small allow-list of upstream Git repositories

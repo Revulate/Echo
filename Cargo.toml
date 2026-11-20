@@ -169,9 +169,6 @@ rust-embed = { version = "8", features = ["include-exclude"] }
 # System information (for streamer mode process detection)
 sysinfo.workspace = true
 
-# HTML parsing (for link preview OpenGraph scraping)
-scraper = "0.29"
-
 # Utilities
 uuid.workspace = true
 chrono = { workspace = true, features = ["serde"] }

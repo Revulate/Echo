@@ -8,7 +8,6 @@
 use crate::backend::link_types::EmbedLoadState;
 use crate::backend::twitch_api;
 use crate::utils::truncate_text;
-use scraper::{Html, Selector};
 
 const TITLE_MAX_LEN: usize = 100;
 const DESCRIPTION_MAX_LEN: usize = 200;
@@ -191,22 +190,29 @@ async fn fetch_open_graph(original_url: &str) -> Option<TwitchEmbedResult> {
     if !response.status().is_success() {
         return None;
     }
-    let html = response.text().await.ok()?;
-    let document = Html::parse_document(&html);
-    let content = |selector: &str| {
-        Selector::parse(selector)
-            .ok()
-            .and_then(|selector| document.select(&selector).next())
-            .and_then(|element| element.value().attr("content"))
-            .map(str::to_string)
-    };
-    let title =
-        content("meta[property='og:title']").or_else(|| content("meta[name='twitter:title']"));
-    let thumbnail_url =
-        content("meta[property='og:image']").or_else(|| content("meta[name='twitter:image']"));
-    let description =
-        content("meta[property='og:description']").or_else(|| content("meta[name='description']"));
-    let subtitle = content("meta[property='og:site_name']").or_else(|| Some("Twitch".to_string()));
+    let header_charset = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::html_head::content_type_charset(value).map(str::to_string));
+    let html = super::read_html_prefix(response).await;
+    let head = super::html_head::scan_head(&html, header_charset.as_deref());
+    let title = head
+        .property("og:title")
+        .or_else(|| head.name("twitter:title"))
+        .map(str::to_string);
+    let thumbnail_url = head
+        .property("og:image")
+        .or_else(|| head.name("twitter:image"))
+        .map(str::to_string);
+    let description = head
+        .property("og:description")
+        .or_else(|| head.name("description"))
+        .map(str::to_string);
+    let subtitle = head
+        .property("og:site_name")
+        .map(str::to_string)
+        .or_else(|| Some("Twitch".to_string()));
 
     (title.is_some() || thumbnail_url.is_some() || description.is_some()).then(|| {
         TwitchEmbedResult {

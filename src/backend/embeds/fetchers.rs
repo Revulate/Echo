@@ -588,29 +588,15 @@ impl EmbedFetcher {
                     return self.create_basic_embed(link_info);
                 }
 
-                const MAX_BODY_SIZE: usize = 512 * 1024;
-                let mut resp = resp;
-                let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-                loop {
-                    match resp.chunk().await {
-                        Ok(Some(chunk)) => {
-                            if chunk.is_empty() {
-                                break;
-                            }
-                            let room = MAX_BODY_SIZE - buf.len();
-                            let take = chunk.len().min(room);
-                            buf.extend_from_slice(&chunk[..take]);
-                            if buf.len() >= MAX_BODY_SIZE {
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => break,
-                    }
-                }
+                let buf = super::read_html_prefix(resp).await;
                 if !buf.is_empty() {
-                    let html = String::from_utf8_lossy(&buf);
-                    return self.parse_opengraph(&html, link_info, content_type, content_length);
+                    let head = super::html_head::scan_head(
+                        &buf,
+                        content_type
+                            .as_deref()
+                            .and_then(super::html_head::content_type_charset),
+                    );
+                    return self.parse_opengraph(&head, link_info, content_type, content_length);
                 }
             }
             _ => {}
@@ -619,97 +605,49 @@ impl EmbedFetcher {
         self.create_basic_embed(link_info)
     }
 
-    /// Parse OpenGraph metadata from HTML
+    /// Build an embed from a page's OpenGraph and related head metadata.
     fn parse_opengraph(
         &self,
-        html: &str,
+        head: &super::html_head::HeadMetadata,
         link_info: &LinkInfo,
         content_type: Option<String>,
         content_length: Option<u64>,
     ) -> EmbedMetadata {
-        use scraper::{Html, Selector};
-
-        let document = Html::parse_document(html);
-
-        let og_title_sel = Selector::parse("meta[property='og:title']").ok();
-        let og_image_sel = Selector::parse("meta[property='og:image']").ok();
-        let og_video_secure_sel = Selector::parse("meta[property='og:video:secure_url']").ok();
-        let og_video_sel = Selector::parse("meta[property='og:video']").ok();
-        let og_desc_sel = Selector::parse("meta[property='og:description']").ok();
-        let og_site_sel = Selector::parse("meta[property='og:site_name']").ok();
-        let twitter_title_sel = Selector::parse("meta[name='twitter:title']").ok();
-        let twitter_site_sel = Selector::parse("meta[name='twitter:site']").ok();
-        let twitter_image_sel = Selector::parse("meta[name='twitter:image']").ok();
-        let title_sel = Selector::parse("title").ok();
-        let desc_sel = Selector::parse("meta[name='description']").ok();
-        let application_name_sel = Selector::parse("meta[name='application-name']").ok();
-
-        let title: Option<String> = og_title_sel
-            .and_then(|s| document.select(&s).next())
-            .and_then(|e| e.value().attr("content"))
+        let title: Option<String> = head
+            .property("og:title")
             .map(|s| truncate_text(s, 100))
+            .or_else(|| head.name("twitter:title").map(|s| truncate_text(s, 100)))
             .or_else(|| {
-                twitter_title_sel
-                    .and_then(|s| document.select(&s).next())
-                    .and_then(|e| e.value().attr("content"))
-                    .map(|s| truncate_text(s, 100))
-            })
-            .or_else(|| {
-                title_sel
-                    .and_then(|s| document.select(&s).next())
-                    .map(|e| e.text().collect::<String>())
+                head.title()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .map(|s| truncate_text(&s, 100))
             });
 
-        let image = og_image_sel
-            .and_then(|s| document.select(&s).next())
-            .and_then(|e| e.value().attr("content"))
-            .or_else(|| {
-                twitter_image_sel
-                    .and_then(|s| document.select(&s).next())
-                    .and_then(|e| e.value().attr("content"))
-            })
+        let image = head
+            .property("og:image")
+            .or_else(|| head.name("twitter:image"))
             .and_then(|s| resolve_embed_url(&link_info.url, s));
 
-        let video = og_video_secure_sel
-            .and_then(|s| document.select(&s).next())
-            .and_then(|e| e.value().attr("content"))
-            .or_else(|| {
-                og_video_sel
-                    .and_then(|s| document.select(&s).next())
-                    .and_then(|e| e.value().attr("content"))
-            })
+        let video = head
+            .property("og:video:secure_url")
+            .or_else(|| head.property("og:video"))
             .and_then(|s| resolve_embed_url(&link_info.url, s));
 
-        let site_name = og_site_sel
-            .and_then(|s| document.select(&s).next())
-            .and_then(|e| e.value().attr("content"))
+        let site_name = head
+            .property("og:site_name")
             .map(String::from)
             .or_else(|| {
-                twitter_site_sel
-                    .and_then(|s| document.select(&s).next())
-                    .and_then(|e| e.value().attr("content"))
+                head.name("twitter:site")
                     .map(|site| site.trim_start_matches('@').to_string())
             })
-            .or_else(|| {
-                application_name_sel
-                    .and_then(|s| document.select(&s).next())
-                    .and_then(|e| e.value().attr("content"))
-                    .map(String::from)
-            })
+            .or_else(|| head.name("application-name").map(String::from))
             .or_else(|| link_info.provider_name.clone())
             .or_else(|| Some(get_domain(&link_info.url)));
 
-        let description = og_desc_sel
-            .and_then(|s| document.select(&s).next())
-            .and_then(|e| e.value().attr("content"))
-            .or_else(|| {
-                desc_sel
-                    .and_then(|s| document.select(&s).next())
-                    .and_then(|e| e.value().attr("content"))
-            })
+        let description = head
+            .property("og:description")
+            .or_else(|| head.name("description"))
             .map(|text| truncate_text(text.trim(), 100))
             .filter(|text| !text.is_empty());
 
