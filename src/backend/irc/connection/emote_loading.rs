@@ -211,8 +211,9 @@ pub(super) fn schedule_staggered_channel_emote_load(
 
     let slot = DEFERRED_CHANNEL_EMOTE_REFRESH_SLOT.fetch_add(1, Ordering::Relaxed);
     let has_cache = cached_count > 0;
-    // A fresh resident catalog is served as is; the non-forced load below
-    // returns it from cache and still hydrates FFZ room badges.
+    // A fresh resident catalog the 7TV EventAPI already owns is served as is;
+    // the non-forced load below returns it from cache and still hydrates FFZ
+    // room badges.
     let force_refresh = has_cache && EMOTE_CACHE.channel_join_needs_forced_refresh(&channel_key);
     if has_cache && !force_refresh {
         crate::backend::metrics::record_emote_event("irc.channel_emotes.deferred_cached.fresh");

@@ -1202,6 +1202,14 @@ pub(crate) fn diagnostics() -> EventApiDiagnostics {
     diagnostics
 }
 
+/// Whether the EventAPI registry owns this channel (an emote set or a 7TV
+/// user registered for it). Only a 7TV channel fetch registers ownership, and
+/// closing the channel removes it.
+pub(crate) fn channel_has_subscription_owner(channel_login: &str) -> bool {
+    let channel = super::normalize_channel_key(channel_login);
+    CHANNEL_TO_SET.contains_key(&channel) || CHANNEL_DETAILS.contains_key(&channel)
+}
+
 /// Whether a channel's registered 7TV set is covered by the live EventAPI stream.
 ///
 /// Channel fetch caching can use the normal emote-cache window only after the

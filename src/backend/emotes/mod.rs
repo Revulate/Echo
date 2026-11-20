@@ -3901,12 +3901,18 @@ impl EmoteCache {
 
     /// Whether a join whose channel already has resident emotes must still
     /// force a provider refresh: the set came from a stale disk cache (this
-    /// call consumes that mark) or its TTL has expired. A fresh entry is
-    /// served as is; the non-forced load still hydrates FFZ room badges.
+    /// call consumes that mark), its TTL has expired, or the 7TV EventAPI does
+    /// not own the channel. Only a 7TV channel fetch registers that ownership,
+    /// and neither a disk hydrate nor a catalog kept across close and reopen
+    /// has it, so skipping the fetch would leave the channel without live 7TV
+    /// updates. A fresh, owned entry is served as is; the non-forced load still
+    /// hydrates FFZ room badges.
     pub fn channel_join_needs_forced_refresh(&self, channel_login: &str) -> bool {
         let cache_key = normalize_channel_key(channel_login);
         let stale_disk = STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key).is_some();
-        stale_disk || self.channel_emotes_need_refresh(&cache_key)
+        stale_disk
+            || !seventv_eventapi::channel_has_subscription_owner(&cache_key)
+            || self.channel_emotes_need_refresh(&cache_key)
     }
 
     /// Return true when a channel cache is missing or stale enough to justify a provider fetch.
@@ -4895,6 +4901,7 @@ mod provider_index_tests {
         impl Drop for MarkCleanup {
             fn drop(&mut self) {
                 STALE_DISK_CHANNEL_HYDRATIONS.remove(&self.0);
+                seventv_eventapi::unsubscribe_channel(&self.0);
             }
         }
         let _mark_cleanup = MarkCleanup(channel.clone());
@@ -4903,9 +4910,10 @@ mod provider_index_tests {
             channel.clone(),
             entry([emote(EmoteProvider::BTTV, "join-1", "joinEmote")]),
         );
+        seventv_eventapi::subscribe_channel_set(&channel, "join-refresh-test-set");
         assert!(
             !EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
-            "a fresh resident catalog is served without a provider refresh"
+            "a fresh, EventAPI-owned catalog is served without a provider refresh"
         );
 
         STALE_DISK_CHANNEL_HYDRATIONS.insert(channel.clone());
@@ -4927,6 +4935,44 @@ mod provider_index_tests {
                 .fetched_at = expired;
             assert!(EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
         }
+    }
+
+    #[test]
+    fn a_fresh_catalog_without_eventapi_ownership_refreshes_at_join() {
+        // A quick relaunch hydrates a fresh catalog from disk, and a channel
+        // reopened within its TTL keeps its catalog, but closing removed the
+        // EventAPI ownership and the disk cache has no 7TV set id. Only the
+        // forced fetch subscribes the channel to live 7TV updates again.
+        let channel = "join_refresh_ownership_test".to_string();
+        let _cleanup = ChannelTestCleanup(channel.clone());
+        struct OwnershipCleanup(String);
+        impl Drop for OwnershipCleanup {
+            fn drop(&mut self) {
+                seventv_eventapi::unsubscribe_channel(&self.0);
+            }
+        }
+        let _ownership_cleanup = OwnershipCleanup(channel.clone());
+
+        EMOTE_CACHE.channels.insert(
+            channel.clone(),
+            entry([emote(EmoteProvider::SevenTV, "own-1", "ownedEmote")]),
+        );
+        assert!(!EMOTE_CACHE.channel_emotes_need_refresh(&channel));
+        assert!(!seventv_eventapi::channel_has_subscription_owner(&channel));
+        assert!(
+            EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "a channel with no EventAPI ownership must fetch so it subscribes"
+        );
+
+        seventv_eventapi::subscribe_channel_set(&channel, "join-ownership-test-set");
+        assert!(seventv_eventapi::channel_has_subscription_owner(&channel));
+        assert!(!EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
+
+        seventv_eventapi::unsubscribe_channel(&channel);
+        assert!(
+            EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "closing the channel drops ownership, so a reopen fetches again"
+        );
     }
 
     #[test]
