@@ -182,6 +182,9 @@ struct DetectionCache {
     last_result: bool,
     last_source: Option<String>,
     refresh_in_flight: bool,
+    /// A detection has finished at least once. `last_check` alone cannot tell,
+    /// because [`refresh_detection`] clears it to force a rescan.
+    completed: bool,
 }
 
 static DETECTION_CACHE: LazyLock<RwLock<DetectionCache>> = LazyLock::new(|| {
@@ -190,6 +193,7 @@ static DETECTION_CACHE: LazyLock<RwLock<DetectionCache>> = LazyLock::new(|| {
         last_result: false,
         last_source: None,
         refresh_in_flight: false,
+        completed: false,
     })
 });
 
@@ -199,57 +203,75 @@ fn detection_cache_is_fresh(cache: &DetectionCache) -> bool {
         .is_some_and(|last_check| last_check.elapsed() < DETECTION_INTERVAL)
 }
 
-fn record_detection(detection: DetectionResult) -> bool {
+/// Whether Auto mode treats streaming software as running. Until the first
+/// detection has completed this is true, so a user in Auto who is already
+/// streaming never sees redacted content shown before the scan finishes.
+fn auto_detection_active(cache: &DetectionCache) -> bool {
+    !cache.completed || cache.last_result
+}
+
+/// Whether recording `active`/`source` changes what streamer mode shows. The
+/// first completed detection always counts, because Auto was treated as active
+/// until then.
+fn detection_result_changed(cache: &DetectionCache, active: bool, source: &Option<String>) -> bool {
+    !cache.completed || cache.last_result != active || cache.last_source != *source
+}
+
+fn record_detection(detection: DetectionResult) {
     let is_running = detection.active;
     let result_changed = {
         let mut cache = DETECTION_CACHE.write_or_recover();
-        let result_changed =
-            cache.last_result != is_running || cache.last_source != detection.source;
+        let result_changed = detection_result_changed(&cache, is_running, &detection.source);
         cache.last_check = Some(Instant::now());
         cache.last_result = is_running;
         cache.last_source = detection.source;
         cache.refresh_in_flight = false;
+        cache.completed = true;
         result_changed
     };
 
     if result_changed {
         super::settings::broadcast_streamer_mode_changed();
     }
-
-    is_running
 }
 
-/// Check if streaming software is running
-/// Uses caching to avoid expensive process scans on every call
-pub fn is_streaming_software_running() -> bool {
-    {
-        let mut cache = DETECTION_CACHE.write_or_recover();
-        if detection_cache_is_fresh(&cache) || cache.refresh_in_flight {
-            return cache.last_result;
-        }
-        cache.refresh_in_flight = true;
+/// Claim the single background refresh when the cached result is stale.
+/// Returns true when the caller must spawn it.
+fn claim_detection_refresh(cache: &mut DetectionCache) -> bool {
+    if detection_cache_is_fresh(cache) || cache.refresh_in_flight {
+        return false;
     }
+    cache.refresh_in_flight = true;
+    true
+}
 
-    record_detection(detect_streaming_software_impl())
+fn spawn_detection_refresh() {
+    crate::backend::bridge::get_runtime().spawn_blocking(|| {
+        record_detection(detect_streaming_software_impl());
+    });
 }
 
 /// Schedule a single background refresh when the cached detection result is stale.
 pub fn schedule_detection_refresh() {
-    let should_schedule = {
-        let mut cache = DETECTION_CACHE.write_or_recover();
-        if detection_cache_is_fresh(&cache) || cache.refresh_in_flight {
-            false
-        } else {
-            cache.refresh_in_flight = true;
-            true
-        }
-    };
-
+    let should_schedule = claim_detection_refresh(&mut DETECTION_CACHE.write_or_recover());
     if should_schedule {
-        crate::backend::bridge::get_runtime().spawn_blocking(|| {
-            let _ = record_detection(detect_streaming_software_impl());
-        });
+        spawn_detection_refresh();
     }
+}
+
+/// Auto mode's cached detection result, scheduling a background refresh when
+/// it is stale. Never scans processes on the calling thread, so UI-thread
+/// callers stay cheap.
+fn cached_auto_detection_active() -> bool {
+    let (active, should_schedule) = {
+        let mut cache = DETECTION_CACHE.write_or_recover();
+        let should_schedule = claim_detection_refresh(&mut cache);
+        (auto_detection_active(&cache), should_schedule)
+    };
+    if should_schedule {
+        spawn_detection_refresh();
+    }
+    active
 }
 
 fn detect_streaming_software_impl() -> DetectionResult {
@@ -520,29 +542,24 @@ fn normalize_process_name(process_name: &str) -> String {
 }
 
 /// Check if streamer mode is currently active
-/// This combines the user's setting with auto-detection
+/// This combines the user's setting with auto-detection. Auto reads the
+/// cached detection result and refreshes a stale one in the background.
 pub fn is_streamer_mode_active() -> bool {
     let settings = get_streamer_mode_settings();
 
     is_active_for_settings(&settings)
 }
 
-/// Cached streamer-mode activity for UI rendering. A stale detection result is
-/// refreshed in the background rather than scanning processes on the UI thread.
+/// Same as [`is_streamer_mode_active`]; every gate now reads cached detection.
 pub fn is_streamer_mode_active_cached() -> bool {
-    let settings = get_streamer_mode_settings();
-    match settings.enabled {
-        StreamerModeStatus::AlwaysOn => true,
-        StreamerModeStatus::Disabled => false,
-        StreamerModeStatus::Auto => get_cached_detection_status().0,
-    }
+    is_streamer_mode_active()
 }
 
 fn is_active_for_settings(settings: &StreamerModeSettings) -> bool {
     match settings.enabled {
         StreamerModeStatus::AlwaysOn => true,
         StreamerModeStatus::Disabled => false,
-        StreamerModeStatus::Auto => is_streaming_software_running(),
+        StreamerModeStatus::Auto => cached_auto_detection_active(),
     }
 }
 
@@ -618,16 +635,15 @@ pub fn should_suppress_notifications() -> bool {
     settings.suppress_notifications && is_active_for_settings(&settings)
 }
 
-/// [`should_mute_mentions`] from cached detection, for UI-thread previews
-/// that must not scan processes.
+/// Same as [`should_mute_mentions`]; every gate now reads cached detection.
 pub fn should_mute_mentions_cached() -> bool {
-    get_streamer_mode_settings().mute_mentions && is_streamer_mode_active_cached()
+    should_mute_mentions()
 }
 
-/// [`should_suppress_notifications`] from cached detection, for UI-thread
-/// previews that must not scan processes.
+/// Same as [`should_suppress_notifications`]; every gate now reads cached
+/// detection.
 pub fn should_suppress_notifications_cached() -> bool {
-    get_streamer_mode_settings().suppress_notifications && is_streamer_mode_active_cached()
+    should_suppress_notifications()
 }
 
 /// Get streamer mode settings from global settings
@@ -702,4 +718,58 @@ pub fn get_cached_detection_status() -> (bool, Option<String>) {
     schedule_detection_refresh();
     let cache = DETECTION_CACHE.read_or_recover();
     (cache.last_result, cache.last_source.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn cache(completed: bool, last_result: bool) -> DetectionCache {
+        DetectionCache {
+            last_check: completed.then(Instant::now),
+            last_result,
+            last_source: None,
+            refresh_in_flight: false,
+            completed,
+        }
+    }
+
+    #[test]
+    fn auto_counts_as_active_until_the_first_detection_completes() {
+        assert!(auto_detection_active(&cache(false, false)));
+        assert!(!auto_detection_active(&cache(true, false)));
+        assert!(auto_detection_active(&cache(true, true)));
+
+        // A forced rescan clears last_check but must not reopen the window.
+        let mut forced = cache(true, false);
+        forced.last_check = None;
+        assert!(!auto_detection_active(&forced));
+    }
+
+    #[test]
+    fn first_detection_always_broadcasts_and_later_ones_only_on_change() {
+        assert!(detection_result_changed(&cache(false, false), false, &None));
+        assert!(!detection_result_changed(&cache(true, false), false, &None));
+        assert!(detection_result_changed(&cache(true, false), true, &None));
+        assert!(detection_result_changed(
+            &cache(true, false),
+            false,
+            &Some("OBS is streaming".to_string())
+        ));
+    }
+
+    #[test]
+    fn detection_refresh_is_claimed_once_and_only_when_stale() {
+        let mut never = cache(false, false);
+        assert!(claim_detection_refresh(&mut never));
+        assert!(!claim_detection_refresh(&mut never), "already in flight");
+
+        let mut fresh = cache(true, false);
+        assert!(!claim_detection_refresh(&mut fresh));
+
+        let mut forced = cache(true, false);
+        forced.last_check = None;
+        assert!(claim_detection_refresh(&mut forced));
+    }
 }

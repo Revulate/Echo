@@ -296,6 +296,13 @@ pub fn initialize() {
     );
 
     crate::backend::settings::init_settings_channel();
+    // Auto streamer mode counts as active until its first detection finishes,
+    // so start that scan now, ahead of the first window.
+    if crate::backend::streamer_mode::get_streamer_mode_settings().enabled
+        == crate::backend::streamer_mode::StreamerModeStatus::Auto
+    {
+        crate::backend::streamer_mode::schedule_detection_refresh();
+    }
     crate::backend::activity_persistence::start();
     if !offline_scenario {
         crate::backend::browser_watching::initialize();

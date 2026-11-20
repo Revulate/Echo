@@ -1,6 +1,6 @@
 //! Contract: streamer-mode privacy gates in `src/backend/streamer_mode.rs` for each
-//! mode (always on, disabled, auto with nothing detected) and the per-gate
-//! content toggles.
+//! mode (always on, disabled, auto before its first detection has completed)
+//! and the per-gate content toggles.
 
 pub(crate) use check_support::category_log as log_ui;
 use check_support::{FIXTURE_HEADER, assert_fixture};
@@ -67,7 +67,9 @@ mod storage_roots {
 }
 
 // Only the settings-driven gates are checked; process detection, cached status
-// and settings updates run against live system state.
+// and settings updates run against live system state. The runtime stub never
+// runs the background detection, so Auto stays in its fail-closed state from
+// before the first detection completes.
 #[path = "../../../src/backend/streamer_mode.rs"]
 #[allow(dead_code)]
 mod streamer_mode;
@@ -108,9 +110,9 @@ fn main() {
         ..Default::default()
     });
     assert_fixture(
-        "streamer_auto_no_detection_gates_off",
+        "streamer_auto_before_first_detection_gates_on",
         gate_summary(),
-        "000000000000",
+        "111111111111",
     );
 
     set_streamer_mode(StreamerModeSettings {

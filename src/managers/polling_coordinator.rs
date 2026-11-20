@@ -285,7 +285,9 @@ fn maybe_refresh_streamer_detection(cadence: &mut Cadence) {
         return;
     }
     cadence.mark();
-    let _ = backend::streamer_mode::is_streaming_software_running();
+    // The scan reads the process list and OBS/Discord log tails, so it runs on
+    // the blocking pool; the result reaches the UI through the change broadcast.
+    backend::streamer_mode::schedule_detection_refresh();
 }
 
 /// Change key for the Activity sidebar snapshots owned by AppState.
