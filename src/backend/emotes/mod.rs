@@ -185,6 +185,20 @@ const USER_EMOTES_DISK_TTL_SECS: u64 = 24 * 60 * 60;
 /// that is stale but present lets history show at once; startup refreshes it
 /// immediately and retokenizes resident rows if the refreshed set differs.
 const GLOBAL_EMOTES_DISK_STALE_SERVE_MAX_SECS: u64 = 7 * 24 * 60 * 60;
+/// The `saved_at` of the global set hydrated from disk, kept until a global
+/// load replaces it (0: none). Saving writes it back instead of the current
+/// time, so a set that was served stale and never refreshed is not persisted
+/// as fresh, and the next launch still refreshes it.
+static GLOBAL_DISK_SAVED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// The `saved_at` to persist for the global set: the hydrated disk time while
+/// no global load has replaced it, otherwise `now`.
+fn global_set_saved_at(now: u64) -> u64 {
+    match GLOBAL_DISK_SAVED_AT.load(Ordering::Acquire) {
+        0 => now,
+        disk_saved_at => disk_saved_at,
+    }
+}
 /// Maximum age a channel disk cache may have and still be served at startup.
 /// Channel emote sets change rarely; serving a stale set immediately and
 /// refreshing in the background beats blocking message tokenization on a
@@ -1841,6 +1855,7 @@ impl EmoteCache {
                     emotes_by_id: arc_emotes_by_id,
                     fetched_at,
                 });
+                GLOBAL_DISK_SAVED_AT.store(cached.saved_at.max(1), Ordering::Release);
                 global_emote_count = global.as_ref().map(|e| e.emotes_by_id.len()).unwrap_or(0);
                 global_loaded = true;
                 global_stale = stale;
@@ -2077,7 +2092,10 @@ impl EmoteCache {
                     .filter(|(k, v)| k.as_ref() == v.name.as_ref())
                     .map(|(k, v)| (k.to_string(), (**v).clone()))
                     .collect();
-                CachedEmoteSet::new(emotes)
+                CachedEmoteSet {
+                    saved_at: global_set_saved_at(crate::utils::unix_now_secs()),
+                    emotes,
+                }
             })
         };
         let global_snapshot_count = global_emotes
@@ -2884,6 +2902,7 @@ impl EmoteCache {
                 emotes_by_id: all_emotes_by_id,
                 fetched_at: Instant::now(),
             });
+            GLOBAL_DISK_SAVED_AT.store(0, Ordering::Release);
             global
                 .as_ref()
                 .map(|entry| entry.emotes_by_id.len())
@@ -4972,6 +4991,24 @@ mod provider_index_tests {
         assert!(
             EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
             "closing the channel drops ownership, so a reopen fetches again"
+        );
+    }
+
+    #[test]
+    fn a_hydrated_global_set_keeps_its_disk_time_until_a_global_load() {
+        let now = 1_900_000_000;
+        let six_days_old = now - 6 * 24 * 60 * 60;
+        GLOBAL_DISK_SAVED_AT.store(six_days_old, Ordering::Release);
+        assert_eq!(
+            global_set_saved_at(now),
+            six_days_old,
+            "an unrefreshed stale set must not be saved as fresh"
+        );
+        GLOBAL_DISK_SAVED_AT.store(0, Ordering::Release);
+        assert_eq!(
+            global_set_saved_at(now),
+            now,
+            "a loaded set saves its load time"
         );
     }
 
