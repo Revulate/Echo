@@ -328,18 +328,40 @@ pub enum UiAction {
 /// Global queue for UI actions
 pub static UI_ACTIONS: LazyLock<RwLock<Vec<UiAction>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 
+/// Wakes EchoApp's pending-UI task, which drains every `PENDING_*` queue and
+/// flag below, as soon as one is filled instead of at its next timer tick.
+static PENDING_UI_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The wake that [`enqueue`], [`enqueue_bounded`] and the pending flags fire.
+pub fn pending_ui_wake() -> &'static tokio::sync::Notify {
+    &PENDING_UI_WAKE
+}
+
 /// Push one value into a queue, recovering the queue if a prior writer panicked.
-fn enqueue<T>(queue: &RwLock<Vec<T>>, value: T) {
+fn push_value<T>(queue: &RwLock<Vec<T>>, value: T) {
     queue.write_or_recover().push(value);
 }
 
+/// Push one value into a pending-UI queue and wake the task that drains it.
+fn enqueue<T>(queue: &RwLock<Vec<T>>, value: T) {
+    push_value(queue, value);
+    PENDING_UI_WAKE.notify_one();
+}
+
 /// Push one value into a bounded queue, retaining its newest values.
-fn enqueue_bounded<T>(queue: &RwLock<Vec<T>>, value: T, capacity: usize) {
+fn push_bounded_value<T>(queue: &RwLock<Vec<T>>, value: T, capacity: usize) {
     let mut values = queue.write_or_recover();
     if values.len() >= capacity {
         values.remove(0);
     }
     values.push(value);
+}
+
+/// Push one value into a bounded pending-UI queue and wake the task that
+/// drains it.
+fn enqueue_bounded<T>(queue: &RwLock<Vec<T>>, value: T, capacity: usize) {
+    push_bounded_value(queue, value, capacity);
+    PENDING_UI_WAKE.notify_one();
 }
 
 /// Drain every queued value, recovering the queue if a prior writer panicked.
@@ -349,7 +371,8 @@ fn drain<T>(queue: &RwLock<Vec<T>>) -> Vec<T> {
 
 /// Push an action to the queue
 pub fn push_action(action: UiAction) {
-    enqueue(&UI_ACTIONS, action);
+    // The poll loop drains this queue; `record_activity` wakes it.
+    push_value(&UI_ACTIONS, action);
     crate::managers::frame_rate_controller::record_activity();
 }
 
@@ -548,6 +571,7 @@ pub fn push_pending_reopen_closed_tab() {
     let _ = PENDING_REOPEN_CLOSED_TAB.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
         Some(count.saturating_add(1).min(10))
     });
+    PENDING_UI_WAKE.notify_one();
     crate::managers::frame_rate_controller::record_activity();
 }
 
@@ -745,6 +769,19 @@ pub fn push_pending_search_jump(channel: String, message_id: String) {
     );
 }
 
+/// Put back a search-result jump that the pending-UI pass could not run yet.
+/// It waits for the next timer tick: a wake would run the pass again before
+/// the frame that can satisfy the jump.
+pub fn requeue_pending_search_jump(channel: String, message_id: String) {
+    push_value(
+        &PENDING_SEARCH_JUMPS,
+        PendingSearchJump {
+            channel,
+            message_id,
+        },
+    );
+}
+
 /// Drain all pending search-result jumps.
 pub fn drain_pending_search_jumps() -> Vec<PendingSearchJump> {
     drain(&PENDING_SEARCH_JUMPS)
@@ -753,6 +790,20 @@ pub fn drain_pending_search_jumps() -> Vec<PendingSearchJump> {
 /// Queue a message jump that must remain within its source split.
 pub fn push_pending_split_message_jump(split_id: SplitId, channel: String, message_id: String) {
     enqueue_bounded(
+        &PENDING_SPLIT_MESSAGE_JUMPS,
+        PendingSplitMessageJump {
+            split_id,
+            channel,
+            message_id,
+        },
+        MAX_PENDING_SPLIT_MESSAGE_JUMPS,
+    );
+}
+
+/// Put back a split-local message jump that the pending-UI pass could not run
+/// yet, without waking the pass (see [`requeue_pending_search_jump`]).
+pub fn requeue_pending_split_message_jump(split_id: SplitId, channel: String, message_id: String) {
+    push_bounded_value(
         &PENDING_SPLIT_MESSAGE_JUMPS,
         PendingSplitMessageJump {
             split_id,
@@ -785,6 +836,7 @@ pub fn push_pending_open_new_tab() {
     let _ = PENDING_OPEN_NEW_TAB.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
         Some(count.saturating_add(1).min(32))
     });
+    PENDING_UI_WAKE.notify_one();
     crate::managers::frame_rate_controller::record_activity();
 }
 
@@ -798,6 +850,7 @@ pub fn take_pending_open_new_tab() -> bool {
 
 pub fn push_pending_open_whispers_split() {
     PENDING_OPEN_WHISPERS_SPLIT.store(true, Ordering::Release);
+    PENDING_UI_WAKE.notify_one();
 }
 
 pub fn take_pending_open_whispers_split() -> bool {
@@ -808,6 +861,7 @@ pub fn take_pending_open_whispers_split() -> bool {
 /// themselves and have no handle on the app.
 pub fn push_pending_refocus_active_input() {
     PENDING_REFOCUS_ACTIVE_INPUT.store(true, Ordering::Release);
+    PENDING_UI_WAKE.notify_one();
     crate::managers::frame_rate_controller::record_activity();
 }
 
@@ -817,6 +871,7 @@ pub fn take_pending_refocus_active_input() -> bool {
 
 pub fn push_pending_open_login() {
     PENDING_OPEN_LOGIN.store(true, Ordering::Release);
+    PENDING_UI_WAKE.notify_one();
     crate::managers::frame_rate_controller::record_activity();
 }
 
@@ -856,9 +911,23 @@ pub fn drain_pending_followed_channel_opens() -> Vec<PendingFollowedChannelOpen>
 
 #[cfg(test)]
 mod tests {
-    use super::{drain, enqueue, enqueue_bounded};
+    use super::{drain, enqueue, enqueue_bounded, pending_ui_wake, push_value};
     use core::prelude::v1::test;
+    use futures_util::FutureExt;
     use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn filling_a_pending_queue_wakes_the_pending_ui_task() {
+        let queue = RwLock::new(Vec::new());
+        enqueue(&queue, 1);
+        assert!(pending_ui_wake().notified().now_or_never().is_some());
+
+        enqueue_bounded(&queue, 2, 4);
+        assert!(pending_ui_wake().notified().now_or_never().is_some());
+
+        push_value(&queue, 3);
+        assert_eq!(drain(&queue), vec![1, 2, 3]);
+    }
 
     fn poison(queue: Arc<RwLock<Vec<u8>>>) {
         let result = std::thread::spawn(move || {

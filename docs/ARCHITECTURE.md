@@ -145,7 +145,9 @@ flowchart TD
 - `src/app.rs` and `src/app/`: the top-level `EchoApp` view, with the split
   menu (`split_menu.rs`), the activity rail (`activity_rail.rs`), the
   pending-UI-work pass that drains backend queues needing `EchoApp`-owned
-  entities (`pending_ui_work.rs`), the settings importer's app side and the
+  entities (`pending_ui_work.rs`; filling one of those queues in
+  `backend/ui_actions.rs` wakes the pass instead of waiting for its
+  mode-dependent timer), the settings importer's app side and the
   benchmark drivers. `src/event_handlers.rs` wires hotkeys and actions; every
   hotkey is a `HotkeyAction`.
 - `src/main.rs` installs the panic hook, the single-instance lock and the

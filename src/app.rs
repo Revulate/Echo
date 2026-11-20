@@ -44,6 +44,9 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 const PENDING_UI_EMBED_INTERVAL: Duration = Duration::from_millis(100);
+/// Shortest gap between two pending-UI passes started by a queue wake, so a
+/// pass whose work fills a queue again cannot keep the task from yielding.
+const PENDING_UI_WAKE_MIN_SPACING: Duration = Duration::from_millis(4);
 const PENDING_UI_REAUTH_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_UI_SETTINGS_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_UI_ORPHAN_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
@@ -601,12 +604,22 @@ impl EchoApp {
                 echo_core::instant_ago(PENDING_UI_FOLLOWED_LIVE_INTERVAL)
                     .unwrap_or_else(Instant::now);
 
+            let mut last_pass = Instant::now();
             loop {
                 let interval = crate::managers::frame_rate_controller::current_mode_cached()
                     .pending_ui_interval();
-                cx.background_executor().timer(interval).await;
+                let woken = tokio::select! {
+                    _ = cx.background_executor().timer(interval) => false,
+                    _ = backend::ui_actions::pending_ui_wake().notified() => true,
+                };
+                if woken
+                    && let Some(wait) = PENDING_UI_WAKE_MIN_SPACING.checked_sub(last_pass.elapsed())
+                {
+                    cx.background_executor().timer(wait).await;
+                }
 
                 let now = Instant::now();
+                last_pass = now;
                 if this
                     .update(cx, |app, cx| {
                         let mut needs_notify = false;

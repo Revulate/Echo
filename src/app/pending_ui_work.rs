@@ -808,7 +808,7 @@ impl EchoApp {
                     jump.split_id,
                     channel
                 );
-                backend::push_pending_split_message_jump(
+                backend::ui_actions::requeue_pending_split_message_jump(
                     jump.split_id,
                     jump.channel,
                     jump.message_id,
@@ -850,7 +850,10 @@ impl EchoApp {
             self.activate_tab_split(tab_index, path.clone(), cx);
 
             let Some((_resolved_channel, split_id)) = self.split_target_for_path(&path, cx) else {
-                backend::push_pending_search_jump(channel.clone(), jump.message_id.clone());
+                backend::ui_actions::requeue_pending_search_jump(
+                    channel.clone(),
+                    jump.message_id.clone(),
+                );
                 continue;
             };
 
@@ -866,7 +869,10 @@ impl EchoApp {
                     channel,
                     path
                 );
-                backend::push_pending_search_jump(channel.clone(), jump.message_id.clone());
+                backend::ui_actions::requeue_pending_search_jump(
+                    channel.clone(),
+                    jump.message_id.clone(),
+                );
             }
         }
 
