@@ -180,7 +180,10 @@ flowchart TD
   `ChatState`'s shared snapshot (`crates/echo-core/src/chat_snapshot.rs`),
   whose unchanged rows, day dividers included, keep their `Arc` from one
   publish to the next. Each split's `ChatView` then syncs its
-  `CanvasMessageList`. While a split follows live chat, paced reveal
+  `CanvasMessageList`; a split in a hidden tab skips these syncs and takes
+  the latest snapshot in one sync when it is shown, prewarmed from a tab
+  hover, or targeted by a message jump (`ChatView::catch_up_hidden_split`).
+  While a split follows live chat, paced reveal
   (`echo_core::reveal_pacer`) holds the newest rows back; a sync whose
   visible rows are the shown ones, row for row by pointer, keeps the list the
   canvas has. The canvas applies an append, a history prepend, and a drop of
@@ -257,7 +260,8 @@ and opens a new window.
 2. **A split owns presentation demand.** A stable `SplitId` survives moves
    and resizes. Visibility, width, scale, visible media and the next due
    deadline belong to the split.
-3. **Scheduling follows demand.** Hidden canvases unregister their wakers;
+3. **Scheduling follows demand.** Hidden canvases unregister their wakers
+   and skip snapshot syncs;
    foreground, unfocused-visible, hidden and minimized windows keep distinct
    policies.
 4. **Static layout and dynamic playback stay separate.** Shaped text, source

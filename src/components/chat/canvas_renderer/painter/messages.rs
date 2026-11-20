@@ -1,7 +1,8 @@
 //! Message-buffer lifecycle and split activity handling.
 
 use super::message_delta::{
-    FrontDrop, MessageDeltaPlan, Reshape, UpdateKind, remap_after_front_drop,
+    FrontDrop, MessageDeltaPlan, Reshape, UpdateKind, first_trailing_new_row,
+    remap_after_front_drop,
 };
 use super::*;
 
@@ -468,6 +469,17 @@ impl CanvasMessageList {
                         self.after_front_drop(new_count, front, kept_changed);
                     }
                     None => {
+                        // No front drop: the rows after the last one this
+                        // split had are the new ones, as an append would
+                        // mark. A hidden split catching up in one sync
+                        // reaches this shape for what drains apart would
+                        // have been an append and a removal.
+                        if was_scrolled_away && front.is_none() && first_new_message_id.is_none() {
+                            first_new_message_id = first_trailing_new_row(&messages, |id| {
+                                self.get_message_index(id).is_some()
+                            })
+                            .map(|index| SharedString::from(messages[index].id.clone()));
+                        }
                         self.viewport_state.cached_viewport_paint_rows = None;
                         self.rebuild_message_model_from(&messages);
                         pending = 0;

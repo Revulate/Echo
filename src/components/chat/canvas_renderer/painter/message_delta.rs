@@ -159,6 +159,20 @@ pub(super) fn front_drop(order: &[SharedString], next: &[Arc<ChatMessage>]) -> O
         })
 }
 
+/// Index of the first of `next`'s last rows that `known` does not hold: the
+/// rows that arrived after every row the split already had. `None` when the
+/// last row is known.
+pub(super) fn first_trailing_new_row(
+    next: &[Arc<ChatMessage>],
+    known: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    let start = next
+        .iter()
+        .rposition(|message| known(message.id.as_ref()))
+        .map_or(0, |index| index + 1);
+    (start < next.len()).then_some(start)
+}
+
 /// The rows of `rows`, ordered by row index, that survive dropping the first
 /// `dropped` rows of the list, with their indices shifted to match.
 pub(super) fn remap_after_front_drop<T: Clone>(
@@ -213,6 +227,18 @@ mod tests {
 
     fn rows(ids: &[&str]) -> Vec<Arc<ChatMessage>> {
         ids.iter().map(|id| row(id)).collect()
+    }
+
+    #[test]
+    fn trailing_new_rows_start_after_the_last_known_row() {
+        let known = |id: &str| ["a", "b", "c"].contains(&id);
+        assert_eq!(
+            first_trailing_new_row(&rows(&["a", "x", "c", "y", "z"]), known),
+            Some(3)
+        );
+        assert_eq!(first_trailing_new_row(&rows(&["b", "x", "c"]), known), None);
+        assert_eq!(first_trailing_new_row(&rows(&["x", "y"]), known), Some(0));
+        assert_eq!(first_trailing_new_row(&rows(&[]), known), None);
     }
 
     #[test]
@@ -940,6 +966,7 @@ mod tests {
     #[test]
     fn paced_syncs_match_a_full_rebuild_for_every_publish_sequence() {
         let mut totals = [0usize; 5];
+        let mut caught_up_when_shown = 0usize;
         for seed in 0..48 {
             let mut rng = Rng(seed);
             // Most seeds run at a small cap; some stay below it, where a
@@ -953,6 +980,9 @@ mod tests {
             channel.hide_deleted = seed % 3 == 0;
             // A hidden split takes many syncs without a frame.
             let mut hidden_for = 0u32;
+            // A hidden split skips the syncs and takes the latest snapshot,
+            // all rows revealed, when it is shown.
+            let mut skipped_for = 0u32;
             for step in 0..400 {
                 match rng.below(24) {
                     0..=7 => {
@@ -1063,6 +1093,7 @@ mod tests {
                     }
                     19 => channel.split.queue_layout_rebuild(rng.below(2) == 0),
                     20 => hidden_for = 10 + rng.below(30) as u32,
+                    22 if skipped_for == 0 => skipped_for = 5 + rng.below(60) as u32,
                     21 => {
                         // Two appends, then a merge with an older and a newer
                         // row, all before a frame.
@@ -1090,6 +1121,17 @@ mod tests {
                     _ => {}
                 }
                 channel.tick(&mut rng);
+                if skipped_for > 0 {
+                    skipped_for -= 1;
+                    if skipped_for == 0 {
+                        channel.sync_with(true, false);
+                        channel
+                            .split
+                            .settle(&format!("seed {seed} step {step} shown"));
+                        caught_up_when_shown += 1;
+                    }
+                    continue;
+                }
                 let render = hidden_for == 0 && rng.below(4) != 0;
                 hidden_for = hidden_for.saturating_sub(1);
                 // Several syncs can land before a frame renders; now and
@@ -1121,5 +1163,6 @@ mod tests {
         assert!(reused > 100, "{reused}");
         assert!(caught_up > 10, "{caught_up}");
         assert!(merges > 50, "{merges}");
+        assert!(caught_up_when_shown > 100, "{caught_up_when_shown}");
     }
 }

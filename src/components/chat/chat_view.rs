@@ -181,24 +181,13 @@ impl ChatView {
             &chat_state,
             |this, entity, event: &ChatStateEvent, cx| match event {
                 ChatStateEvent::Added | ChatStateEvent::Replaced | ChatStateEvent::Retokenized => {
-                    let messages = entity.read(cx).messages.clone();
-                    if this.defer_inactive_history_prepend_if_needed(&messages, cx) {
+                    // A split in a hidden tab takes the latest snapshot when
+                    // it is shown, prewarmed or jumped in
+                    // (`catch_up_hidden_split`), not on every drain.
+                    if !this.canvas_list.read(cx).is_tab_visible() {
                         return;
                     }
-                    let message_width = canvas_message_width(this.message_width);
-                    let viewport_height = this.viewport_height;
-                    let highlights_enabled = this.highlights_enabled;
-                    let show_timestamp = this.show_timestamp;
-                    let is_active_split = this.is_active_split;
-                    let changed = this.sync_canvas_list_state(
-                        messages,
-                        message_width,
-                        viewport_height,
-                        highlights_enabled,
-                        show_timestamp,
-                        is_active_split,
-                        cx,
-                    );
+                    let changed = this.sync_latest_messages(&entity, cx);
                     if changed {
                         this.mark_dirty_for(ChatViewDirtyReason::ChatStateEvent);
                         crate::backend::metrics::record_ui_notify_source(
@@ -374,6 +363,40 @@ impl ChatView {
             self.canvas_list.update(cx, |_, cx| cx.notify());
             cx.notify();
         }
+    }
+
+    /// Apply the channel's latest snapshot, as each drain does for a shown
+    /// split; returns whether the canvas changed.
+    fn sync_latest_messages(
+        &mut self,
+        chat_state: &Entity<ChatState>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let messages = chat_state.read(cx).messages.clone();
+        if self.defer_inactive_history_prepend_if_needed(&messages, cx) {
+            return false;
+        }
+        self.sync_canvas_list_state(
+            messages,
+            canvas_message_width(self.message_width),
+            self.viewport_height,
+            self.highlights_enabled,
+            self.show_timestamp,
+            self.is_active_split,
+            cx,
+        )
+    }
+
+    /// Give a split in a hidden tab the snapshot it skipped while hidden, as
+    /// one sync. Call it before the split is shown, and before acting on its
+    /// rows (a message jump). Still hidden, the sync reveals every row
+    /// instead of pacing them. Returns whether the canvas changed.
+    pub fn catch_up_hidden_split(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.canvas_list.read(cx).is_tab_visible() {
+            return false;
+        }
+        let chat_state = self.chat_state.clone();
+        self.sync_latest_messages(&chat_state, cx)
     }
 
     /// Record the newest message as this split's last read position.

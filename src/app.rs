@@ -3298,6 +3298,9 @@ impl EchoApp {
         for (split_id, chat_view) in &self.chat_views {
             let visible = visible_split_ids.contains(split_id);
             chat_view.update(cx, |view, cx| {
+                if visible {
+                    view.catch_up_hidden_split(cx);
+                }
                 let changed = view.canvas_list.update(cx, |list, cx| {
                     let visibility_changed = list.set_tab_visible(visible);
                     let modifier_changed = if visible {

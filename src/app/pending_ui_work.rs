@@ -32,6 +32,8 @@ impl EchoApp {
     /// Scroll a chat view to `message_id`; returns whether the message is laid out.
     fn jump_chat_view(chat_view: &Entity<ChatView>, message_id: &str, cx: &mut App) -> bool {
         chat_view.update(cx, |view, cx| {
+            // The split may still be in a hidden tab, behind its snapshot.
+            view.catch_up_hidden_split(cx);
             let found = view
                 .canvas_list
                 .update(cx, |list, cx| list.scroll_to_message(message_id, cx));
