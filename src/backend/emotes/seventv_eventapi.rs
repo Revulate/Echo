@@ -49,6 +49,10 @@ const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 25_000;
 const HEARTBEAT_TIMEOUT_MULTIPLIER: u32 = 3;
 const DISPATCH_REFRESH_DEBOUNCE_MS: u64 = 250;
 const COMMAND_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest a connection sleeps between subscription flushes when nothing
+/// signals a change: it bounds the delay from a change that misses
+/// [`note_subscriptions_changed`].
+const SUBSCRIPTION_FLUSH_BACKSTOP: Duration = Duration::from_secs(5);
 
 /// Sentinel channel name for global emote set events
 const GLOBAL_SET_CHANNEL: &str = "__global__";
@@ -296,6 +300,19 @@ static PENDING_REFRESHES: LazyLock<Mutex<HashMap<String, PendingRefresh>>> =
 /// Whether a coalescing refresh worker is already sleeping/draining.
 static REFRESH_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Bumped whenever the desired subscriptions or the queued commands may have
+/// changed; a connection flushes only when it differs from its last flush.
+static SUBSCRIPTION_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Wakes the connection loop after [`SUBSCRIPTION_GENERATION`] moves or a
+/// shutdown is requested. `notify_one` keeps a permit, so a change made while
+/// the loop is busy is not lost.
+static SUBSCRIPTION_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+fn note_subscriptions_changed() {
+    SUBSCRIPTION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    SUBSCRIPTION_WAKE.notify_one();
+}
+
 static DIAGNOSTICS: LazyLock<Mutex<EventApiDiagnostics>> =
     LazyLock::new(|| Mutex::new(EventApiDiagnostics::default()));
 
@@ -498,6 +515,62 @@ impl ConnectionSubscriptions {
         AUTHORITATIVE_RECONCILE_REQUIRED.store(true, Ordering::SeqCst);
         RESUME_ACKED_SUBSCRIPTIONS.lock_or_recover().clear();
     }
+
+    /// The connection state a flush reads. Every transition that can change
+    /// what a flush sends (HELLO, RESUME and command ACKs, a failed RESUME
+    /// clearing the active set) changes it.
+    fn flush_state(&self) -> ConnectionFlushState {
+        ConnectionFlushState {
+            hello_received: self.hello_received,
+            resume_sent: self.resume_sent,
+            resume_pending: self.resume_pending,
+            active: self.active.len(),
+            pending: self.pending.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConnectionFlushState {
+    hello_received: bool,
+    resume_sent: bool,
+    resume_pending: bool,
+    active: usize,
+    pending: usize,
+}
+
+/// Whether a flush could send anything new: the shared generation moved
+/// since the last flush, or the connection's own state changed.
+fn flush_needed(
+    flushed_generation: Option<u64>,
+    generation: u64,
+    state_before: ConnectionFlushState,
+    state_after: ConnectionFlushState,
+) -> bool {
+    flushed_generation != Some(generation) || state_before != state_after
+}
+
+/// How long the connection loop may sleep before it must check for an
+/// expired ACK, never longer than [`SUBSCRIPTION_FLUSH_BACKSTOP`].
+fn subscription_tick_wait(
+    resume_pending: bool,
+    resume_sent_at: Option<Instant>,
+    pending: &[PendingSubscriptionCommand],
+    now: Instant,
+) -> Duration {
+    let resume_deadline = resume_sent_at
+        .filter(|_| resume_pending)
+        .map(|sent_at| sent_at + COMMAND_ACK_TIMEOUT);
+    pending
+        .iter()
+        .map(|pending| pending.sent_at + COMMAND_ACK_TIMEOUT)
+        .chain(resume_deadline)
+        .min()
+        .map_or(SUBSCRIPTION_FLUSH_BACKSTOP, |deadline| {
+            deadline
+                .saturating_duration_since(now)
+                .min(SUBSCRIPTION_FLUSH_BACKSTOP)
+        })
 }
 
 fn in_flight_command_count(resume_pending: bool, pending_count: usize) -> usize {
@@ -668,6 +741,7 @@ pub fn start_seventv_event_api() {
 pub fn shutdown() {
     let start = Instant::now();
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    SUBSCRIPTION_WAKE.notify_one();
     crate::log_emotes!(
         info,
         elapsed_ms = start.elapsed().as_millis(),
@@ -831,6 +905,7 @@ pub(crate) fn resubscribe_channel(channel_login: &str) {
         DIAGNOSTICS.lock_or_recover().connected
     );
     FORCED_RESUBSCRIBES.lock_or_recover().extend(keys);
+    note_subscriptions_changed();
     if !RUNNING.load(Ordering::SeqCst) && !replay_only() {
         start_seventv_event_api();
     }
@@ -1634,13 +1709,19 @@ fn get_channels_for_user(user_id: &str) -> Vec<String> {
 }
 
 fn add_set_channel_mapping(set_id: &str, channel: &str) {
-    let mut owners = SET_TO_CHANNELS.entry(set_id.to_string()).or_default();
-    owners.insert(channel.to_string());
+    SET_TO_CHANNELS
+        .entry(set_id.to_string())
+        .or_default()
+        .insert(channel.to_string());
+    note_subscriptions_changed();
 }
 
 fn add_user_channel_mapping(user_id: &str, channel: &str) {
-    let mut owners = USER_TO_CHANNELS.entry(user_id.to_string()).or_default();
-    owners.insert(channel.to_string());
+    USER_TO_CHANNELS
+        .entry(user_id.to_string())
+        .or_default()
+        .insert(channel.to_string());
+    note_subscriptions_changed();
 }
 
 fn remove_set_channel_mapping(set_id: &str, channel: &str) {
@@ -1648,6 +1729,7 @@ fn remove_set_channel_mapping(set_id: &str, channel: &str) {
         owners.remove(channel);
         owners.is_empty()
     });
+    note_subscriptions_changed();
 }
 
 fn remove_user_channel_mapping(user_id: &str, channel: &str) {
@@ -1681,10 +1763,13 @@ fn channel_details_for_user_connection(
 }
 
 fn queue_subscription_command(command: SubscriptionCommand) {
-    let mut pending = PENDING_SUBSCRIPTIONS.lock_or_recover();
-    if !pending.contains(&command) {
-        pending.push(command);
+    {
+        let mut pending = PENDING_SUBSCRIPTIONS.lock_or_recover();
+        if !pending.contains(&command) {
+            pending.push(command);
+        }
     }
+    note_subscriptions_changed();
 }
 
 fn update_diagnostics(update: impl FnOnce(&mut EventApiDiagnostics)) {
@@ -1824,6 +1909,8 @@ async fn run_connection() -> Result<&'static str, String> {
     let mut subscriptions = ConnectionSubscriptions::new(previous_session_id);
 
     let mut health = ConnectionHealth::new();
+    // Generation of the last flush; `None` makes the first chance flush.
+    let mut flushed_generation = None;
 
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
@@ -1832,8 +1919,27 @@ async fn run_connection() -> Result<&'static str, String> {
         }
 
         let heartbeat_wait = health.timeout_remaining();
+        let tick_wait = subscription_tick_wait(
+            subscriptions.resume_pending,
+            subscriptions.resume_sent_at,
+            &subscriptions.pending,
+            Instant::now(),
+        );
         tokio::select! {
-            _ = sleep(Duration::from_millis(250)) => {
+            _ = SUBSCRIPTION_WAKE.notified() => {
+                if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                    let _ = ws_sink.send(Message::Close(None)).await;
+                    return Ok("shutdown");
+                }
+                let state = subscriptions.flush_state();
+                let generation = SUBSCRIPTION_GENERATION.load(Ordering::SeqCst);
+                if flush_needed(flushed_generation, generation, state, state) {
+                    flushed_generation = Some(generation);
+                    flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
+                }
+            }
+
+            _ = sleep(tick_wait) => {
                 if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                     let _ = ws_sink.send(Message::Close(None)).await;
                     return Ok("shutdown");
@@ -1846,6 +1952,8 @@ async fn run_connection() -> Result<&'static str, String> {
                             .to_string(),
                     );
                 }
+                // Backstop: flush even without a signalled change.
+                flushed_generation = Some(SUBSCRIPTION_GENERATION.load(Ordering::SeqCst));
                 flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
             }
 
@@ -1867,6 +1975,7 @@ async fn run_connection() -> Result<&'static str, String> {
                         return Err(format!("WebSocket error: {e}"));
                     }
                     Some(Ok(Message::Text(text))) => {
+                        let state_before = subscriptions.flush_state();
                         if handle_message(&text, &mut health, &mut subscriptions).await? == MessageControl::Reconnect {
                             update_diagnostics(|diag| {
                                 diag.connected = false;
@@ -1877,7 +1986,16 @@ async fn run_connection() -> Result<&'static str, String> {
                             diag.last_heartbeat_ms_ago =
                                 Some(health.last_heartbeat.elapsed().as_millis() as u64);
                         });
-                        flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
+                        let generation = SUBSCRIPTION_GENERATION.load(Ordering::SeqCst);
+                        if flush_needed(
+                            flushed_generation,
+                            generation,
+                            state_before,
+                            subscriptions.flush_state(),
+                        ) {
+                            flushed_generation = Some(generation);
+                            flush_connection_commands(&mut ws_sink, &mut subscriptions).await?;
+                        }
                     }
                     Some(Ok(Message::Close(_))) => {
                         return Ok("server sent close frame");
@@ -3871,6 +3989,79 @@ fn push_emote_notification(channel: &str, text: &str) {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+
+    fn flush_state(active: usize, pending: usize) -> ConnectionFlushState {
+        ConnectionFlushState {
+            hello_received: true,
+            resume_sent: true,
+            resume_pending: false,
+            active,
+            pending,
+        }
+    }
+
+    #[test]
+    fn flush_runs_only_when_the_generation_or_connection_state_moved() {
+        let state = flush_state(3, 0);
+        assert!(
+            flush_needed(None, 0, state, state),
+            "the first chance flushes"
+        );
+        assert!(!flush_needed(Some(7), 7, state, state));
+        assert!(flush_needed(Some(7), 8, state, state));
+        // A subscribe ACK moves a command from pending to active.
+        assert!(flush_needed(
+            Some(7),
+            7,
+            flush_state(3, 1),
+            flush_state(4, 0)
+        ));
+        let mut greeted = state;
+        greeted.hello_received = false;
+        assert!(flush_needed(Some(7), 7, greeted, state));
+    }
+
+    #[test]
+    fn noting_a_change_bumps_the_generation() {
+        let before = SUBSCRIPTION_GENERATION.load(Ordering::SeqCst);
+        note_subscriptions_changed();
+        assert!(SUBSCRIPTION_GENERATION.load(Ordering::SeqCst) > before);
+    }
+
+    #[test]
+    fn tick_waits_for_the_earliest_ack_deadline_within_the_backstop() {
+        let now = Instant::now();
+        assert_eq!(
+            subscription_tick_wait(false, None, &[], now),
+            SUBSCRIPTION_FLUSH_BACKSTOP
+        );
+
+        let pending = |sent_ago: Duration| PendingSubscriptionCommand {
+            command: SubscriptionCommand::Subscribe(SubscriptionKey::emote_set("set".to_string())),
+            sent_at: now - sent_ago,
+        };
+        let near = [pending(COMMAND_ACK_TIMEOUT - Duration::from_secs(2))];
+        assert_eq!(
+            subscription_tick_wait(false, None, &near, now),
+            Duration::from_secs(2)
+        );
+        let overdue = [pending(COMMAND_ACK_TIMEOUT + Duration::from_secs(1))];
+        assert_eq!(
+            subscription_tick_wait(false, None, &overdue, now),
+            Duration::ZERO
+        );
+
+        let resume_sent = now - (COMMAND_ACK_TIMEOUT - Duration::from_secs(1));
+        assert_eq!(
+            subscription_tick_wait(true, Some(resume_sent), &[], now),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            subscription_tick_wait(false, Some(resume_sent), &[], now),
+            SUBSCRIPTION_FLUSH_BACKSTOP,
+            "an answered RESUME has no deadline"
+        );
+    }
 
     #[test]
     fn reconnect_backoff_resets_only_after_a_healthy_session() {
