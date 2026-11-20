@@ -359,6 +359,7 @@ pub fn initialize() {
                         crate::backend::emotes::DiskCacheParts::Shared,
                     )
                     .await;
+                crate::backend::emotes::mark_shared_disk_hydration_finished();
                 crate::log_emotes!(
                     info,
                     "Loaded shared emote cache: global={}, channels={}",

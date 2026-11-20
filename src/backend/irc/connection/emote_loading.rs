@@ -210,14 +210,9 @@ pub(super) fn schedule_staggered_channel_emote_load(
     }
 
     let slot = DEFERRED_CHANNEL_EMOTE_REFRESH_SLOT.fetch_add(1, Ordering::Relaxed);
+    // The resident catalog at scheduling picks the delay only; whether to
+    // refresh is decided when the load runs (see `join_load_decision`).
     let has_cache = cached_count > 0;
-    // A fresh resident catalog the 7TV EventAPI already owns is served as is;
-    // the non-forced load below returns it from cache and still hydrates FFZ
-    // room badges.
-    let force_refresh = has_cache && EMOTE_CACHE.channel_join_needs_forced_refresh(&channel_key);
-    if has_cache && !force_refresh {
-        crate::backend::metrics::record_emote_event("irc.channel_emotes.deferred_cached.fresh");
-    }
     let (base_delay, stagger) = if has_cache {
         (
             CACHED_CHANNEL_EMOTE_REFRESH_BASE_DELAY_MS,
@@ -242,14 +237,9 @@ pub(super) fn schedule_staggered_channel_emote_load(
     if has_cache {
         crate::log_emotes!(
             debug,
-            "Using cached emotes for {} immediately ({} emotes); deferred {} in {}ms ({})",
+            "Using cached emotes for {} immediately ({} emotes); deferred load in {}ms ({})",
             channel_key,
             cached_count,
-            if force_refresh {
-                "refresh"
-            } else {
-                "cache check"
-            },
             delay_ms,
             reason
         );
@@ -265,6 +255,28 @@ pub(super) fn schedule_staggered_channel_emote_load(
 
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        // A fresh resident catalog the 7TV EventAPI owns (or that registers
+        // its saved 7TV state here) is served as is; the non-forced load
+        // returns it from cache and still hydrates FFZ room badges.
+        let (cached_count, force_refresh) = EMOTE_CACHE.join_load_decision(&channel_key).await;
+        if cached_count > 0 {
+            if !force_refresh {
+                crate::backend::metrics::record_emote_event(
+                    "irc.channel_emotes.deferred_cached.fresh",
+                );
+            }
+            crate::log_emotes!(
+                debug,
+                "Join catalog decision for {} ({} emotes): {}",
+                channel_key,
+                cached_count,
+                if force_refresh {
+                    "refresh"
+                } else {
+                    "cache check"
+                }
+            );
+        }
         let started_at = std::time::Instant::now();
         let outcome = EMOTE_CACHE
             .load_channel_emotes_reporting(&channel_id, &channel_key, force_refresh)

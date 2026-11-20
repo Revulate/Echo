@@ -136,6 +136,36 @@ pub(crate) async fn wait_for_initial_catalogs_ready() {
     }
 }
 
+/// Set once startup's shared disk hydration (the global set and the startup
+/// channels' catalogs with their saved 7TV state) has finished.
+static SHARED_DISK_HYDRATED: AtomicBool = AtomicBool::new(false);
+static SHARED_DISK_HYDRATED_NOTIFY: LazyLock<tokio::sync::Notify> =
+    LazyLock::new(tokio::sync::Notify::new);
+/// Longest a join's catalog decision waits for that hydration. It usually
+/// takes milliseconds; the bound only covers a start-up path that never runs
+/// it.
+const SHARED_DISK_HYDRATION_WAIT: Duration = Duration::from_secs(2);
+
+pub(crate) fn mark_shared_disk_hydration_finished() {
+    SHARED_DISK_HYDRATED.store(true, Ordering::Release);
+    SHARED_DISK_HYDRATED_NOTIFY.notify_waiters();
+}
+
+async fn wait_for_shared_disk_hydration() {
+    let wait = async {
+        loop {
+            // Created before the check, so a `notify_waiters` in between is
+            // not lost.
+            let notified = SHARED_DISK_HYDRATED_NOTIFY.notified();
+            if SHARED_DISK_HYDRATED.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    };
+    let _ = tokio::time::timeout(SHARED_DISK_HYDRATION_WAIT, wait).await;
+}
+
 static EMOTE_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
     LazyLock::new(|| crate::backend::http::ClientCache::new(build_emote_http_client));
 
@@ -4156,6 +4186,19 @@ impl EmoteCache {
             || self.channel_emotes_need_refresh(&cache_key)
     }
 
+    /// A join's catalog decision, taken when its load is about to run rather
+    /// than when the JOIN scheduled it: after startup's shared disk hydration
+    /// (waiting for it at most [`SHARED_DISK_HYDRATION_WAIT`]), so a catalog
+    /// and a saved 7TV state hydrated after the JOIN are seen. Returns the
+    /// resident emote count and whether the load must force a refresh.
+    pub async fn join_load_decision(&self, channel_login: &str) -> (usize, bool) {
+        wait_for_shared_disk_hydration().await;
+        let cached_count = self.channel_emote_count(channel_login);
+        let force_refresh =
+            cached_count > 0 && self.channel_join_needs_forced_refresh(channel_login);
+        (cached_count, force_refresh)
+    }
+
     /// Return true when a channel cache is missing or stale enough to justify a provider fetch.
     pub fn channel_emotes_need_refresh(&self, channel_login: &str) -> bool {
         let cache_key = normalize_channel_key(channel_login);
@@ -5304,6 +5347,57 @@ mod provider_index_tests {
             merge(twitch_channel_emotes_without_token(false)),
             Vec::<String>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn the_join_decision_waits_for_disk_hydration_and_sees_its_state() {
+        let channel = "join_decision_order_test".to_string();
+        let _cleanup = ChannelTestCleanup(channel.clone());
+        struct StateCleanup(String);
+        impl Drop for StateCleanup {
+            fn drop(&mut self) {
+                EMOTE_CACHE.channel_emote_set_ids.remove(&self.0);
+                seventv_eventapi::unsubscribe_channel(&self.0);
+                mark_shared_disk_hydration_finished();
+            }
+        }
+        let _state_cleanup = StateCleanup(channel.clone());
+        SHARED_DISK_HYDRATED.store(false, Ordering::Release);
+
+        // The JOIN asks before hydration has landed.
+        let decision = tokio::spawn(async {
+            EMOTE_CACHE
+                .join_load_decision("join_decision_order_test")
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!decision.is_finished(), "the decision waits for hydration");
+
+        // Hydration then installs a fresh catalog and its saved 7TV state.
+        EMOTE_CACHE.channels.insert(
+            channel.clone(),
+            entry([emote(EmoteProvider::SevenTV, "order-1", "orderEmote")]),
+        );
+        seventv_eventapi::stash_disk_channel_state(
+            &channel,
+            disk_seventv_state(
+                crate::utils::unix_now_secs() - 60,
+                "order-user",
+                "order-set",
+            ),
+        );
+        mark_shared_disk_hydration_finished();
+
+        let (cached_count, force_refresh) = tokio::time::timeout(Duration::from_secs(5), decision)
+            .await
+            .expect("hydration wakes the decision")
+            .unwrap();
+        assert_eq!(cached_count, 1, "the hydrated catalog is seen");
+        assert!(
+            !force_refresh,
+            "its saved state registers instead of a refetch"
+        );
+        assert!(seventv_eventapi::channel_has_subscription_owner(&channel));
     }
 
     fn disk_seventv_state(
