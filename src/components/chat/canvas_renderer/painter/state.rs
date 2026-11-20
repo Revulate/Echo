@@ -450,12 +450,69 @@ pub(super) struct WakeState {
     pub(super) stall_repaint_requested: bool,
     pub(super) window_visibility_subscription: Option<gpui::Subscription>,
     pub(super) window_activation_subscription: Option<gpui::Subscription>,
+    /// Renders in a row that requested a settle frame for themselves.
+    pub(super) consecutive_settle_frames: u16,
 }
 
+/// Settle frames a canvas requests for itself in a row before it stops. Each
+/// settle frame refreshes or rebuilds a bounded number of visible rows, so a
+/// full viewport converges well within this; the cap only ends a loop whose
+/// condition fails to clear.
+pub(super) const MAX_CONSECUTIVE_SETTLE_FRAMES: u16 = 120;
+
 impl WakeState {
+    /// Whether this render should request a settle frame for itself, given
+    /// that it still needs one. A render that needs none resets the count.
+    pub(super) fn take_settle_frame_request(&mut self, needs_settle: bool) -> bool {
+        if !needs_settle {
+            self.consecutive_settle_frames = 0;
+            return false;
+        }
+        if self.consecutive_settle_frames >= MAX_CONSECUTIVE_SETTLE_FRAMES {
+            return false;
+        }
+        self.consecutive_settle_frames += 1;
+        if self.consecutive_settle_frames == MAX_CONSECUTIVE_SETTLE_FRAMES {
+            crate::log_ui!(
+                warn,
+                "Canvas stopped requesting settle frames after {} in a row",
+                MAX_CONSECUTIVE_SETTLE_FRAMES
+            );
+        }
+        true
+    }
+
     /// Invalidate work started for the previous hover target.
     #[inline]
     pub(super) fn bump_hover_generation(&mut self) {
         self.hover_generation = self.hover_generation.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CONSECUTIVE_SETTLE_FRAMES, WakeState};
+    use core::prelude::v1::test;
+
+    #[test]
+    fn settle_frame_requests_stop_at_the_cap_until_a_render_settles() {
+        let mut state = WakeState::default();
+        for _ in 0..MAX_CONSECUTIVE_SETTLE_FRAMES {
+            assert!(state.take_settle_frame_request(true));
+        }
+        assert!(!state.take_settle_frame_request(true));
+        assert!(!state.take_settle_frame_request(true));
+
+        assert!(!state.take_settle_frame_request(false));
+        assert!(state.take_settle_frame_request(true));
+    }
+
+    #[test]
+    fn a_settled_render_requests_no_frame_and_resets_the_count() {
+        let mut state = WakeState::default();
+        assert!(state.take_settle_frame_request(true));
+        assert!(state.take_settle_frame_request(true));
+        assert!(!state.take_settle_frame_request(false));
+        assert_eq!(state.consecutive_settle_frames, 0);
     }
 }

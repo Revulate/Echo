@@ -188,7 +188,12 @@ flowchart TD
   async-layout waker, an image-load waker keyed on a visible-image readiness
   signature, and a width-stabilization waker that renders once more after a
   pending width-bucket change settles. A canvas repaints only when one of
-  these, input, or a model change notifies it.
+  these, input, or a model change notifies it. A view that notifies itself
+  during its own render is only redrawn on the next frame something else
+  causes, so the canvas asks for its next frame with
+  `window.request_animation_frame()` instead: each smooth-scroll step, and
+  a settle frame after a render that rebuilt visible rows or moved the
+  scroll target (capped at `MAX_CONSECUTIVE_SETTLE_FRAMES` in a row).
 - **Animation patching.** An animation tick patches the new emote or
   name-paint frame into the already presented scene
   (`Window::patch_animated_image` in the fork) instead of redrawing the

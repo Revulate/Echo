@@ -49,7 +49,12 @@ impl Render for CanvasMessageList {
             self.end_lost_selection_drag();
         }
 
-        if self.update_scroll_animation() && !self.wake_state.animation_waker_running {
+        // A view notifying itself during its own render is only redrawn on
+        // the next frame something else causes, so the next animation step
+        // requests that frame.
+        // The animation ends once the remaining distance is under half a
+        // pixel (`update_scroll_animation`).
+        if self.update_scroll_animation() {
             crate::backend::metrics::record_ui_notify_source("canvas.scroll_animation");
             if *RENDER_TRACE_ENABLED {
                 crate::log_perf_render!(
@@ -58,7 +63,7 @@ impl Render for CanvasMessageList {
                     self.channel_id
                 );
             }
-            cx.notify();
+            window.request_animation_frame();
         }
 
         self.clamp_scroll_offset_to_content();
@@ -829,14 +834,15 @@ impl Render for CanvasMessageList {
 
         needs_notify |= self.resume_stranded_bottom_follow(cx);
 
-        if needs_notify
-            && !self.wake_state.animation_waker_running
-            && !self.wake_state.async_layout_waker_running
-            && !self.wake_state.image_load_waker_running
-            && !self.wake_state.width_stabilization_waker_running
+        // The async-layout waker renders again when its layouts land; every
+        // other waker may patch or stay silent, so it cannot stand in for
+        // the settle frame.
+        if self
+            .wake_state
+            .take_settle_frame_request(needs_notify && !self.wake_state.async_layout_waker_running)
         {
             crate::backend::metrics::record_ui_notify_source("canvas.render_state_settled");
-            cx.notify();
+            window.request_animation_frame();
         }
 
         render_trace.finish();
