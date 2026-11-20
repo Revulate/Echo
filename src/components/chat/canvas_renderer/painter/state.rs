@@ -469,9 +469,16 @@ pub(super) const MAX_CONSECUTIVE_SETTLE_FRAMES: u16 = 120;
 
 impl WakeState {
     /// Whether this render should request a settle frame for itself, given
-    /// that it still needs one. A render that needs none resets the count.
-    pub(super) fn take_settle_frame_request(&mut self, needs_settle: bool) -> bool {
-        if !needs_settle {
+    /// that it still needs one. A render that needs none, or whose next frame
+    /// is already coming (`next_frame_covered`: a scroll-animation step or the
+    /// async-layout waker), resets the count, so the cap only counts settle
+    /// frames that keep the canvas rendering on their own.
+    pub(super) fn take_settle_frame_request(
+        &mut self,
+        needs_settle: bool,
+        next_frame_covered: bool,
+    ) -> bool {
+        if !needs_settle || next_frame_covered {
             self.consecutive_settle_frames = 0;
             return false;
         }
@@ -505,21 +512,32 @@ mod tests {
     fn settle_frame_requests_stop_at_the_cap_until_a_render_settles() {
         let mut state = WakeState::default();
         for _ in 0..MAX_CONSECUTIVE_SETTLE_FRAMES {
-            assert!(state.take_settle_frame_request(true));
+            assert!(state.take_settle_frame_request(true, false));
         }
-        assert!(!state.take_settle_frame_request(true));
-        assert!(!state.take_settle_frame_request(true));
+        assert!(!state.take_settle_frame_request(true, false));
+        assert!(!state.take_settle_frame_request(true, false));
 
-        assert!(!state.take_settle_frame_request(false));
-        assert!(state.take_settle_frame_request(true));
+        assert!(!state.take_settle_frame_request(false, false));
+        assert!(state.take_settle_frame_request(true, false));
     }
 
     #[test]
     fn a_settled_render_requests_no_frame_and_resets_the_count() {
         let mut state = WakeState::default();
-        assert!(state.take_settle_frame_request(true));
-        assert!(state.take_settle_frame_request(true));
-        assert!(!state.take_settle_frame_request(false));
+        assert!(state.take_settle_frame_request(true, false));
+        assert!(state.take_settle_frame_request(true, false));
+        assert!(!state.take_settle_frame_request(false, false));
         assert_eq!(state.consecutive_settle_frames, 0);
+    }
+
+    #[test]
+    fn frames_a_scroll_animation_requested_do_not_count_toward_the_cap() {
+        let mut state = WakeState::default();
+        for _ in 0..3 * MAX_CONSECUTIVE_SETTLE_FRAMES {
+            assert!(!state.take_settle_frame_request(true, true));
+        }
+        assert_eq!(state.consecutive_settle_frames, 0);
+        // The first frame after the animation ends still gets its settle frame.
+        assert!(state.take_settle_frame_request(true, false));
     }
 }

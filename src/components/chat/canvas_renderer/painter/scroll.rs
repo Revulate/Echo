@@ -76,6 +76,7 @@ impl CanvasMessageList {
     pub fn revalidate_on_show(&mut self) {
         self.clamp_scroll_offset_to_content();
         self.viewport_state.cached_visible_render_range = None;
+        self.wake_state.consecutive_settle_frames = 0;
     }
 
     /// Scroll to top of chat (Ctrl+Home / Home) - with smooth animation
@@ -542,20 +543,15 @@ impl CanvasMessageList {
             .as_secs_f32();
         self.scroll_controller.state.scroll_animation_start = now;
 
-        let duration_s = (duration_ms as f32) / 1000.0;
-        let smoothness = 3.0 / duration_s;
-
-        let factor = 1.0 - (-smoothness * dt).exp();
-        let diff = self.scroll_controller.state.scroll_desired - self.scroll_controller.offset;
-        self.scroll_controller.offset += diff * factor;
-
-        if diff.abs() < 0.5 {
-            self.scroll_controller.offset = self.scroll_controller.state.scroll_desired;
-            self.scroll_controller.state.scroll_animating = false;
-            return false;
-        }
-
-        true
+        let (offset, animating) = scroll_animation_step(
+            self.scroll_controller.offset,
+            self.scroll_controller.state.scroll_desired,
+            dt,
+            (duration_ms as f32) / 1000.0,
+        );
+        self.scroll_controller.offset = offset;
+        self.scroll_controller.state.scroll_animating = animating;
+        animating
     }
 
     /// Start a smooth scroll animation to a target position.
@@ -688,5 +684,86 @@ impl CanvasMessageList {
     pub(super) fn predictive_lookahead_boost(&self) -> usize {
         const MAX_PREDICTIVE_AHEAD: f32 = 30.0;
         (self.scroll_controller.state.accel_ema * MAX_PREDICTIVE_AHEAD) as usize
+    }
+}
+
+/// One frame of the smooth-scroll animation: move `offset` toward `desired`
+/// by the frame-rate-independent fraction `1 - exp(-3 dt / duration)` of the
+/// remaining distance. Returns the new offset and whether the animation goes
+/// on; it stops, snapped to `desired`, once less than half a pixel remained.
+fn scroll_animation_step(offset: f32, desired: f32, dt_s: f32, duration_s: f32) -> (f32, bool) {
+    let diff = desired - offset;
+    if diff.abs() < 0.5 {
+        return (desired, false);
+    }
+    let factor = 1.0 - (-(3.0 / duration_s) * dt_s).exp();
+    (offset + diff * factor, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scroll_animation_step;
+    use core::prelude::v1::test;
+
+    /// Run the animation at `hz` until it stops, moving the target by
+    /// `target_step` px for the first `moving_frames` frames. Returns the
+    /// frames it ran and the final offset, or `None` past `limit` frames.
+    fn run(
+        mut offset: f32,
+        mut desired: f32,
+        duration_s: f32,
+        hz: f32,
+        moving_frames: usize,
+        target_step: f32,
+        limit: usize,
+    ) -> Option<(usize, f32, f32)> {
+        for frame in 1..=limit {
+            if frame <= moving_frames {
+                desired += target_step;
+            }
+            let (next, animating) = scroll_animation_step(offset, desired, 1.0 / hz, duration_s);
+            offset = next;
+            if !animating {
+                return Some((frame, offset, desired));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_page_scroll_ends_on_its_target_within_a_bounded_number_of_frames() {
+        for hz in [60.0, 144.0, 240.0] {
+            for duration_s in [0.05, 0.15, 1.0] {
+                let (frames, offset, desired) =
+                    run(4000.0, 3320.0, duration_s, hz, 0, 0.0, 10_000).expect("terminates");
+                assert_eq!(offset, desired);
+                // 680 px decays below half a pixel in ln(1360) / 3 durations.
+                let bound = (1360f32.ln() / 3.0 * duration_s * hz).ceil() as usize + 2;
+                assert!(
+                    frames <= bound,
+                    "{hz} Hz {duration_s} s: {frames} > {bound}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_target_that_keeps_moving_ends_once_it_stops() {
+        // A target that grows faster than the animation closes the gap keeps
+        // it running; once the target stops, the remaining gap decays.
+        let (frames, offset, desired) =
+            run(0.0, 600.0, 0.15, 144.0, 300, 4.0, 10_000).expect("terminates");
+        assert!(frames > 300);
+        assert_eq!(offset, desired);
+        assert!(frames <= 300 + 60, "{frames}");
+    }
+
+    #[test]
+    fn a_sub_pixel_gap_snaps_at_once_and_a_zero_dt_frame_holds_still() {
+        assert_eq!(
+            scroll_animation_step(10.0, 10.3, 0.007, 0.15),
+            (10.3, false)
+        );
+        assert_eq!(scroll_animation_step(10.0, 100.0, 0.0, 0.15), (10.0, true));
     }
 }

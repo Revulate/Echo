@@ -587,7 +587,11 @@ root_test	src/components/chat/canvas_renderer/global_layout_cache.rs	replacement
 root_test	src/components/chat/canvas_renderer/layout.rs	cache_distinguishes_key_and_exact_measurement
 root_test	src/components/chat/canvas_renderer/layout.rs	cache_keeps_recent_keys_for_several_scales
 root_test	src/components/chat/canvas_renderer/layout.rs	poison_discards_partial_probe_and_allows_reuse
+root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_page_scroll_ends_on_its_target_within_a_bounded_number_of_frames
+root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_sub_pixel_gap_snaps_at_once_and_a_zero_dt_frame_holds_still
+root_test	src/components/chat/canvas_renderer/painter/scroll.rs	a_target_that_keeps_moving_ends_once_it_stops
 root_test	src/components/chat/canvas_renderer/painter/state.rs	a_settled_render_requests_no_frame_and_resets_the_count
+root_test	src/components/chat/canvas_renderer/painter/state.rs	frames_a_scroll_animation_requested_do_not_count_toward_the_cap
 root_test	src/components/chat/canvas_renderer/painter/state.rs	settle_frame_requests_stop_at_the_cap_until_a_render_settles
 root_test	src/components/chat/canvas_renderer/painter/viewport_element.rs	culls_only_fully_clipped_rows_with_bounded_paint
 root_test	src/components/chat/canvas_renderer/painter/viewport_element.rs	retains_rows_with_unbounded_name_paint_overflow
@@ -876,7 +880,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	390
+summary	root_tests	400
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

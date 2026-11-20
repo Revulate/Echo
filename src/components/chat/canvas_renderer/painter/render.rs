@@ -53,8 +53,9 @@ impl Render for CanvasMessageList {
         // the next frame something else causes, so the next animation step
         // requests that frame.
         // The animation ends once the remaining distance is under half a
-        // pixel (`update_scroll_animation`).
-        if self.update_scroll_animation() {
+        // pixel (`scroll_animation_step`).
+        let scroll_frame_requested = self.update_scroll_animation();
+        if scroll_frame_requested {
             crate::backend::metrics::record_ui_notify_source("canvas.scroll_animation");
             if *RENDER_TRACE_ENABLED {
                 crate::log_perf_render!(
@@ -836,13 +837,14 @@ impl Render for CanvasMessageList {
 
         needs_notify |= self.resume_stranded_bottom_follow(cx);
 
-        // The async-layout waker renders again when its layouts land; every
+        // The async-layout waker renders again when its layouts land, and a
+        // running scroll animation already requested the next frame; every
         // other waker may patch or stay silent, so it cannot stand in for
         // the settle frame.
-        if self
-            .wake_state
-            .take_settle_frame_request(needs_notify && !self.wake_state.async_layout_waker_running)
-        {
+        if self.wake_state.take_settle_frame_request(
+            needs_notify,
+            scroll_frame_requested || self.wake_state.async_layout_waker_running,
+        ) {
             crate::backend::metrics::record_ui_notify_source("canvas.render_state_settled");
             window.request_animation_frame();
         }
