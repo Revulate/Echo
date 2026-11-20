@@ -528,11 +528,17 @@ async fn run_detection_loop(
 /// the window opens, so a result normally exists before chat ingest checks
 /// [`detection_pending`]: cached history reaches that check a few
 /// milliseconds after backend init, sooner than a scan started at init
-/// finishes. Settings are not loaded yet, so this runs whatever the mode;
-/// outside Auto the result is never read, and a switch into Auto resets it.
+/// finishes. Settings are not loaded yet, so it reads only the saved mode from
+/// the settings file and scans only when that is Auto (also when the file is
+/// missing or unreadable); in another mode nothing scans, and a switch into
+/// Auto resets detection and asks for a scan anyway. If the full load ends in
+/// Auto when this did not scan, the task scans at backend init as before.
 /// It claims and records like the detection task, so the task never scans at
 /// the same time and a reset in the meantime discards the result.
 pub fn run_startup_detection() {
+    if super::settings::streamer_mode_status_before_load() != StreamerModeStatus::Auto {
+        return;
+    }
     let Some(generation) = claim_detection_refresh(&mut DETECTION_CACHE.write_or_recover()) else {
         return;
     };

@@ -3439,6 +3439,39 @@ pub fn settings_file_was_missing_at_startup() -> bool {
     SETTINGS_FILE_MISSING_AT_LOAD.load(Ordering::Acquire)
 }
 
+/// The streamer mode settings.json selects, read before [`SETTINGS`] loads
+/// and without loading it (no keyring, no migration, no backup recovery), so
+/// the launch detection can skip its process scan outside Auto. A missing or
+/// unreadable file gives the default, Auto.
+pub(crate) fn streamer_mode_status_before_load() -> super::streamer_mode::StreamerModeStatus {
+    let path = crate::storage_roots::config_root_or_current_dir().join("settings.json");
+    fs::read_to_string(path)
+        .map(|content| streamer_mode_status_in_settings_json(&content))
+        .unwrap_or_default()
+}
+
+/// The streamer mode a settings document selects, reading only that value.
+/// Anything that does not yield it gives the default, Auto.
+fn streamer_mode_status_in_settings_json(
+    content: &str,
+) -> super::streamer_mode::StreamerModeStatus {
+    #[derive(Deserialize)]
+    struct Document {
+        #[serde(default)]
+        streamer_mode: Option<StreamerMode>,
+    }
+    #[derive(Deserialize)]
+    struct StreamerMode {
+        #[serde(default)]
+        enabled: super::streamer_mode::StreamerModeStatus,
+    }
+    serde_json::from_str::<Document>(content)
+        .ok()
+        .and_then(|document| document.streamer_mode)
+        .map(|streamer_mode| streamer_mode.enabled)
+        .unwrap_or_default()
+}
+
 /// Path to Echo's active settings file.
 pub fn settings_file_path() -> PathBuf {
     SettingsManager::new().file_path
@@ -7923,6 +7956,51 @@ mod salvage_tests {
             salvaged.mod_buttons.len(),
             AppSettings::default().mod_buttons.len()
         );
+    }
+
+    #[test]
+    fn the_launch_reads_only_the_streamer_mode_and_defaults_to_auto() {
+        use super::super::streamer_mode::{StreamerModeSettings, StreamerModeStatus};
+        for mode in [
+            StreamerModeStatus::Auto,
+            StreamerModeStatus::AlwaysOn,
+            StreamerModeStatus::Disabled,
+        ] {
+            let mut settings = AppSettings::default();
+            settings.streamer_mode = Some(StreamerModeSettings {
+                enabled: mode,
+                ..Default::default()
+            });
+            let mut document = serde_json::to_value(&settings).unwrap();
+            // A value the full load would reset elsewhere does not matter.
+            document["font_scale"] = serde_json::json!("from a newer build");
+            assert_eq!(
+                streamer_mode_status_in_settings_json(&document.to_string()),
+                mode
+            );
+        }
+        let default_document = serde_json::to_string(&AppSettings::default()).unwrap();
+        for (content, why) in [
+            (default_document.as_str(), "no streamer settings saved"),
+            ("{}", "empty document"),
+            (r#"{"streamer_mode":null}"#, "null streamer settings"),
+            (r#"{"streamer_mode":{}}"#, "no mode saved"),
+            (
+                r#"{"streamer_mode":{"enabled":"new_mode"}}"#,
+                "unknown mode",
+            ),
+            (r#"{"streamer_mode":{"enabled":3}}"#, "wrong type"),
+            (r#"{"streamer_mode":"disabled"}"#, "wrong shape"),
+            ("[]", "not an object"),
+            (r#"{"streamer_mode":{"enabled":"disabled""#, "truncated"),
+            ("", "empty file"),
+        ] {
+            assert_eq!(
+                streamer_mode_status_in_settings_json(content),
+                StreamerModeStatus::Auto,
+                "{why}"
+            );
+        }
     }
 
     #[test]

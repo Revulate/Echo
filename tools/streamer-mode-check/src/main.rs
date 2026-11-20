@@ -55,6 +55,10 @@ mod settings {
     pub fn broadcast_streamer_mode_changed() {}
 
     pub fn forget_streamer_layout_state() {}
+
+    pub fn streamer_mode_status_before_load() -> crate::streamer_mode::StreamerModeStatus {
+        Default::default()
+    }
 }
 
 // The production detector consults the profile-aware external config root for

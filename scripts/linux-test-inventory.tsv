@@ -554,6 +554,7 @@ root_test	src/backend/settings.rs	placeholder_uploader_key_is_disabled_during_ru
 root_test	src/backend/settings.rs	remote_and_device_paths_are_detected
 root_test	src/backend/settings.rs	switch_on_style_defaults_to_neutral_for_older_settings_files
 root_test	src/backend/settings.rs	switch_on_style_serializes_with_stable_values
+root_test	src/backend/settings.rs	the_launch_reads_only_the_streamer_mode_and_defaults_to_auto
 root_test	src/backend/settings.rs	uploader_config_validates_mapping_edits_and_enable_transitions_only
 root_test	src/backend/settings/secrets.rs	keyring_availability_probe_is_cached_when_available
 root_test	src/backend/settings/secrets.rs	keyring_availability_probe_is_cached_when_unavailable
@@ -903,7 +904,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	412
+summary	root_tests	413
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
