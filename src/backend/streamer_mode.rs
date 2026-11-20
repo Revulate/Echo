@@ -409,19 +409,33 @@ fn start_detection_task() {
     }
     DETECTION_SCAN_NOW.notify_one();
     crate::backend::bridge::get_runtime().spawn(async {
-        run_detection_loop(
-            &DETECTION_CACHE,
-            &DETECTION_SCAN_NOW,
-            DETECTION_INTERVAL,
-            auto_selected,
-            detect_streaming_software_impl,
-            apply_detection_outcome,
-        )
-        .await;
-        DETECTION_TASK_RUNNING.store(false, Ordering::Release);
+        {
+            let _running = DetectionTaskRunning(&DETECTION_TASK_RUNNING);
+            run_detection_loop(
+                &DETECTION_CACHE,
+                &DETECTION_SCAN_NOW,
+                DETECTION_INTERVAL,
+                auto_selected,
+                detect_streaming_software_impl,
+                apply_detection_outcome,
+            )
+            .await;
+        }
         // Auto may have been selected again after the loop last checked.
         ensure_detection_task();
     });
+}
+
+/// Clears the task-running flag however the detection task ends: the loop
+/// returning, a panic anywhere in its body (the outcome's broadcast, the
+/// logging), or the future being dropped. The next gate read in Auto then
+/// starts the task again instead of finding it marked running forever.
+struct DetectionTaskRunning(&'static AtomicBool);
+
+impl Drop for DetectionTaskRunning {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Scan as soon as the task is free, starting it if needed. Auto must be
@@ -1236,6 +1250,50 @@ mod tests {
             Some(generation),
             "a just-finished result does not refuse the next tick"
         );
+    }
+
+    #[test]
+    fn a_panic_in_the_detection_loop_lets_the_next_gate_read_start_it_again() {
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        fn detect() -> DetectionResult {
+            DetectionResult::default()
+        }
+        let cache: &'static RwLock<DetectionCache> =
+            Box::leak(Box::new(RwLock::new(cache(false, false))));
+        let scan_now: &'static tokio::sync::Notify =
+            Box::leak(Box::new(tokio::sync::Notify::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        // start_detection_task claims the flag, then the task holds the guard.
+        assert!(!RUNNING.swap(true, Ordering::AcqRel));
+        let task = runtime.spawn(async move {
+            let _running = DetectionTaskRunning(&RUNNING);
+            run_detection_loop(
+                cache,
+                scan_now,
+                Duration::from_millis(10),
+                || true,
+                detect,
+                |_| panic!("simulated panic outside the scan"),
+            )
+            .await;
+        });
+        scan_now.notify_one();
+        let joined = runtime.block_on(task);
+        assert!(joined.is_err_and(|error| error.is_panic()));
+
+        assert!(
+            !RUNNING.load(Ordering::Acquire),
+            "the panic cleared the running flag"
+        );
+        assert!(
+            !RUNNING.swap(true, Ordering::AcqRel),
+            "the next gate read can start the task again"
+        );
+        assert!(!cache.read().unwrap().refresh_in_flight);
     }
 
     #[test]
