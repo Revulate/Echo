@@ -56,6 +56,7 @@ pub async fn spawn_history_load(channel: String) {
         );
         return;
     }
+    super::wait_for_pending_streamer_detection().await;
     load_channel_history_async(&channel).await;
 }
 

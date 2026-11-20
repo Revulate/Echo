@@ -276,6 +276,13 @@ fn enter_auto_mode() {
     schedule_detection_refresh();
 }
 
+/// True while Auto has no completed detection since startup, the last switch
+/// into Auto or the last system wake, so its gates are failing closed.
+pub fn detection_pending() -> bool {
+    get_streamer_mode_settings().enabled == StreamerModeStatus::Auto
+        && DETECTION_CACHE.read_or_recover().completed_at.is_none()
+}
+
 /// Streaming may have started while the system slept, so Auto fails closed
 /// until a scan after the wake completes.
 pub fn note_system_wake() {

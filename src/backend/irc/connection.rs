@@ -100,6 +100,30 @@ const CACHED_CHANNEL_EMOTE_REFRESH_STAGGER_MS: u64 = 500;
 const CACHED_CHANNEL_EMOTE_INITIAL_STAGGER_MS: u64 = 100;
 const CACHED_CHANNEL_EMOTE_REFRESH_MAX_DELAY_MS: u64 = 4_000;
 const COALESCED_CHANNEL_EMOTE_RETRY_DELAY_MS: u64 = 7_000;
+/// Longest chat ingest waits for streamer mode's pending Auto detection.
+const STREAMER_DETECTION_INGEST_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+const STREAMER_DETECTION_INGEST_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Before history or live chat is ingested, give a pending Auto streamer-mode
+/// detection up to [`STREAMER_DETECTION_INGEST_WAIT`] to finish. Rows built
+/// while it is pending get streamer-mode text and suppressed sounds and
+/// notifications even for a user who is not streaming, and a later
+/// detection does not rebuild them. On timeout ingest goes ahead and the gates
+/// stay fail-closed. Returns at once when no detection is pending.
+pub(crate) async fn wait_for_pending_streamer_detection() {
+    wait_while_bounded(
+        crate::backend::streamer_mode::detection_pending,
+        STREAMER_DETECTION_INGEST_WAIT,
+    )
+    .await;
+}
+
+async fn wait_while_bounded(mut pending: impl FnMut() -> bool, limit: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while pending() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(STREAMER_DETECTION_INGEST_POLL).await;
+    }
+}
 
 /// Per-channel message deduplicator (DashMap provides per-shard locking)
 static MESSAGE_DEDUP: LazyLock<DashMap<String, MessageDeduplicator>> =
@@ -1066,6 +1090,7 @@ async fn run_supervised_read_connection() {
         info,
         "Auth initialization complete, proceeding with connection"
     );
+    wait_for_pending_streamer_detection().await;
 
     loop {
         if READ_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
@@ -1676,6 +1701,43 @@ pub fn shutdown_read_connection(timeout: std::time::Duration) -> bool {
         std::thread::yield_now();
     }
     true
+}
+
+#[cfg(test)]
+mod streamer_detection_wait_tests {
+    use super::{STREAMER_DETECTION_INGEST_POLL, wait_while_bounded};
+    use core::prelude::v1::test;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn ingest_wait_returns_when_detection_finishes_and_is_bounded() {
+        let started = Instant::now();
+        wait_while_bounded(|| false, Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "nothing pending"
+        );
+
+        let mut checks = 0;
+        let started = Instant::now();
+        wait_while_bounded(
+            || {
+                checks += 1;
+                checks < 3
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(checks, 3, "stops as soon as the detection completes");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let limit = Duration::from_millis(60);
+        let started = Instant::now();
+        wait_while_bounded(|| true, limit).await;
+        let waited = started.elapsed();
+        assert!(waited >= limit, "a stuck detection is waited out");
+        assert!(waited < limit + STREAMER_DETECTION_INGEST_POLL * 20);
+    }
 }
 
 #[cfg(test)]
