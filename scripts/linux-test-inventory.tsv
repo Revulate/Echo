@@ -828,9 +828,10 @@ media_cache_test	crates/echo-media-cache/src/decode.rs	frame_compressor_matches_
 media_cache_test	crates/echo-media-cache/src/decode.rs	test_bgra_conversion
 media_cache_test	crates/echo-media-cache/src/decode.rs	test_bgra_conversion_consistency
 media_cache_test	crates/echo-media-cache/src/decode.rs	test_decode_simple_png
+media_cache_test	crates/echo-media-cache/src/disk.rs	a_burst_during_a_running_save_is_saved_when_it_ends_without_another_write
 media_cache_test	crates/echo-media-cache/src/disk.rs	a_source_blob_that_cannot_be_deleted_stays_indexed_and_counted
 media_cache_test	crates/echo-media-cache/src/disk.rs	an_autosave_during_the_index_load_saves_the_installed_index
-media_cache_test	crates/echo-media-cache/src/disk.rs	an_autosave_neither_blocks_the_insert_nor_repeats_a_running_save
+media_cache_test	crates/echo-media-cache/src/disk.rs	autosave_triggers_during_a_running_save_coalesce_into_one_save
 media_cache_test	crates/echo-media-cache/src/disk.rs	index_writes_and_lookups_during_the_load_see_the_installed_index
 media_cache_test	crates/echo-media-cache/src/disk.rs	legacy_index_is_used_only_when_current_index_is_absent
 media_cache_test	crates/echo-media-cache/src/disk.rs	legacy_source_index_native_bincode_fixture_migrates_to_postcard
@@ -908,7 +909,7 @@ summary	chat_render_tests	28
 summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
-summary	media_cache_tests	44
+summary	media_cache_tests	45
 summary	core_tests	247
 summary	render_core_tests	46
 summary	text_core_tests	26

@@ -142,6 +142,14 @@ pub struct DiskLayer {
     stats: Arc<CacheStats>,
 }
 
+/// Log lines for one autosave.
+struct AutosaveLog {
+    started: &'static str,
+    failed: &'static str,
+    /// The triggering write was due by count rather than by time.
+    due_by_count: bool,
+}
+
 /// Save bookkeeping for one persisted index. It is shared through an `Arc`
 /// with the save an autosave spawns, so the write that triggered the save
 /// does not wait for it.
@@ -152,6 +160,9 @@ struct IndexSaveState {
     dirty_writes: AtomicU64,
     /// Last time the index was saved (unix seconds).
     last_save_ts: AtomicU64,
+    /// An autosave is waiting for [`Self::lock`] to save after the running
+    /// save; later autosave triggers leave their writes to it.
+    autosave_pending: AtomicBool,
 }
 
 impl IndexSaveState {
@@ -160,12 +171,13 @@ impl IndexSaveState {
             lock: Mutex::new(()),
             dirty_writes: AtomicU64::new(0),
             last_save_ts: AtomicU64::new(current_timestamp()),
+            autosave_pending: AtomicBool::new(false),
         }
     }
 
-    /// Count one index write. Returns `(writes, seconds since the last save,
-    /// due by count)` when the autosave policy wants a save.
-    fn record_write(&self) -> Option<(u64, u64, bool)> {
+    /// Count one index write. Returns whether it is due by count (rather
+    /// than by time) when the autosave policy wants a save.
+    fn record_write(&self) -> Option<bool> {
         // Release: a save that sees this count also sees the index write
         // made before it.
         let writes = self.dirty_writes.fetch_add(1, Ordering::AcqRel) + 1;
@@ -173,7 +185,7 @@ impl IndexSaveState {
         let due_by_count = writes >= INDEX_AUTOSAVE_EVERY_INSERTS;
         let due_by_time = elapsed >= INDEX_AUTOSAVE_MAX_DELAY_SECS;
         let count_save_ok = due_by_count && elapsed >= INDEX_AUTOSAVE_MIN_INTERVAL_SECS;
-        (count_save_ok || due_by_time).then_some((writes, elapsed, due_by_count))
+        (count_save_ok || due_by_time).then_some(due_by_count)
     }
 
     /// Writes counted so far; read under [`Self::lock`] before the snapshot.
@@ -897,37 +909,35 @@ impl DiskLayer {
     }
 
     async fn maybe_autosave_index(&self) {
-        let Some((writes, elapsed, due_by_count)) = self.index_save.record_write() else {
+        let Some(due_by_count) = self.index_save.record_write() else {
             return;
         };
-        crate::log_cache!(
-            debug,
-            writes,
-            elapsed_since_last_save_secs = elapsed,
-            reason = if due_by_count { "count" } else { "time" },
-            "Autosaving disk cache index"
+        self.spawn_autosave(
+            &self.index_save,
+            AutosaveLog {
+                started: "Autosaving disk cache index",
+                failed: "Failed to save disk cache index",
+                due_by_count,
+            },
+            {
+                let path = self.index_path();
+                let index = Arc::clone(&self.index);
+                async move { save_index_snapshot(&path, index).await }
+            },
         );
-        self.spawn_autosave(&self.index_save, "Failed to save disk cache index", {
-            let path = self.index_path();
-            let index = Arc::clone(&self.index);
-            async move { save_index_snapshot(&path, index).await }
-        });
     }
 
     async fn maybe_autosave_source_index(&self) {
-        let Some((writes, elapsed, due_by_count)) = self.source_index_save.record_write() else {
+        let Some(due_by_count) = self.source_index_save.record_write() else {
             return;
         };
-        crate::log_cache!(
-            debug,
-            writes,
-            elapsed_since_last_save_secs = elapsed,
-            reason = if due_by_count { "count" } else { "time" },
-            "Autosaving source blob cache index"
-        );
         self.spawn_autosave(
             &self.source_index_save,
-            "Failed to save source blob index",
+            AutosaveLog {
+                started: "Autosaving source blob cache index",
+                failed: "Failed to save source blob index",
+                due_by_count,
+            },
             {
                 let path = self.source_index_path();
                 let index = Arc::clone(&self.source_index);
@@ -939,28 +949,46 @@ impl DiskLayer {
     /// Run an autosave without making the write that triggered it wait.
     ///
     /// Like [`Self::save_index_result`] it first waits for an index load to
-    /// end, so it never writes the index the load is about to replace. It is
-    /// skipped while another save of the same index holds the lock: during a
-    /// burst of inserts that save, or a later one, covers the writes made
-    /// meanwhile, instead of one full serialize, compress and fsync per
-    /// insert. Writes its snapshot missed stay counted.
+    /// end, so it never writes the index the load is about to replace. At
+    /// most one autosave waits behind a running save of the same index: a
+    /// trigger that finds one already waiting leaves its write to it, because
+    /// that save snapshots after the running one ends. A burst of inserts
+    /// therefore costs one save at a time instead of one full serialize,
+    /// compress and fsync per insert, and its last writes are still saved
+    /// when it ends. Writes a snapshot missed stay counted.
     fn spawn_autosave(
         &self,
         state: &Arc<IndexSaveState>,
-        failure: &'static str,
+        log: AutosaveLog,
         save: impl std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static,
     ) {
+        if state.autosave_pending.swap(true, Ordering::AcqRel) {
+            crate::log_cache!(trace, "Index autosave already pending");
+            return;
+        }
         let state = Arc::clone(state);
         let mut loading = self.index_loading.subscribe();
         tokio::spawn(async move {
             let _ = loading.wait_for(Option::is_none).await;
-            let Ok(_save_guard) = state.lock.try_lock() else {
-                crate::log_cache!(trace, "Skipping index autosave: a save is running");
-                return;
-            };
+            let _save_guard = state.lock.lock().await;
+            // A write counted after this starts its own autosave; every
+            // earlier one is in the snapshot below.
+            state.autosave_pending.store(false, Ordering::Release);
             let saved_writes = state.writes_before_snapshot();
+            if saved_writes == 0 {
+                return;
+            }
+            crate::log_cache!(
+                debug,
+                writes = saved_writes,
+                elapsed_since_last_save_secs =
+                    current_timestamp().saturating_sub(state.last_save_ts.load(Ordering::Relaxed)),
+                reason = if log.due_by_count { "count" } else { "time" },
+                "{}",
+                log.started
+            );
             if let Err(e) = save.await {
-                crate::log_cache!(warn, error = %e, "{failure}");
+                crate::log_cache!(warn, error = %e, "{}", log.failed);
                 return;
             }
             state.mark_saved(saved_writes);
@@ -2259,7 +2287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_autosave_neither_blocks_the_insert_nor_repeats_a_running_save() {
+    async fn a_burst_during_a_running_save_is_saved_when_it_ends_without_another_write() {
         let temp = tempfile::tempdir().unwrap();
         let layer = DiskLayer::new(
             temp.path().join("cache"),
@@ -2291,28 +2319,82 @@ mod tests {
         }
         assert!(
             !layer.source_index_path().exists(),
-            "autosaves skip while a save is running"
+            "no autosave runs beside the running save"
         );
         assert_eq!(
             layer.source_index_save.dirty_writes.load(Ordering::Relaxed),
             3,
-            "the skipped writes stay counted"
+            "the writes stay counted"
         );
-        drop(running_save);
 
-        layer
-            .insert_source_blob(
-                None,
-                "https://example.test/d.webp".to_string(),
-                test_blob("d", 10),
-            )
-            .await;
+        // The burst ends with the running save; nothing else is written.
+        drop(running_save);
         wait_until(|| layer.source_index_save.dirty_writes.load(Ordering::Relaxed) == 0).await;
         assert_ne!(
             layer.source_index_save.last_save_ts.load(Ordering::Relaxed),
             0
         );
-        assert_eq!(saved_source_blobs(&layer).await, ["a", "b", "c", "d"]);
+        assert_eq!(saved_source_blobs(&layer).await, ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn autosave_triggers_during_a_running_save_coalesce_into_one_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = DiskLayer::new(
+            temp.path().join("cache"),
+            Arc::new(BudgetManager::new()),
+            Arc::new(CacheStats::new()),
+        );
+        let state = Arc::clone(&layer.source_index_save);
+        let saves = Arc::new(AtomicUsize::new(0));
+        let trigger = |layer: &DiskLayer| {
+            let saves = Arc::clone(&saves);
+            layer.spawn_autosave(
+                &state,
+                AutosaveLog {
+                    started: "test autosave",
+                    failed: "test autosave failed",
+                    due_by_count: false,
+                },
+                async move {
+                    saves.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+        };
+
+        let running_save = state.lock.lock().await;
+        for _ in 0..3 {
+            state.dirty_writes.fetch_add(1, Ordering::AcqRel);
+            trigger(&layer);
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            saves.load(Ordering::SeqCst),
+            0,
+            "the running save is not repeated"
+        );
+
+        drop(running_save);
+        wait_until(|| state.dirty_writes.load(Ordering::Relaxed) == 0).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            saves.load(Ordering::SeqCst),
+            1,
+            "three triggers during the running save cost one save after it"
+        );
+
+        // With every write saved, a later trigger saves nothing.
+        trigger(&layer);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(saves.load(Ordering::SeqCst), 1);
+        assert!(!state.autosave_pending.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
