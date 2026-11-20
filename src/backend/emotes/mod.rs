@@ -186,10 +186,22 @@ const USER_EMOTES_DISK_TTL_SECS: u64 = 24 * 60 * 60;
 /// immediately and retokenizes resident rows if the refreshed set differs.
 const GLOBAL_EMOTES_DISK_STALE_SERVE_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 /// The `saved_at` of the global set hydrated from disk, kept until a global
-/// load replaces it (0: none). Saving writes it back instead of the current
-/// time, so a set that was served stale and never refreshed is not persisted
-/// as fresh, and the next launch still refreshes it.
+/// load refreshes every provider (0: none). Saving writes it back instead of
+/// the current time, so a set that was served stale and never fully refreshed
+/// is not persisted as fresh, and the next launch still refreshes it.
 static GLOBAL_DISK_SAVED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// The hydrated disk time a finished global load leaves behind, given which
+/// providers (Twitch, FFZ, BTTV, 7TV) returned a fresh set. It is cleared only
+/// when all of them did: a provider that failed or timed out kept its old rows
+/// (7TV its stale fallback), which are as old as that disk time.
+fn global_disk_saved_at_after_load(hydrated_saved_at: u64, providers_loaded: [bool; 4]) -> u64 {
+    if providers_loaded.iter().all(|&loaded| loaded) {
+        0
+    } else {
+        hydrated_saved_at
+    }
+}
 
 /// The `saved_at` to persist for the global set: the hydrated disk time while
 /// no global load has replaced it, otherwise `now`.
@@ -2777,6 +2789,12 @@ impl EmoteCache {
             }
         );
         record_emote_stage_timed("emotes.global.fetch.parallel", fetch_parallel_start, 0);
+        let providers_loaded = [
+            twitch.is_ok(),
+            ffz.is_ok(),
+            bttv.is_ok(),
+            matches!(seventv, SevenTvGlobalFetchState::Ready(Ok(_))),
+        ];
 
         let merge_start = Instant::now();
         let mut defer_global_7tv_refresh = false;
@@ -2902,7 +2920,13 @@ impl EmoteCache {
                 emotes_by_id: all_emotes_by_id,
                 fetched_at: Instant::now(),
             });
-            GLOBAL_DISK_SAVED_AT.store(0, Ordering::Release);
+            GLOBAL_DISK_SAVED_AT.store(
+                global_disk_saved_at_after_load(
+                    GLOBAL_DISK_SAVED_AT.load(Ordering::Acquire),
+                    providers_loaded,
+                ),
+                Ordering::Release,
+            );
             global
                 .as_ref()
                 .map(|entry| entry.emotes_by_id.len())
@@ -5009,6 +5033,35 @@ mod provider_index_tests {
             global_set_saved_at(now),
             now,
             "a loaded set saves its load time"
+        );
+    }
+
+    #[test]
+    fn a_global_load_clears_the_disk_time_only_when_every_provider_loaded() {
+        let six_days_old = 1_900_000_000 - 6 * 24 * 60 * 60;
+        assert_eq!(
+            global_disk_saved_at_after_load(six_days_old, [true; 4]),
+            0,
+            "a fully refreshed set is saved with its load time"
+        );
+        assert_eq!(
+            global_disk_saved_at_after_load(six_days_old, [false; 4]),
+            six_days_old,
+            "an offline load carried every provider over, so the set is still stale"
+        );
+        for failed in 0..4 {
+            let mut loaded = [true; 4];
+            loaded[failed] = false;
+            assert_eq!(
+                global_disk_saved_at_after_load(six_days_old, loaded),
+                six_days_old,
+                "provider {failed} kept its old rows"
+            );
+        }
+        assert_eq!(
+            global_disk_saved_at_after_load(0, [true, false, true, true]),
+            0,
+            "with no hydrated set there is no disk time to keep"
         );
     }
 
