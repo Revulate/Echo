@@ -210,8 +210,14 @@ pub(super) fn schedule_staggered_channel_emote_load(
     }
 
     let slot = DEFERRED_CHANNEL_EMOTE_REFRESH_SLOT.fetch_add(1, Ordering::Relaxed);
-    let force_refresh = cached_count > 0;
-    let (base_delay, stagger) = if force_refresh {
+    let has_cache = cached_count > 0;
+    // A fresh resident catalog is served as is; the non-forced load below
+    // returns it from cache and still hydrates FFZ room badges.
+    let force_refresh = has_cache && EMOTE_CACHE.channel_join_needs_forced_refresh(&channel_key);
+    if has_cache && !force_refresh {
+        crate::backend::metrics::record_emote_event("irc.channel_emotes.deferred_cached.fresh");
+    }
+    let (base_delay, stagger) = if has_cache {
         (
             CACHED_CHANNEL_EMOTE_REFRESH_BASE_DELAY_MS,
             CACHED_CHANNEL_EMOTE_REFRESH_STAGGER_MS,
@@ -222,7 +228,7 @@ pub(super) fn schedule_staggered_channel_emote_load(
     let delay_ms = base_delay
         .saturating_add(slot.saturating_mul(stagger))
         .min(CACHED_CHANNEL_EMOTE_REFRESH_MAX_DELAY_MS);
-    let scheduled_stage = if force_refresh {
+    let scheduled_stage = if has_cache {
         "irc.channel_emotes.deferred_cached.scheduled"
     } else {
         "irc.channel_emotes.staggered_initial.scheduled"
@@ -232,12 +238,17 @@ pub(super) fn schedule_staggered_channel_emote_load(
         std::time::Duration::from_millis(delay_ms),
         cached_count,
     );
-    if force_refresh {
+    if has_cache {
         crate::log_emotes!(
             debug,
-            "Using cached emotes for {} immediately ({} emotes); deferred refresh in {}ms ({})",
+            "Using cached emotes for {} immediately ({} emotes); deferred {} in {}ms ({})",
             channel_key,
             cached_count,
+            if force_refresh {
+                "refresh"
+            } else {
+                "cache check"
+            },
             delay_ms,
             reason
         );
@@ -290,7 +301,7 @@ pub(super) fn schedule_staggered_channel_emote_load(
             Ok(_) => {
                 DEFERRED_CHANNEL_EMOTE_REFRESHES.remove(&channel_key);
                 let count = EMOTE_CACHE.channel_emote_count(&channel_key);
-                let completed_stage = if force_refresh {
+                let completed_stage = if has_cache {
                     "irc.channel_emotes.deferred_cached.completed"
                 } else {
                     "irc.channel_emotes.staggered_initial.completed"
@@ -309,7 +320,7 @@ pub(super) fn schedule_staggered_channel_emote_load(
             }
             Err(e) => {
                 DEFERRED_CHANNEL_EMOTE_REFRESHES.remove(&channel_key);
-                let failed_stage = if force_refresh {
+                let failed_stage = if has_cache {
                     "irc.channel_emotes.deferred_cached.failed"
                 } else {
                     "irc.channel_emotes.staggered_initial.failed"

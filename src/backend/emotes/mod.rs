@@ -173,6 +173,10 @@ static FFZ_LIMITER: LazyLock<RateLimiter<NotKeyed, InMemoryState, DefaultClock, 
 /// request per channel in flight so cache reuse cannot leave the badge state
 /// empty for the entire session.
 static FFZ_ROOM_BADGE_HYDRATIONS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+/// Channels hydrated from a disk set older than the refresh delay. Their entry
+/// is backdated only into the startup grace window, so its TTL does not show
+/// the set's real age; the first join consumes the mark and refreshes.
+static STALE_DISK_CHANNEL_HYDRATIONS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
 /// TTL for cached emotes on disk (in seconds)
 const USER_EMOTES_DISK_TTL_SECS: u64 = 24 * 60 * 60;
@@ -1936,6 +1940,11 @@ impl EmoteCache {
             if !cached.is_expired(CHANNEL_EMOTES_DISK_STALE_SERVE_MAX_SECS) {
                 loaded_channels.push(cache_key.clone());
                 let is_fresh = cached.is_fresh_enough_to_delay();
+                if is_fresh {
+                    STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key);
+                } else {
+                    STALE_DISK_CHANNEL_HYDRATIONS.insert(cache_key.clone());
+                }
                 let fetched_at = channel_disk_cache_fetched_at(is_fresh, self.ttl);
                 let mut arc_emotes: EmoteNameMap = HashMap::with_capacity(cached.emotes.len() * 2);
                 for emote in cached.emotes.into_values() {
@@ -3890,6 +3899,16 @@ impl EmoteCache {
         }
     }
 
+    /// Whether a join whose channel already has resident emotes must still
+    /// force a provider refresh: the set came from a stale disk cache (this
+    /// call consumes that mark) or its TTL has expired. A fresh entry is
+    /// served as is; the non-forced load still hydrates FFZ room badges.
+    pub fn channel_join_needs_forced_refresh(&self, channel_login: &str) -> bool {
+        let cache_key = normalize_channel_key(channel_login);
+        let stale_disk = STALE_DISK_CHANNEL_HYDRATIONS.remove(&cache_key).is_some();
+        stale_disk || self.channel_emotes_need_refresh(&cache_key)
+    }
+
     /// Return true when a channel cache is missing or stale enough to justify a provider fetch.
     pub fn channel_emotes_need_refresh(&self, channel_login: &str) -> bool {
         let cache_key = normalize_channel_key(channel_login);
@@ -4866,6 +4885,48 @@ mod provider_index_tests {
         };
         EmoteCache::rebuild_name_map_from_identities(&mut entry);
         entry
+    }
+
+    #[test]
+    fn join_forces_a_refresh_only_for_stale_disk_or_expired_entries() {
+        let channel = "join_refresh_decision_test".to_string();
+        let _cleanup = ChannelTestCleanup(channel.clone());
+        struct MarkCleanup(String);
+        impl Drop for MarkCleanup {
+            fn drop(&mut self) {
+                STALE_DISK_CHANNEL_HYDRATIONS.remove(&self.0);
+            }
+        }
+        let _mark_cleanup = MarkCleanup(channel.clone());
+
+        EMOTE_CACHE.channels.insert(
+            channel.clone(),
+            entry([emote(EmoteProvider::BTTV, "join-1", "joinEmote")]),
+        );
+        assert!(
+            !EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "a fresh resident catalog is served without a provider refresh"
+        );
+
+        STALE_DISK_CHANNEL_HYDRATIONS.insert(channel.clone());
+        assert!(
+            EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "a set hydrated from a stale disk cache refreshes at join despite its grace TTL"
+        );
+        assert!(
+            !EMOTE_CACHE.channel_join_needs_forced_refresh(&channel),
+            "the stale-disk mark is consumed by the first join"
+        );
+
+        if let Some(expired) = Instant::now().checked_sub(EMOTE_CACHE.ttl + Duration::from_secs(1))
+        {
+            EMOTE_CACHE
+                .channels
+                .get_mut(&channel)
+                .expect("test entry")
+                .fetched_at = expired;
+            assert!(EMOTE_CACHE.channel_join_needs_forced_refresh(&channel));
+        }
     }
 
     #[test]
