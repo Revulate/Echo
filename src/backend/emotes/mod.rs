@@ -166,20 +166,30 @@ async fn wait_for_shared_disk_hydration() {
     let _ = tokio::time::timeout(SHARED_DISK_HYDRATION_WAIT, wait).await;
 }
 
-static EMOTE_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(build_emote_http_client));
+// Twitch, BTTV and FFZ emote requests use the shared Twitch client (the same
+// 10 s total timeout), so Helix emote fetches reuse its api.twitch.tv pool.
+use crate::backend::twitch_api::TWITCH_HTTP_CLIENT as EMOTE_HTTP_CLIENT;
 
-fn build_emote_http_client() -> reqwest::Client {
+/// One client for the 7TV REST API (emote sets, users and 7TV embed cards), so
+/// those requests share a 7tv.io pool. Each caller sets its own total timeout
+/// through an [`crate::backend::http::TimedClientCache`]. Cosmetics keep their
+/// own client: their read timeout is client-level.
+pub(crate) static SEVENTV_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
+    LazyLock::new(|| crate::backend::http::ClientCache::new(build_seventv_http_client));
+
+fn build_seventv_http_client() -> reqwest::Client {
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25);
     match crate::backend::http::client_builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(DEFAULT_TIMEOUT)
+        .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(4)
         .build()
     {
         Ok(client) => client,
         Err(e) => {
-            tracing::error!("Failed to create emote provider HTTP client: {e}");
-            crate::backend::http::timed_client(Duration::from_secs(10))
+            tracing::error!("Failed to create 7TV HTTP client: {e}");
+            crate::backend::http::timed_client(DEFAULT_TIMEOUT)
         }
     }
 }

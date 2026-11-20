@@ -6,7 +6,7 @@ use crate::backend::settings;
 use std::collections::HashMap;
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 static CLIENT_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -113,6 +113,43 @@ impl ClientCache {
 
     pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
         self.client().delete(url)
+    }
+}
+
+/// A view of a shared [`ClientCache`] for callers whose time budget differs
+/// from the shared client's: every request built through it carries its own
+/// total timeout, which replaces the client-level one for that request. The
+/// connect timeout, connection pool and redirect policy stay the shared
+/// client's, so only clients that agree on those may share one.
+#[derive(Clone, Copy)]
+pub struct TimedClientCache {
+    cache: &'static LazyLock<ClientCache>,
+    timeout: Duration,
+}
+
+impl TimedClientCache {
+    pub const fn new(cache: &'static LazyLock<ClientCache>, timeout: Duration) -> Self {
+        Self { cache, timeout }
+    }
+
+    pub fn client(&self) -> reqwest::Client {
+        self.cache.client()
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.cache.get(url).timeout(self.timeout)
+    }
+
+    pub fn put<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.cache.put(url).timeout(self.timeout)
+    }
+
+    pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        self.cache.delete(url).timeout(self.timeout)
     }
 }
 

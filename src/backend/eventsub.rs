@@ -392,14 +392,10 @@ struct TransportInfo {
 /// Global EventSub client instance
 pub static EVENTSUB_CLIENT: LazyLock<Arc<EventSubClient>> = LazyLock::new(EventSubClient::new);
 
-/// Shared, pooled client for Helix subscription create/delete. The timeout keeps
-/// a stalled request from hanging the supervisor before its keepalive check.
-static EVENTSUB_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(build_eventsub_http_client));
-
-fn build_eventsub_http_client() -> reqwest::Client {
-    crate::backend::http::timed_client(Duration::from_secs(10))
-}
+// Helix subscription create/delete use the shared Twitch client. Its 10 s
+// timeout keeps a stalled request from hanging the supervisor before its
+// keepalive check.
+use crate::backend::twitch_api::TWITCH_HTTP_CLIENT as EVENTSUB_HTTP_CLIENT;
 
 /// Atomic flag to prevent multiple simultaneous connection attempts.
 /// Uses compare-and-swap to ensure only one thread can be connecting at a time.

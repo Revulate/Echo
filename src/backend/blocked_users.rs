@@ -33,8 +33,14 @@ const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MUTATION_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_MANUAL_AUTH_RECOVERY_ATTEMPTS: usize = 3;
 
-static HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(crate::backend::http::client));
+/// Blocked-user requests share the Twitch client. Each request is bounded on
+/// its own: a page within the whole refresh's [`REFRESH_TIMEOUT`], a mutation
+/// by the same [`MUTATION_TIMEOUT`] that bounds it from outside.
+static HTTP_CLIENT: crate::backend::http::TimedClientCache =
+    crate::backend::http::TimedClientCache::new(
+        &crate::backend::twitch_api::TWITCH_HTTP_CLIENT,
+        MUTATION_TIMEOUT,
+    );
 static AUTH_EPOCH: AtomicU64 = AtomicU64::new(0);
 static REFRESH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Message admission reads these on every Twitch row. They mirror the current

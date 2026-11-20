@@ -185,7 +185,7 @@ pub struct TwitchBadgeCache {
     /// Cache TTL (default: 1 hour)
     ttl: Duration,
     /// HTTP Client
-    client: http::ClientCache,
+    client: http::TimedClientCache,
 }
 
 /// Rows laid out before a badge set loaded lack those badges; rebuild them.
@@ -193,9 +193,9 @@ fn notify_all_badge_decorations_changed() {
     crate::backend::observers::get_observer_registry()
         .notify_all(crate::backend::observers::ChannelEvent::BadgeDecorationsChanged);
 }
-fn build_badge_http_client() -> reqwest::Client {
-    http::timed_client(Duration::from_secs(20))
-}
+/// Badge requests (Helix, the API proxy, FFZ and BTTV) share the Twitch
+/// client with a 20 s budget per request.
+const BADGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl TwitchBadgeCache {
     pub fn new() -> Self {
@@ -214,7 +214,10 @@ impl TwitchBadgeCache {
             bttv_pro_loading: DashSet::new(),
             token: RwLock::new(None),
             ttl: Duration::from_secs(60 * 60),
-            client: http::ClientCache::new(build_badge_http_client),
+            client: http::TimedClientCache::new(
+                &crate::backend::twitch_api::TWITCH_HTTP_CLIENT,
+                BADGE_REQUEST_TIMEOUT,
+            ),
         }
     }
 }

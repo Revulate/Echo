@@ -4,43 +4,11 @@
 
 use super::*;
 
-static SEVENTV_USER_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(build_seventv_user_http_client));
+static SEVENTV_USER_HTTP_CLIENT: crate::backend::http::TimedClientCache =
+    crate::backend::http::TimedClientCache::new(&SEVENTV_HTTP_CLIENT, Duration::from_secs(20));
 
-fn build_seventv_user_http_client() -> reqwest::Client {
-    match crate::backend::http::client_builder()
-        .timeout(Duration::from_secs(20))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(4)
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!("Failed to create 7TV user HTTP client: {e}");
-            crate::backend::http::timed_client(Duration::from_secs(20))
-        }
-    }
-}
-
-static SEVENTV_EMOTE_SET_HTTP_CLIENT: LazyLock<crate::backend::http::ClientCache> =
-    LazyLock::new(|| crate::backend::http::ClientCache::new(build_seventv_emote_set_http_client));
-
-fn build_seventv_emote_set_http_client() -> reqwest::Client {
-    match crate::backend::http::client_builder()
-        .timeout(Duration::from_secs(25))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(4)
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            tracing::error!("Failed to create 7TV emote-set HTTP client: {e}");
-            crate::backend::http::timed_client(Duration::from_secs(25))
-        }
-    }
-}
+static SEVENTV_EMOTE_SET_HTTP_CLIENT: crate::backend::http::TimedClientCache =
+    crate::backend::http::TimedClientCache::new(&SEVENTV_HTTP_CLIENT, Duration::from_secs(25));
 
 /// Rate limiter for 7TV API requests (10 req/s - conservative, actual limit higher)
 static SEVENTV_LIMITER: LazyLock<

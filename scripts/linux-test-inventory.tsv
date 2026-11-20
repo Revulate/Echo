@@ -555,6 +555,7 @@ root_test	src/backend/retry.rs	ratelimit_reset_is_epoch_relative
 root_test	src/backend/retry.rs	retry_after_parsing
 root_test	src/backend/retry.rs	retryable_statuses
 root_test	src/backend/retry.rs	server_wait_delay_jitters_within_cap
+root_test	src/backend/retry.rs	timed_client_view_sets_its_timeout_on_every_request
 root_test	src/backend/settings.rs	a_list_with_no_readable_entry_resets_to_its_default
 root_test	src/backend/settings.rs	an_unreadable_list_entry_is_dropped_without_resetting_the_list
 root_test	src/backend/settings.rs	an_unreadable_value_resets_only_its_own_setting
@@ -931,7 +932,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	439
+summary	root_tests	440
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

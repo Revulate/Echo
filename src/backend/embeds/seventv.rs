@@ -8,7 +8,6 @@ use super::{image_media, non_empty, read_bounded_json};
 use crate::backend::http;
 use crate::backend::link_types::{EmbedLoadState, EmbedMetadata, LinkInfo};
 use serde::Deserialize;
-use std::sync::LazyLock;
 use std::time::Duration;
 use url::Url;
 
@@ -17,12 +16,10 @@ const MAX_RESPONSE_BYTES: usize = 128 * 1024;
 const API_BASE: &str = "https://7tv.io/v3";
 const CDN_BASE: &str = "https://cdn.7tv.app/";
 
-static SEVENTV_HTTP_CLIENT: LazyLock<http::ClientCache> =
-    LazyLock::new(|| http::ClientCache::new(build_seventv_http_client));
-
-fn build_seventv_http_client() -> reqwest::Client {
-    super::provider_http_client(FETCH_TIMEOUT, "7TV")
-}
+/// Embed cards share the 7TV REST client (and its 7tv.io pool) with the emote
+/// fetchers, with their own short budget per request.
+static SEVENTV_HTTP_CLIENT: http::TimedClientCache =
+    http::TimedClientCache::new(&crate::backend::emotes::SEVENTV_HTTP_CLIENT, FETCH_TIMEOUT);
 
 /// Stateless 7TV API provider. `ClientCache` reacquires a proxy-aware client
 /// for each request, so proxy changes do not leave this provider pinned to an

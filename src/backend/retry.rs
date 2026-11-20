@@ -27,6 +27,11 @@ use std::time::Duration;
 
 pub trait RetryHttpClient {
     fn retry_client(&self) -> reqwest::Client;
+
+    /// Total timeout each request sets, replacing the client's own.
+    fn request_timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 impl RetryHttpClient for reqwest::Client {
@@ -44,6 +49,26 @@ impl RetryHttpClient for crate::backend::http::ClientCache {
 impl RetryHttpClient for std::sync::LazyLock<crate::backend::http::ClientCache> {
     fn retry_client(&self) -> reqwest::Client {
         self.client()
+    }
+}
+
+impl RetryHttpClient for crate::backend::http::TimedClientCache {
+    fn retry_client(&self) -> reqwest::Client {
+        self.client()
+    }
+
+    fn request_timeout(&self) -> Option<Duration> {
+        Some(self.timeout())
+    }
+}
+
+fn with_request_timeout(
+    request: reqwest::RequestBuilder,
+    timeout: Option<Duration>,
+) -> reqwest::RequestBuilder {
+    match timeout {
+        Some(timeout) => request.timeout(timeout),
+        None => request,
     }
 }
 
@@ -289,11 +314,11 @@ pub async fn retry_helix_get(
     token: &str,
     max_server_wait: Duration,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    let timeout = client.request_timeout();
     let client = client.retry_client();
 
     send_with_retry(url, max_server_wait, None, || {
-        client
-            .get(url)
+        with_request_timeout(client.get(url), timeout)
             .header("Client-Id", client_id)
             .header("Authorization", format!("Bearer {}", token))
             .send()
@@ -337,9 +362,13 @@ pub async fn fetch_with_retry(
     max_server_wait: Duration,
     limiter: Option<&ProviderLimiter>,
 ) -> Result<reqwest::Response, reqwest::Error> {
+    let timeout = client.request_timeout();
     let client = client.retry_client();
 
-    send_with_retry(url, max_server_wait, limiter, || client.get(url).send()).await
+    send_with_retry(url, max_server_wait, limiter, || {
+        with_request_timeout(client.get(url), timeout).send()
+    })
+    .await
 }
 
 /// Simple GET request with retry, returning String error.
@@ -361,6 +390,30 @@ pub async fn fetch_with_retry_str(
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+
+    #[test]
+    fn timed_client_view_sets_its_timeout_on_every_request() {
+        const URL: &str = "https://example.invalid/";
+        static SHARED: std::sync::LazyLock<crate::backend::http::ClientCache> =
+            std::sync::LazyLock::new(|| {
+                crate::backend::http::ClientCache::new(|| {
+                    crate::backend::http::ensure_rustls_crypto_provider();
+                    reqwest::Client::new()
+                })
+            });
+        let budget = Duration::from_secs(20);
+        let view = crate::backend::http::TimedClientCache::new(&SHARED, budget);
+        for request in [
+            view.get(URL),
+            view.put(URL),
+            view.delete(URL),
+            with_request_timeout(view.retry_client().get(URL), view.request_timeout()),
+        ] {
+            assert_eq!(request.build().unwrap().timeout(), Some(&budget));
+        }
+        let shared = with_request_timeout(SHARED.retry_client().get(URL), SHARED.request_timeout());
+        assert_eq!(shared.build().unwrap().timeout(), None);
+    }
 
     #[test]
     fn retryable_statuses() {

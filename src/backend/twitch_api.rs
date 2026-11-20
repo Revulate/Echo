@@ -16,7 +16,10 @@ use url::Url;
 
 use crate::backend::lock_utils::MutexExt;
 
-/// Shared HTTP client for Twitch API requests - avoids creating new clients per request
+/// Shared HTTP client for api.twitch.tv and the API proxy: Helix, EventSub
+/// subscriptions, badges, blocked users and the emote providers all use it, so
+/// their requests to one host share a connection pool. Callers with a longer
+/// budget than its 10 s total timeout use an [`http::TimedClientCache`] view.
 pub(crate) static TWITCH_HTTP_CLIENT: LazyLock<http::ClientCache> =
     LazyLock::new(|| http::ClientCache::new(build_twitch_http_client));
 
@@ -31,6 +34,7 @@ pub fn prewarm_http_client() {
 fn build_twitch_http_client() -> reqwest::Client {
     http::client_builder()
         .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .unwrap_or_else(|error| {
             crate::log_net!(
