@@ -6585,6 +6585,7 @@ dependencies = [
  "echo-core",
  "serde",
  "sysinfo 0.40.4",
+ "tokio",
 ]
 
 [[package]]

@@ -12,3 +12,4 @@ dirs.workspace = true
 echo-core.workspace = true
 serde.workspace = true
 sysinfo.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

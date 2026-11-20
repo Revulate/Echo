@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -141,12 +142,13 @@ const STREAMING_PROCESS_STEMS: &[&str] = &[
 const STREAMING_PROCESS_ALIASES: &[&str] =
     &["streamlabs", "xsplit", "twitchstudio", "twitch studio"];
 
+/// How often Auto's detection task starts a scan.
 const DETECTION_INTERVAL: Duration = Duration::from_secs(2);
-/// How old a completed detection may be and still be trusted. Auto keeps
-/// scanning every [`DETECTION_INTERVAL`], so an older result means scans
-/// stopped (another mode was selected, or the system slept); it then counts as
-/// active until a new scan completes.
-const DETECTION_TRUST_WINDOW: Duration = Duration::from_secs(6);
+/// How long a completed detection stays trusted without another completing.
+/// Auto fails closed on events (startup, a switch into Auto, a system wake);
+/// this only covers the task dying or a missed wake. The task completes a scan
+/// every [`DETECTION_INTERVAL`], or as soon as a slow scan finishes.
+const DETECTION_BACKSTOP: Duration = Duration::from_secs(60);
 const MAX_ACTIVITY_LOG_WINDOW: u64 = 16 * 1024 * 1024;
 
 #[derive(Default)]
@@ -183,122 +185,144 @@ static CAPTURE_PROBE_CACHE: LazyLock<Mutex<CaptureProbeCache>> =
 
 /// Detection state cache
 struct DetectionCache {
-    last_check: Option<Instant>,
     last_result: bool,
     last_source: Option<String>,
     refresh_in_flight: bool,
-    /// When the last detection finished; `None` before the first one and
-    /// after switching into Auto. Kept apart from `last_check`, which
-    /// [`refresh_detection`] clears to force a rescan.
+    /// When the last trusted detection finished; `None` before the first one
+    /// and after each [`reset_detection_for_auto`].
     completed_at: Option<Instant>,
+    /// Bumped by every reset. A scan claimed under an older generation took
+    /// its snapshot before the reset, so its result is discarded.
+    generation: u64,
+    /// Set when a gate answered "active" only because no trusted result
+    /// existed while the cached one said "not streaming". The next recorded
+    /// result then rebuilds layouts and broadcasts; an untrusted period no
+    /// gate observed costs nothing.
+    untrusted_observed: AtomicBool,
 }
 
 static DETECTION_CACHE: LazyLock<RwLock<DetectionCache>> = LazyLock::new(|| {
     RwLock::new(DetectionCache {
-        last_check: None,
         last_result: false,
         last_source: None,
         refresh_in_flight: false,
         completed_at: None,
+        generation: 0,
+        untrusted_observed: AtomicBool::new(false),
     })
 });
 
-fn detection_cache_is_fresh(cache: &DetectionCache) -> bool {
-    cache
-        .last_check
-        .is_some_and(|last_check| last_check.elapsed() < DETECTION_INTERVAL)
-}
-
-/// Whether the last completed detection is recent enough to trust at `now`.
+/// Whether the last completed detection can be trusted at `now`: one exists
+/// since the last reset and it finished within [`DETECTION_BACKSTOP`].
 fn detection_trusted(cache: &DetectionCache, now: Instant) -> bool {
     cache.completed_at.is_some_and(|completed_at| {
-        now.saturating_duration_since(completed_at) <= DETECTION_TRUST_WINDOW
+        now.saturating_duration_since(completed_at) <= DETECTION_BACKSTOP
     })
 }
 
 /// Whether Auto mode treats streaming software as running. Without a trusted
-/// detection (none yet, just switched into Auto, or too old) this is true, so
-/// a user in Auto who is streaming never sees unredacted content before a
-/// scan confirms they are not.
+/// detection this is true, so a user in Auto who is streaming never sees
+/// unredacted content before a scan confirms they are not. Callers hold at
+/// least the read lock, so the observation is never lost to a concurrent
+/// [`record_detection_into`].
 fn auto_detection_active(cache: &DetectionCache, now: Instant) -> bool {
-    !detection_trusted(cache, now) || cache.last_result
+    if detection_trusted(cache, now) {
+        return cache.last_result;
+    }
+    if !cache.last_result {
+        cache.untrusted_observed.store(true, Ordering::Relaxed);
+    }
+    true
 }
 
-/// Whether recording `active`/`source` changes what streamer mode shows. A
-/// result that replaces an untrusted one always counts, because Auto was
-/// treated as active until then.
-fn detection_result_changed(
-    cache: &DetectionCache,
+/// What recording a finished scan requires of the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetectionOutcome {
+    /// The scan was claimed before a reset and was not recorded.
+    Discarded,
+    Recorded {
+        /// A gate failed closed against the cached result, so layouts built
+        /// meanwhile must be rebuilt whatever the last broadcast state was.
+        forget_layout_state: bool,
+        broadcast: bool,
+    },
+}
+
+/// Store a scan claimed under `generation` that finished at `now`, releasing
+/// the claim either way.
+fn record_detection_into(
+    cache: &mut DetectionCache,
+    detection: DetectionResult,
+    generation: u64,
     now: Instant,
-    active: bool,
-    source: &Option<String>,
-) -> bool {
-    !detection_trusted(cache, now) || cache.last_result != active || cache.last_source != *source
-}
-
-/// Store a finished detection. Returns `(changed, was_untrusted)`.
-fn record_detection_into(cache: &mut DetectionCache, detection: DetectionResult) -> (bool, bool) {
-    let now = Instant::now();
-    let was_untrusted = !detection_trusted(cache, now);
-    let changed = detection_result_changed(cache, now, detection.active, &detection.source);
-    cache.last_check = Some(now);
+) -> DetectionOutcome {
+    cache.refresh_in_flight = false;
+    if generation != cache.generation {
+        return DetectionOutcome::Discarded;
+    }
+    let observed = std::mem::take(cache.untrusted_observed.get_mut());
+    let changed = cache.last_result != detection.active || cache.last_source != detection.source;
     cache.last_result = detection.active;
     cache.last_source = detection.source;
-    cache.refresh_in_flight = false;
     cache.completed_at = Some(now);
-    (changed, was_untrusted)
+    DetectionOutcome::Recorded {
+        forget_layout_state: observed,
+        broadcast: observed || changed,
+    }
 }
 
-fn record_detection(detection: DetectionResult) {
-    let (changed, was_untrusted) =
-        record_detection_into(&mut DETECTION_CACHE.write_or_recover(), detection);
-    if was_untrusted {
-        // Gates flipped to redacted while the result was untrusted without a
-        // broadcast, so layouts built meanwhile must be rebuilt whatever the
-        // last broadcast layout state was.
+fn apply_detection_outcome(outcome: DetectionOutcome) {
+    let DetectionOutcome::Recorded {
+        forget_layout_state,
+        broadcast,
+    } = outcome
+    else {
+        return;
+    };
+    if forget_layout_state {
         super::settings::forget_streamer_layout_state();
     }
-    if changed {
+    if broadcast {
         super::settings::broadcast_streamer_mode_changed();
     }
 }
 
-/// Drop the completed detection so Auto fails closed until a new scan
-/// finishes. Called when the mode switches into Auto: scans stop outside
-/// Auto, so the cached result can be arbitrarily old.
+/// Drop the completed detection so Auto fails closed until a scan claimed
+/// after this reset finishes. Called on startup-equivalent events: a switch
+/// into Auto (scans stop outside Auto, so the cached result can be
+/// arbitrarily old) and a system wake.
 fn reset_detection_for_auto(cache: &mut DetectionCache) {
     cache.completed_at = None;
-    cache.last_check = None;
+    cache.generation = cache.generation.wrapping_add(1);
 }
 
-fn enter_auto_mode() {
-    reset_detection_for_auto(&mut DETECTION_CACHE.write_or_recover());
-    schedule_detection_refresh();
+fn auto_selected() -> bool {
+    get_streamer_mode_settings().enabled == StreamerModeStatus::Auto
 }
 
 /// True while Auto has no completed detection since startup, the last switch
 /// into Auto or the last system wake, so its gates are failing closed.
 pub fn detection_pending() -> bool {
-    get_streamer_mode_settings().enabled == StreamerModeStatus::Auto
-        && DETECTION_CACHE.read_or_recover().completed_at.is_none()
+    auto_selected() && DETECTION_CACHE.read_or_recover().completed_at.is_none()
 }
 
 /// Streaming may have started while the system slept, so Auto fails closed
-/// until a scan after the wake completes.
+/// until a scan started after the wake completes.
 pub fn note_system_wake() {
-    if get_streamer_mode_settings().enabled == StreamerModeStatus::Auto {
-        enter_auto_mode();
+    if auto_selected() {
+        reset_detection_for_auto(&mut DETECTION_CACHE.write_or_recover());
+        request_detection_scan();
     }
 }
 
-/// Claim the single background refresh when the cached result is stale.
-/// Returns true when the caller must spawn it.
-fn claim_detection_refresh(cache: &mut DetectionCache) -> bool {
-    if detection_cache_is_fresh(cache) || cache.refresh_in_flight {
-        return false;
+/// Claim the next scan unless one is running. Returns the generation the
+/// scan's result belongs to.
+fn claim_detection_refresh(cache: &mut DetectionCache) -> Option<u64> {
+    if cache.refresh_in_flight {
+        return None;
     }
     cache.refresh_in_flight = true;
-    true
+    Some(cache.generation)
 }
 
 /// Clears the in-flight claim when the detection task unwinds before it
@@ -328,39 +352,109 @@ fn run_claimed_detection(
     detection
 }
 
-fn spawn_detection_refresh() {
-    crate::backend::bridge::get_runtime().spawn_blocking(|| {
-        record_detection(run_claimed_detection(
+/// Whether Auto's detection task is running on the backend runtime.
+static DETECTION_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Asks the detection task for a scan now instead of at its next tick.
+static DETECTION_SCAN_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Start Auto's detection task unless it is running. Does nothing outside
+/// Auto. The caller must not hold the settings lock.
+pub fn ensure_detection_task() {
+    if auto_selected() {
+        start_detection_task();
+    }
+}
+
+/// Start the detection task for a caller that knows Auto is selected. The
+/// common case is one atomic load.
+fn start_detection_task() {
+    if DETECTION_TASK_RUNNING.load(Ordering::Acquire)
+        || DETECTION_TASK_RUNNING.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    DETECTION_SCAN_NOW.notify_one();
+    crate::backend::bridge::get_runtime().spawn(async {
+        run_detection_loop(
             &DETECTION_CACHE,
+            &DETECTION_SCAN_NOW,
+            DETECTION_INTERVAL,
+            auto_selected,
             detect_streaming_software_impl,
-        ));
+            apply_detection_outcome,
+        )
+        .await;
+        DETECTION_TASK_RUNNING.store(false, Ordering::Release);
+        // Auto may have been selected again after the loop last checked.
+        ensure_detection_task();
     });
 }
 
-/// Schedule a single background refresh when the cached detection result is stale.
-pub fn schedule_detection_refresh() {
-    let should_schedule = claim_detection_refresh(&mut DETECTION_CACHE.write_or_recover());
-    if should_schedule {
-        spawn_detection_refresh();
+/// Scan as soon as the task is free, starting it if needed. Auto must be
+/// selected.
+fn request_detection_scan() {
+    start_detection_task();
+    DETECTION_SCAN_NOW.notify_one();
+}
+
+/// Auto's detection cadence: a scan every `period` (or at once when
+/// `scan_now` is notified) on the blocking pool, awaited so two never run
+/// at once, independent of the UI thread. Returns once `still_auto` is false
+/// at a tick. A panicking scan releases its claim and the loop carries on.
+async fn run_detection_loop(
+    cache: &'static RwLock<DetectionCache>,
+    scan_now: &tokio::sync::Notify,
+    period: Duration,
+    still_auto: impl Fn() -> bool,
+    detect: fn() -> DetectionResult,
+    mut on_outcome: impl FnMut(DetectionOutcome),
+) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    // A scan that overruns the period does not start the next one back to
+    // back; the cadence resumes at the next whole period.
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticks.tick() => {}
+            () = scan_now.notified() => ticks.reset(),
+        }
+        if !still_auto() {
+            return;
+        }
+        let Some(generation) = claim_detection_refresh(&mut cache.write_or_recover()) else {
+            continue;
+        };
+        let started = Instant::now();
+        let scan = tokio::task::spawn_blocking(move || run_claimed_detection(cache, detect));
+        let Ok(detection) = scan.await else {
+            // It panicked or never ran; either way nothing holds the claim.
+            cache.write_or_recover().refresh_in_flight = false;
+            crate::log_ui!(warn, "Streamer-mode detection scan did not finish");
+            continue;
+        };
+        let active = detection.active;
+        let outcome = record_detection_into(
+            &mut cache.write_or_recover(),
+            detection,
+            generation,
+            Instant::now(),
+        );
+        crate::log_ui!(
+            debug,
+            duration_ms = started.elapsed().as_millis() as u64,
+            active,
+            outcome = ?outcome,
+            "Streamer-mode detection scan completed"
+        );
+        on_outcome(outcome);
     }
 }
 
-/// Auto mode's cached detection result, scheduling a background refresh when
-/// it is stale. Never scans processes on the calling thread, so UI-thread
-/// callers stay cheap.
+/// Auto mode's cached detection result. Never scans on the calling thread;
+/// the detection task keeps it current.
 fn cached_auto_detection_active() -> bool {
-    let (active, should_schedule) = {
-        let mut cache = DETECTION_CACHE.write_or_recover();
-        let should_schedule = claim_detection_refresh(&mut cache);
-        (
-            auto_detection_active(&cache, Instant::now()),
-            should_schedule,
-        )
-    };
-    if should_schedule {
-        spawn_detection_refresh();
-    }
-    active
+    start_detection_task();
+    auto_detection_active(&DETECTION_CACHE.read_or_recover(), Instant::now())
 }
 
 fn detect_streaming_software_impl() -> DetectionResult {
@@ -761,11 +855,14 @@ pub fn set_streamer_mode_status(status: StreamerModeStatus) {
             .streamer_mode
             .get_or_insert_with(StreamerModeSettings::default)
             .enabled = status;
+        if status == StreamerModeStatus::Auto {
+            reset_detection_for_auto(&mut DETECTION_CACHE.write_or_recover());
+        }
         true
     };
     if changed {
         if status == StreamerModeStatus::Auto {
-            enter_auto_mode();
+            request_detection_scan();
         }
         super::settings::save_settings();
         super::settings::broadcast_streamer_mode_changed();
@@ -780,20 +877,23 @@ pub fn update_streamer_mode_settings<F>(update_fn: F)
 where
     F: FnOnce(&mut StreamerModeSettings),
 {
-    let changed = {
+    let (changed, entered_auto) = {
         let mut settings = super::settings::SETTINGS.lock_or_recover();
         let streamer_mode = settings
             .streamer_mode
             .get_or_insert_with(StreamerModeSettings::default);
         let before = streamer_mode.clone();
         update_fn(streamer_mode);
-        if before.enabled != StreamerModeStatus::Auto
-            && streamer_mode.enabled == StreamerModeStatus::Auto
-        {
-            enter_auto_mode();
+        let entered_auto = before.enabled != StreamerModeStatus::Auto
+            && streamer_mode.enabled == StreamerModeStatus::Auto;
+        if entered_auto {
+            reset_detection_for_auto(&mut DETECTION_CACHE.write_or_recover());
         }
-        before != *streamer_mode
+        (before != *streamer_mode, entered_auto)
     };
+    if entered_auto {
+        request_detection_scan();
+    }
     if changed {
         super::settings::save_settings();
         super::settings::broadcast_streamer_mode_changed();
@@ -803,16 +903,16 @@ where
     }
 }
 
-/// Force a cache refresh for streaming software detection
-/// Useful for manual testing or when the user wants to re-check
+/// Ask Auto's detection task to scan now rather than at its next tick, for a
+/// user who wants to re-check. Does nothing outside Auto.
 pub fn refresh_detection() {
-    DETECTION_CACHE.write_or_recover().last_check = None;
-    schedule_detection_refresh();
+    if auto_selected() {
+        request_detection_scan();
+    }
 }
 
 /// Get the latest cached detection status without scanning processes.
 pub fn get_cached_detection_status() -> (bool, Option<String>) {
-    schedule_detection_refresh();
     let cache = DETECTION_CACHE.read_or_recover();
     (cache.last_result, cache.last_source.clone())
 }
@@ -821,15 +921,37 @@ pub fn get_cached_detection_status() -> (bool, Option<String>) {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+    use std::sync::atomic::AtomicUsize;
 
     fn cache(completed: bool, last_result: bool) -> DetectionCache {
-        let now = Instant::now();
         DetectionCache {
-            last_check: completed.then_some(now),
             last_result,
             last_source: None,
             refresh_in_flight: false,
-            completed_at: completed.then_some(now),
+            completed_at: completed.then(Instant::now),
+            generation: 0,
+            untrusted_observed: AtomicBool::new(false),
+        }
+    }
+
+    fn not_streaming() -> DetectionResult {
+        DetectionResult::default()
+    }
+
+    /// Claim a scan and record `detection` as finishing at `now`.
+    fn scan(
+        cache: &mut DetectionCache,
+        detection: DetectionResult,
+        now: Instant,
+    ) -> DetectionOutcome {
+        let generation = claim_detection_refresh(cache).expect("no scan in flight");
+        record_detection_into(cache, detection, generation, now)
+    }
+
+    fn recorded(forget_layout_state: bool, broadcast: bool) -> DetectionOutcome {
+        DetectionOutcome::Recorded {
+            forget_layout_state,
+            broadcast,
         }
     }
 
@@ -839,68 +961,173 @@ mod tests {
         assert!(auto_detection_active(&cache(false, false), now));
         assert!(!auto_detection_active(&cache(true, false), now));
         assert!(auto_detection_active(&cache(true, true), now));
-
-        // A forced rescan clears last_check but must not reopen the window.
-        let mut forced = cache(true, false);
-        forced.last_check = None;
-        assert!(!auto_detection_active(&forced, now));
     }
 
     #[test]
-    fn first_detection_always_broadcasts_and_later_ones_only_on_change() {
-        let now = Instant::now();
-        assert!(detection_result_changed(
-            &cache(false, false),
-            now,
-            false,
-            &None
-        ));
-        assert!(!detection_result_changed(
-            &cache(true, false),
-            now,
-            false,
-            &None
-        ));
-        assert!(detection_result_changed(
-            &cache(true, false),
-            now,
-            true,
-            &None
-        ));
-        assert!(detection_result_changed(
-            &cache(true, false),
-            now,
-            false,
-            &Some("OBS is streaming".to_string())
-        ));
-    }
-
-    #[test]
-    fn a_detection_too_old_to_trust_counts_as_active_until_a_new_scan() {
-        let not_streaming = cache(true, false);
-        let completed_at = not_streaming.completed_at.unwrap();
-        assert!(!auto_detection_active(
-            &not_streaming,
-            completed_at + DETECTION_TRUST_WINDOW
-        ));
-        // After a sleep, or with scans stalled, the old result is not trusted.
-        let later = completed_at + DETECTION_TRUST_WINDOW + Duration::from_millis(1);
-        assert!(auto_detection_active(&not_streaming, later));
+    fn every_tick_completes_a_scan_once_per_detection_period() {
+        // The task ticks every DETECTION_INTERVAL, a little late at times, and
+        // each tick claims a scan; scans here take 40 ms or 900 ms. No tick is
+        // refused because the previous result still looks fresh (that halved
+        // the polling coordinator's rate to one scan every two periods).
+        let mut cache = cache(false, false);
+        let start = Instant::now();
+        let mut completions = Vec::new();
+        for tick in 0..10u32 {
+            let lateness = Duration::from_millis(u64::from(tick % 3) * 15);
+            let ticked_at = start + DETECTION_INTERVAL * tick + lateness;
+            let generation = claim_detection_refresh(&mut cache).expect("every tick claims a scan");
+            let scan_time = Duration::from_millis(if tick % 2 == 0 { 40 } else { 900 });
+            let finished_at = ticked_at + scan_time;
+            let outcome =
+                record_detection_into(&mut cache, not_streaming(), generation, finished_at);
+            assert_ne!(outcome, DetectionOutcome::Discarded);
+            completions.push(finished_at);
+        }
+        for pair in completions.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap < DETECTION_INTERVAL * 2,
+                "a tick went without a scan: {gap:?}"
+            );
+        }
+        let mean_gap = (completions[9] - completions[0]) / 9;
         assert!(
-            detection_result_changed(&not_streaming, later, false, &None),
-            "the scan that replaces an untrusted result broadcasts"
+            mean_gap.abs_diff(DETECTION_INTERVAL) < Duration::from_millis(150),
+            "{mean_gap:?}"
+        );
+    }
+
+    #[test]
+    fn slow_scans_never_redact_a_not_streaming_result() {
+        let mut cache = cache(true, false);
+        let completed_at = cache.completed_at.unwrap();
+        // The next scan takes 40 s: far longer than the period, shorter than
+        // the backstop. Gates keep the not-streaming answer throughout.
+        let generation = claim_detection_refresh(&mut cache).unwrap();
+        let finished_at = completed_at + Duration::from_secs(40);
+        let mut now = completed_at;
+        while now <= finished_at {
+            assert!(!auto_detection_active(&cache, now), "redacted at {now:?}");
+            now += Duration::from_millis(500);
+        }
+        assert_eq!(
+            record_detection_into(&mut cache, not_streaming(), generation, finished_at),
+            recorded(false, false),
+            "nothing changed, so nothing is relaid out or broadcast"
+        );
+    }
+
+    #[test]
+    fn the_backstop_trips_only_after_its_full_duration_without_completions() {
+        let cache = cache(true, false);
+        let completed_at = cache.completed_at.unwrap();
+        assert!(!auto_detection_active(
+            &cache,
+            completed_at + DETECTION_BACKSTOP
+        ));
+        assert!(!cache.untrusted_observed.load(Ordering::Relaxed));
+        // The task died or a wake was missed: fail closed and note it.
+        let later = completed_at + DETECTION_BACKSTOP + Duration::from_millis(1);
+        assert!(auto_detection_active(&cache, later));
+        assert!(cache.untrusted_observed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn switching_into_auto_or_waking_fails_closed_until_a_new_generation_scan_completes() {
+        // set_streamer_mode_status, update_streamer_mode_settings and
+        // note_system_wake all reset the cache this way.
+        let mut cache = cache(true, false);
+        let now = cache.completed_at.unwrap();
+        assert!(!auto_detection_active(&cache, now));
+
+        reset_detection_for_auto(&mut cache);
+        assert!(
+            auto_detection_active(&cache, now),
+            "an old not-streaming result must not unredact a switch into Auto or a wake"
+        );
+        let later = now + Duration::from_millis(50);
+        assert_eq!(
+            scan(&mut cache, not_streaming(), later),
+            recorded(true, true),
+            "the gate that failed closed above forces a rebuild"
+        );
+        assert!(!auto_detection_active(&cache, later));
+        assert!(!cache.refresh_in_flight);
+    }
+
+    #[test]
+    fn a_scan_in_flight_across_a_reset_is_discarded() {
+        let mut cache = cache(true, false);
+        let now = cache.completed_at.unwrap();
+        let stale = claim_detection_refresh(&mut cache).unwrap();
+        reset_detection_for_auto(&mut cache);
+        assert_eq!(
+            claim_detection_refresh(&mut cache),
+            None,
+            "the old scan still runs"
         );
 
-        // Refresh clears last_check only, so it does not distrust the result.
-        let mut refreshed = cache(true, false);
-        refreshed.last_check = None;
-        assert!(!auto_detection_active(&refreshed, completed_at));
+        let finished_at = now + Duration::from_secs(1);
+        assert_eq!(
+            record_detection_into(&mut cache, not_streaming(), stale, finished_at),
+            DetectionOutcome::Discarded
+        );
+        assert!(cache.completed_at.is_none());
+        assert!(auto_detection_active(&cache, finished_at));
+
+        let fresh = claim_detection_refresh(&mut cache).expect("discarding released the claim");
+        assert_ne!(fresh, stale);
+        assert!(matches!(
+            record_detection_into(&mut cache, not_streaming(), fresh, finished_at),
+            DetectionOutcome::Recorded { .. }
+        ));
+        assert!(!auto_detection_active(&cache, finished_at));
+    }
+
+    #[test]
+    fn detections_broadcast_only_on_change_or_an_observed_untrusted_period() {
+        let now = Instant::now();
+        let mut steady = cache(true, false);
+        assert_eq!(
+            scan(&mut steady, not_streaming(), now),
+            recorded(false, false)
+        );
+        let obs = || DetectionResult {
+            active: true,
+            source: Some("OBS is streaming".to_string()),
+        };
+        assert_eq!(scan(&mut steady, obs(), now), recorded(false, true));
+        assert_eq!(scan(&mut steady, obs(), now), recorded(false, false));
+
+        // An untrusted period no gate read neither relays out nor broadcasts.
+        let mut unobserved = cache(true, false);
+        reset_detection_for_auto(&mut unobserved);
+        assert_eq!(
+            scan(&mut unobserved, not_streaming(), now),
+            recorded(false, false)
+        );
+
+        // Failing closed while "streaming" was cached showed nothing new.
+        let mut streaming = cache(true, true);
+        streaming.last_source = obs().source;
+        reset_detection_for_auto(&mut streaming);
+        assert!(auto_detection_active(&streaming, now));
+        assert_eq!(scan(&mut streaming, obs(), now), recorded(false, false));
+
+        // Startup: a gate read before the first result rebuilds after it.
+        let mut startup = cache(false, false);
+        assert!(auto_detection_active(&startup, now));
+        assert_eq!(
+            scan(&mut startup, not_streaming(), now),
+            recorded(true, true)
+        );
+        assert!(!startup.untrusted_observed.load(Ordering::Relaxed));
     }
 
     #[test]
     fn a_panicking_detection_releases_its_claim_without_completing() {
         let lock = RwLock::new(cache(false, false));
-        assert!(claim_detection_refresh(&mut lock.write().unwrap()));
+        assert!(claim_detection_refresh(&mut lock.write().unwrap()).is_some());
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_claimed_detection(&lock, || panic!("simulated detection panic"))
@@ -911,43 +1138,73 @@ mod tests {
         assert!(!cache.refresh_in_flight, "a later scan can be claimed");
         assert!(cache.completed_at.is_none(), "the panic is not a detection");
         assert!(auto_detection_active(&cache, Instant::now()));
-        assert!(claim_detection_refresh(&mut cache));
+        assert!(claim_detection_refresh(&mut cache).is_some());
     }
 
     #[test]
-    fn switching_into_auto_fails_closed_until_a_new_scan_completes() {
+    fn detection_refresh_is_claimed_once_at_a_time() {
         let mut cache = cache(true, false);
-        let now = cache.completed_at.unwrap();
-        assert!(!auto_detection_active(&cache, now));
-
-        reset_detection_for_auto(&mut cache);
-        assert!(
-            auto_detection_active(&cache, now),
-            "an old not-streaming result must not unredact a switch into Auto"
-        );
-        assert!(
+        let generation = claim_detection_refresh(&mut cache).unwrap();
+        assert_eq!(
             claim_detection_refresh(&mut cache),
-            "the reset makes a scan due"
+            None,
+            "already in flight"
         );
-
-        let (changed, was_untrusted) =
-            record_detection_into(&mut cache, DetectionResult::default());
-        assert!(changed && was_untrusted);
-        assert!(!auto_detection_active(&cache, Instant::now()));
-        assert!(!cache.refresh_in_flight);
+        record_detection_into(&mut cache, not_streaming(), generation, Instant::now());
+        assert_eq!(
+            claim_detection_refresh(&mut cache),
+            Some(generation),
+            "a just-finished result does not refuse the next tick"
+        );
     }
 
     #[test]
-    fn detection_refresh_is_claimed_once_and_only_when_stale() {
-        let mut never = cache(false, false);
-        assert!(claim_detection_refresh(&mut never));
-        assert!(!claim_detection_refresh(&mut never), "already in flight");
+    fn the_detection_loop_scans_on_every_tick_and_survives_a_panicking_scan() {
+        static SCANS: AtomicUsize = AtomicUsize::new(0);
+        static SCANNING: AtomicBool = AtomicBool::new(false);
+        fn detect() -> DetectionResult {
+            assert!(!SCANNING.swap(true, Ordering::SeqCst), "two scans at once");
+            let scan = SCANS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(3));
+            SCANNING.store(false, Ordering::SeqCst);
+            assert_ne!(scan, 1, "simulated detection panic");
+            DetectionResult::default()
+        }
 
-        let mut fresh = cache(true, false);
-        assert!(!claim_detection_refresh(&mut fresh));
+        let cache: &'static RwLock<DetectionCache> =
+            Box::leak(Box::new(RwLock::new(cache(false, false))));
+        let scan_now = tokio::sync::Notify::new();
+        let checks = AtomicUsize::new(0);
+        let outcomes = AtomicUsize::new(0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(run_detection_loop(
+            cache,
+            &scan_now,
+            Duration::from_millis(10),
+            || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                outcomes.load(Ordering::SeqCst) < 5
+            },
+            detect,
+            |outcome| {
+                assert_ne!(outcome, DetectionOutcome::Discarded);
+                outcomes.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
 
-        let mut forced = cache(true, false);
-        forced.last_check = None;
-        assert!(claim_detection_refresh(&mut forced));
+        let scans = SCANS.load(Ordering::SeqCst);
+        assert_eq!(outcomes.load(Ordering::SeqCst), 5);
+        assert_eq!(scans, 6, "the panicking scan did not stop the loop");
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            scans + 1,
+            "every tick but the stopping one ran a scan"
+        );
+        let cache = cache.read().unwrap();
+        assert!(!cache.refresh_in_flight);
+        assert!(cache.completed_at.is_some());
     }
 }

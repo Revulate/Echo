@@ -275,21 +275,6 @@ fn poll_due(last: Option<Instant>, interval: Duration) -> bool {
     last.is_none_or(|last| last.elapsed() >= interval)
 }
 
-fn maybe_refresh_streamer_detection(cadence: &mut Cadence) {
-    if !cadence.is_due()
-        || !matches!(
-            backend::streamer_mode::get_streamer_mode_settings().enabled,
-            backend::streamer_mode::StreamerModeStatus::Auto
-        )
-    {
-        return;
-    }
-    cadence.mark();
-    // The scan reads the process list and OBS/Discord log tails, so it runs on
-    // the blocking pool; the result reaches the UI through the change broadcast.
-    backend::streamer_mode::schedule_detection_refresh();
-}
-
 /// Change key for the Activity sidebar snapshots owned by AppState.
 ///
 /// `refresh_sidebar_caches` rebuilds both Vecs unconditionally, so buffer
@@ -458,7 +443,6 @@ struct PollLoop {
     empty_channel_recovery: Cadence,
     theme_file_reload: Cadence,
     system_theme: Cadence,
-    streamer_detection: Cadence,
 
     last_uptime_fingerprint: u64,
     tracked_global_emote_version: u32,
@@ -489,7 +473,6 @@ impl PollLoop {
             empty_channel_recovery: Cadence::immediate(Duration::from_millis(500)),
             theme_file_reload: Cadence::after(Duration::from_secs(2)),
             system_theme: Cadence::after(Duration::from_secs(2)),
-            streamer_detection: Cadence::immediate(Duration::from_secs(2)),
             last_uptime_fingerprint: 0,
             tracked_global_emote_version: 0,
             tracked_user_emote_version: 0,
@@ -519,7 +502,6 @@ impl PollLoop {
         }
         maybe_reload_custom_theme_file(&mut self.theme_file_reload);
         maybe_refresh_system_theme(&mut self.system_theme);
-        maybe_refresh_streamer_detection(&mut self.streamer_detection);
 
         let should_recover_empty_channels = self.empty_channel_recovery.is_due();
         if woken_by_activity || should_recover_empty_channels {
@@ -560,12 +542,6 @@ impl PollLoop {
         } else {
             Duration::from_secs(30)
         };
-        if matches!(
-            backend::streamer_mode::get_streamer_mode_settings().enabled,
-            backend::streamer_mode::StreamerModeStatus::Auto
-        ) {
-            health_interval = health_interval.min(self.streamer_detection.every);
-        }
         health_interval = health_interval.min(self.stream_info.every);
         let housekeeping = [
             Some(self.image_cleanup.until_due()),
@@ -745,8 +721,6 @@ impl PollLoop {
         }
 
         let mut needs_notify = false;
-
-        maybe_refresh_streamer_detection(&mut self.streamer_detection);
 
         if !image_cache::has_visible_animations() {
             dynamic_tick_scheduler::reset_to_default();

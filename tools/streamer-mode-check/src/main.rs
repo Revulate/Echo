@@ -24,9 +24,9 @@ mod backend {
         pub struct Runtime;
 
         impl Runtime {
-            pub fn spawn_blocking<F>(&self, _task: F)
+            pub fn spawn<F>(&self, _task: F)
             where
-                F: FnOnce() + Send + 'static,
+                F: std::future::Future<Output = ()> + Send + 'static,
             {
             }
         }
@@ -70,8 +70,8 @@ mod storage_roots {
 
 // Only the settings-driven gates are checked; process detection, cached status
 // and settings updates run against live system state. The runtime stub never
-// runs the background detection, so Auto stays in its fail-closed state from
-// before the first detection completes.
+// runs the detection task, so Auto stays in its fail-closed state from before
+// the first detection completes.
 #[path = "../../../src/backend/streamer_mode.rs"]
 #[allow(dead_code)]
 mod streamer_mode;
