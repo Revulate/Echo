@@ -1095,7 +1095,7 @@ impl EventSubClient {
                     && !self
                         .notification_ids
                         .lock_or_recover()
-                        .check_and_add(delivery_id.to_string())
+                        .check_and_add(delivery_id)
                 {
                     crate::log_net!(debug, "Dropped duplicate EventSub delivery {}", delivery_id);
                     return Ok(());

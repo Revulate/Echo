@@ -565,16 +565,28 @@ fn record_activity(connection_generation: u64) {
 /// Mark a message ID as seen for a channel
 /// Returns true if the message was new, false if it was a duplicate
 pub fn mark_message_seen(channel: &str, msg_id: &str) -> bool {
+    // Same key as `channel.to_lowercase()`, without allocating for a channel
+    // that is already lowercase ASCII (every caller passes a channel key).
+    let channel_lower = if channel.is_ascii() && !channel.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(channel)
+    } else {
+        std::borrow::Cow::Owned(channel.to_lowercase())
+    };
+    if let Some(mut dedup) = MESSAGE_DEDUP.get_mut(channel_lower.as_ref()) {
+        return dedup.insert(msg_id);
+    }
+
+    // Only a new channel grows the map, so the channel bound is enforced here
+    // rather than by counting every shard on each message.
     if MESSAGE_DEDUP.len() > DEDUP_MAX_CHANNELS {
         let connected = CONNECTED_CHANNELS.read();
         MESSAGE_DEDUP.retain(|ch, _| connected.contains(ch));
     }
 
-    let channel_lower = channel.to_lowercase();
     let mut entry = MESSAGE_DEDUP
-        .entry(channel_lower)
+        .entry(channel_lower.into_owned())
         .or_insert_with(|| MessageDeduplicator::new(DEDUP_MAX_SIZE));
-    entry.insert(msg_id.to_string())
+    entry.insert(msg_id)
 }
 
 fn admit_received_chat_message(channel: &str, msg_id: &str) -> bool {
@@ -1704,43 +1716,6 @@ pub fn shutdown_read_connection(timeout: std::time::Duration) -> bool {
 }
 
 #[cfg(test)]
-mod streamer_detection_wait_tests {
-    use super::{STREAMER_DETECTION_INGEST_POLL, wait_while_bounded};
-    use core::prelude::v1::test;
-    use std::time::{Duration, Instant};
-
-    #[tokio::test]
-    async fn ingest_wait_returns_when_detection_finishes_and_is_bounded() {
-        let started = Instant::now();
-        wait_while_bounded(|| false, Duration::from_secs(5)).await;
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "nothing pending"
-        );
-
-        let mut checks = 0;
-        let started = Instant::now();
-        wait_while_bounded(
-            || {
-                checks += 1;
-                checks < 3
-            },
-            Duration::from_secs(5),
-        )
-        .await;
-        assert_eq!(checks, 3, "stops as soon as the detection completes");
-        assert!(started.elapsed() < Duration::from_secs(1));
-
-        let limit = Duration::from_millis(60);
-        let started = Instant::now();
-        wait_while_bounded(|| true, limit).await;
-        let waited = started.elapsed();
-        assert!(waited >= limit, "a stuck detection is waited out");
-        assert!(waited < limit + STREAMER_DETECTION_INGEST_POLL * 20);
-    }
-}
-
-#[cfg(test)]
 mod timeout_format_tests {
     use super::format_timeout_duration;
     use core::prelude::v1::test;
@@ -1790,6 +1765,49 @@ mod tests {
         store_received_chat_row, update_buffered_message_emote_lookup_scope,
     };
     use core::prelude::v1::test;
+
+    #[tokio::test]
+    async fn ingest_wait_returns_when_detection_finishes_and_is_bounded() {
+        let started = std::time::Instant::now();
+        super::wait_while_bounded(|| false, std::time::Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "nothing pending"
+        );
+
+        let mut checks = 0;
+        let started = std::time::Instant::now();
+        super::wait_while_bounded(
+            || {
+                checks += 1;
+                checks < 3
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(checks, 3, "stops as soon as the detection completes");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let limit = std::time::Duration::from_millis(60);
+        let started = std::time::Instant::now();
+        super::wait_while_bounded(|| true, limit).await;
+        let waited = started.elapsed();
+        assert!(waited >= limit, "a stuck detection is waited out");
+        assert!(waited < limit + super::STREAMER_DETECTION_INGEST_POLL * 20);
+    }
+
+    #[test]
+    fn message_dedup_keys_channels_by_lowercase_and_ids_by_value() {
+        let id = "0a1b2c3d-4977-403a-8a94-33c6bac34fb8";
+        assert!(super::mark_message_seen("dedup_case_check", id));
+        assert!(!super::mark_message_seen("Dedup_Case_Check", id));
+        assert!(!super::mark_message_seen("dedup_case_check", id));
+        assert!(super::mark_message_seen("dedup_case_check", "local-1"));
+        assert!(!super::mark_message_seen("DEDUP_CASE_CHECK", "local-1"));
+        assert!(super::mark_message_seen("dedup_case_other", id));
+        super::MESSAGE_DEDUP.remove("dedup_case_check");
+        super::MESSAGE_DEDUP.remove("dedup_case_other");
+    }
 
     #[test]
     fn account_mentions_match_unicode_names_at_word_boundaries() {

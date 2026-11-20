@@ -136,6 +136,10 @@ core_test	crates/echo-core/src/chatterino_import.rs	chatterino_import_selection_
 core_test	crates/echo-core/src/chatterino_import.rs	chatterino_import_tolerates_malformed_and_partial_files
 core_test	crates/echo-core/src/chatterino_import.rs	chatterino_import_translates_qt_replacements
 core_test	crates/echo-core/src/commands.rs	trigger_requires_word_boundary
+core_test	crates/echo-core/src/deduplicator.rs	canonical_uuids_key_by_value_and_other_ids_stay_distinct
+core_test	crates/echo-core/src/deduplicator.rs	matches_the_string_deduplicator_on_mixed_ids
+core_test	crates/echo-core/src/deduplicator.rs	nothing_is_reserved_until_ids_arrive
+core_test	crates/echo-core/src/deduplicator.rs	prune_drops_the_oldest_ids_down_to_the_threshold
 core_test	crates/echo-core/src/deduplicator.rs	test_message_deduplicator_basic
 core_test	crates/echo-core/src/deduplicator.rs	test_message_deduplicator_pruning
 core_test	crates/echo-core/src/emote_display_rules.rs	emote_display_rules_deserialize_with_defaults
@@ -519,6 +523,7 @@ root_test	src/backend/irc/connection.rs	canonical_twitch_id_prevents_duplicates_
 root_test	src/backend/irc/connection.rs	confirmed_send_requires_one_positive_result_with_a_real_message_id
 root_test	src/backend/irc/connection.rs	failed_history_emote_readiness_releases_loaded_marker
 root_test	src/backend/irc/connection.rs	ingest_wait_returns_when_detection_finishes_and_is_bounded
+root_test	src/backend/irc/connection.rs	message_dedup_keys_channels_by_lowercase_and_ids_by_value
 root_test	src/backend/irc/connection.rs	resolved_shared_source_updates_scope_without_retokenizing
 root_test	src/backend/irc/connection.rs	restart_aimed_at_the_running_connection_applies
 root_test	src/backend/irc/connection.rs	shared_chat_emote_lookup_uses_source_or_global_scope_never_foreign_host
@@ -883,7 +888,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	403
+summary	root_tests	404
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
@@ -892,7 +897,7 @@ summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	23
 summary	media_cache_tests	39
-summary	core_tests	242
+summary	core_tests	246
 summary	render_core_tests	46
 summary	text_core_tests	26
 summary	root_doctests_runnable	3
