@@ -139,9 +139,7 @@ pub(super) struct PreloadState {
     pub(super) emote_scan: RangeScan,
     pub(super) last_layout_image_preload_range: Option<(usize, usize)>,
     pub(super) last_layout_image_preload_time: std::time::Instant,
-    pub(super) last_embed_fetch_range: Option<(usize, usize)>,
-    pub(super) embed_fetch_scan_cursor: usize,
-    pub(super) last_embed_fetch_time: std::time::Instant,
+    pub(super) embed_scan: RangeScan,
     pub(super) last_burst_direction: Option<ScrollDirection>,
     /// Last velocity-scaled lookahead window dispatched for async layout.
     /// Guards `preload_layouts_for_visible_range` so the offscreen lookahead is
@@ -158,25 +156,46 @@ impl PreloadState {
             emote_scan: RangeScan::initial(),
             last_layout_image_preload_range: None,
             last_layout_image_preload_time: instant_minus_secs(10),
-            last_embed_fetch_range: None,
-            embed_fetch_scan_cursor: 0,
-            last_embed_fetch_time: instant_minus_secs(10),
+            embed_scan: RangeScan::initial(),
             last_burst_direction: None,
             last_layout_lookahead_range: None,
             last_layout_landing_range: None,
         }
     }
 
-    /// Rows from `from` on were just added; the next emote preload pass
-    /// scans them first.
+    /// Rows from `from` on were just added; the next emote and embed passes
+    /// scan them first.
     pub(super) fn note_new_rows(&mut self, from: usize) {
         self.emote_scan.note_new_rows(from);
+        self.embed_scan.note_new_rows(from);
     }
 
-    /// Keep the emote preload range naming the same rows after the first
-    /// `dropped` rows left.
+    /// Forget every row-index range after rows moved in a way that cannot be
+    /// followed (a rebuild, a history merge), so each pass starts afresh.
+    pub(super) fn reset_index_ranges(&mut self) {
+        self.emote_scan.reset();
+        self.embed_scan.reset();
+        self.last_layout_image_preload_range = None;
+        self.last_layout_lookahead_range = None;
+        self.last_layout_landing_range = None;
+    }
+
+    /// Keep every row-index range naming the same rows after the first
+    /// `dropped` rows left. The emote and embed scans then cover just the new
+    /// rows; the static-image preload sees a changed range and rescans the
+    /// visible rows (some are new); the async-layout lookahead and landing
+    /// windows are dispatched again only if the rows they cover moved.
     pub(super) fn shift_after_front_drop(&mut self, dropped: usize) {
+        use super::message_delta::range_after_front_drop;
         self.emote_scan.shift_after_front_drop(dropped);
+        self.embed_scan.shift_after_front_drop(dropped);
+        for range in [
+            &mut self.last_layout_image_preload_range,
+            &mut self.last_layout_lookahead_range,
+            &mut self.last_layout_landing_range,
+        ] {
+            *range = range.and_then(|range| range_after_front_drop(range, dropped));
+        }
     }
 }
 

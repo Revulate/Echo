@@ -230,7 +230,7 @@ impl CanvasMessageList {
         self.message_model.reset_rows(messages, &heights);
         self.message_state.needs_layout_rebuild = false;
         self.layout_store.runtime.restart_width_refresh();
-        self.preload_state.emote_scan.reset();
+        self.preload_state.reset_index_ranges();
         self.interaction_state.hitbox_manager.invalidate_cache();
     }
 
@@ -268,7 +268,8 @@ impl CanvasMessageList {
     /// Keep the index-keyed state across a drop of `dropped` front rows by
     /// shifting it to the rows' new indices: the prepared paint rows (the
     /// rows still shown are the same, so the next frame reuses them), the
-    /// emote preload range and the stale-layout scan cursor.
+    /// preload, embed, lookahead and landing ranges, and the stale-layout
+    /// scan cursor.
     fn remap_index_state_after_front_drop(&mut self, dropped: usize) {
         if let Some(rows) = self.viewport_state.cached_viewport_paint_rows.take() {
             let kept = remap_after_front_drop(&rows, dropped, |row| &mut row.message_index);
@@ -436,7 +437,7 @@ impl CanvasMessageList {
                 // a merge restripes the rows it keeps: check offscreen
                 // layouts again.
                 self.layout_store.runtime.mark_stale();
-                self.preload_state.emote_scan.reset();
+                self.preload_state.reset_index_ranges();
                 self.interaction_state.hitbox_manager.invalidate_cache();
                 self.after_history_insert(
                     &messages[..existing_start],

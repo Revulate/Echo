@@ -198,31 +198,20 @@ impl CanvasMessageList {
         let preload_end = (end_idx + 8).min(self.message_model.message_order.len());
 
         const EMBED_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
-        let current_range = (preload_start, preload_end);
-        let range_changed = self.preload_state.last_embed_fetch_range != Some(current_range);
-        let elapsed = self.preload_state.last_embed_fetch_time.elapsed();
-        if !range_changed && elapsed < EMBED_SCAN_INTERVAL {
+        let scan = self.preload_state.embed_scan.rows_to_scan(
+            (preload_start, preload_end),
+            0,
+            EMBED_SCAN_INTERVAL,
+            EMBED_SCAN_MESSAGE_BUDGET,
+            std::time::Instant::now(),
+        );
+        if scan.is_empty() {
             return;
         }
-        if range_changed {
-            self.preload_state.embed_fetch_scan_cursor = 0;
-        }
-        self.preload_state.last_embed_fetch_range = Some(current_range);
-        self.preload_state.last_embed_fetch_time = std::time::Instant::now();
 
-        let range_len = preload_end.saturating_sub(preload_start);
-        if range_len == 0 {
-            return;
-        }
-        let scan_count = range_len.min(EMBED_SCAN_MESSAGE_BUDGET);
-        let start_offset = self.preload_state.embed_fetch_scan_cursor % range_len;
-        self.preload_state.embed_fetch_scan_cursor = (start_offset + scan_count) % range_len;
+        let mut media_plan = VisibleMediaPlan::with_capacity(0, scan.len(), 0);
 
-        let mut media_plan = VisibleMediaPlan::with_capacity(0, scan_count, 0);
-
-        for step in 0..scan_count {
-            let idx = preload_start + ((start_offset + step) % range_len);
-
+        for idx in scan {
             let msg_id = &self.message_model.message_order[idx];
             let Some(message) = self.get_message(msg_id) else {
                 continue;

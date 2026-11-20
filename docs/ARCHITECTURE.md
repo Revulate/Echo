@@ -186,9 +186,12 @@ flowchart TD
   canvas has. The canvas applies an append, a history prepend, and a drop of
   rows from the front with or without an append (a rotation at the buffer
   cap, or front rows removed) incrementally (`painter/message_delta.rs`),
-  shifting its prepared paint rows and emote-preload range to the rows' new
-  indices, so the next frame reuses the rows still shown and scans only the
-  new ones; any other shape rebuilds its model.
+  shifting its row-index state (prepared paint rows, emote-preload, embed,
+  static-image, lookahead and landing ranges, stale-layout scan cursor) to the
+  rows' new indices, so the next frame reuses the rows still shown and scans
+  only the new ones; any other shape rebuilds its model. Rows appended by
+  these paths wait for their heights until `update_layouts`' pending-row pass,
+  and every path keeps the rows already waiting.
 - **Duplicate-channel splits** share one `ChatState`. Each split owns its own
   `CanvasMessageList` (scroll, selection, width-dependent layout) keyed by a
   stable `SplitId`. Split-specific actions carry the source `SplitId`

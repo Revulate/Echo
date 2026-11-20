@@ -492,7 +492,7 @@ mod tests {
             self.needs_layout_rebuild = false;
             self.stale = true;
             self.width_refresh = true;
-            self.preload.emote_scan.reset();
+            self.preload.reset_index_ranges();
             self.index_state.prepared.clear();
             self.index_state.stale_cursor_row = None;
             self.rebuilds += 1;
@@ -552,7 +552,7 @@ mod tests {
                     self.model
                         .insert_around(next, existing_start, &heights, &mut pending);
                     self.stale = true;
-                    self.preload.emote_scan.reset();
+                    self.preload.reset_index_ranges();
                     self.index_state.prepared.clear();
                     self.index_state.stale_cursor_row = None;
                     self.primed.extend(
@@ -699,7 +699,13 @@ mod tests {
             for (index, id) in &self.index_state.prepared {
                 assert_eq!(order.get(*index), Some(id), "prepared row {index}");
             }
-            let ranges = [self.preload.emote_scan.range()];
+            let ranges = [
+                self.preload.emote_scan.range(),
+                self.preload.embed_scan.range(),
+                self.preload.last_layout_image_preload_range,
+                self.preload.last_layout_lookahead_range,
+                self.preload.last_layout_landing_range,
+            ];
             for (range, end_row) in ranges.iter().zip(&self.index_state.range_ends) {
                 if let Some((start, end)) = *range {
                     assert!(start < end && end <= order.len(), "range {start}..{end}");
@@ -720,8 +726,14 @@ mod tests {
             self.preload
                 .emote_scan
                 .rows_to_scan(range, 0, Duration::ZERO, 64, now);
+            self.preload
+                .embed_scan
+                .rows_to_scan(range, 0, Duration::ZERO, 48, now);
+            self.preload.last_layout_image_preload_range = Some(range);
+            self.preload.last_layout_lookahead_range = Some(range);
+            self.preload.last_layout_landing_range = Some(range);
             self.index_state.range_ends = if len > 0 {
-                vec![order[len - 1].clone()]
+                vec![order[len - 1].clone(); 5]
             } else {
                 Vec::new()
             };
