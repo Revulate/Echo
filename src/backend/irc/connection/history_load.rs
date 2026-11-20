@@ -115,6 +115,21 @@ pub(super) fn seed_chatters_from_visible_buffer(channel: &str) {
     }
 }
 
+/// Drop the rows of a history batch that the channel's buffer already holds,
+/// and repeats within the batch: the commit would drop them anyway, after
+/// parsing them. The commit still checks again under the gate, for rows that
+/// arrive meanwhile.
+pub(super) fn retain_history_rows_not_buffered(messages: &mut Vec<ChatMessage>, channel: &str) {
+    let buffer = CHAT_MESSAGES.get(channel);
+    let mut seen_ids = HashSet::with_capacity(messages.len());
+    messages.retain(|message| {
+        !buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.contains_id(message.id.as_ref()))
+            && seen_ids.insert(message.id.clone())
+    });
+}
+
 pub(super) async fn merge_visible_history_messages(
     channel: &str,
     messages: Vec<ChatMessage>,
@@ -124,14 +139,25 @@ pub(super) async fn merge_visible_history_messages(
     }
     let mut messages = messages;
     prepare_history_emote_scopes(&mut messages, channel).await;
+    retain_history_rows_not_buffered(&mut messages, channel);
     // Retokenize before taking the gate: every live PRIVMSG commit and the
     // UI's visible-row reads wait on it, and a large history batch takes
-    // milliseconds to parse. A catalog that changed while parsing gets one
-    // more pass under the gate so committed rows match the current catalog.
+    // milliseconds to parse, so it runs on the blocking pool rather than a
+    // runtime worker that IRC ingest shares. A catalog that changed while
+    // parsing gets one more pass under the gate so committed rows match the
+    // current catalog.
     let parsed_against = history_emote_versions(channel);
-    for message in &mut messages {
-        reparse_message_slots(message, channel, true);
-    }
+    let reparse_channel = channel.to_string();
+    let Ok(mut messages) = tokio::task::spawn_blocking(move || {
+        for message in &mut messages {
+            reparse_message_slots(message, &reparse_channel, true);
+        }
+        messages
+    })
+    .await
+    else {
+        return 0;
+    };
     let visibility_commit = crate::backend::blocked_users::visibility_commit_guard();
     if READ_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
         return 0;
@@ -330,7 +356,15 @@ pub(super) async fn load_channel_history_async(channel: &str) {
         if !crate::backend::settings::get_persist_history_enabled() {
             return;
         }
-        let local = crate::backend::history_cache::load_channel_history(channel);
+        // The file read and decode are synchronous, so they run on the
+        // blocking pool. The merge reparses every row against the current
+        // catalogs, so the rows are built without slots.
+        let load_channel = channel.to_string();
+        let local = tokio::task::spawn_blocking(move || {
+            crate::backend::history_cache::load_channel_history(&load_channel, false)
+        })
+        .await
+        .unwrap_or_default();
         if local.is_empty() {
             return;
         }

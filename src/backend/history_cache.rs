@@ -187,37 +187,42 @@ impl StoredMessage {
     }
 
     /// Reconstruct a ChatMessage from stored data, retokenizing slots
-    fn into_chat_message(self, channel: &str) -> ChatMessage {
-        let twitch_emotes: FxHashMap<usize, (String, usize)> = self
-            .twitch_emotes_tag
-            .as_deref()
-            .map(parse_emotes_tag)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(start, (id, end))| {
-                if end <= self.reply_emote_offset {
-                    return None;
-                }
-                let new_start = start.saturating_sub(self.reply_emote_offset);
-                let new_end = end.saturating_sub(self.reply_emote_offset);
-                if new_end <= new_start {
-                    return None;
-                }
-                Some((new_start, (id, new_end)))
-            })
-            .collect();
-
+    /// The stored row as a chat row. Without `tokenize` its slots are left
+    /// empty, for a caller that parses every row again anyway.
+    fn into_chat_message(self, channel: &str, tokenize: bool) -> ChatMessage {
         let stored_emote_lookup_channel = self.emote_lookup_channel.map(Arc::from);
         let stored_emote_lookup_source_id = self.emote_lookup_source_id.map(Arc::from);
-        let emote_lookup_channel = stored_emote_lookup_channel.as_deref().unwrap_or(channel);
-        let slots = crate::backend::slots::parser::parse_to_slots_with_gifs(
-            &self.content,
-            emote_lookup_channel,
-            crate::backend::emotes::EmoteSender::new(self.user_id.as_deref(), &self.sender),
-            &twitch_emotes,
-            self.twitch_gifs_tag.as_deref(),
-            self.reply_emote_offset,
-        );
+        let slots = if tokenize {
+            let twitch_emotes: FxHashMap<usize, (String, usize)> = self
+                .twitch_emotes_tag
+                .as_deref()
+                .map(parse_emotes_tag)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(start, (id, end))| {
+                    if end <= self.reply_emote_offset {
+                        return None;
+                    }
+                    let new_start = start.saturating_sub(self.reply_emote_offset);
+                    let new_end = end.saturating_sub(self.reply_emote_offset);
+                    if new_end <= new_start {
+                        return None;
+                    }
+                    Some((new_start, (id, new_end)))
+                })
+                .collect();
+            let emote_lookup_channel = stored_emote_lookup_channel.as_deref().unwrap_or(channel);
+            crate::backend::slots::parser::parse_to_slots_with_gifs(
+                &self.content,
+                emote_lookup_channel,
+                crate::backend::emotes::EmoteSender::new(self.user_id.as_deref(), &self.sender),
+                &twitch_emotes,
+                self.twitch_gifs_tag.as_deref(),
+                self.reply_emote_offset,
+            )
+        } else {
+            Vec::new()
+        };
         let structure_hash = compute_structure_hash(&slots);
         let slots: Arc<[_]> = slots.into();
 
@@ -795,7 +800,10 @@ pub fn save_channel_history(channel: &str, messages: &[ChatMessage]) {
 }
 
 /// Load channel history from local cache file
-pub fn load_channel_history(channel: &str) -> Vec<ChatMessage> {
+/// The channel's cached history rows, oldest first. Without `tokenize` the
+/// rows have no slots: for a caller that reparses every row against the
+/// current catalogs before showing it.
+pub fn load_channel_history(channel: &str, tokenize: bool) -> Vec<ChatMessage> {
     let Some(history_dir) = get_history_dir() else {
         return vec![];
     };
@@ -829,7 +837,7 @@ pub fn load_channel_history(channel: &str) -> Vec<ChatMessage> {
         .filter(|message| {
             !is_legacy_protocol_status_message(message) && !is_legacy_synthetic_message(message)
         })
-        .map(|s| s.into_chat_message(channel))
+        .map(|s| s.into_chat_message(channel, tokenize))
         .collect();
     let count = messages.len();
     let filtered_count = stored_count.saturating_sub(count);
@@ -1218,6 +1226,29 @@ mod tests {
         assert!(path.exists());
     }
 
+    #[test]
+    fn untokenized_rows_keep_everything_but_the_slots() {
+        let tokenized = stored_message_fixture().into_chat_message("host", true);
+        let bare = stored_message_fixture().into_chat_message("host", false);
+        assert!(!tokenized.slots.is_empty());
+        assert!(bare.slots.is_empty());
+        assert_eq!(
+            bare.structure_hash,
+            crate::backend::slots::compute_structure_hash(&[])
+        );
+        assert_eq!(bare.id, tokenized.id);
+        assert_eq!(bare.content, tokenized.content);
+        assert_eq!(bare.twitch_emotes_tag, tokenized.twitch_emotes_tag);
+        assert_eq!(bare.emote_lookup_channel, tokenized.emote_lookup_channel);
+        assert_eq!(
+            bare.emote_lookup_source_id,
+            tokenized.emote_lookup_source_id
+        );
+        assert_eq!(bare.user_id, tokenized.user_id);
+        assert_eq!(bare.reply_emote_offset, tokenized.reply_emote_offset);
+        assert_eq!(bare.flags.highlight_type, tokenized.flags.highlight_type);
+    }
+
     fn stored_message_fixture() -> StoredMessage {
         StoredMessage {
             twitch_gifs_tag: None,
@@ -1377,7 +1408,7 @@ mod tests {
             .expect("v3 history should decode")
             .pop()
             .expect("one row")
-            .into_chat_message("host");
+            .into_chat_message("host", true);
 
         assert_eq!(restored.emote_lookup_channel.as_deref(), Some("source"));
         assert_eq!(
@@ -1455,7 +1486,7 @@ mod tests {
             .expect("v2 history should decode")
             .pop()
             .expect("one row")
-            .into_chat_message("host");
+            .into_chat_message("host", true);
 
         assert_eq!(restored.emote_lookup_channel, None);
     }

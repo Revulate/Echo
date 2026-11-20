@@ -192,7 +192,7 @@ pub async fn fetch_recent_messages_streaming(channel: &str) -> Result<HistoryFet
         }
         Ok(_empty) => {
             let cached = apply_blocked_visibility(
-                super::history_cache::load_channel_history(channel),
+                super::history_cache::load_channel_history(channel, true),
                 channel,
             );
             if cached.is_empty() {
@@ -222,7 +222,7 @@ pub async fn fetch_recent_messages_streaming(channel: &str) -> Result<HistoryFet
         }
         Err(e) => {
             let cached = apply_blocked_visibility(
-                super::history_cache::load_channel_history(channel),
+                super::history_cache::load_channel_history(channel, true),
                 channel,
             );
             if cached.is_empty() {

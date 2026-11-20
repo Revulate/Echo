@@ -519,6 +519,7 @@ root_test	src/backend/history_cache.rs	readable_day_log_names_match_only_echo_da
 root_test	src/backend/history_cache.rs	readable_log_channel_name_reads_daily_and_legacy_paths
 root_test	src/backend/history_cache.rs	readable_log_in_place_redaction_keeps_byte_length
 root_test	src/backend/history_cache.rs	readable_log_tail_scan_redacts_only_the_matching_whole_row
+root_test	src/backend/history_cache.rs	untokenized_rows_keep_everything_but_the_slots
 root_test	src/backend/hotkeys.rs	conflict_index_groups_precomputed_keys_with_reachable_scopes
 root_test	src/backend/hotkeys.rs	isolated_capture_config_saves_custom_hotkeys_in_memory
 root_test	src/backend/http.rs	blocked_proxy_url_is_valid
@@ -533,6 +534,7 @@ root_test	src/backend/irc/connection.rs	back_to_back_restarts_sharing_one_permit
 root_test	src/backend/irc/connection.rs	canonical_twitch_id_prevents_duplicates_in_both_echo_race_orders
 root_test	src/backend/irc/connection.rs	confirmed_send_requires_one_positive_result_with_a_real_message_id
 root_test	src/backend/irc/connection.rs	history_readiness_leaves_the_join_catalog_load_to_the_join
+root_test	src/backend/irc/connection.rs	history_rows_already_buffered_are_dropped_before_parsing
 root_test	src/backend/irc/connection.rs	ingest_wait_returns_when_detection_finishes_and_is_bounded
 root_test	src/backend/irc/connection.rs	irc_waits_for_auth_in_full_only_for_a_known_expired_token
 root_test	src/backend/irc/connection.rs	message_dedup_keys_channels_by_lowercase_and_ids_by_value
@@ -922,7 +924,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	430
+summary	root_tests	432
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

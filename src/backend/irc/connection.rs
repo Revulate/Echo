@@ -1808,10 +1808,39 @@ mod tests {
         active_emote_lookup_channels, apply_pending_message_emote_scope,
         ensure_channel_emotes_ready_for_history, insert_confirmed_local_row,
         message_emote_lookup_channel, publish_resolved_message_emote_scope,
-        select_shared_chat_emote_lookup, store_received_chat_row,
+        retain_history_rows_not_buffered, select_shared_chat_emote_lookup, store_received_chat_row,
         update_buffered_message_emote_lookup_scope,
     };
     use core::prelude::v1::test;
+
+    #[test]
+    fn history_rows_already_buffered_are_dropped_before_parsing() {
+        let channel = format!("history-prefilter-{}", std::process::id());
+        let row = |id: &str| ChatMessage {
+            id: id.into(),
+            channel: channel.clone().into(),
+            content: id.into(),
+            ..Default::default()
+        };
+        let mut batch = vec![row("a"), row("c"), row("c"), row("d")];
+        retain_history_rows_not_buffered(&mut batch, &channel);
+        let ids = |batch: &[ChatMessage]| {
+            batch
+                .iter()
+                .map(|message| message.id.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&batch), ["a", "c", "d"], "repeats within the batch go");
+
+        let mut buffer = echo_core::message_buffer::MessageBuffer::with_default_capacity();
+        buffer.push(row("a"));
+        buffer.push(row("b"));
+        super::CHAT_MESSAGES.insert(channel.clone(), buffer);
+        let mut batch = vec![row("a"), row("b"), row("c"), row("d"), row("d")];
+        retain_history_rows_not_buffered(&mut batch, &channel);
+        super::CHAT_MESSAGES.remove(&channel);
+        assert_eq!(ids(&batch), ["c", "d"], "buffered rows go, in batch order");
+    }
 
     #[tokio::test]
     async fn ingest_wait_returns_when_detection_finishes_and_is_bounded() {
