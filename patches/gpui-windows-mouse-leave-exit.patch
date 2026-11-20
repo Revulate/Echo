@@ -1,4 +1,4 @@
-From 6fbdf443160fa69dc1b3197267bc0fb5383cdee9 Mon Sep 17 00:00:00 2001
+From b3614057804710b2e39f6fecee22223f09f0a81e Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 21:27:06 -0700
 Subject: [PATCH] fix(gpui_windows): dispatch MouseExited when the pointer
@@ -16,10 +16,10 @@ records that position for subsequent hit tests.
  2 files changed, 46 insertions(+), 2 deletions(-)
 
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 101ba3f64a..562f061535 100644
+index 4c844f3856..6d828dd32c 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -6572,6 +6572,7 @@ impl Window {
+@@ -6579,6 +6579,7 @@ impl Window {
                  PlatformInput::MousePressure(mouse_pressure)
              }
              PlatformInput::MouseExited(mouse_exited) => {

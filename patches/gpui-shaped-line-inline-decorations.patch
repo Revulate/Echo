@@ -1,4 +1,4 @@
-From a79c92c56c707d8445f1f5c9d5b57f2aa37cc6ff Mon Sep 17 00:00:00 2001
+From 01dc39e59a3ea794bb9380fb48f68dc92b69e560 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 17:21:25 -0700
 Subject: [PATCH] perf(gpui): store 8 decoration runs inline in ShapedLine

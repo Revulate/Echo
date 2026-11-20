@@ -1,4 +1,4 @@
-From ed7ec125ce16893105b5a207793a62d3f33352d9 Mon Sep 17 00:00:00 2001
+From d80ce78635982d0b11626004bc0456bedb78cc7a Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 19:22:31 -0700
 Subject: [PATCH] perf(gpui): release image pixels after upload; add a
@@ -811,7 +811,7 @@ index 36cd97c624..e2d2fcab32 100644
 +    }
  }
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 79601f3bda..101ba3f64a 100644
+index 91f49b3e0c..4c844f3856 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
 @@ -28,9 +28,10 @@ use crate::{
@@ -834,7 +834,7 @@ index 79601f3bda..101ba3f64a 100644
      text_system: Rc<WindowTextSystem>,
      text_rendering_mode: Rc<Cell<TextRenderingMode>>,
      rem_size: Pixels,
-@@ -1684,6 +1686,27 @@ fn default_bounds(
+@@ -1686,6 +1688,27 @@ fn default_bounds(
      window_bounds_ctor(Bounds::new(final_origin, base_size))
  }
  
@@ -862,7 +862,7 @@ index 79601f3bda..101ba3f64a 100644
  impl Window {
      pub(crate) fn new(
          handle: AnyWindowHandle,
-@@ -2448,6 +2471,7 @@ impl Window {
+@@ -2450,6 +2473,7 @@ impl Window {
              is_minimizable,
              last_window_bounds: window_bounds,
              sprite_atlas,
@@ -870,7 +870,7 @@ index 79601f3bda..101ba3f64a 100644
              text_system,
              text_rendering_mode: cx.text_rendering_mode.clone(),
              rem_size: px(16.),
-@@ -5796,24 +5820,11 @@ impl Window {
+@@ -5803,24 +5827,11 @@ impl Window {
              return Ok(false);
          }
  
@@ -898,7 +898,7 @@ index 79601f3bda..101ba3f64a 100644
          let visible_bounds_snapped = self.snap_bounds(visible_bounds);
          let sub_tile = visible_image_tile(tile, visible_bounds, image_bounds);
  
-@@ -5912,42 +5923,55 @@ impl Window {
+@@ -5919,42 +5930,55 @@ impl Window {
                  return false;
              }
          };
@@ -984,7 +984,7 @@ index 79601f3bda..101ba3f64a 100644
  
          if let PresentDamage::Regions(regions) = &mut self.present_damage {
              regions.push(damage);
-@@ -5982,6 +6006,78 @@ impl Window {
+@@ -5989,6 +6013,78 @@ impl Window {
          });
      }
  
@@ -1063,7 +1063,7 @@ index 79601f3bda..101ba3f64a 100644
      /// Removes an image from the sprite atlas.
      pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
          let mut removed_any = false;
-@@ -11552,6 +11648,88 @@ fn duration_nanos(duration: std::time::Duration) -> u64 {
+@@ -11573,6 +11669,88 @@ fn duration_nanos(duration: std::time::Duration) -> u64 {
      u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
  }
  
@@ -1152,7 +1152,7 @@ index 79601f3bda..101ba3f64a 100644
  /// The part of `tile` that shows `visible_bounds` of an image drawn at `image_bounds`.
  fn visible_image_tile(
      tile: AtlasTile,
-@@ -11600,17 +11778,18 @@ fn visible_image_tile(
+@@ -11621,17 +11799,18 @@ fn visible_image_tile(
  
  #[cfg(test)]
  mod animated_image_patch_tests {
@@ -1175,7 +1175,7 @@ index 79601f3bda..101ba3f64a 100644
      };
  
      const SQUARE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="8" height="16"/></svg>"#;
-@@ -11891,4 +12070,95 @@ mod animated_image_patch_tests {
+@@ -11935,4 +12114,95 @@ mod animated_image_patch_tests {
          })
          .unwrap();
      }

@@ -1,4 +1,4 @@
-From 5a0249a729ffd9d189c4860ae45a701d83cb98bc Mon Sep 17 00:00:00 2001
+From 6a5a0e307d6c3fde4fba7c8ac133b52212c7b17c Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 23:27:42 -0700
 Subject: [PATCH] fix(gpui): refresh after an atlas drop only when the scene
@@ -62,10 +62,10 @@ index 95f93d48c3..4fae33fb62 100644
      }
  
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 562f061535..962ae7ae74 100644
+index 6d828dd32c..e17aa4ef5d 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -6072,31 +6072,52 @@ impl Window {
+@@ -6079,31 +6079,52 @@ impl Window {
  
      /// Removes a [`PaintMask`] from the sprite atlas (local Echo extension).
      pub fn drop_paint_mask(&mut self, mask_id: u64) {

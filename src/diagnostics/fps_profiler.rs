@@ -481,6 +481,7 @@ fn log_frame_stage_delta(delta: &FrameStageDelta) {
             renderer_present_call_ms = format!("{:.3}", renderer.present_call_ms),
             renderer_upload_kb = format!("{:.1}", renderer.upload_kb),
             gpui_presents = delta.presents,
+            gpui_patch_presents = delta.patch_presents,
             gpui_partial_presents = delta.partial_presents,
             gpui_animation_patches = delta.animation_patches,
             gpui_patch_rejections = %format!(
@@ -491,8 +492,9 @@ fn log_frame_stage_delta(delta: &FrameStageDelta) {
                 delta.patch_rejections[3],
                 delta.patch_rejections[4]
             ),
-            "GPUI frame stages: {} presents ({} partial, {} animation patches) | per drawn frame over {} frames | draw {:.3}ms (layout+paint {:.3}ms = render/request {:.3}ms + prepaint {:.3}ms + paint {:.3}ms; views {:.1} rendered {:.1} reused; scene finish {:.3}ms) | present {:.3}ms (upload {:.3}ms {:.1}KB, encode {:.3}ms, present call {:.3}ms) | primitives {:.0} ({:.1}% replayed)",
+            "GPUI frame stages: {} presents ({} patched, {} partial, {} animation patches) | per drawn frame over {} frames | draw {:.3}ms (layout+paint {:.3}ms = render/request {:.3}ms + prepaint {:.3}ms + paint {:.3}ms; views {:.1} rendered {:.1} reused; scene finish {:.3}ms) | present {:.3}ms (upload {:.3}ms {:.1}KB, encode {:.3}ms, present call {:.3}ms) | primitives {:.0} ({:.1}% replayed)",
             delta.presents,
+            delta.patch_presents,
             delta.partial_presents,
             delta.animation_patches,
             delta.frames,
@@ -977,6 +979,7 @@ pub fn disable_secondary_window_gpu_timing(window: &gpui::Window) {
 struct FrameStageDelta {
     frames: u64,
     presents: u64,
+    patch_presents: u64,
     partial_presents: u64,
     animation_patches: u64,
     patch_rejections: [u64; 5],
@@ -1051,6 +1054,9 @@ impl FrameStageDelta {
         Some(Self {
             frames,
             presents,
+            patch_presents: current
+                .patch_presents
+                .saturating_sub(previous.patch_presents),
             partial_presents: current
                 .partial_presents
                 .saturating_sub(previous.partial_presents),

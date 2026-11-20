@@ -200,7 +200,9 @@ flowchart TD
   name-paint frame into the already presented scene
   (`Window::patch_animated_image` in the fork) instead of redrawing the
   window; a full repaint happens only when visible animated content has no
-  patchable slot. `ECHO_ANIMATION_PATCH=0` turns patching off.
+  patchable slot. The patched frame is presented whole without redrawing any
+  view; `ECHO_PRESENT_DIRTY_RECTS=1` presents only its dirty rectangles, which
+  measured dearer. `ECHO_ANIMATION_PATCH=0` turns patching off.
 - **Async layout** (`canvas_renderer/async_layout.rs`) is one process-wide
   bounded queue (1,024 jobs, 2-6 workers) shared by all splits, fenced by a
   per-split generation/epoch so stale jobs are discarded rather than

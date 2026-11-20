@@ -1,4 +1,4 @@
-From 686e9d086c75b779ba610d94a0202117fa07b714 Mon Sep 17 00:00:00 2001
+From 685dae8a57ba29244e590bb8c214cbf407fd8557 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 22:12:20 -0700
 Subject: [PATCH] fix(gpui_windows): place the IME window at the selection's

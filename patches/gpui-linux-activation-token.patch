@@ -1,4 +1,4 @@
-From f706f2c1bb280f508dcbb15cd983aba350ca2407 Mon Sep 17 00:00:00 2001
+From ed0f96bf213aae547ae7aedc473f551a488c04dd Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Wed, 21 Oct 2026 17:53:36 -0700
 Subject: [PATCH] feat(gpui): activate a window with a token from another
@@ -42,10 +42,10 @@ index 4fae33fb62..bf8dcdb3c3 100644
      fn request_attention(&self) {}
      fn is_active(&self) -> bool;
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 962ae7ae74..fe1b061cae 100644
+index e17aa4ef5d..8ab83b82a2 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
-@@ -7604,6 +7604,14 @@ impl Window {
+@@ -7611,6 +7611,14 @@ impl Window {
          self.platform_window.activate();
      }
  

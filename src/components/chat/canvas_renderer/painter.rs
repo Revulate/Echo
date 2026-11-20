@@ -100,6 +100,7 @@ use self::trace::{CanvasRenderTraceGuard, RENDER_TRACE_ENABLED, SCROLL_SMOKE_TRA
 use self::viewport_element::render_visible_rows_viewport_element;
 use self::visible_rows::{ScrollDirection, VisibleRenderRow};
 use self::wake::AnimationPatchOutcome;
+pub(crate) use self::wake::patch_present_damage_enabled;
 
 /// Splits narrower than this show the jump-to-live pill as a bare arrow.
 const JUMP_TO_LIVE_COMPACT_WIDTH: f32 = 200.0;

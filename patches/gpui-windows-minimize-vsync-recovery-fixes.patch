@@ -1,4 +1,4 @@
-From ba6e1d329f9237dd704fb3ebe4dc5d2a8b54dcf8 Mon Sep 17 00:00:00 2001
+From 7b4ffa36f6d6b5ca773c4bbd11fafccb7bbdbeb9 Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 17:21:25 -0700
 Subject: [PATCH] fix(gpui_windows): keep repainting after repeated minimize

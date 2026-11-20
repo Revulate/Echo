@@ -25,6 +25,9 @@ pub fn open_native_window<V: 'static + Render>(
     build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
 ) -> Result<WindowHandle<NativeWindowRoot>> {
     cx.open_window(options, |window, cx| {
+        window.set_patch_present_damage(
+            crate::components::chat::canvas_renderer::painter::patch_present_damage_enabled(),
+        );
         let view = build_root_view(window, cx);
         cx.new(|cx| NativeWindowRoot::new(view, window, cx))
     })

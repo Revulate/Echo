@@ -635,6 +635,15 @@ fn animation_patching_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether a present of patched animation frames passes the patched regions
+/// to the platform as dirty rectangles (`Window::set_patch_present_damage`).
+/// Off by default; `ECHO_PRESENT_DIRTY_RECTS=1` turns it on for diagnosis.
+pub(crate) fn patch_present_damage_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| echo_core::env::flag_or("ECHO_PRESENT_DIRTY_RECTS", false));
+    *ENABLED
+}
+
 /// How an animation-waker frame change reached the screen.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum AnimationPatchOutcome {

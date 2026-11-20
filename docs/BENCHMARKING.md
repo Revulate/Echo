@@ -82,7 +82,7 @@ categories with `ECHO_LOG=perf` (plus others as needed). The log is
 | Variable | Output |
 | --- | --- |
 | `ECHO_LOG_PERF_RENDER=1` | One "Canvas render/layout aggregate" line per split every 2 s while it renders: frames, layout and element time, cache hits, animation reuse, rebuild reasons. |
-| `ECHO_FPS_PROFILER=1` | A frame, GPU and present line every 30 root frames (`cadence_fps`, `work_ms`, `canvas_cpu_ms`, `canvas_paint_ms`, `gpu_ms`, `present_latency_ms`, jank and frame classes). `ECHO_FPS_OVERLAY=1` shows the FPS overlay as well. |
+| `ECHO_FPS_PROFILER=1` | A frame, GPU and present line every 30 root frames (`cadence_fps`, `work_ms`, `canvas_cpu_ms`, `canvas_paint_ms`, `gpu_ms`, `present_latency_ms`, jank and frame classes). `ECHO_FPS_OVERLAY=1` shows the FPS overlay as well. With `ECHO_LOG=perf` it also writes a "GPUI frame stages" line every 2 s: drawn frames (`gpui_frames`), presents, patch-only presents (`gpui_patch_presents`), the part of them sent as dirty rectangles (`gpui_partial_presents`), patches and patch rejections by reason, and per-stage times including `renderer_present_call_ms`. |
 | `ECHO_MEM_REPORT_SECS=N` | A "memory breakdown" line every N seconds: decoded media, layout caches, GPUI image entries, private and working-set bytes. |
 | `ECHO_PERF_MONITOR=1` | Backend counters (UI notify sources, emote stages and events) read through the metrics overlay and the metrics JSON. |
 | `ECHO_LOG_PERF`, `ECHO_LOG_PERF_EMOTES`, `ECHO_LOG_PERF_CACHE` | Timing logs for all perf areas, emotes, or the cache. |

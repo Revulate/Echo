@@ -376,21 +376,64 @@ Animated content that changes only its frame does not need a window redraw.
   sprite bounds as damage and requests a present-only frame. It refuses when
   the key was not painted, was painted twice, the sprite was not found, the
   frame data or atlas tile is unavailable, or a draw is running.
-- `PlatformWindow::set_present_damage`: the Direct3D 11 renderer presents
-  patch-only frames with `IDXGISwapChain1::Present1` dirty rectangles. Every
-  frame still redraws the whole back buffer, so the rectangles are only a
-  compositor hint. The first present after a resize, a device recovery or a
-  failed draw or present is full, and so is every present while the scene runs
-  upstream's timed scene animations, which move sprites outside the patched
-  regions. Other backends ignore the damage.
+- A patch-only frame is presented without redrawing its views, and by default
+  it is presented whole. `Window::set_patch_present_damage(true)` passes the
+  patched regions to the platform instead (`PlatformWindow::set_present_damage`);
+  the Direct3D 11 renderer then presents with `IDXGISwapChain1::Present1` dirty
+  rectangles, and other backends ignore the damage. Every frame still redraws
+  the whole back buffer, so the rectangles are only a compositor hint. A
+  present is always full after a resize, a device recovery or a failed draw or
+  present, and while the scene runs upstream's timed scene animations, which
+  move sprites outside the patched regions. Echo turns the rectangles on only
+  with `ECHO_PRESENT_DIRTY_RECTS=1`, for diagnosis.
+- Why whole presents are the default. One dist binary was measured on one
+  Windows machine, switching only by environment variable, in ABBA order, on
+  isolated warmed profiles. Arm a is dirty rectangles, arm b whole presents and
+  arm c `ECHO_ANIMATION_PATCH=0`. Each arm had 4 runs, except c in the focused
+  case (2). Figures are medians, with the range in brackets.
+  - Busy: the perf rig, three splits at about 50 presents per second, 75 s.
+    | | a | b | c |
+    | --- | --- | --- | --- |
+    | Process CPU, % of one core | 10.6 (9.2-15.2) | 6.4 (6.0-8.3) | 9.9 (6.3-10.9) |
+    | Main thread, % of one core | 7.6 | 4.1 | 6.9 |
+    | Present call, ms | 1.47 | 0.55 | 0.42 |
+    | GPU 3D busy | 1.33 % | 0.17 % | 0.17 % |
+
+    Patches had no rejections in any arm. a and b drew 140 frames per run and c
+    about 3,720.
+  - One animated emote, process cycles per minute over 60 s:
+    | | a | b | c |
+    | --- | --- | --- | --- |
+    | 600x480 window, unfocused | 15.7 G (8.9-16.6) | 8.8 G (8.7-15.9) | 11.2 G (11.1-18.2) |
+    | 1200x960 window, focused | 14.9 G (14.6-15.0) | 15.3 G (15.0-15.3) | 18.8 G (18.7-19.0) |
+  - Idle: one animated emote, window unfocused, 240 s. Process cycles per
+    minute were a 10.9 G (9.1-17.0), b 9.8 G (8.9-14.5) and c 14.6 G
+    (12.7-19.2).
+- The slow state.
+  - Present calls of 1.5-2 ms appeared in every arm. With one emote, b reached
+    it in 1 of 4 unfocused runs, against 3 of 4 for a and 1 of 4 for c; in the
+    busy rig only a reached it, in all 4 runs. With the window focused, every
+    arm sat at about 1.5 ms. Whole presents therefore do not avoid the state,
+    but they reach it less often, and a whole present costs less in either
+    state.
+  - The one case where b cost more was the focused single emote: 2.4 % more
+    cycles than a, with 17 % less GPU time.
 - Unit tests in `crates/gpui/src/window.rs` (`animated_image_patch_tests`) paint
   slots inside nested layers and in a replayed cached view and assert that they
-  resolve and patch, that a duplicated key is refused, and that scene animations
-  force a full present.
+  resolve and patch, and that a duplicated key is refused. They also check that
+  patched frames are presented whole by default without a redraw, are partial
+  only with dirty rectangles on, and are always whole while scene animations
+  run.
 - `Window::frame_stage_statistics` returns cumulative CPU time per frame
-  stage, view render/reuse counts, presents, partial presents, patches and
-  refusals; the Direct3D 11 renderer adds upload, encode and present-call
-  time (`PlatformWindow::renderer_cpu_statistics`).
+  stage, view render/reuse counts, presents, patch-only presents
+  (`patch_presents`, sent whole or as dirty rectangles), partial presents (the
+  subset sent as dirty rectangles), patches and refusals. The Direct3D 11
+  renderer adds upload, encode and present-call time
+  (`PlatformWindow::renderer_cpu_statistics`). Echo logs them as the "GPUI
+  frame stages" line (`gpui_presents`, `gpui_patch_presents`,
+  `gpui_partial_presents`, `gpui_frames` for drawn frames, ...), so a patched
+  frame presented whole counts in `gpui_patch_presents` and not in
+  `gpui_frames`.
 
 ### Minimize, vsync and recovery fixes (`gpui-windows-minimize-vsync-recovery-fixes.patch`)
 

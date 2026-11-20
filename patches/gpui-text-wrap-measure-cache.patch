@@ -1,4 +1,4 @@
-From 1c599d1962fc69da484bb8f5b0c6a23c5b62a5c8 Mon Sep 17 00:00:00 2001
+From 92cd038f3b6f211573dcb5637e1ffc97aafd1c0d Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 16:43:20 -0700
 Subject: [PATCH] fix(gpui): don't answer unconstrained text probes with a

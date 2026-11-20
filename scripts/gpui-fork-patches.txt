@@ -6,7 +6,7 @@
 # fork-tree is the git tree id of the fork after the last patch. It changes
 # whenever the base revision or any patch changes; recompute it with
 # `git -C ../zed-gpui-fork rev-parse 'HEAD^{tree}'` after rebuilding the series.
-fork-tree = c9d3ad851649bcc588363640248f1850897c9bec
+fork-tree = 11f3e1449b416d8b4abb160e2a08ee4b4433fbc0
 
 patches/gpui-paint-fork.patch
 patches/gpui-image-features.patch

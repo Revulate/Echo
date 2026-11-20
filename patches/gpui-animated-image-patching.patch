@@ -1,4 +1,4 @@
-From 985e6a20b7c8a5fb8ec68bc846c0f23d93aff359 Mon Sep 17 00:00:00 2001
+From 3ba239bb2042deb52e90bfe969a14d344c79e0ca Mon Sep 17 00:00:00 2001
 From: Revulate <76570121+Revulate@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 05:33:55 -0700
 Subject: [PATCH] perf(gpui): patch animated image frames into the presented
@@ -13,15 +13,21 @@ paint operation cached views replay, records the sprite's bounds as
 damage and requests a present-only frame. It refuses (returns false)
 when the key was not painted, was painted twice, or a draw is running.
 
-The Direct3D 11 renderer presents patch-only frames with
-`IDXGISwapChain1::Present1` dirty rectangles. Every frame still redraws
-the whole back buffer; the rectangles only let the compositor update
-less. The first present after resize or device recovery is full.
+A patch-only frame is presented without redrawing its views. By default
+it is presented whole; `Window::set_patch_present_damage(true)` makes the
+Direct3D 11 renderer pass the patched regions to
+`IDXGISwapChain1::Present1` as dirty rectangles instead. Every frame
+still redraws the whole back buffer, so the rectangles only let the
+compositor update less, and Echo measured them as dearer than a full
+`Present` (about 1.5 ms per present call against 0.55 ms in a
+three-split replay). The first present after resize, device recovery or
+a failed draw or present is full.
 
 `Window::frame_stage_statistics` reports cumulative CPU time per frame
 stage (layout, prepaint, paint, scene ordering, renderer upload, encode
 and the swap-chain present call), views rendered and reused, presents,
-partial presents, patches and patch refusals by reason.
+patch-only presents, partial presents, patches and patch refusals by
+reason.
 
 Rebased onto Zed 7279c76ef7, where scenes no longer write draw orders
 back into their paint operations and primitives inside a layer get
@@ -36,20 +42,20 @@ slots in nested layers and in a replayed cached view.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- crates/gpui/src/gpui.rs                     |  65 ++
+ crates/gpui/src/gpui.rs                     |  69 ++
  crates/gpui/src/platform.rs                 |  19 +-
  crates/gpui/src/scene.rs                    |  96 +++
  crates/gpui/src/view.rs                     |   3 +
- crates/gpui/src/window.rs                   | 648 ++++++++++++++++++--
+ crates/gpui/src/window.rs                   | 692 ++++++++++++++++++--
  crates/gpui_windows/src/directx_renderer.rs | 126 +++-
  crates/gpui_windows/src/window.rs           |   8 +
- 7 files changed, 904 insertions(+), 61 deletions(-)
+ 7 files changed, 952 insertions(+), 61 deletions(-)
 
 diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
-index bc3da7930b..aae1a86bd2 100644
+index bc3da7930b..1141d8c13e 100644
 --- a/crates/gpui/src/gpui.rs
 +++ b/crates/gpui/src/gpui.rs
-@@ -384,3 +384,68 @@ pub struct GpuFrameStatistics {
+@@ -384,3 +384,72 @@ pub struct GpuFrameStatistics {
      /// Running count of successfully resolved, non-disjoint timestamp samples.
      pub sample_count: u64,
  }
@@ -89,7 +95,11 @@ index bc3da7930b..aae1a86bd2 100644
 +    pub primitives: u64,
 +    /// Primitives copied from the previous frame by cached views.
 +    pub replayed_primitives: u64,
-+    /// Presents that sent only damaged regions to the platform.
++    /// Presents of frames that changed only by animated image patches, sent in
++    /// full or as damaged regions; such a frame is not redrawn.
++    pub patch_presents: u64,
++    /// Presents that sent only damaged regions to the platform (a subset of
++    /// `patch_presents`, see `Window::set_patch_present_damage`).
 +    pub partial_presents: u64,
 +    /// Animated image sprites retargeted by `Window::patch_animated_image`.
 +    pub animated_image_patches: u64,
@@ -337,7 +347,7 @@ index 733373aac1..08df735f6c 100644
                  let prepaint_start = window.prepaint_index();
                  let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
 diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index ca913340ca..79601f3bda 100644
+index ca913340ca..91f49b3e0c 100644
 --- a/crates/gpui/src/window.rs
 +++ b/crates/gpui/src/window.rs
 @@ -11,8 +11,8 @@ use crate::{
@@ -438,25 +448,28 @@ index ca913340ca..79601f3bda 100644
      }
  }
  
-@@ -1296,6 +1341,8 @@ pub struct Window {
+@@ -1296,6 +1341,10 @@ pub struct Window {
      pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
      #[cfg(feature = "profiler")]
      pub(crate) window_profiler: profiler::WindowProfiler,
 +    pub(crate) frame_stage_statistics: FrameStageStatistics,
 +    present_damage: PresentDamage,
++    /// See [`Window::set_patch_present_damage`].
++    patch_present_damage: bool,
      last_input_modality: InputModality,
      touch_gestures: TouchGestureRecognizer,
      touch_prediction_enabled: bool,
-@@ -2446,6 +2493,8 @@ impl Window {
+@@ -2446,6 +2495,9 @@ impl Window {
              input_rate_tracker,
              #[cfg(feature = "profiler")]
              window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
 +            frame_stage_statistics: FrameStageStatistics::default(),
 +            present_damage: PresentDamage::Full,
++            patch_present_damage: false,
              last_input_modality: InputModality::Mouse,
              touch_gestures: TouchGestureRecognizer::new(
                  cx.platform
-@@ -3798,6 +3847,7 @@ impl Window {
+@@ -3798,6 +3850,7 @@ impl Window {
          let frame_dirty = self.invalidator.take_frame_dirty();
          #[cfg(feature = "profiler")]
          self.window_profiler.begin_draw();
@@ -464,7 +477,7 @@ index ca913340ca..79601f3bda 100644
  
          // Set up the per-App arena for element allocation during this draw.
          // This ensures that multiple test Apps have isolated arenas.
-@@ -3830,7 +3880,10 @@ impl Window {
+@@ -3830,7 +3883,10 @@ impl Window {
              }
          }
          if !cx.mode.skip_drawing() {
@@ -475,7 +488,7 @@ index ca913340ca..79601f3bda 100644
              #[cfg(feature = "profiler")]
              {
                  let viewport_size = self.viewport_size;
-@@ -3876,7 +3929,11 @@ impl Window {
+@@ -3876,7 +3932,11 @@ impl Window {
  
          self.layout_engine.as_mut().unwrap().clear();
          self.text_system().finish_frame();
@@ -488,7 +501,7 @@ index ca913340ca..79601f3bda 100644
  
          self.invalidator.set_phase(DrawPhase::Focus);
          let previous_focus_path = self.rendered_frame.focus_path();
-@@ -3935,6 +3992,9 @@ impl Window {
+@@ -3935,6 +3995,9 @@ impl Window {
              self.refresh();
          }
          self.needs_present.set(true);
@@ -498,7 +511,7 @@ index ca913340ca..79601f3bda 100644
  
          #[cfg(feature = "profiler")]
          {
-@@ -3977,7 +4037,25 @@ impl Window {
+@@ -3977,7 +4040,29 @@ impl Window {
          let _foreground_turn = profiler::journal::foreground_turn();
          #[cfg(feature = "profiler")]
          let present_start = Instant::now();
@@ -507,13 +520,17 @@ index ca913340ca..79601f3bda 100644
 +            &mut self.present_damage,
 +            PresentDamage::Regions(SmallVec::new()),
 +        ) {
-+            // Scene animations move their sprites anywhere in the window
-+            // between presents, so only a present of patches alone is partial.
-+            PresentDamage::Regions(regions)
-+                if !regions.is_empty() && self.scene_animation_interval.get().is_none() =>
-+            {
-+                self.frame_stage_statistics.partial_presents += 1;
-+                self.platform_window.set_present_damage(Some(&regions));
++            PresentDamage::Regions(regions) if !regions.is_empty() => {
++                self.frame_stage_statistics.patch_presents += 1;
++                // Scene animations move their sprites anywhere in the window
++                // between presents, so only a present of patches alone can be
++                // partial, and only when dirty rectangles are turned on.
++                if self.patch_present_damage && self.scene_animation_interval.get().is_none() {
++                    self.frame_stage_statistics.partial_presents += 1;
++                    self.platform_window.set_present_damage(Some(&regions));
++                } else {
++                    self.platform_window.set_present_damage(None);
++                }
 +            }
 +            _ => self.platform_window.set_present_damage(None),
 +        }
@@ -524,7 +541,7 @@ index ca913340ca..79601f3bda 100644
          #[cfg(feature = "profiler")]
          self.window_profiler.record_present(
              present_start,
-@@ -4070,6 +4148,7 @@ impl Window {
+@@ -4070,6 +4155,7 @@ impl Window {
          let scale_factor = self.scale_factor();
          #[cfg(feature = "profiler")]
          let request_layout_start = Instant::now();
@@ -532,7 +549,7 @@ index ca913340ca..79601f3bda 100644
          let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
          let root_layout_id = root_element.request_layout(self, cx);
          #[cfg(feature = "profiler")]
-@@ -4078,6 +4157,9 @@ impl Window {
+@@ -4078,6 +4164,9 @@ impl Window {
              .as_mut()
              .unwrap()
              .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
@@ -542,7 +559,7 @@ index ca913340ca..79601f3bda 100644
          root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
  
          #[cfg(any(feature = "inspector", debug_assertions))]
-@@ -4113,6 +4195,9 @@ impl Window {
+@@ -4113,6 +4202,9 @@ impl Window {
          // Now actually paint the elements.
          #[cfg(feature = "profiler")]
          let paint_start = Instant::now();
@@ -552,7 +569,7 @@ index ca913340ca..79601f3bda 100644
          self.invalidator.set_phase(DrawPhase::Paint);
          root_element.paint(self, cx);
  
-@@ -4131,6 +4216,7 @@ impl Window {
+@@ -4131,6 +4223,7 @@ impl Window {
  
          #[cfg(any(feature = "inspector", debug_assertions))]
          self.paint_inspector_hitbox(cx);
@@ -560,7 +577,7 @@ index ca913340ca..79601f3bda 100644
  
          #[cfg(feature = "profiler")]
          self.window_profiler
-@@ -5676,14 +5762,38 @@ impl Window {
+@@ -5676,14 +5769,38 @@ impl Window {
          frame_index: usize,
          grayscale: bool,
      ) -> Result<()> {
@@ -601,7 +618,7 @@ index ca913340ca..79601f3bda 100644
          }
  
          let params = RenderImageParams {
-@@ -5705,46 +5815,7 @@ impl Window {
+@@ -5705,46 +5822,7 @@ impl Window {
              .expect("Callback above only returns Some");
  
          let visible_bounds_snapped = self.snap_bounds(visible_bounds);
@@ -649,7 +666,7 @@ index ca913340ca..79601f3bda 100644
  
          let content_mask = self.snapped_content_mask();
          let corner_radii = corner_radii
-@@ -5752,7 +5823,7 @@ impl Window {
+@@ -5752,7 +5830,7 @@ impl Window {
              .scale(self.scale_factor());
          let opacity = self.element_opacity();
  
@@ -658,7 +675,7 @@ index ca913340ca..79601f3bda 100644
              order: 0,
              pad: 0,
              grayscale: grayscale.into(),
-@@ -5761,8 +5832,131 @@ impl Window {
+@@ -5761,8 +5839,131 @@ impl Window {
              corner_radii,
              tile: sub_tile,
              opacity,
@@ -792,10 +809,24 @@ index ca913340ca..79601f3bda 100644
      }
  
      /// Paint a surface into the scene for the next frame at the current z-index.
-@@ -7623,6 +7817,17 @@ impl Window {
+@@ -7623,6 +7824,31 @@ impl Window {
          self.platform_window.gpu_frame_statistics()
      }
  
++    /// Whether a present of a frame that changed only by
++    /// [`Self::patch_animated_image`] passes the patched regions to the platform
++    /// as dirty rectangles (`IDXGISwapChain1::Present1` on Direct3D 11) instead
++    /// of presenting the whole frame. Local Echo extension (`echo-paint-fork`).
++    ///
++    /// Off by default. Either way the frame is presented without redrawing its
++    /// views. On Windows, after several seconds of uninterrupted patch-only
++    /// presents, a `Present1` call with dirty rectangles became several times
++    /// dearer than a full `Present` and stayed so, while full presents never
++    /// did; Echo's measurements are in its docs/GPUI_FORK.md.
++    pub fn set_patch_present_damage(&mut self, enabled: bool) {
++        self.patch_present_damage = enabled;
++    }
++
 +    /// Cumulative CPU time this window has spent per frame-pipeline stage.
 +    ///
 +    /// Local Echo extension (`echo-paint-fork`). Diff two snapshots to get the
@@ -810,7 +841,7 @@ index ca913340ca..79601f3bda 100644
      /// Perform titlebar double-click action.
      /// This is macOS specific.
      pub fn titlebar_double_click(&self) {
-@@ -11342,3 +11547,348 @@ mod inspector_tests {
+@@ -11342,3 +11568,371 @@ mod inspector_tests {
          .expect("closed inspector has no bookkeeping and no style overrides");
      }
  }
@@ -1107,8 +1138,29 @@ index ca913340ca..79601f3bda 100644
 +                panic!("patches after a present damage only their regions");
 +            };
 +            assert_eq!(regions.len(), 3);
++
++            // By default a patched frame is presented whole, without a redraw.
++            let drawn = window.frame_stage_statistics.frames_drawn;
 +            window.present();
++            let statistics = window.frame_stage_statistics;
++            assert_eq!(statistics.patch_presents, 1);
++            assert_eq!(statistics.partial_presents, 0);
++            assert_eq!(statistics.frames_drawn, drawn);
++
++            // With dirty rectangles on, it is presented as its damaged regions.
++            window.set_patch_present_damage(true);
++            assert!(window.patch_animated_image(1, &image, 0));
++            window.present();
++            let statistics = window.frame_stage_statistics;
++            assert_eq!(statistics.patch_presents, 2);
++            assert_eq!(statistics.partial_presents, 1);
++            assert_eq!(statistics.frames_drawn, drawn);
++
++            // A present with nothing patched since the last one is whole.
++            window.present();
++            assert_eq!(window.frame_stage_statistics.patch_presents, 2);
 +            assert_eq!(window.frame_stage_statistics.partial_presents, 1);
++            assert!(window.patch_animated_image(1, &image, 1));
 +        })
 +        .unwrap();
 +
@@ -1152,8 +1204,10 @@ index ca913340ca..79601f3bda 100644
 +        let (window, _, image) = open(true, false, cx);
 +        cx.update_window(window.into(), |_, window, _| {
 +            assert!(window.scene_animation_interval.get().is_some());
++            window.set_patch_present_damage(true);
 +            assert!(window.patch_animated_image(1, &image, 1));
 +            window.present();
++            assert_eq!(window.frame_stage_statistics.patch_presents, 1);
 +            assert_eq!(window.frame_stage_statistics.partial_presents, 0);
 +        })
 +        .unwrap();
