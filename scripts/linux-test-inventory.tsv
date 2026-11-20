@@ -750,6 +750,8 @@ root_test	src/components/ui/input/element.rs	secure_accessibility_value_masks_th
 root_test	src/components/ui/input/state.rs	leaves_single_line_unicode_text_unchanged
 root_test	src/components/ui/input/state.rs	normalizes_all_supported_line_separators_without_joining_words
 root_test	src/components/ui/input/state.rs	utf16_ranges_preserve_astral_character_boundaries
+root_test	src/components/ui/menu.rs	clones_share_the_highlight_and_the_owner
+root_test	src/components/ui/menu.rs	navigation_keys_move_the_highlight_and_wrap
 root_test	src/diagnostics/fps_profiler.rs	test_frame_timing
 root_test	src/diagnostics/fps_profiler.rs	test_percentiles
 root_test	src/log.rs	redact_url_hides_unparseable_input
@@ -862,7 +864,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	383
+summary	root_tests	385
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

@@ -3998,6 +3998,8 @@ impl EchoApp {
         let overlays = self.overlay_manager.read(cx);
         let overlay_manager = self.overlay_manager.clone();
         let app = cx.entity();
+        // EchoApp's render builds every chrome menu.
+        overlays.menu_nav.set_owner(app.entity_id());
         MenuHost {
             focus: overlays.menu_focus.clone(),
             nav: overlays.menu_nav.clone(),

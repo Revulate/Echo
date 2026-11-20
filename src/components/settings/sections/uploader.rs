@@ -2064,6 +2064,7 @@ fn render_provider_dropdown<T: 'static>(
     let nav_for_trigger = nav.clone();
     let outside = Rc::clone(&inputs.preset_menu_open);
     let entity = cx.entity();
+    nav.set_owner(entity.entity_id());
     let actions: Vec<MenuAction> = UploaderPreset::ALL
         .into_iter()
         .map(|preset| {

@@ -25,9 +25,25 @@ pub type MenuAction = Rc<dyn Fn(&mut Window, &mut App)>;
 #[derive(Clone, Default)]
 pub struct MenuNav {
     highlighted: Rc<Cell<Option<usize>>>,
+    /// The view whose render builds the menu rows. A highlight change
+    /// notifies it; without one it refreshes the whole window.
+    owner: Rc<Cell<Option<EntityId>>>,
 }
 
 impl MenuNav {
+    /// Record the view that renders this menu, so highlight changes repaint
+    /// that view instead of the whole window.
+    pub fn set_owner(&self, owner: EntityId) {
+        self.owner.set(Some(owner));
+    }
+
+    fn repaint(&self, window: &mut Window, cx: &mut App) {
+        match self.owner.get() {
+            Some(owner) => cx.notify(owner),
+            None => window.refresh(),
+        }
+    }
+
     pub fn highlighted(&self) -> Option<usize> {
         self.highlighted.get()
     }
@@ -159,9 +175,9 @@ pub fn menu_item(
         .cursor_pointer()
         .when(nav.is_highlighted(index), |row| row.bg(colors::bg_hover()))
         .hover(|style| style.bg(colors::bg_hover()))
-        .on_mouse_move(move |_, window, _| {
+        .on_mouse_move(move |_, window, cx| {
             if hover_nav.highlight(index) {
-                window.refresh();
+                hover_nav.repaint(window, cx);
             }
         })
         .on_press_click(move |_, window, cx| action(window, cx))
@@ -208,13 +224,13 @@ pub trait MenuKeyboard: InteractiveElement + Sized {
         let next_nav = nav.clone();
         let prev_nav = nav.clone();
         self.track_focus(focus)
-            .on_action(move |_: &FocusNext, window, _| {
+            .on_action(move |_: &FocusNext, window, cx| {
                 next_nav.step(1, action_count);
-                window.refresh();
+                next_nav.repaint(window, cx);
             })
-            .on_action(move |_: &FocusPrev, window, _| {
+            .on_action(move |_: &FocusPrev, window, cx| {
                 prev_nav.step(-1, action_count);
-                window.refresh();
+                prev_nav.repaint(window, cx);
             })
             .on_key_down(move |event: &KeyDownEvent, window, cx| {
                 let Some(key) = menu_key(event) else {
@@ -225,14 +241,63 @@ pub trait MenuKeyboard: InteractiveElement + Sized {
                     return;
                 };
                 cx.stop_propagation();
-                if key == MenuKey::Close {
-                    on_close(window, cx);
-                } else if let Some(action) = nav.apply(key, &actions) {
-                    action(window, cx);
+                match key {
+                    MenuKey::Close => {
+                        on_close(window, cx);
+                        window.refresh();
+                    }
+                    MenuKey::Activate => {
+                        if let Some(action) = nav.apply(key, &actions) {
+                            action(window, cx);
+                        }
+                        window.refresh();
+                    }
+                    MenuKey::Previous | MenuKey::Next | MenuKey::First | MenuKey::Last => {
+                        nav.apply(key, &actions);
+                        nav.repaint(window, cx);
+                    }
                 }
-                window.refresh();
             })
     }
 }
 
 impl<E: InteractiveElement> MenuKeyboard for E {}
+
+#[cfg(test)]
+mod tests {
+    use super::{MenuKey, MenuNav};
+    use core::prelude::v1::test;
+    use gpui::EntityId;
+
+    #[test]
+    fn clones_share_the_highlight_and_the_owner() {
+        let nav = MenuNav::default();
+        let rows = nav.clone();
+        assert_eq!(rows.owner.get(), None);
+
+        nav.set_owner(EntityId::from(7));
+        assert!(rows.highlight(2));
+        assert_eq!(rows.owner.get(), Some(EntityId::from(7)));
+        assert_eq!(nav.highlighted(), Some(2));
+        assert!(!nav.highlight(2));
+    }
+
+    #[test]
+    fn navigation_keys_move_the_highlight_and_wrap() {
+        let nav = MenuNav::default();
+        assert!(nav.apply(MenuKey::Previous, &[]).is_none());
+        assert_eq!(nav.highlighted(), None);
+
+        let action: super::MenuAction = std::rc::Rc::new(|_, _| {});
+        let actions = vec![action.clone(), action.clone(), action];
+        nav.apply(MenuKey::Previous, &actions);
+        assert_eq!(nav.highlighted(), Some(2));
+        nav.apply(MenuKey::Next, &actions);
+        assert_eq!(nav.highlighted(), Some(0));
+        nav.apply(MenuKey::Last, &actions);
+        assert_eq!(nav.highlighted(), Some(2));
+        nav.apply(MenuKey::First, &actions);
+        assert_eq!(nav.highlighted(), Some(0));
+        assert!(nav.apply(MenuKey::Activate, &actions).is_some());
+    }
+}

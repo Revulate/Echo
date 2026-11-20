@@ -2323,6 +2323,7 @@ fn render_settings_choice_menu<T: 'static>(
     });
     let on_change = Rc::new(on_change);
     let entity = cx.entity();
+    state.nav.set_owner(entity.entity_id());
     let actions: Vec<MenuAction> = options
         .iter()
         .map(|option| {
