@@ -12,8 +12,9 @@ use gpui::*;
 use crate::backend::ConnectionStatus;
 use crate::theme::colors;
 
-/// Most frames a second the window presents for the pulse alone. Matches the
-/// old timer's 40 ms focused tick (a multiple of the 20 ms animation grid).
+/// Most frames a second the window presents for the pulse alone, the old
+/// timer's focused rate (one step every 40 ms). The window paces these
+/// presents itself; they are not aligned to the emote animation grid.
 const PULSE_MAX_FPS: f32 = 25.0;
 
 /// Get the color based on connection status
@@ -34,9 +35,15 @@ fn status_color(status: &ConnectionStatus) -> Hsla {
 ///
 /// The pulse is a timed transformation of the SVG: the window advances its
 /// alpha in the presented scene before each present, at most
-/// [`PULSE_MAX_FPS`] times a second, without re-rendering the owning view,
-/// and holds it at full opacity under reduced motion.
-pub fn render_logo(connection_status: &ConnectionStatus, size: f32) -> AnyElement {
+/// [`PULSE_MAX_FPS`] times a second, without re-rendering the owning view.
+/// Under reduced motion the logo holds the middle of the pulse's range
+/// instead (70% or 65%), so a non-connected logo is dimmer than a connected
+/// one, not only differently colored.
+pub fn render_logo(
+    connection_status: &ConnectionStatus,
+    size: f32,
+    reduce_motion: bool,
+) -> AnyElement {
     let color = status_color(connection_status);
     let logo = |id: &'static str, svg: Svg| {
         div()
@@ -70,6 +77,10 @@ pub fn render_logo(connection_status: &ConnectionStatus, size: f32) -> AnyElemen
     // Full opacity down to the minimum and back once per period. A linear
     // ramp each way is the closest of the available easings to the old
     // sine-cubic breath (within 0.054 of its normalized curve).
+    if reduce_motion {
+        let resting = Transformation::alpha((1.0 + min_opacity) / 2.0);
+        return logo(id, svg.with_transformation(resting)).into_any_element();
+    }
     let pulse = TimedTransformation::new(period)
         .from(Transformation::alpha(1.0))
         .to(Transformation::alpha(min_opacity))

@@ -610,7 +610,7 @@ impl TopBarView {
 }
 
 impl Render for TopBarView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(frame) = self.frame.clone() else {
             return div().into_any_element();
         };
@@ -643,7 +643,7 @@ impl Render for TopBarView {
             update_attention.then_some(crate::components::settings::SettingsSectionId::Updates);
         let logo = branding
             .show_logo
-            .then(|| render_logo(&connection_status, 18.0));
+            .then(|| render_logo(&connection_status, 18.0, cx.reduce_motion()));
         let show_app_title = branding.show_app_title;
         let show_version = branding.show_version;
         let activity_count = cached
