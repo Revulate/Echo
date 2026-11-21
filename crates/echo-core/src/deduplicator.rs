@@ -67,11 +67,21 @@ fn canonical_uuid_value(id: &str) -> Option<u128> {
 }
 
 impl MessageDeduplicator {
-    /// Heap bytes the key set and the order queue have allocated, for memory
-    /// reports: their capacity, with one control byte per set slot.
+    /// Estimated heap bytes of the key set and the order queue, for memory
+    /// reports. The set's figure follows the standard library's SwissTable
+    /// layout: `capacity()` is at most 7/8 of a power-of-two bucket count, and
+    /// each bucket holds a key and a control byte, plus one group (16 bytes) of
+    /// trailing control bytes. The queue's is its capacity in keys.
     pub fn heap_bytes(&self) -> usize {
         let key = std::mem::size_of::<u128>();
-        self.seen.capacity() * (key + 1) + self.order.capacity() * key
+        let capacity = self.seen.capacity();
+        let set = if capacity == 0 {
+            0
+        } else {
+            let buckets = (capacity * 8).div_ceil(7).next_power_of_two();
+            buckets * (key + 1) + 16
+        };
+        set + self.order.capacity() * key
     }
 
     /// Create a new deduplicator with default prune ratio of 0.8.
@@ -193,6 +203,25 @@ mod tests {
 
     fn uuid_like(n: u32) -> String {
         format!("{n:08x}-4977-403a-8a94-33c6bac34fb8")
+    }
+
+    #[test]
+    fn heap_bytes_covers_the_buckets_behind_the_set_capacity() {
+        let mut dedup = MessageDeduplicator::new(10_000);
+        assert_eq!(dedup.heap_bytes(), 0);
+        for i in 0..100 {
+            dedup.add(&format!("id-{i}"));
+        }
+        let key = std::mem::size_of::<u128>();
+        let capacity = dedup.seen.capacity();
+        assert!(capacity >= 100);
+        // At least the buckets the capacity implies, at most twice that.
+        let set_floor = capacity * 8 / 7 * (key + 1);
+        let set = dedup.heap_bytes() - dedup.order.capacity() * key;
+        assert!(
+            set >= set_floor && set <= 2 * set_floor + 16,
+            "{set} vs {set_floor}"
+        );
     }
 
     #[test]

@@ -139,6 +139,7 @@ core_test	crates/echo-core/src/chatterino_import.rs	chatterino_import_tolerates_
 core_test	crates/echo-core/src/chatterino_import.rs	chatterino_import_translates_qt_replacements
 core_test	crates/echo-core/src/commands.rs	trigger_requires_word_boundary
 core_test	crates/echo-core/src/deduplicator.rs	canonical_uuids_key_by_value_and_other_ids_stay_distinct
+core_test	crates/echo-core/src/deduplicator.rs	heap_bytes_covers_the_buckets_behind_the_set_capacity
 core_test	crates/echo-core/src/deduplicator.rs	matches_the_string_deduplicator_on_mixed_ids
 core_test	crates/echo-core/src/deduplicator.rs	nothing_is_reserved_until_ids_arrive
 core_test	crates/echo-core/src/deduplicator.rs	prune_drops_the_oldest_ids_down_to_the_threshold
