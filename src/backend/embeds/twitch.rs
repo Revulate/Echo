@@ -182,7 +182,9 @@ async fn fetch_public_fallback(original_url: &str, basic_subtitle: &str) -> Twit
 }
 
 async fn fetch_open_graph(original_url: &str) -> Option<TwitchEmbedResult> {
-    let response = twitch_api::TWITCH_HTTP_CLIENT
+    // The page is the user's link: fetch it like any other link preview,
+    // with redirects and DNS answers limited to public addresses.
+    let response = super::fetchers::EMBED_HTTP_CLIENT
         .get(original_url)
         .send()
         .await

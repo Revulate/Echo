@@ -180,7 +180,7 @@ fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
         || documentation)
 }
 
-static EMBED_HTTP_CLIENT: std::sync::LazyLock<http::ClientCache> =
+pub(super) static EMBED_HTTP_CLIENT: std::sync::LazyLock<http::ClientCache> =
     std::sync::LazyLock::new(|| http::ClientCache::new(build_embed_http_client));
 
 impl EmbedFetcher {
@@ -827,7 +827,9 @@ static FETCHER: LazyLock<Arc<EmbedFetcher>> = LazyLock::new(|| Arc::new(EmbedFet
 
 /// Fetch embed metadata for a URL (uses global fetcher)
 pub async fn fetch_embed_metadata(url: &str) -> EmbedMetadata {
-    FETCHER.fetch(url).await
+    let mut metadata = FETCHER.fetch(url).await;
+    super::sanitize_embed_metadata(&mut metadata);
+    metadata
 }
 
 /// Construct the terminal failure result used when the flight-level timeout

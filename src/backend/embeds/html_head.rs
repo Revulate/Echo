@@ -11,12 +11,18 @@
 //! like `meta[property='og:title']` would find: attribute names are matched
 //! without case and attribute values with it, the first matching tag wins
 //! (even when it has no `content`), the first copy of a repeated attribute
-//! wins, quoted values may contain `>`, comments and the raw-text elements
-//! (`script`, `style`, `noscript` with scripting on, and the rest) hide the
-//! tags inside them, and a tag cut off by the end of the input is dropped.
-//! Values are decoded from the document's charset (UTF-8, or windows-1252
-//! for the labels that mean it; anything else is read as UTF-8 with
-//! replacement characters), then character references are decoded.
+//! wins, quoted values may contain `>`, comments (ended by `-->` or `--!>`)
+//! and the raw-text elements (`script`, `style`, `noscript` with scripting
+//! on, and the rest) hide the tags inside them, and a tag cut off by the end
+//! of the input is dropped. Values are decoded from the document's charset
+//! (UTF-8, or windows-1252 for the labels that mean it; anything else is read
+//! as UTF-8 with replacement characters), then character references are
+//! decoded with the full WHATWG named-reference list (`html_entities.rs`).
+//! Each value is decoded from at most its first [`MAX_VALUE_BYTES`].
+//!
+//! Known differences from a full HTML parser, all deliberate: nothing after
+//! `</head>` is read; `<svg>`/`<math>` foreign content, `<frameset>` and
+//! script double-escaping (`<script><!--<script>`) are not modelled.
 
 /// Bytes scanned at most, whatever the caller passes.
 pub(crate) const MAX_SCAN_BYTES: usize = 512 * 1024;
@@ -148,7 +154,10 @@ pub(crate) fn scan_head(html: &[u8], header_charset: Option<&str>) -> HeadMetada
     };
 
     let attribute = |span: Option<Span>| {
-        span.map(|span| decode_references(&decode_bytes(input, span, charset), true))
+        span.map(|span| {
+            let span = capped_value_span(input, span, charset);
+            decode_references(&decode_bytes(input, span, charset), true)
+        })
     };
     let mut metadata = HeadMetadata::default();
     for (slot, found) in metadata.properties.iter_mut().zip(raw.properties) {
@@ -157,10 +166,33 @@ pub(crate) fn scan_head(html: &[u8], header_charset: Option<&str>) -> HeadMetada
     for (slot, found) in metadata.names.iter_mut().zip(raw.names) {
         *slot = found.map(attribute);
     }
-    metadata.title = raw
-        .title
-        .map(|span| decode_references(&decode_bytes(input, span, charset), false));
+    metadata.title = raw.title.map(|span| {
+        let span = capped_value_span(input, span, charset);
+        decode_references(&decode_bytes(input, span, charset), false)
+    });
     metadata
+}
+
+/// Bytes of one value that are decoded at most. Previews show the first 100
+/// to 200 characters, so the rest of a long value is never needed, and the
+/// cap bounds the decoding work and allocation a crafted page can cause.
+const MAX_VALUE_BYTES: usize = 2048;
+
+/// `span` cut to [`MAX_VALUE_BYTES`], ending on a character boundary in UTF-8.
+fn capped_value_span(input: &[u8], span: Span, charset: Charset) -> Span {
+    if span.end - span.start <= MAX_VALUE_BYTES {
+        return span;
+    }
+    let mut end = span.start + MAX_VALUE_BYTES;
+    if charset == Charset::Utf8 {
+        while end > span.start && input[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+    }
+    Span {
+        start: span.start,
+        end,
+    }
 }
 
 /// What the scan found, as spans into the input.
@@ -178,6 +210,20 @@ fn find_byte(input: &[u8], from: usize, byte: u8) -> Option<usize> {
         .iter()
         .position(|&b| b == byte)
         .map(|at| from + at)
+}
+
+/// Index just after the `-->` or `--!>` that ends a comment whose text starts
+/// at `from`.
+fn find_comment_end(input: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(dashes) = find_bytes(input, at, b"--") {
+        match input.get(dashes + 2..) {
+            Some([b'>', ..]) => return Some(dashes + 3),
+            Some([b'!', b'>', ..]) => return Some(dashes + 4),
+            _ => at = dashes + 1,
+        }
+    }
+    None
 }
 
 fn find_bytes(input: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
@@ -224,8 +270,8 @@ fn scan(input: &[u8], raw: &mut RawHead) {
                 i = open + 6;
                 continue;
             }
-            match find_bytes(input, open + 4, b"-->") {
-                Some(end) => i = end + 3,
+            match find_comment_end(input, open + 4) {
+                Some(end) => i = end,
                 None => return,
             }
             continue;
@@ -451,186 +497,18 @@ fn decode_bytes(input: &[u8], span: Span, charset: Charset) -> String {
         .replace('\0', "\u{FFFD}")
 }
 
-/// Named character references decoded here, with whether the name also
-/// matches without a trailing `;` (the legacy names). Names outside this
-/// table are left as written.
-const NAMED_REFERENCES: &[(&str, &str, bool)] = &[
-    ("amp", "&", true),
-    ("lt", "<", true),
-    ("gt", ">", true),
-    ("quot", "\"", true),
-    ("apos", "'", false),
-    ("nbsp", "\u{A0}", true),
-    ("iexcl", "\u{A1}", true),
-    ("cent", "\u{A2}", true),
-    ("pound", "\u{A3}", true),
-    ("curren", "\u{A4}", true),
-    ("yen", "\u{A5}", true),
-    ("brvbar", "\u{A6}", true),
-    ("sect", "\u{A7}", true),
-    ("uml", "\u{A8}", true),
-    ("copy", "\u{A9}", true),
-    ("ordf", "\u{AA}", true),
-    ("laquo", "\u{AB}", true),
-    ("not", "\u{AC}", true),
-    ("shy", "\u{AD}", true),
-    ("reg", "\u{AE}", true),
-    ("macr", "\u{AF}", true),
-    ("deg", "\u{B0}", true),
-    ("plusmn", "\u{B1}", true),
-    ("sup2", "\u{B2}", true),
-    ("sup3", "\u{B3}", true),
-    ("acute", "\u{B4}", true),
-    ("micro", "\u{B5}", true),
-    ("para", "\u{B6}", true),
-    ("middot", "\u{B7}", true),
-    ("cedil", "\u{B8}", true),
-    ("sup1", "\u{B9}", true),
-    ("ordm", "\u{BA}", true),
-    ("raquo", "\u{BB}", true),
-    ("frac14", "\u{BC}", true),
-    ("frac12", "\u{BD}", true),
-    ("frac34", "\u{BE}", true),
-    ("iquest", "\u{BF}", true),
-    ("Agrave", "\u{C0}", true),
-    ("Aacute", "\u{C1}", true),
-    ("Acirc", "\u{C2}", true),
-    ("Atilde", "\u{C3}", true),
-    ("Auml", "\u{C4}", true),
-    ("Aring", "\u{C5}", true),
-    ("AElig", "\u{C6}", true),
-    ("Ccedil", "\u{C7}", true),
-    ("Egrave", "\u{C8}", true),
-    ("Eacute", "\u{C9}", true),
-    ("Ecirc", "\u{CA}", true),
-    ("Euml", "\u{CB}", true),
-    ("Igrave", "\u{CC}", true),
-    ("Iacute", "\u{CD}", true),
-    ("Icirc", "\u{CE}", true),
-    ("Iuml", "\u{CF}", true),
-    ("ETH", "\u{D0}", true),
-    ("Ntilde", "\u{D1}", true),
-    ("Ograve", "\u{D2}", true),
-    ("Oacute", "\u{D3}", true),
-    ("Ocirc", "\u{D4}", true),
-    ("Otilde", "\u{D5}", true),
-    ("Ouml", "\u{D6}", true),
-    ("times", "\u{D7}", true),
-    ("Oslash", "\u{D8}", true),
-    ("Ugrave", "\u{D9}", true),
-    ("Uacute", "\u{DA}", true),
-    ("Ucirc", "\u{DB}", true),
-    ("Uuml", "\u{DC}", true),
-    ("Yacute", "\u{DD}", true),
-    ("THORN", "\u{DE}", true),
-    ("szlig", "\u{DF}", true),
-    ("agrave", "\u{E0}", true),
-    ("aacute", "\u{E1}", true),
-    ("acirc", "\u{E2}", true),
-    ("atilde", "\u{E3}", true),
-    ("auml", "\u{E4}", true),
-    ("aring", "\u{E5}", true),
-    ("aelig", "\u{E6}", true),
-    ("ccedil", "\u{E7}", true),
-    ("egrave", "\u{E8}", true),
-    ("eacute", "\u{E9}", true),
-    ("ecirc", "\u{EA}", true),
-    ("euml", "\u{EB}", true),
-    ("igrave", "\u{EC}", true),
-    ("iacute", "\u{ED}", true),
-    ("icirc", "\u{EE}", true),
-    ("iuml", "\u{EF}", true),
-    ("eth", "\u{F0}", true),
-    ("ntilde", "\u{F1}", true),
-    ("ograve", "\u{F2}", true),
-    ("oacute", "\u{F3}", true),
-    ("ocirc", "\u{F4}", true),
-    ("otilde", "\u{F5}", true),
-    ("ouml", "\u{F6}", true),
-    ("divide", "\u{F7}", true),
-    ("oslash", "\u{F8}", true),
-    ("ugrave", "\u{F9}", true),
-    ("uacute", "\u{FA}", true),
-    ("ucirc", "\u{FB}", true),
-    ("uuml", "\u{FC}", true),
-    ("yacute", "\u{FD}", true),
-    ("thorn", "\u{FE}", true),
-    ("yuml", "\u{FF}", true),
-    ("OElig", "\u{152}", false),
-    ("oelig", "\u{153}", false),
-    ("Scaron", "\u{160}", false),
-    ("scaron", "\u{161}", false),
-    ("Yuml", "\u{178}", false),
-    ("fnof", "\u{192}", false),
-    ("circ", "\u{2C6}", false),
-    ("tilde", "\u{2DC}", false),
-    ("ensp", "\u{2002}", false),
-    ("emsp", "\u{2003}", false),
-    ("thinsp", "\u{2009}", false),
-    ("zwnj", "\u{200C}", false),
-    ("zwj", "\u{200D}", false),
-    ("lrm", "\u{200E}", false),
-    ("rlm", "\u{200F}", false),
-    ("ndash", "\u{2013}", false),
-    ("mdash", "\u{2014}", false),
-    ("lsquo", "\u{2018}", false),
-    ("rsquo", "\u{2019}", false),
-    ("sbquo", "\u{201A}", false),
-    ("ldquo", "\u{201C}", false),
-    ("rdquo", "\u{201D}", false),
-    ("bdquo", "\u{201E}", false),
-    ("dagger", "\u{2020}", false),
-    ("Dagger", "\u{2021}", false),
-    ("bull", "\u{2022}", false),
-    ("hellip", "\u{2026}", false),
-    ("permil", "\u{2030}", false),
-    ("prime", "\u{2032}", false),
-    ("Prime", "\u{2033}", false),
-    ("lsaquo", "\u{2039}", false),
-    ("rsaquo", "\u{203A}", false),
-    ("euro", "\u{20AC}", false),
-    ("trade", "\u{2122}", false),
-    ("larr", "\u{2190}", false),
-    ("uarr", "\u{2191}", false),
-    ("rarr", "\u{2192}", false),
-    ("darr", "\u{2193}", false),
-    ("harr", "\u{2194}", false),
-    ("minus", "\u{2212}", false),
-    ("infin", "\u{221E}", false),
-    ("ne", "\u{2260}", false),
-    ("le", "\u{2264}", false),
-    ("ge", "\u{2265}", false),
-    ("hearts", "\u{2665}", false),
-    ("star", "\u{2606}", false),
-    ("check", "\u{2713}", false),
-    ("Tab", "\t", false),
-    ("NewLine", "\n", false),
-    ("colon", ":", false),
-    ("comma", ",", false),
-    ("period", ".", false),
-    ("excl", "!", false),
-    ("quest", "?", false),
-    ("num", "#", false),
-    ("dollar", "$", false),
-    ("percnt", "%", false),
-    ("lpar", "(", false),
-    ("rpar", ")", false),
-    ("ast", "*", false),
-    ("plus", "+", false),
-    ("sol", "/", false),
-    ("semi", ";", false),
-    ("equals", "=", false),
-    ("commat", "@", false),
-    ("lsqb", "[", false),
-    ("rsqb", "]", false),
-    ("bsol", "\\", false),
-    ("lowbar", "_", false),
-    ("grave", "`", false),
-    ("lcub", "{", false),
-    ("rcub", "}", false),
-    ("verbar", "|", false),
-    ("vert", "|", false),
-];
+/// The characters and legacy flag of the named reference `name` (without
+/// `&` or `;`), from the full WHATWG list.
+fn named_reference(name: &str) -> Option<(&'static str, bool)> {
+    use super::html_entities::NAMED_REFERENCES;
+    NAMED_REFERENCES
+        .binary_search_by(|(candidate, ..)| candidate.as_bytes().cmp(name.as_bytes()))
+        .ok()
+        .map(|index| (NAMED_REFERENCES[index].1, NAMED_REFERENCES[index].2))
+}
+
+/// Longest legacy name (one that matches without `;`): `frac12`, `middot`.
+const LONGEST_LEGACY_NAME: usize = 6;
 
 /// Characters numeric references to 0x80..=0x9F stand for (windows-1252).
 fn numeric_reference(value: u32) -> char {
@@ -691,7 +569,7 @@ fn decode_references(text: &str, in_attribute: bool) -> String {
         }
         let run = &text[i..j];
         if bytes.get(j) == Some(&b';')
-            && let Some((_, value, _)) = NAMED_REFERENCES.iter().find(|(name, ..)| *name == run)
+            && let Some((value, _)) = named_reference(run)
         {
             out.push_str(value);
             copied = j + 1;
@@ -699,12 +577,14 @@ fn decode_references(text: &str, in_attribute: bool) -> String {
             continue;
         }
         // The longest legacy name the run starts with, matched without `;`.
-        let legacy = NAMED_REFERENCES
-            .iter()
-            .filter(|(name, _, legacy)| *legacy && run.starts_with(name))
-            .max_by_key(|(name, ..)| name.len());
-        if let Some((name, value, _)) = legacy {
-            let after = i + name.len();
+        let legacy = (2..=run.len().min(LONGEST_LEGACY_NAME))
+            .rev()
+            .find_map(|len| match named_reference(&run[..len]) {
+                Some((value, true)) => Some((len, value)),
+                _ => None,
+            });
+        if let Some((name_len, value)) = legacy {
+            let after = i + name_len;
             let blocked = in_attribute
                 && bytes
                     .get(after)
@@ -854,6 +734,217 @@ mod tests {
             Some("UTF-8")
         );
         assert_eq!(content_type_charset("text/html"), None);
+    }
+
+    #[test]
+    fn names_missing_a_semicolon_use_the_full_reference_list() {
+        // Full names that begin with a legacy name decode as themselves.
+        let head = scan("<title>a &notin; b &parallel; c &centerdot; d &ltimes; e &acE;</title>");
+        assert_eq!(
+            head.title(),
+            Some("a \u{2209} b \u{2225} c \u{B7} d \u{22C9} e \u{223E}\u{333}")
+        );
+        // An unknown name decodes only its legacy prefix in text, as the
+        // tokenizer does, and stays as written in an attribute.
+        let head = scan(concat!(
+            "<meta property=\"og:title\" content=\"&notit; &spades; &frac13;\">",
+            "<title>&notit; &frac12x &CounterClockwiseContourIntegral;</title>",
+        ));
+        assert_eq!(head.property("og:title"), Some("&notit; \u{2660} \u{2153}"));
+        assert_eq!(head.title(), Some("\u{AC}it; \u{BD}x \u{2233}"));
+    }
+
+    #[test]
+    fn the_reference_table_is_sorted_and_its_legacy_names_are_short() {
+        use super::super::html_entities::NAMED_REFERENCES;
+        assert_eq!(NAMED_REFERENCES.len(), 2125);
+        assert!(
+            NAMED_REFERENCES
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        );
+        let legacy: Vec<&str> = NAMED_REFERENCES
+            .iter()
+            .filter(|(_, _, legacy)| *legacy)
+            .map(|(name, ..)| *name)
+            .collect();
+        assert_eq!(legacy.len(), 106);
+        assert!(
+            legacy
+                .iter()
+                .all(|name| (2..=LONGEST_LEGACY_NAME).contains(&name.len()))
+        );
+    }
+
+    #[test]
+    fn comments_end_at_either_closing_form() {
+        let head = scan("<!----!><meta name=description content=X>");
+        assert_eq!(head.name("description"), Some("X"));
+        let head = scan("<!-- a -- b --!> <meta property=og:title content=T> <!-- x -->");
+        assert_eq!(head.property("og:title"), Some("T"));
+        let head = scan("<!-- <meta property=og:title content=hidden> --!");
+        assert_eq!(head.property("og:title"), None);
+    }
+
+    #[test]
+    fn long_values_are_decoded_from_their_first_bytes_only() {
+        let long = "\u{E9}".repeat(MAX_VALUE_BYTES);
+        let html = format!(
+            "<meta property=\"og:title\" content=\"x{long}\"><title>{}</title>",
+            "&amp;".repeat(MAX_VALUE_BYTES)
+        );
+        let head = scan(&html);
+        let title = head.property("og:title").unwrap();
+        assert!(title.len() <= MAX_VALUE_BYTES);
+        assert!(!title.contains('\u{FFFD}'));
+        assert!(head.title().unwrap().len() <= MAX_VALUE_BYTES);
+
+        // A crafted page of references stays cheap: the decoded span is capped.
+        let crafted = format!(
+            "<meta property=og:title name=description content=\"{}\"><title>{}",
+            "&a".repeat(MAX_SCAN_BYTES / 4),
+            "&a".repeat(MAX_SCAN_BYTES / 4)
+        );
+        let head = scan(&crafted);
+        assert!(head.property("og:title").unwrap().len() <= MAX_VALUE_BYTES);
+    }
+
+    /// Cases from the review's adversarial pass (scratchpad `hh/src/adv.rs`),
+    /// with the tokenizer's answers.
+    #[test]
+    fn adversarial_cases_from_review() {
+        let head = scan("<head><!-- x --!><meta property=og:title content=Visible></head>");
+        assert_eq!(head.property("og:title"), Some("Visible"));
+
+        let head = scan(concat!(
+            "<title>a &notin; b &parallel; c &centerdot; d &ltimes; e &spades; f</title>",
+            "<meta property=og:title content=\"x &notin; y &copysr; z\">",
+        ));
+        assert_eq!(
+            head.title(),
+            Some("a \u{2209} b \u{2225} c \u{B7} d \u{22C9} e \u{2660} f")
+        );
+        assert_eq!(head.property("og:title"), Some("x \u{2209} y \u{2117} z"));
+
+        for (html, image) in [
+            (
+                "<head><meta property=og:title content=A></head ><meta property=og:image content=B>",
+                None,
+            ),
+            (
+                "<head><meta property=og:title content=A></HEAD><meta property=og:image content=B>",
+                None,
+            ),
+            (
+                "<head><meta property=og:title content=A></head/><meta property=og:image content=B>",
+                None,
+            ),
+            (
+                "<head><meta property=og:title content=A></head x='>'><meta property=og:image content=B>",
+                None,
+            ),
+            (
+                "<head><meta property=og:title content=A></header><meta property=og:image content=B>",
+                Some("B"),
+            ),
+            (
+                "<head><meta property=og:title content=A><textarea></head></textarea><meta property=og:image content=B>",
+                Some("B"),
+            ),
+        ] {
+            let head = scan(html);
+            assert_eq!(head.property("og:title"), Some("A"), "{html}");
+            assert_eq!(head.property("og:image"), image, "{html}");
+        }
+
+        let head = scan("<head><noscript><meta property=og:image content=/ns.png></noscript>");
+        assert_eq!(head.property("og:image"), None);
+
+        for (html, title) in [
+            ("<title>&</title>", "&"),
+            ("<title>&#</title>", "&#"),
+            ("<title>&#x</title>", "&#x"),
+            ("<title>&#x;</title>", "&#x;"),
+            (
+                "<title>&\u{E9} &#\u{E9} &amp\u{E9} &amp;\u{E9}</title>",
+                "&\u{E9} &#\u{E9} &\u{E9} &\u{E9}",
+            ),
+        ] {
+            assert_eq!(scan(html).title(), Some(title), "{html}");
+        }
+        let _ = scan("<meta property=og:title content=\"&\u{1F600}&#x\u{1F600};&lt\u{1F600}\">");
+        for content_type in [
+            "text/html; charset=\u{212A}oi8",
+            "charset",
+            "charset=",
+            "\u{17F}charset=utf-8",
+            "text/html;charset=\"\"",
+            "\u{C4} charset = 'latin1'",
+        ] {
+            let _ = content_type_charset(content_type);
+        }
+        let multibyte = "<meta http-equiv=content-type content=\"\u{FC}; charset=latin1\"><title>\u{E9}</title>";
+        // The content is not plain ASCII but is valid UTF-8, so the label is read.
+        assert_eq!(scan(multibyte).title(), Some("\u{C3}\u{A9}"));
+
+        let bom = scan_head(
+            b"\xEF\xBB\xBF<meta charset=latin1><title>\xC3\xA9</title>",
+            None,
+        );
+        assert_eq!(bom.title(), Some("\u{E9}"));
+        let header = scan_head(
+            b"<meta charset=latin1><title>\xC3\xA9</title>",
+            Some("utf-8"),
+        );
+        assert_eq!(header.title(), Some("\u{E9}"));
+        let unknown = scan_head(
+            b"<meta charset=latin1><title>\xC3\xA9</title>",
+            Some("shift_jis"),
+        );
+        assert_eq!(unknown.title(), Some("\u{C3}\u{A9}"));
+    }
+
+    /// The review's worst-case shapes, each a full 512 KB: they must finish
+    /// (linear work, capped decoding) and give the expected value.
+    #[test]
+    fn worst_case_inputs_finish() {
+        let n = MAX_SCAN_BYTES;
+        let fill = |prefix: &str, unit: &str, suffix: &str| {
+            let mut html = String::from(prefix);
+            while html.len() < n - suffix.len() - unit.len() {
+                html.push_str(unit);
+            }
+            html.push_str(suffix);
+            html
+        };
+        let head = scan(&fill(
+            "<meta property=og:title name=description content=\"",
+            "&a",
+            "\">",
+        ));
+        assert!(
+            head.property("og:title")
+                .is_some_and(|value| value.len() <= MAX_VALUE_BYTES)
+        );
+        let _ = scan(&fill(
+            "<meta property=og:title content=\"",
+            "&aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\">",
+        ));
+        assert!(scan(&fill("<title>", "&a", "")).title().is_some());
+        let _ = scan(&fill("", "<a>", ""));
+        let _ = scan(&fill("<meta", " a", ">"));
+        let _ = scan(&fill("<meta", " content=x name=y", ">"));
+        let _ = scan(&fill("<script>", "</scrip", ""));
+        let _ = scan(&fill("<!--", "--", ""));
+        let _ = scan(&fill("", "</ ", ""));
+        let _ = scan(&fill("", "<<", ""));
+        let _ = scan(&fill("<meta property=og:title content=\"", "&#9;", "\">"));
+        let mut latin = b"<meta charset=latin1><title>".to_vec();
+        while latin.len() < n {
+            latin.extend_from_slice(b"\r\x80\0");
+        }
+        assert!(scan_head(&latin, None).title().is_some());
     }
 
     #[test]

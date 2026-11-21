@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod fetchers;
+mod html_entities;
 mod html_head;
 pub mod seventv;
 pub mod spotify;
@@ -86,6 +87,45 @@ async fn read_html_prefix(mut response: reqwest::Response) -> Vec<u8> {
     body
 }
 
+/// Remove what could reorder or hide the chat text around a preview from its
+/// fetched display text: C0 and C1 control characters (tab, line feed and
+/// carriage return become spaces) and the bidirectional embedding, override
+/// and isolate controls (U+202A..=U+202E, U+2066..=U+2069). Directional marks
+/// (LRM, RLM, ALM) and joiners stay: titles in right-to-left scripts and emoji
+/// sequences use them.
+fn sanitize_display_text(text: &mut String) {
+    let unsafe_char = |ch: char| {
+        ch.is_control() || matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    };
+    if !text.contains(unsafe_char) {
+        return;
+    }
+    *text = text
+        .chars()
+        .filter_map(|ch| match ch {
+            '\t' | '\n' | '\r' => Some(' '),
+            ch if unsafe_char(ch) => None,
+            ch => Some(ch),
+        })
+        .collect();
+}
+
+/// Sanitize every display string of fetched metadata before it reaches the
+/// UI (see [`sanitize_display_text`]).
+fn sanitize_embed_metadata(metadata: &mut crate::backend::link_types::EmbedMetadata) {
+    for text in [
+        &mut metadata.title,
+        &mut metadata.description,
+        &mut metadata.subtitle,
+        &mut metadata.duration,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        sanitize_display_text(text);
+    }
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -97,5 +137,23 @@ fn image_media(source_url: String) -> MediaAsset {
         kind: MediaKind::Image,
         poster_url: Some(source_url.clone()),
         source_url,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn preview_text_loses_controls_and_bidi_overrides() {
+        let mut text = "a\u{202E}b\u{1}c\u{7F}d\u{2066}e\nf\rg\u{85}h\u{9F}i\u{2069}".to_string();
+        sanitize_display_text(&mut text);
+        assert_eq!(text, "abcde f ghi");
+        // Marks and joiners used by real titles stay.
+        let mut kept = "\u{5E9}\u{200F}\u{5DC} \u{1F468}\u{200D}\u{1F469}".to_string();
+        let before = kept.clone();
+        sanitize_display_text(&mut kept);
+        assert_eq!(kept, before);
     }
 }
