@@ -109,19 +109,7 @@ impl FilterStore {
 
     /// Test a message against all enabled filters.
     pub fn test_message(&self, ctx: &TestContext) -> Vec<FilterTestResult> {
-        self.compiled_rules()
-            .iter()
-            .map(|(action, expression)| {
-                let evaluation = expression
-                    .as_ref()
-                    .and_then(|expression| expression.evaluate(ctx).ok());
-                FilterTestResult {
-                    matched: evaluation.as_ref().is_some_and(|e| e.matched),
-                    action: *action,
-                    matched_text: evaluation.and_then(|e| e.matched_text),
-                }
-            })
-            .collect()
+        evaluate_rules(&self.compiled_rules(), ctx)
     }
 
     /// The rules to evaluate, compiled once per filter-set version instead
@@ -134,8 +122,15 @@ impl FilterStore {
         {
             return Arc::clone(rules);
         }
-        let rules: Arc<[CompiledRule]> = self
-            .filters()
+        let rules = self.compile_rules(self.filters());
+        self.state.write_or_recover().rules = Some((version, Arc::clone(&rules)));
+        rules
+    }
+
+    /// The enabled, non-empty, non-Replace rules of `filters`, in order,
+    /// each with its compiled expression or none when it does not parse.
+    fn compile_rules(&self, filters: Vec<FilterRule>) -> Arc<[CompiledRule]> {
+        filters
             .into_iter()
             .filter(|filter| {
                 filter.enabled
@@ -146,9 +141,7 @@ impl FilterStore {
                 let compiled = self.compiled_expression(&filter.expression).ok();
                 (filter.action, compiled.map(Arc::new))
             })
-            .collect();
-        self.state.write_or_recover().rules = Some((version, Arc::clone(&rules)));
-        rules
+            .collect()
     }
 
     fn compiled_expression(&self, expr: &str) -> Result<FilterExpression, String> {
@@ -171,6 +164,24 @@ impl FilterStore {
     }
 }
 
+/// One result per rule: a rule whose expression did not parse, or failed to
+/// evaluate, is unmatched but keeps its action.
+fn evaluate_rules(rules: &[CompiledRule], ctx: &TestContext) -> Vec<FilterTestResult> {
+    rules
+        .iter()
+        .map(|(action, expression)| {
+            let evaluation = expression
+                .as_ref()
+                .and_then(|expression| expression.evaluate(ctx).ok());
+            FilterTestResult {
+                matched: evaluation.as_ref().is_some_and(|e| e.matched),
+                action: *action,
+                matched_text: evaluation.and_then(|e| e.matched_text),
+            }
+        })
+        .collect()
+}
+
 pub fn validate_filter_expression(expr: &str) -> Result<(), String> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
@@ -181,3 +192,60 @@ pub fn validate_filter_expression(expr: &str) -> Result<(), String> {
 
 /// Global filter store instance
 pub static FILTER_STORE: LazyLock<FilterStore> = LazyLock::new(FilterStore::new);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn rule(id: &str, expression: &str, action: FilterAction, enabled: bool) -> FilterRule {
+        FilterRule {
+            id: id.to_string(),
+            expression: expression.to_string(),
+            action,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn a_rule_that_does_not_parse_yields_an_unmatched_result_with_its_action() {
+        let store = FilterStore::new();
+        let rules = store.compile_rules(vec![
+            rule(
+                "broken",
+                "message.content contains (",
+                FilterAction::Hide,
+                true,
+            ),
+            rule(
+                "disabled",
+                r#"message.content contains "hi""#,
+                FilterAction::Hide,
+                false,
+            ),
+            rule("blank", "   ", FilterAction::Hide, true),
+            rule("replace", "hi", FilterAction::Replace, true),
+            rule(
+                "match",
+                r#"message.content contains "hi""#,
+                FilterAction::Highlight,
+                true,
+            ),
+        ]);
+        assert!(rules[0].1.is_none(), "the broken rule does not parse");
+        let ctx = TestContext {
+            content: "hi chat".to_string(),
+            ..Default::default()
+        };
+        let results = evaluate_rules(&rules, &ctx);
+        let summary: Vec<(bool, FilterAction)> = results
+            .iter()
+            .map(|result| (result.matched, result.action))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(false, FilterAction::Hide), (true, FilterAction::Highlight)]
+        );
+        assert!(results[0].matched_text.is_none());
+    }
+}
