@@ -1,0 +1,145 @@
+From 6c94e753138ea9192d2a9c63053f2e9c159ce84c Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:40:38 -0700
+Subject: [PATCH] perf(gpui): present after high-rate input only on Apple
+ platforms
+
+`InputRateTracker` marks a window as receiving high-rate input after six
+invalidating inputs within 100 ms and keeps that state for a second.
+While it holds, every frame request presents the unchanged frame and
+counts as frame demand. Upstream added the presents for ProMotion
+displays (zed#7305, #7347, narrowed to high-rate input in #45369):
+ProMotion lowers the display's refresh rate when an app stops presenting,
+so frames during interaction (fast key repeat, scrolling) arrived at the
+lowered rate.
+
+Off Apple platforms the backends start frames again on demand (the
+Windows vsync thread on the frame waker, Wayland on `schedule_frame`),
+and no effect of the presents is expected for a windowed app on Windows
+with GPUI's default DirectComposition swap chain or on Linux, so there
+they only repeat an unchanged frame. Configurations where the display
+follows the app's present rate were not tested: NVIDIA "G-SYNC for
+windowed mode" with a plain HWND flip-model swap chain
+(`GPUI_DISABLE_DIRECT_COMPOSITION`), Windows 11 dynamic refresh rate, and
+fullscreen VRR on Linux. With a frame request on every vsync (Windows
+before demand gating, or with it turned off), a window presented on every
+vsync for that second after the pointer moved over hover-sensitive
+content. The presents are now limited to macOS and iOS, which also turns
+them off for the web backend. High-rate input still lifts the
+inactive-window frame cap on every platform, so an unfocused window that
+is scrolled or hovered keeps drawing its real changes at full rate.
+
+With demand-driven frames on Windows the presents rarely happened
+anyway, since a clean window gets no frame requests; this keeps a
+window's frame source from staying busy for that second and removes the
+cost when frame demand gating is turned off. Not measured separately.
+
+`test_high_rate_input_presents_only_on_apple_platforms` checks that a
+clean window presents after a burst of input only where
+`PRESENT_AFTER_HIGH_RATE_INPUT` holds, and that elsewhere the burst does
+not wake the frame source.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/src/window.rs | 58 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 48ae450a0a..653a43149a 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1394,6 +1394,16 @@ pub(crate) struct InputRateTracker {
+ 
+ const FRAME_INTERVAL_TOLERANCE: Duration = Duration::from_millis(1);
+ 
++/// Whether a window keeps presenting its unchanged frame for a while after
++/// high-rate input. Upstream added this for ProMotion displays, whose frame
++/// callbacks slow down when an app stops presenting. Windows and Linux do not
++/// lower the refresh rate of a windowed app that stops presenting, and their
++/// backends restart frame delivery as soon as there is demand, so there it
++/// only adds a present of an unchanged frame per vsync. High-rate
++/// input still lifts the inactive-window frame cap on every platform. Local
++/// Echo change (`echo-paint-fork`).
++const PRESENT_AFTER_HIGH_RATE_INPUT: bool = cfg!(any(target_os = "macos", target_os = "ios"));
++
+ /// Keeps throttled frames on a stable cadence despite callback delivery jitter.
+ #[derive(Default)]
+ struct FramePacer {
+@@ -2046,13 +2056,14 @@ impl Window {
+                 // Keep presenting briefly after high-rate input to prevent display
+                 // underclocking, but subject to the same power limits as redraws.
+                 let high_rate_input = input_rate_tracker.borrow_mut().is_high_rate();
++                let present_for_high_rate_input = PRESENT_AFTER_HIGH_RATE_INPUT && high_rate_input;
+                 let has_next_frame_callbacks = !next_frame_callbacks.borrow().is_empty();
+                 let has_demand_besides_animation = invalidator.is_dirty()
+                     || force_render
+                     || has_next_frame_callbacks
+                     || request_frame_options.require_presentation
+                     || needs_present.get()
+-                    || high_rate_input;
++                    || present_for_high_rate_input;
+                 let has_frame_demand =
+                     has_demand_besides_animation || scene_animation_interval.get().is_some();
+ 
+@@ -2150,7 +2161,7 @@ impl Window {
+                 let needs_present = request_frame_options.require_presentation
+                     || needs_present.get()
+                     || scene_animation_interval.get().is_some()
+-                    || high_rate_input;
++                    || present_for_high_rate_input;
+                 if should_draw {
+                     measure("frame duration", || {
+                         handle
+@@ -9921,6 +9932,49 @@ mod tests {
+         );
+     }
+ 
++    /// Presenting an unchanged frame after high-rate input is a ProMotion
++    /// measure; elsewhere a clean window must stay idle (and must not keep a
++    /// demand-driven frame source running) after an input burst.
++    #[gpui::test]
++    fn test_high_rate_input_presents_only_on_apple_platforms(cx: &mut TestAppContext) {
++        use super::PRESENT_AFTER_HIGH_RATE_INPUT;
++
++        let window = cx.add_window(|_, _| EmptyView);
++        let test_window = cx.test_window(window.into());
++        test_window.simulate_active_status_change(true);
++        test_window.simulate_frame_request(RequestFrameOptions::default());
++
++        let presented_before = window
++            .update(cx, |_, window, _| {
++                for _ in 0..8 {
++                    window.input_rate_tracker.borrow_mut().record_input();
++                }
++                assert!(window.input_rate_tracker.borrow_mut().is_high_rate());
++                window.frame_stage_statistics.frames_presented
++            })
++            .unwrap();
++        let wakes_before = test_window.frame_wake_count();
++        test_window.simulate_frame_request(RequestFrameOptions::default());
++        let presented_after = window
++            .update(cx, |_, window, _| {
++                window.frame_stage_statistics.frames_presented
++            })
++            .unwrap();
++
++        assert_eq!(
++            presented_after - presented_before,
++            u64::from(PRESENT_AFTER_HIGH_RATE_INPUT),
++            "a clean window presents after high-rate input only where that keeps ProMotion from downclocking"
++        );
++        if !PRESENT_AFTER_HIGH_RATE_INPUT {
++            assert_eq!(
++                test_window.frame_wake_count(),
++                wakes_before,
++                "high-rate input alone must not wake the frame source of a clean window"
++            );
++        }
++    }
++
+     /// A frame request that arrives while next-frame callbacks are pending
+     /// must never strand them: either the frame runs them, or (when the
+     /// inactive-window frame-rate throttle defers the frame) the waker fires
+-- 
+2.56.1.windows.1
+

@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 # Cargo.toml's rev and the manifest's fork-tree, and the checks below fail when
 # either copy drifts.
 $PinnedRev = "7279c76ef71d45504d7cfea00ee054f852ca0fbf"
-$ExpectedForkTree = "11f3e1449b416d8b4abb160e2a08ee4b4433fbc0"
+$ExpectedForkTree = "383751ee775de7ed1f0e25578d0b51aac3b2f742"
 $Branch = "echo-paint-fork"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PatchManifest = Join-Path $RepoRoot "scripts/gpui-fork-patches.txt"

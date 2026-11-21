@@ -91,6 +91,14 @@ Animation, layout and image wake loops only repaint a split when something
 visible changes, so an idle window should show few frames. A high frame count
 on an idle split is a finding, not noise.
 
+On Windows the fork requests frames only on demand (`ECHO_FRAME_DEMAND_GATING`,
+on by default). The profiler sees the same drawn frames either way, since a
+frame request without demand never drew, but there are no idle frame requests
+any more: `cadence_fps` is the rate of frames something asked for, and
+`present_latency_ms` sampled after a quiet period is the age of the last
+present. Thread wake counts and idle CPU differ greatly between the two
+settings, so compare runs with the same value.
+
 ## Scripts
 
 Most scripts under `scripts/bench/` write into a run directory created by

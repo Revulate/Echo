@@ -57,10 +57,14 @@ Echo installs rustls's ring provider (`backend::http::ensure_rustls_crypto_provi
 and enables no crate feature that pulls in AWS-LC: its own `rustls` and
 `tokio-rustls` use `ring`, and `twitch-irc` is built with `transport-tcp`
 only, because Echo makes the IRC TLS stream itself
-(`src/backend/irc/proxy_transport.rs`). The one remaining path to `aws-lc-rs`
-is the GPUI fork's `http_client_tls` (rustls default features);
-`cargo tree --locked -e features --target all -i rustls` shows which features
-enable `rustls feature "aws_lc_rs"`.
+(`src/backend/irc/proxy_transport.rs`). The GPUI fork's `http_client_tls`
+also uses rustls with `ring` only and installs ring as the default provider
+when the app has not (`gpui-http-client-tls-ring-only.patch`), so ring is the
+only TLS crypto library in the build:
+`cargo tree --locked -e features --target all -i aws-lc-rs` (and `-i
+aws-lc-sys`) match no package, and neither is in the lockfile.
+`cargo tree --locked -e features --target all -i rustls` shows the rustls
+features in use.
 
 ## Git sources
 

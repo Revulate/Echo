@@ -1,0 +1,1885 @@
+From ac704ed3443f66f6d8e32eb5073ce655193019b7 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:39:51 -0700
+Subject: [PATCH] perf(gpui_windows): request frames only for windows with
+ frame demand
+
+The vsync thread invalidated every window on every vsync, so each window
+received a WM_PAINT and ran its `on_request_frame` callback at the
+display rate even when nothing was dirty. An idle, unfocused window kept
+the vsync thread and the main thread awake at the refresh rate all day.
+
+Windows now implements the frame-demand protocol GPUI already has for
+macOS and the web. `frame_waker` fires when a window first becomes dirty.
+`schedule_frame` is called for next-frame callbacks, present-only frames
+from animation patching, running scene animations, and at the end of
+every effect flush for a window that is dirty, has a pending present or
+callbacks, or runs a scene animation (that last condition is added here).
+Both set a per-window `FrameDemand`, and the vsync thread invalidates a
+window only when it has demand that is due, consuming it then.
+
+A frame that GPUI's frame-rate throttle defers (the inactive-window cap,
+low power, thermal, a scene animation's interval) used to ask for a
+retry on every vsync, so a throttled animation still woke the main thread
+at the refresh rate. GPUI now offers the deadline to the platform
+(`PlatformWindow::schedule_frame_after`, false by default, so other
+platforms keep the retry), and Windows holds the frame until then. The
+deadline replaces the demand GPUI just deferred: the effect flush at the
+start of a frame request schedules every window with demand again, and
+that must not make the deferred frame due on the next vsync. Later
+demand (a notify, activation, the start of high-rate input, which lifts
+the inactive cap) makes the frame due at once.
+
+The backend adds its own demand where it needs a frame:
+
+- a draw deferred because another draw was in progress (Windows can
+  re-enter the window procedure mid-draw), and the GPUI callback's own
+  re-entrant deferral, which now wakes the frame source;
+- a resize or restore (`WM_SIZE`), being shown (`WM_SHOWWINDOW`),
+  activation, a renderer resize failure, a device-loss recovery, and a
+  draw or present that fails because the device was removed, which now
+  also starts recovery at once instead of at the vsync thread's next
+  device check;
+- a touchpad gesture: Direct Manipulation only advances a gesture and its
+  inertia when it is updated from `draw_window`. The viewport's status
+  handler requests frames whenever it reports running or inertia (the
+  status can arrive outside a draw and long after the contact). The
+  window then gets every vsync; for a second after a contact is handed
+  over, and for 250 ms after the viewport becomes ready (its transform
+  reset runs a second cycle), it polls at about 30 Hz.
+
+`draw_window` validates the update region before it draws, not after. A
+window that keeps animating re-arms its demand while it is drawn, and the
+vsync thread may consume that demand and invalidate the window before the
+draw returns; validating afterwards erased that invalidation while GPUI,
+still dirty, would not ask again, so the window stalled until another
+effect flush or the safety frame.
+
+A hidden or minimized window keeps its demand without being invalidated.
+The window procedure tracks both states, so such a window's requests (one
+per effect flush while it stays dirty) do not wake the vsync thread, and
+showing or restoring it requests a frame.
+
+The vsync thread keeps waiting for vsyncs for 250 ms after it last
+delivered a frame, which covers the gaps of ordinary animations and
+typing, then parks until a request, the next deferred frame or the next
+safety frame. Every second it invalidates each drawable window anyway (a
+safety frame), so a demand source that was missed shows up as a late
+frame rather than a frozen window; the deadline also bounds how late a
+parked thread notices a lost device or runs the hardware-adapter probe.
+When a request (or a deadline) wakes the parked thread it invalidates at
+once instead of first waiting on `DwmFlush`, whose first call after a
+pause can return early and fall back to a full-interval sleep. Only a
+thread that finds no other thread's sleeping mark may set its own, so a
+stopped thread winding down after a GPU detach/attach cannot hide the new
+thread's sleep from requests.
+
+Demand that arrives on the UI thread after a pause is painted at once:
+when the window has had no `WM_PAINT` for a refresh period, the frame
+waker and `schedule_frame` take the demand and call `InvalidateRect`
+themselves, so the frame is drawn as soon as the UI thread is idle. With
+a request on every vsync a `WM_PAINT` was nearly always pending, and a
+frame for new input came that soon; waiting for the next vsync instead
+made the first keystroke after a pause measurably slower. Within a
+refresh period of the last paint the vsync thread paces the window as
+above, so it still draws at most about once per refresh period.
+
+`Window::set_frame_demand_gating(false)` (`PlatformWindow::
+set_frame_demand_gating`, a no-op on other platforms) restores an
+invalidation on every vsync for that window, and keeps the thread
+ticking while such a window exists. Gating is on by default.
+
+Measured on one Windows machine (143 Hz display), debug builds of the
+examples, per-thread context switches from NtQuerySystemInformation,
+ABBA:
+
+- `hello_world`, idle, visible and unfocused, 60 s: before this change
+  the main thread switched 369 and 156 times/s and the VSyncProvider
+  thread 204 and 169/s; with it, main 1.2 and 1.2/s and VSyncProvider
+  2.6 and 2.6/s.
+- `frame_demand --animate`, unfocused (the default 33 ms inactive cap),
+  30 s: without the deadline, main 188 and 183/s; with it, 97 and 97/s.
+  VSyncProvider stays at about 175/s while frames keep coming (the
+  250 ms wait).
+- Delay from a timer notify to its render (`frame_demand --fps N
+  --report 20`, focused, measured before the immediate paint above was
+  added): at 2 Hz, where the thread parks between frames,
+  6.8 and 6.5 ms mean with a 4-vsync wait and a `DwmFlush` after waking,
+  3.9 and 4.1 ms with frames on every vsync, 0.15 and 0.16 ms now; at
+  5 Hz 5.0 and 6.6, 3.5 and 3.6, and 3.7 and 4.4 ms now; at 20 Hz 5.2 and
+  4.8, 4.4 and 3.7, and 4.2 and 3.9 ms now.
+- Echo dist build, keystroke in the focused composer to its pixels
+  changing on screen (polling the composer region), three runs each, ABBA,
+  90 keys after 1.5-2.5 s of idle and 180 keys at 110 ms intervals per
+  setting: without the immediate paint, idle-then-type median 15.6 ms and
+  p95 24.9 ms against 14.6 and 20.1 ms with a request on every vsync; with
+  it, 13.4 and 19.4 ms against 14.0 and 20.3 ms, and continuous typing
+  12.5 and 16.3 ms against 15.1 and 23.0 ms.
+
+The new `frame_demand` example shows static content, and optionally a
+timer-driven counter (`--tick`, `--fps`), a continuous animation
+(`--animate`), the ungated behaviour (`--no-gating`) and a pacing report
+(`--report`). Unit tests cover the demand transitions, deferred frames
+and which requests override them, hidden and restored windows, an
+invalidation landing during a draw (`serve_paint`), the immediate
+paint and its pacing, the vsync thread's
+wait, sleep and safety-frame schedule, the sleeping mark, a request
+waking the sleeping thread, and a patched animated image waking the frame
+source.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/gpui/examples/frame_demand.rs          | 182 +++++
+ crates/gpui/src/app.rs                        |   1 +
+ crates/gpui/src/platform.rs                   |  19 +
+ crates/gpui/src/window.rs                     |  69 +-
+ .../gpui_windows/src/direct_manipulation.rs   |  94 ++-
+ crates/gpui_windows/src/directx_renderer.rs   |   8 +
+ crates/gpui_windows/src/events.rs             |  95 ++-
+ crates/gpui_windows/src/platform.rs           |  89 ++-
+ crates/gpui_windows/src/vsync.rs              | 702 +++++++++++++++++-
+ crates/gpui_windows/src/window.rs             |  59 +-
+ 10 files changed, 1258 insertions(+), 60 deletions(-)
+ create mode 100644 crates/gpui/examples/frame_demand.rs
+
+diff --git a/crates/gpui/examples/frame_demand.rs b/crates/gpui/examples/frame_demand.rs
+new file mode 100644
+index 0000000000..338e1cb82e
+--- /dev/null
++++ b/crates/gpui/examples/frame_demand.rs
+@@ -0,0 +1,182 @@
++#![cfg_attr(target_family = "wasm", no_main)]
++
++//! A window for checking demand-driven frames (`Window::set_frame_demand_gating`).
++//!
++//! By default it shows static content, so an idle window should cost no
++//! frames. `--tick` notifies the view from a timer twice a second, and
++//! `--fps <n>` does so `n` times a second; either must keep the counter
++//! advancing while the window is otherwise idle. `--animate` requests an
++//! animation frame on every render, which must keep the render counter
++//! climbing (at the display rate while focused, at the inactive-window cap
++//! while not). `--no-gating` restores a frame request on every vsync.
++//!
++//! `--report <seconds>` prints, after that long, how late each timer
++//! notification was rendered and how evenly those renders were spaced, then
++//! quits.
++
++#[path = "example_support/fonts.rs"]
++mod example_support;
++
++use std::time::{Duration, Instant};
++
++use gpui::{
++    App, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
++};
++use gpui_platform::application;
++
++struct FrameDemand {
++    animate: bool,
++    ticks: u64,
++    renders: u64,
++    /// When the oldest notification not yet rendered was sent.
++    notified_at: Option<Instant>,
++    /// Notification-to-render delays and the render times that served them.
++    delays: Vec<Duration>,
++    served_at: Vec<Instant>,
++}
++
++impl Render for FrameDemand {
++    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
++        self.renders += 1;
++        if let Some(notified_at) = self.notified_at.take() {
++            let now = Instant::now();
++            self.delays.push(now - notified_at);
++            self.served_at.push(now);
++        }
++        if self.animate {
++            window.request_animation_frame();
++        }
++        div()
++            .flex()
++            .flex_col()
++            .gap_3()
++            .size_full()
++            .justify_center()
++            .items_center()
++            .bg(rgb(0x202830))
++            .text_xl()
++            .text_color(rgb(0xffffff))
++            .child(format!("Ticks: {}", self.ticks))
++            .child(format!("Renders: {}", self.renders))
++    }
++}
++
++impl FrameDemand {
++    fn report(&self) {
++        fn millis(duration: Duration) -> f64 {
++            duration.as_secs_f64() * 1000.0
++        }
++        fn summary(mut values: Vec<f64>) -> String {
++            if values.is_empty() {
++                return "n=0".into();
++            }
++            values.sort_by(f64::total_cmp);
++            let n = values.len();
++            let mean = values.iter().sum::<f64>() / n as f64;
++            let sd = (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
++            let at = |q: f64| values[((n - 1) as f64 * q).round() as usize];
++            format!(
++                "n={n} mean={mean:.2} sd={sd:.2} p50={:.2} p95={:.2} max={:.2}",
++                at(0.5),
++                at(0.95),
++                values[n - 1]
++            )
++        }
++        let delays = self.delays.iter().map(|d| millis(*d)).collect();
++        let intervals = self
++            .served_at
++            .windows(2)
++            .map(|pair| millis(pair[1] - pair[0]))
++            .collect();
++        println!("notify_to_render_ms {}", summary(delays));
++        println!("render_interval_ms {}", summary(intervals));
++    }
++}
++
++fn run_example() {
++    application().run(|cx: &mut App| {
++        if !example_support::load_fonts(cx) {
++            return;
++        }
++        let arguments: Vec<String> = std::env::args().collect();
++        let has_flag = |flag: &str| arguments.iter().any(|argument| argument == flag);
++        let value = |flag: &str| {
++            arguments
++                .iter()
++                .position(|argument| argument == flag)
++                .and_then(|index| arguments.get(index + 1))
++                .and_then(|value| value.parse::<f64>().ok())
++        };
++        let animate = has_flag("--animate");
++        let tick_hz = value("--fps").or(has_flag("--tick").then_some(2.0));
++        let report_after = value("--report").map(Duration::from_secs_f64);
++        let gating = !has_flag("--no-gating");
++        let bounds = Bounds::centered(None, size(px(400.), px(300.)), cx);
++        cx.open_window(
++            WindowOptions {
++                window_bounds: Some(WindowBounds::Windowed(bounds)),
++                ..Default::default()
++            },
++            |window, cx| {
++                window.set_frame_demand_gating(gating);
++                cx.new(|cx| {
++                    if let Some(tick_hz) = tick_hz {
++                        let period = Duration::from_secs_f64(1.0 / tick_hz);
++                        cx.spawn(async move |this, cx| {
++                            let started = Instant::now();
++                            let mut next = started + period;
++                            loop {
++                                let now = Instant::now();
++                                cx.background_executor()
++                                    .timer(next.saturating_duration_since(now))
++                                    .await;
++                                next += period;
++                                let done =
++                                    report_after.is_some_and(|after| started.elapsed() >= after);
++                                if this
++                                    .update(cx, |this: &mut FrameDemand, cx| {
++                                        if done {
++                                            this.report();
++                                            cx.quit();
++                                            return;
++                                        }
++                                        this.ticks += 1;
++                                        this.notified_at.get_or_insert_with(Instant::now);
++                                        cx.notify();
++                                    })
++                                    .is_err()
++                                    || done
++                                {
++                                    break;
++                                }
++                            }
++                        })
++                        .detach();
++                    }
++                    FrameDemand {
++                        animate,
++                        ticks: 0,
++                        renders: 0,
++                        notified_at: None,
++                        delays: Vec::new(),
++                        served_at: Vec::new(),
++                    }
++                })
++            },
++        )
++        .unwrap();
++        cx.activate(true);
++    });
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn main() {
++    run_example();
++}
++
++#[cfg(target_family = "wasm")]
++#[wasm_bindgen::prelude::wasm_bindgen(start)]
++pub fn start() {
++    gpui_platform::web_init();
++    run_example();
++}
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 019475b4e7..2408fa0c5a 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -2299,6 +2299,7 @@ impl App {
+                         if window.invalidator.is_dirty()
+                             || window.needs_present.get()
+                             || !window.next_frame_callbacks.borrow().is_empty()
++                            || window.scene_animation_interval.get().is_some()
+                         {
+                             window.platform_window.schedule_frame();
+                         }
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index bf8dcdb3c3..5b78e10c17 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1483,6 +1483,25 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     /// present only the damaged regions; the default ignores it.
+     fn set_present_damage(&self, _regions: Option<&[Bounds<ScaledPixels>]>) {}
+ 
++    /// Whether the platform requests frames only while GPUI has frame demand
++    /// (reported through [`Self::frame_waker`] and [`Self::schedule_frame`]).
++    ///
++    /// Local Echo extension (`echo-paint-fork`). Windows requests a frame on
++    /// every vsync when this is off; other platforms ignore it.
++    fn set_frame_demand_gating(&self, _enabled: bool) {}
++
++    /// Asks for a frame request at or after `not_before`, for a frame that
++    /// GPUI's frame-rate throttle deferred. Returns false when the platform
++    /// cannot wait for a time; GPUI then asks with [`Self::schedule_frame`] and
++    /// the frame waker instead (a request at the next opportunity, which it
++    /// defers again until the time has come).
++    ///
++    /// Local Echo extension (`echo-paint-fork`); the Windows vsync thread
++    /// holds the window's frame until then.
++    fn schedule_frame_after(&self, _not_before: Instant) -> bool {
++        false
++    }
++
+     /// Whether the renderer draws [`crate::PaintedText`] primitives.
+     ///
+     /// Local Echo extension (`echo-paint-fork`). Callers must use another way
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index fe8ec2a03f..48ae450a0a 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1338,7 +1338,7 @@ pub struct Window {
+     pub(crate) needs_present: Rc<Cell<bool>>,
+     /// The rendered scene's [`Scene::animation_frame_interval`]. While it is
+     /// `Some`, the scene must keep being presented even when nothing is redrawn.
+-    scene_animation_interval: Rc<Cell<Option<Duration>>>,
++    pub(crate) scene_animation_interval: Rc<Cell<Option<Duration>>>,
+     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
+     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
+     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+@@ -1422,6 +1422,11 @@ impl FramePacer {
+         }
+         false
+     }
++
++    /// When a frame that [`Self::should_defer`] deferred becomes due.
++    fn deadline(&self, minimum_interval: Option<Duration>) -> Option<Instant> {
++        Some(self.last_frame? + minimum_interval?)
++    }
+ }
+ 
+ fn minimum_frame_interval(
+@@ -2015,6 +2020,9 @@ impl Window {
+                 if draw_in_progress() {
+                     log::debug!("deferring re-entrant window draw request");
+                     deferred_force_render |= request_frame_options.force_render;
++                    // Platforms that request frames only on demand must still
++                    // deliver the deferred one.
++                    invalidator.wake_platform();
+                     #[cfg(feature = "profiler")]
+                     profiler::journal::record_reentrant_frame_skipped(window_id, Instant::now());
+                     return;
+@@ -2073,10 +2081,17 @@ impl Window {
+                 if has_frame_demand && frame_pacer.should_defer(now, min_frame_interval) {
+                     // Don't lose a pending forced render to throttling.
+                     deferred_force_render |= force_render;
+-                    // Deferred by throttling: ask demand-driven platforms to retry.
+-                    handle
++                    // Deferred by throttling: ask demand-driven platforms to
++                    // retry, when the frame is due if the platform can wait.
++                    let not_before = frame_pacer.deadline(min_frame_interval);
++                    let scheduled_for_deadline = handle
+                         .update(&mut cx, |_, window, _| {
+-                            window.platform_window.schedule_frame();
++                            not_before.is_some_and(|not_before| {
++                                window.platform_window.schedule_frame_after(not_before)
++                            }) || {
++                                window.platform_window.schedule_frame();
++                                false
++                            }
+                         })
+                         .with_context(|| {
+                             format!(
+@@ -2084,10 +2099,13 @@ impl Window {
+                                 handle.window_id()
+                             )
+                         })
+-                        .log_err();
++                        .log_err()
++                        .unwrap_or(false);
+                     // The demand is still unserved; platforms that stop
+                     // requesting frames for idle windows need a wakeup to retry.
+-                    invalidator.wake_platform();
++                    if !scheduled_for_deadline {
++                        invalidator.wake_platform();
++                    }
+                     #[cfg(feature = "profiler")]
+                     profiler::journal::record_frame_skipped(
+                         window_id,
+@@ -6735,7 +6753,15 @@ impl Window {
+ 
+         let caused_invalidation = self.invalidator.update_count() > update_count_before;
+         if caused_invalidation {
+-            self.input_rate_tracker.borrow_mut().record_input();
++            let mut input_rate_tracker = self.input_rate_tracker.borrow_mut();
++            let was_high_rate = input_rate_tracker.is_high_rate();
++            input_rate_tracker.record_input();
++            // High-rate input lifts the inactive-window frame cap, so a frame
++            // the platform holds for the capped deadline is wanted now.
++            if !was_high_rate && input_rate_tracker.is_high_rate() {
++                drop(input_rate_tracker);
++                self.invalidator.wake_platform();
++            }
+         }
+         #[cfg(feature = "profiler")]
+         self.window_profiler.end_input(caused_invalidation);
+@@ -7980,6 +8006,19 @@ impl Window {
+         self.patch_present_damage = enabled;
+     }
+ 
++    /// Whether the platform asks this window for a frame only while it has
++    /// frame demand. Local Echo extension (`echo-paint-fork`).
++    ///
++    /// On by default. On Windows the vsync thread then invalidates the window
++    /// only when it is dirty, has next-frame callbacks, a pending present or a
++    /// running scene animation, or the backend needs a frame for its own
++    /// reasons, plus a safety frame about once a second; it sleeps while no
++    /// window has demand. Off restores a `WM_PAINT` on every vsync. macOS and
++    /// Linux ignore it.
++    pub fn set_frame_demand_gating(&self, enabled: bool) {
++        self.platform_window.set_frame_demand_gating(enabled);
++    }
++
+     /// Cumulative CPU time this window has spent per frame-pipeline stage.
+     ///
+     /// Local Echo extension (`echo-paint-fork`). Diff two snapshots to get the
+@@ -12147,6 +12186,22 @@ mod animated_image_patch_tests {
+         .unwrap();
+     }
+ 
++    /// A patched frame needs a present but no redraw, so it must wake frame
++    /// sources that run only on demand (Windows with frame demand gating, web).
++    #[crate::test]
++    fn a_patch_wakes_the_frame_source(cx: &mut TestAppContext) {
++        let (window, _, image) = open(false, false, cx);
++        let test_window = cx.test_window(window.into());
++        let wakes_before = test_window.frame_wake_count();
++        cx.update_window(window.into(), |_, window, _| {
++            assert!(!window.invalidator.is_dirty());
++            assert!(window.patch_animated_image(1, &image, 1));
++            assert!(window.needs_present.get());
++        })
++        .unwrap();
++        assert!(test_window.frame_wake_count() > wakes_before);
++    }
++
+     #[crate::test]
+     fn scene_animations_make_patched_presents_full(cx: &mut TestAppContext) {
+         let (window, _, image) = open(true, false, cx);
+diff --git a/crates/gpui_windows/src/direct_manipulation.rs b/crates/gpui_windows/src/direct_manipulation.rs
+index 4ad4cc77b3..429b904439 100644
+--- a/crates/gpui_windows/src/direct_manipulation.rs
++++ b/crates/gpui_windows/src/direct_manipulation.rs
+@@ -1,5 +1,7 @@
+ use std::cell::{Cell, RefCell};
+ use std::rc::Rc;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
+ 
+ use anyhow::Result;
+ use gpui::*;
+@@ -18,6 +20,30 @@ use crate::*;
+ /// visual output.
+ const DEFAULT_VIEWPORT_SIZE: i32 = 1000;
+ 
++/// How long a touchpad contact handed to Direct Manipulation keeps the window
++/// polling for the gesture to start, in case its status only arrives from an
++/// update.
++const CONTACT_START_GRACE: Duration = Duration::from_secs(1);
++
++/// How long the window keeps polling after a gesture ends, so the transform
++/// reset that follows it (a second running-to-ready cycle) completes.
++const READY_TAIL: Duration = Duration::from_millis(250);
++
++/// How often a window polls Direct Manipulation while no gesture runs but one
++/// may be about to (about 30 Hz instead of every vsync).
++const POLL_INTERVAL: Duration = Duration::from_millis(33);
++
++/// The frames a window needs to drive Direct Manipulation, which only advances
++/// a gesture (and its inertia) when it is updated from a draw.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum DirectManipulationFrames {
++    None,
++    /// A gesture is running or coasting.
++    EveryVSync,
++    /// A contact may start a gesture, or a transform reset is finishing.
++    PollAt(Instant),
++}
++
+ pub(crate) struct DirectManipulationHandler {
+     manager: IDirectManipulationManager,
+     update_manager: IDirectManipulationUpdateManager,
+@@ -26,10 +52,15 @@ pub(crate) struct DirectManipulationHandler {
+     window: HWND,
+     scale_factor: Rc<Cell<f32>>,
+     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
++    /// The viewport's latest status, recorded by the event handler.
++    status: Rc<Cell<DIRECTMANIPULATION_STATUS>>,
++    contact_at: Cell<Option<Instant>>,
++    /// When the viewport last became ready, recorded by the event handler.
++    ready_at: Rc<Cell<Option<Instant>>>,
+ }
+ 
+ impl DirectManipulationHandler {
+-    pub fn new(window: HWND, scale_factor: f32) -> Result<Self> {
++    pub fn new(window: HWND, scale_factor: f32, frame_demand: Arc<FrameDemand>) -> Result<Self> {
+         unsafe {
+             let manager: IDirectManipulationManager =
+                 CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER)?;
+@@ -65,12 +96,17 @@ impl DirectManipulationHandler {
+ 
+             let scale_factor = Rc::new(Cell::new(scale_factor));
+             let pending_events = Rc::new(RefCell::new(Vec::new()));
++            let status = Rc::new(Cell::new(DIRECTMANIPULATION_BUILDING));
++            let ready_at = Rc::new(Cell::new(None));
+ 
+             let event_handler: IDirectManipulationViewportEventHandler =
+                 DirectManipulationEventHandler::new(
+                     window,
+                     Rc::clone(&scale_factor),
+                     Rc::clone(&pending_events),
++                    Rc::clone(&status),
++                    Rc::clone(&ready_at),
++                    frame_demand,
+                 )
+                 .into();
+ 
+@@ -86,6 +122,9 @@ impl DirectManipulationHandler {
+                 window,
+                 scale_factor,
+                 pending_events,
++                status,
++                contact_at: Cell::new(None),
++                ready_at,
+             })
+         }
+     }
+@@ -94,15 +133,21 @@ impl DirectManipulationHandler {
+         self.scale_factor.set(scale_factor);
+     }
+ 
+-    pub fn on_pointer_hit_test(&self, wparam: WPARAM) {
++    /// Hands a touchpad contact to Direct Manipulation. Returns whether it did,
++    /// in which case the window needs frames to drive the gesture.
++    pub fn on_pointer_hit_test(&self, wparam: WPARAM) -> bool {
+         unsafe {
+             let pointer_id = wparam.loword() as u32;
+             let mut pointer_type = POINTER_INPUT_TYPE::default();
+             if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
+             {
+-                self.viewport.SetContact(pointer_id).log_err();
++                if self.viewport.SetContact(pointer_id).log_err().is_some() {
++                    self.contact_at.set(Some(Instant::now()));
++                    return true;
++                }
+             }
+         }
++        false
+     }
+ 
+     pub fn update(&self) {
+@@ -111,6 +156,31 @@ impl DirectManipulationHandler {
+         }
+     }
+ 
++    /// The frames the window needs next. Content updates (and the scroll and
++    /// pinch events made from them) arrive only from [`Self::update`].
++    pub fn frames_needed(&self) -> DirectManipulationFrames {
++        let now = Instant::now();
++        let status = self.status.get();
++        let recent = |at: &Cell<Option<Instant>>, window: Duration| match at.get() {
++            Some(at) if now.saturating_duration_since(at) < window => true,
++            Some(_) => {
++                at.set(None);
++                false
++            }
++            None => false,
++        };
++        if status == DIRECTMANIPULATION_RUNNING || status == DIRECTMANIPULATION_INERTIA {
++            // The contact started its gesture.
++            self.contact_at.set(None);
++            DirectManipulationFrames::EveryVSync
++        } else if recent(&self.contact_at, CONTACT_START_GRACE)
++            || recent(&self.ready_at, READY_TAIL)
++        {
++            DirectManipulationFrames::PollAt(now + POLL_INTERVAL)
++        } else {
++            DirectManipulationFrames::None
++        }
++    }
+     pub fn drain_events(&self) -> Vec<PlatformInput> {
+         std::mem::take(&mut *self.pending_events.borrow_mut())
+     }
+@@ -143,6 +213,9 @@ struct DirectManipulationEventHandler {
+     last_y_offset: Cell<f32>,
+     scroll_phase: Cell<TouchPhase>,
+     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
++    status: Rc<Cell<DIRECTMANIPULATION_STATUS>>,
++    ready_at: Rc<Cell<Option<Instant>>>,
++    frame_demand: Arc<FrameDemand>,
+ }
+ 
+ impl DirectManipulationEventHandler {
+@@ -150,6 +223,9 @@ impl DirectManipulationEventHandler {
+         window: HWND,
+         scale_factor: Rc<Cell<f32>>,
+         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
++        status: Rc<Cell<DIRECTMANIPULATION_STATUS>>,
++        ready_at: Rc<Cell<Option<Instant>>>,
++        frame_demand: Arc<FrameDemand>,
+     ) -> Self {
+         Self {
+             window,
+@@ -160,6 +236,9 @@ impl DirectManipulationEventHandler {
+             last_y_offset: Cell::new(0.0),
+             scroll_phase: Cell::new(TouchPhase::Started),
+             pending_events,
++            status,
++            ready_at,
++            frame_demand,
+         }
+     }
+ 
+@@ -211,6 +290,15 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
+         current: DIRECTMANIPULATION_STATUS,
+         previous: DIRECTMANIPULATION_STATUS,
+     ) -> windows_core::Result<()> {
++        self.status.set(current);
++        if current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA {
++            // The status may arrive outside a draw (and long after the
++            // contact), so the gesture must get its frames from here.
++            self.frame_demand.request();
++        } else if current == DIRECTMANIPULATION_READY && previous != DIRECTMANIPULATION_READY {
++            self.ready_at.set(Some(Instant::now()));
++            self.frame_demand.request();
++        }
+         if current == previous {
+             return Ok(());
+         }
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index abe5f1771d..6cd346ae9e 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -504,6 +504,14 @@ impl DirectXRenderer {
+         Ok(())
+     }
+ 
++    /// Whether the renderer's device was removed or reset (a lost GPU), as a
++    /// failed draw or present reports it.
++    pub(crate) fn device_removed(&self) -> bool {
++        self.devices
++            .as_ref()
++            .is_some_and(|devices| unsafe { devices.device.GetDeviceRemovedReason() }.is_err())
++    }
++
+     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+         try_to_recover_from_device_lost(|| {
+             self.handle_device_lost_impl(directx_devices)
+diff --git a/crates/gpui_windows/src/events.rs b/crates/gpui_windows/src/events.rs
+index 9dca4e44c6..51a6899173 100644
+--- a/crates/gpui_windows/src/events.rs
++++ b/crates/gpui_windows/src/events.rs
+@@ -17,6 +17,7 @@ use windows::{
+     core::PCWSTR,
+ };
+ 
++use crate::direct_manipulation::DirectManipulationFrames;
+ use crate::*;
+ use gpui::*;
+ 
+@@ -226,6 +227,7 @@ impl WindowsWindowInner {
+         // Don't resize the renderer when the window is minimized, but record that it was minimized so
+         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
+         if wparam.0 == SIZE_MINIMIZED as usize {
++            self.state.frame_demand.set_minimized(true);
+             // A second minimize report before restore (a DPI change or a
+             // SetWindowPos on the minimized window) finds the callback already
+             // parked; overwriting it with `None` would stop all repaints.
+@@ -235,6 +237,10 @@ impl WindowsWindowInner {
+             return Some(0);
+         }
+ 
++        // A resized or restored window must draw again; GPUI's resize handler
++        // dirties it too, but a restore can find it already dirty.
++        self.state.frame_demand.set_minimized(false);
++
+         let width = lparam.loword().max(1) as i32;
+         let height = lparam.hiword().max(1) as i32;
+         let new_size = size(DevicePixels(width), DevicePixels(height));
+@@ -270,6 +276,7 @@ impl WindowsWindowInner {
+             self.state
+                 .invalidate_devices
+                 .store(true, std::sync::atomic::Ordering::Release);
++            self.state.frame_demand.request();
+         }
+         if let Some(mut callback) = self.state.callbacks.resize.take() {
+             callback(new_logical_size, scale_factor);
+@@ -857,6 +864,9 @@ impl WindowsWindowInner {
+ 
+     fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
+         let activated = wparam.loword() > 0;
++        // Activation changes the inactive-window frame cap, so a frame the
++        // cap deferred must not keep waiting for its old deadline.
++        self.state.frame_demand.request();
+ 
+         let events = self
+             .state
+@@ -1367,6 +1377,9 @@ impl WindowsWindowInner {
+         wparam: WPARAM,
+     ) -> Option<isize> {
+         self.report_visibility();
++        // Shown again, the window asks for a frame (a dirty hidden window's
++        // requests did not wake the vsync thread).
++        self.state.frame_demand.set_hidden(wparam.0 == 0);
+         if wparam.0 == 1 {
+             self.draw_window(handle, false);
+         }
+@@ -1431,6 +1444,7 @@ impl WindowsWindowInner {
+             self.state
+                 .invalidate_devices
+                 .store(true, std::sync::atomic::Ordering::Release);
++            self.state.frame_demand.request();
+             return Some(0);
+         }
+         // Make sure the first `draw_window` after recovery (whether it comes
+@@ -1438,11 +1452,14 @@ impl WindowsWindowInner {
+         // between) is treated as a forced render so it both clears
+         // `skip_draws` and bypasses the view cache.
+         self.state.force_render_pending.set(true);
++        self.state.frame_demand.request();
+         Some(0)
+     }
+ 
+     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
+-        self.state.direct_manipulation.on_pointer_hit_test(wparam);
++        if self.state.direct_manipulation.on_pointer_hit_test(wparam) {
++            self.state.frame_demand.request();
++        }
+         None
+     }
+ 
+@@ -1455,47 +1472,65 @@ impl WindowsWindowInner {
+             }
+             // Validate the region so a nested message pump doesn't keep
+             // re-dispatching WM_PAINT for the still-invalid region in a busy
+-            // loop until the in-progress draw unwinds. The vsync thread
+-            // re-invalidates every window on each vsync (see
+-            // `begin_vsync_thread`), so the deferred frame still gets drawn,
+-            // at most one vsync late.
++            // loop until the in-progress draw unwinds. Asking the vsync thread
++            // for another frame (see `begin_vsync_thread`) still gets the
++            // deferred frame drawn, at most one vsync late.
+             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
++            self.state.frame_demand.request();
+             return Some(0);
+         };
+         let mut request_frame = self.state.callbacks.request_frame.take()?;
+ 
+-        self.state.direct_manipulation.update();
++        serve_paint(
++            || {
++                unsafe { ValidateRect(Some(handle), None).ok().log_err() };
++                self.state.frame_demand.painting(std::time::Instant::now());
++            },
++            || {
++                self.state.direct_manipulation.update();
++
++                let events = self.state.direct_manipulation.drain_events();
++                if !events.is_empty() {
++                    if let Some(mut func) = self.state.callbacks.input.take() {
++                        for event in events {
++                            func(event);
++                        }
++                        self.state.callbacks.input.set(Some(func));
++                    }
++                }
+ 
+-        let events = self.state.direct_manipulation.drain_events();
+-        if !events.is_empty() {
+-            if let Some(mut func) = self.state.callbacks.input.take() {
+-                for event in events {
+-                    func(event);
++                let force_render = force_render || self.state.force_render_pending.take();
++                if force_render {
++                    // Re-enable drawing after a device loss recovery. The forced
++                    // render will rebuild the scene with fresh atlas textures.
++                    self.state.renderer.borrow_mut().mark_drawable();
+                 }
+-                self.state.callbacks.input.set(Some(func));
+-            }
+-        }
++                let (signal_at, signal_source) = self.state.frame_signal.take().map_or(
++                    (None, FrameRequestSource::NativeCallback),
++                    |(at, source)| (Some(at), source),
++                );
++                request_frame(RequestFrameOptions {
++                    require_presentation: false,
++                    force_render,
++                    signal_at,
++                    signal_source,
++                });
+ 
+-        let force_render = force_render || self.state.force_render_pending.take();
+-        if force_render {
+-            // Re-enable drawing after a device loss recovery. The forced render
+-            // will rebuild the scene with fresh atlas textures.
+-            self.state.renderer.borrow_mut().mark_drawable();
+-        }
+-        let (signal_at, signal_source) = self.state.frame_signal.take().map_or(
+-            (None, FrameRequestSource::NativeCallback),
+-            |(at, source)| (Some(at), source),
++                // After the frame request: a frame GPUI throttles replaces the
++                // window's demand with its deadline, and Direct Manipulation
++                // still needs its updates while a gesture runs.
++                match self.state.direct_manipulation.frames_needed() {
++                    DirectManipulationFrames::EveryVSync => self.state.frame_demand.request(),
++                    DirectManipulationFrames::PollAt(at) => {
++                        self.state.frame_demand.request_after(at)
++                    }
++                    DirectManipulationFrames::None => {}
++                }
++            },
+         );
+-        request_frame(RequestFrameOptions {
+-            require_presentation: false,
+-            force_render,
+-            signal_at,
+-            signal_source,
+-        });
+ 
+         self.state.callbacks.request_frame.set(Some(request_frame));
+         self.update_ime_enabled(handle);
+-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+ 
+         Some(0)
+     }
+diff --git a/crates/gpui_windows/src/platform.rs b/crates/gpui_windows/src/platform.rs
+index b979531be2..8057549c96 100644
+--- a/crates/gpui_windows/src/platform.rs
++++ b/crates/gpui_windows/src/platform.rs
+@@ -42,12 +42,18 @@ use gpui::*;
+ struct TrackedWindow {
+     handle: SafeHwnd,
+     frame_signal: Arc<PlatformFrameSignal>,
++    frame_demand: Arc<FrameDemand>,
+ }
+ 
+ impl TrackedWindow {
+     fn as_raw(&self) -> HWND {
+         self.handle.as_raw()
+     }
++
++    /// Whether the window can receive `WM_PAINT`: visible and not minimized.
++    fn is_drawable(&self) -> bool {
++        unsafe { IsWindowVisible(self.as_raw()).as_bool() && !IsIconic(self.as_raw()).as_bool() }
++    }
+ }
+ 
+ pub struct WindowsPlatform {
+@@ -422,6 +428,7 @@ impl WindowsPlatform {
+             // Not joined: the thread can be sending this thread a message. It exits after its
+             // next vsync, and drops its reference to the devices then.
+             stop.store(true, Ordering::Release);
++            wake_vsync_thread();
+         }
+         self.inner.state.directx_devices.borrow_mut().take();
+     }
+@@ -441,14 +448,24 @@ impl WindowsPlatform {
+         std::thread::Builder::new()
+             .name("VSyncProvider".to_owned())
+             .spawn(move || {
++                let registration = register_vsync_thread();
+                 let vsync_provider = VSyncProvider::new();
++                set_vsync_interval(vsync_provider.interval());
++                let mut schedule = VSyncSchedule::new(std::time::Instant::now());
++                // Set when the thread wakes from sleep with a frame due: that
++                // frame is invalidated at once instead of a vsync later.
++                let mut due_on_wake = false;
+                 let mut device_lost_since: Option<std::time::Instant> = None;
+                 let mut last_recovery_at = std::time::Instant::now();
+                 let mut presents_at_recovery = 0u64;
+                 let mut recovery_attempts = 0u32;
+                 let mut hardware_probe: Option<HardwareAdapterProbe> = None;
+                 loop {
+-                    let signal_source = vsync_provider.wait_for_vsync();
++                    let signal_source = if std::mem::take(&mut due_on_wake) {
++                        FrameRequestSource::LocalSchedule
++                    } else {
++                        vsync_provider.wait_for_vsync()
++                    };
+                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
+                     if stop.load(Ordering::Acquire) {
+                         break;
+@@ -508,26 +525,70 @@ impl WindowsPlatform {
+                     } else if !directx_device.software {
+                         hardware_probe = None;
+                     }
+-                    let Some(all_windows) = all_windows.upgrade() else {
++                    let Some(windows) = all_windows.upgrade() else {
+                         break;
+                     };
+-                    for hwnd in all_windows.read().iter() {
+-                        unsafe {
+-                            if let Some(signal_at) = signal_at {
+-                                if IsWindowVisible(hwnd.as_raw()).as_bool()
+-                                    && !IsIconic(hwnd.as_raw()).as_bool()
+-                                {
+-                                    hwnd.frame_signal.record(signal_at, signal_source);
+-                                } else {
+-                                    // Hidden windows may not consume WM_PAINT until shown again.
+-                                    hwnd.frame_signal.take();
+-                                }
++                    let now = std::time::Instant::now();
++                    let safety_frame = schedule.take_safety_frame(now);
++                    let mut delivered = false;
++                    let mut next_deferred: Option<std::time::Instant> = None;
++                    for hwnd in windows.read().iter() {
++                        let drawable = hwnd.is_drawable();
++                        let action = hwnd.frame_demand.on_vsync(drawable, safety_frame, now);
++                        delivered |= action.delivered;
++                        if let Some(deferred) = hwnd.frame_demand.deferred_until(drawable) {
++                            next_deferred =
++                                Some(next_deferred.map_or(deferred, |next| next.min(deferred)));
++                        }
++                        if !action.invalidate {
++                            continue;
++                        }
++                        if let Some(signal_at) = signal_at {
++                            if drawable {
++                                hwnd.frame_signal.record(signal_at, signal_source);
++                            } else {
++                                // Hidden windows may not consume WM_PAINT until shown again.
++                                hwnd.frame_signal.take();
+                             }
++                        }
++                        unsafe {
+                             RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
+                                 .ok()
+                                 .log_err();
+                         }
+                     }
++                    drop(windows);
++                    // Device-loss recovery counts its episode in vsyncs and
++                    // presents, so it keeps the thread ticking.
++                    let busy = device_lost_since.is_some();
++                    let AfterVSync::Sleep(wake_at) =
++                        schedule.after_vsync(now, delivered, busy, next_deferred)
++                    else {
++                        continue;
++                    };
++                    // No window wants a frame now: sleep until one does, until
++                    // a deferred frame is due, or until the next safety frame
++                    // (which also bounds how late a device loss or the
++                    // hardware-adapter probe is noticed while nothing draws).
++                    let has_due_demand = || {
++                        all_windows.upgrade().is_none_or(|windows| {
++                            windows.read().iter().any(|hwnd| {
++                                hwnd.frame_demand
++                                    .wants_vsync(hwnd.is_drawable(), std::time::Instant::now())
++                            })
++                        })
++                    };
++                    sleep_until_demand(registration, wake_at, || {
++                        stop.load(Ordering::Acquire)
++                            || invalidate_devices.load(Ordering::Acquire)
++                            || has_due_demand()
++                    });
++                    // Woken by a request (or a deferred frame's deadline):
++                    // invalidate now. Waiting for the compositor clock first
++                    // would add up to a vsync, and the first DwmFlush after
++                    // the thread slept can return early and fall back to a
++                    // full-interval sleep.
++                    due_on_wake = has_due_demand();
+                 }
+             })
+             .unwrap();
+@@ -800,6 +861,7 @@ impl Platform for WindowsPlatform {
+         self.raw_window_handles.write().push(TrackedWindow {
+             handle: handle.into(),
+             frame_signal: window.state.frame_signal.clone(),
++            frame_demand: window.state.frame_demand.clone(),
+         });
+ 
+         Ok(Box::new(window))
+@@ -1504,6 +1566,7 @@ impl Drop for WindowsPlatform {
+     fn drop(&mut self) {
+         if let Some(stop) = self.vsync_stop.borrow_mut().take() {
+             stop.store(true, Ordering::Release);
++            wake_vsync_thread();
+         }
+         unsafe {
+             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
+diff --git a/crates/gpui_windows/src/vsync.rs b/crates/gpui_windows/src/vsync.rs
+index 1cadc3ac07..2daf776a89 100644
+--- a/crates/gpui_windows/src/vsync.rs
++++ b/crates/gpui_windows/src/vsync.rs
+@@ -1,5 +1,9 @@
+ use std::{
+-    sync::LazyLock,
++    sync::{
++        LazyLock, Mutex,
++        atomic::{AtomicBool, AtomicU64, Ordering},
++    },
++    thread::Thread,
+     time::{Duration, Instant},
+ };
+ 
+@@ -25,6 +29,406 @@ const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
+ /// Longest plausible refresh period (5 Hz); anything slower is a bogus rate.
+ const MAX_VSYNC_INTERVAL: Duration = Duration::from_millis(200);
+ 
++/// How often the vsync thread invalidates every drawable window even when none
++/// asked for a frame. A demand source that never reaches [`FrameDemand`]
++/// therefore shows up as a late frame instead of a frozen window.
++pub(crate) const SAFETY_FRAME_INTERVAL: Duration = Duration::from_secs(1);
++
++/// How long the vsync thread keeps waiting for vsyncs after it last delivered
++/// a frame before it sleeps. It covers the gaps of ordinary animations (10 fps
++/// and up) and typing, so those frames stay paced by vsync instead of
++/// alternating between a sleeping and a waiting thread. Waiting costs only
++/// vsync-thread wakes: no window is invalidated without demand.
++pub(crate) const VSYNC_GRACE: Duration = Duration::from_millis(250);
++
++/// A deferred frame is due this long before its not-before time, matching the
++/// tolerance GPUI's frame pacer applies to the same deadline.
++const DEADLINE_TOLERANCE: Duration = Duration::from_millis(1);
++
++/// Origin of the not-before times stored in [`FrameDemand`].
++static DEMAND_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
++
++/// A not-before time as nanoseconds after [`DEMAND_EPOCH`] plus one, so that 0
++/// (the smallest value) means "due now".
++fn encode_not_before(at: Instant) -> u64 {
++    let nanos = at.saturating_duration_since(*DEMAND_EPOCH).as_nanos();
++    u64::try_from(nanos)
++        .unwrap_or(u64::MAX - 1)
++        .saturating_add(1)
++}
++
++fn decode_not_before(encoded: u64) -> Option<Instant> {
++    (encoded != 0).then(|| *DEMAND_EPOCH + Duration::from_nanos(encoded - 1))
++}
++
++/// One window's demand for a vsync-paced `WM_PAINT`.
++///
++/// GPUI reports demand through the window's frame waker and `schedule_frame`
++/// (a dirty window, next-frame callbacks, a present-only frame, scene
++/// animations), and a frame its frame-rate throttle deferred through
++/// `schedule_frame_after` ([`Self::defer_until`]), which only becomes due at
++/// its not-before time. The
++/// Windows backend adds its own sources (a deferred re-entrant draw, a
++/// device-loss or failed-present recovery, a resize, restore or show,
++/// activation, a touchpad gesture). The vsync thread consumes the demand when
++/// it invalidates the window.
++pub(crate) struct FrameDemand {
++    pending: AtomicBool,
++    /// When the pending frame becomes due (see [`encode_not_before`]); 0 when
++    /// it is due now.
++    not_before: AtomicU64,
++    /// When false the window is invalidated on every vsync, as GPUI did before
++    /// frame demand existed on Windows (see `Window::set_frame_demand_gating`).
++    gated: AtomicBool,
++    /// Kept by the window procedure. A hidden or minimized window receives no
++    /// `WM_PAINT`, so its requests (one per effect flush while it stays dirty)
++    /// must not wake the vsync thread; becoming drawable requests a frame.
++    hidden: AtomicBool,
++    minimized: AtomicBool,
++    /// When the window last started serving a `WM_PAINT` (see
++    /// [`encode_not_before`]); 0 before its first.
++    last_paint: AtomicU64,
++}
++
++/// The display's refresh period as the vsync thread measured it, in
++/// nanoseconds, for pacing paints that do not wait for a vsync.
++static VSYNC_INTERVAL_NANOS: AtomicU64 = AtomicU64::new(16_666_667);
++
++pub(crate) fn set_vsync_interval(interval: Duration) {
++    let nanos = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
++    VSYNC_INTERVAL_NANOS.store(nanos.max(1), Ordering::Relaxed);
++}
++
++/// What the vsync thread does with one window on one vsync.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct VSyncWindowAction {
++    /// Invalidate the window, so it receives `WM_PAINT`.
++    pub invalidate: bool,
++    /// The invalidation served demand (not only a safety frame), so the thread
++    /// keeps waiting for vsyncs for a while.
++    pub delivered: bool,
++}
++
++impl FrameDemand {
++    /// A new window wants its first frame.
++    pub(crate) fn new() -> Self {
++        Self {
++            pending: AtomicBool::new(true),
++            not_before: AtomicU64::new(0),
++            gated: AtomicBool::new(true),
++            hidden: AtomicBool::new(false),
++            minimized: AtomicBool::new(false),
++            last_paint: AtomicU64::new(0),
++        }
++    }
++
++    /// Records that the window starts serving a `WM_PAINT`.
++    pub(crate) fn painting(&self, now: Instant) {
++        self.last_paint
++            .store(encode_not_before(now), Ordering::SeqCst);
++    }
++
++    /// Called on the UI thread when demand arrives: whether to invalidate the
++    /// window at once instead of at the next vsync, taking the demand.
++    ///
++    /// Before frame demand existed every window was invalidated on every
++    /// vsync, so a `WM_PAINT` was nearly always pending and a frame for new
++    /// input was drawn as soon as the input had been handled. Waiting for the
++    /// next vsync added up to a refresh period to the first frame after a
++    /// pause. This keeps the old pacing: a drawable, gated window with
++    /// demand that is due and no paint within the last refresh period paints
++    /// right away; otherwise the vsync thread paces it, so a window still
++    /// draws at most about once per refresh period.
++    pub(crate) fn take_for_immediate_paint(&self, now: Instant) -> bool {
++        if !self.gated.load(Ordering::SeqCst)
++            || self.hidden.load(Ordering::SeqCst)
++            || self.minimized.load(Ordering::SeqCst)
++            || !self.pending.load(Ordering::SeqCst)
++            || self.not_before.load(Ordering::SeqCst) != 0
++        {
++            return false;
++        }
++        let interval = Duration::from_nanos(VSYNC_INTERVAL_NANOS.load(Ordering::Relaxed));
++        if decode_not_before(self.last_paint.load(Ordering::SeqCst))
++            .is_some_and(|last_paint| now.saturating_duration_since(last_paint) < interval)
++        {
++            return false;
++        }
++        self.pending.swap(false, Ordering::SeqCst)
++    }
++
++    /// Asks for a `WM_PAINT` on the next vsync, dropping any not-before time,
++    /// and wakes the vsync thread if it sleeps and the window can draw.
++    pub(crate) fn request(&self) {
++        self.not_before.store(0, Ordering::SeqCst);
++        self.pending.store(true, Ordering::SeqCst);
++        self.wake();
++    }
++
++    /// Like [`Self::request`], but a frame already deferred to a not-before
++    /// time stays deferred. GPUI calls `schedule_frame` for every dirty window
++    /// at the end of every effect flush, and a throttled window stays dirty
++    /// until its deferred frame is drawn.
++    pub(crate) fn schedule(&self) {
++        if self.pending.load(Ordering::SeqCst) && self.not_before.load(Ordering::SeqCst) != 0 {
++            return;
++        }
++        self.request();
++    }
++
++    /// Holds the window's frame until `not_before`, for a frame GPUI's
++    /// frame-rate throttle deferred. It replaces whatever was pending: the
++    /// requests made for the frame GPUI just deferred (an effect flush at the
++    /// start of the frame request re-schedules every window with demand) must
++    /// not make it due again on the next vsync. Demand that arrives later
++    /// still overrides it through [`Self::request`].
++    pub(crate) fn defer_until(&self, not_before: Instant) {
++        self.not_before
++            .store(encode_not_before(not_before), Ordering::SeqCst);
++        self.pending.store(true, Ordering::SeqCst);
++        // The sleeping thread recomputes its wake-up time.
++        self.wake();
++    }
++
++    /// Asks for a `WM_PAINT` on the first vsync at or after `not_before`. A
++    /// pending request that is due earlier stays as it is.
++    pub(crate) fn request_after(&self, not_before: Instant) {
++        let encoded = encode_not_before(not_before);
++        if self.pending.load(Ordering::SeqCst) {
++            self.not_before.fetch_min(encoded, Ordering::SeqCst);
++        } else {
++            self.not_before.store(encoded, Ordering::SeqCst);
++        }
++        self.pending.store(true, Ordering::SeqCst);
++        // The sleeping thread recomputes its wake-up time.
++        self.wake();
++    }
++
++    pub(crate) fn set_gated(&self, gated: bool) {
++        self.gated.store(gated, Ordering::SeqCst);
++        if !gated {
++            VSYNC_SLEEP.wake();
++        }
++    }
++
++    pub(crate) fn set_hidden(&self, hidden: bool) {
++        self.hidden.store(hidden, Ordering::SeqCst);
++        if !hidden {
++            self.request();
++        }
++    }
++
++    pub(crate) fn set_minimized(&self, minimized: bool) {
++        self.minimized.store(minimized, Ordering::SeqCst);
++        if !minimized {
++            self.request();
++        }
++    }
++
++    fn wake(&self) {
++        if !self.hidden.load(Ordering::SeqCst) && !self.minimized.load(Ordering::SeqCst) {
++            VSYNC_SLEEP.wake();
++        }
++    }
++
++    fn is_due(&self, now: Instant) -> bool {
++        decode_not_before(self.not_before.load(Ordering::SeqCst))
++            .is_none_or(|not_before| now + DEADLINE_TOLERANCE >= not_before)
++    }
++
++    /// Whether this window needs a vsync now: it is ungated, or it is
++    /// drawable and has demand that is due.
++    pub(crate) fn wants_vsync(&self, drawable: bool, now: Instant) -> bool {
++        !self.gated.load(Ordering::SeqCst)
++            || (drawable && self.pending.load(Ordering::SeqCst) && self.is_due(now))
++    }
++
++    /// When this drawable window's deferred frame becomes due, if it has one.
++    pub(crate) fn deferred_until(&self, drawable: bool) -> Option<Instant> {
++        if !drawable || !self.gated.load(Ordering::SeqCst) || !self.pending.load(Ordering::SeqCst) {
++            return None;
++        }
++        decode_not_before(self.not_before.load(Ordering::SeqCst))
++    }
++
++    /// Decides one vsync for this window. `drawable` is false for a hidden or
++    /// minimized window, which keeps its demand until it can draw again (it
++    /// receives no `WM_PAINT` meanwhile). A deferred frame stays pending until
++    /// it is due. `safety_frame` invalidates a drawable window without
++    /// consuming its demand.
++    pub(crate) fn on_vsync(
++        &self,
++        drawable: bool,
++        safety_frame: bool,
++        now: Instant,
++    ) -> VSyncWindowAction {
++        if !self.gated.load(Ordering::SeqCst) {
++            self.pending.store(false, Ordering::SeqCst);
++            return VSyncWindowAction {
++                invalidate: true,
++                delivered: true,
++            };
++        }
++        if !drawable {
++            return VSyncWindowAction {
++                invalidate: false,
++                delivered: false,
++            };
++        }
++        let delivered = self.pending.load(Ordering::SeqCst)
++            && self.is_due(now)
++            && self.pending.swap(false, Ordering::SeqCst);
++        VSyncWindowAction {
++            invalidate: delivered || safety_frame,
++            delivered,
++        }
++    }
++}
++
++/// Serves one `WM_PAINT`: the window's update region is validated before the
++/// frame is drawn, never after. Drawing re-arms the demand of a window that
++/// keeps animating, and the vsync thread may consume that demand and
++/// invalidate the window before the draw returns; validating afterwards would
++/// erase that invalidation while GPUI still thinks a frame is on its way.
++pub(crate) fn serve_paint<R>(validate: impl FnOnce(), draw: impl FnOnce() -> R) -> R {
++    validate();
++    draw()
++}
++
++/// What the vsync thread does after a vsync.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum AfterVSync {
++    /// Wait for the next vsync.
++    Tick,
++    /// Sleep until this time or until a request wakes the thread.
++    Sleep(Instant),
++}
++
++/// The vsync thread's timing decisions, apart from the windows themselves.
++pub(crate) struct VSyncSchedule {
++    last_safety_frame: Instant,
++    last_delivery: Instant,
++}
++
++impl VSyncSchedule {
++    pub(crate) fn new(now: Instant) -> Self {
++        Self {
++            last_safety_frame: now,
++            last_delivery: now,
++        }
++    }
++
++    /// Whether this vsync carries a safety frame.
++    pub(crate) fn take_safety_frame(&mut self, now: Instant) -> bool {
++        let due = now.saturating_duration_since(self.last_safety_frame) >= SAFETY_FRAME_INTERVAL;
++        if due {
++            self.last_safety_frame = now;
++        }
++        due
++    }
++
++    /// Decides what follows a vsync on which `delivered` says whether any
++    /// window's demand was served, `busy` whether something else needs every
++    /// vsync (a device-loss recovery), and `next_deferred` the earliest time a
++    /// deferred frame becomes due.
++    pub(crate) fn after_vsync(
++        &mut self,
++        now: Instant,
++        delivered: bool,
++        busy: bool,
++        next_deferred: Option<Instant>,
++    ) -> AfterVSync {
++        if delivered || busy {
++            self.last_delivery = now;
++            return AfterVSync::Tick;
++        }
++        if now.saturating_duration_since(self.last_delivery) < VSYNC_GRACE {
++            return AfterVSync::Tick;
++        }
++        let safety = self.last_safety_frame + SAFETY_FRAME_INTERVAL;
++        AfterVSync::Sleep(next_deferred.map_or(safety, |deferred| deferred.min(safety)))
++    }
++}
++
++/// Lets the vsync thread sleep while no window wants a frame. A
++/// [`FrameDemand::request`] wakes it.
++struct VSyncSleep {
++    /// The registration of the sleeping vsync thread, or 0. Only a thread that
++    /// finds it 0 may set it, and only the thread that set it clears it, so a
++    /// stopped thread winding down after a new one started cannot hide the new
++    /// thread's sleep from requests.
++    sleeping: AtomicU64,
++    thread: Mutex<Option<Thread>>,
++}
++
++static VSYNC_SLEEP: VSyncSleep = VSyncSleep {
++    sleeping: AtomicU64::new(0),
++    thread: Mutex::new(None),
++};
++
++static NEXT_VSYNC_REGISTRATION: AtomicU64 = AtomicU64::new(1);
++
++impl VSyncSleep {
++    fn wake(&self) {
++        if self.sleeping.load(Ordering::SeqCst) != 0 {
++            self.unpark();
++        }
++    }
++
++    fn unpark(&self) {
++        if let Some(thread) = self
++            .thread
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .as_ref()
++        {
++            thread.unpark();
++        }
++    }
++}
++
++/// Registers the calling thread as the vsync thread that demand wakes, and
++/// returns its registration for [`sleep_until_demand`].
++pub(crate) fn register_vsync_thread() -> u64 {
++    *VSYNC_SLEEP.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
++    NEXT_VSYNC_REGISTRATION.fetch_add(1, Ordering::Relaxed)
++}
++
++/// Wakes the vsync thread unconditionally (to make it notice a stop request).
++pub(crate) fn wake_vsync_thread() {
++    VSYNC_SLEEP.unpark();
++}
++
++/// Sleeps the vsync thread until `deadline` or until a window has demand.
++/// `has_demand` is re-checked after the thread announces that it sleeps, so a
++/// request racing with the decision to sleep is never lost: either the check
++/// sees it, or the request sees `sleeping` and unparks the thread. The thread
++/// may also return early (a spurious or stale unpark, or another thread's mark
++/// still set); callers loop anyway.
++pub(crate) fn sleep_until_demand(
++    registration: u64,
++    deadline: Instant,
++    has_demand: impl Fn() -> bool,
++) {
++    if VSYNC_SLEEP
++        .sleeping
++        .compare_exchange(0, registration, Ordering::SeqCst, Ordering::SeqCst)
++        .is_err()
++    {
++        return;
++    }
++    if !has_demand() {
++        let now = Instant::now();
++        if deadline > now {
++            std::thread::park_timeout(deadline - now);
++        }
++    }
++    let _ =
++        VSYNC_SLEEP
++            .sleeping
++            .compare_exchange(registration, 0, Ordering::SeqCst, Ordering::SeqCst);
++}
++
+ pub(crate) struct VSyncProvider {
+     interval: Duration,
+     f: Box<dyn Fn() -> bool>,
+@@ -40,6 +444,10 @@ impl VSyncProvider {
+         Self { interval, f }
+     }
+ 
++    pub(crate) fn interval(&self) -> Duration {
++        self.interval
++    }
++
+     pub(crate) fn wait_for_vsync(&self) -> FrameRequestSource {
+         let vsync_start = Instant::now();
+         let wait_succeeded = (self.f)();
+@@ -130,4 +538,296 @@ mod tests {
+ 
+         assert_eq!(provider.wait_for_vsync(), FrameRequestSource::LocalSchedule);
+     }
++
++    const IDLE: VSyncWindowAction = VSyncWindowAction {
++        invalidate: false,
++        delivered: false,
++    };
++    const DRAW: VSyncWindowAction = VSyncWindowAction {
++        invalidate: true,
++        delivered: true,
++    };
++    const SAFETY: VSyncWindowAction = VSyncWindowAction {
++        invalidate: true,
++        delivered: false,
++    };
++
++    fn ms(n: u64) -> Duration {
++        Duration::from_millis(n)
++    }
++
++    #[test]
++    fn a_new_window_gets_its_first_frame_then_idles() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        assert!(demand.wants_vsync(true, now));
++        assert_eq!(demand.on_vsync(true, false, now), DRAW);
++        assert!(!demand.wants_vsync(true, now));
++        assert_eq!(demand.on_vsync(true, false, now), IDLE);
++    }
++
++    #[test]
++    fn each_request_invalidates_once() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        demand.request();
++        demand.schedule();
++        assert_eq!(demand.on_vsync(true, false, now), DRAW);
++        assert_eq!(demand.on_vsync(true, false, now), IDLE);
++    }
++
++    #[test]
++    fn safety_frames_reach_idle_drawable_windows_only() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        assert_eq!(demand.on_vsync(true, true, now), SAFETY);
++        assert_eq!(demand.on_vsync(false, true, now), IDLE);
++    }
++
++    #[test]
++    fn hidden_windows_keep_demand_without_keeping_vsync_awake() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        demand.set_minimized(true);
++        demand.request();
++        assert!(!demand.wants_vsync(false, now));
++        assert_eq!(demand.on_vsync(false, false, now), IDLE);
++        assert_eq!(demand.on_vsync(false, true, now), IDLE);
++        // Restored (or shown) again, it gets the frame it asked for.
++        demand.set_minimized(false);
++        assert!(demand.wants_vsync(true, now));
++        assert_eq!(demand.on_vsync(true, false, now), DRAW);
++    }
++
++    #[test]
++    fn becoming_drawable_requests_a_frame() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        demand.set_hidden(true);
++        assert_eq!(demand.on_vsync(true, false, now), IDLE);
++        demand.set_hidden(false);
++        assert_eq!(demand.on_vsync(true, false, now), DRAW);
++    }
++
++    #[test]
++    fn ungated_windows_draw_on_every_vsync() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.set_gated(false);
++        for drawable in [true, false, true] {
++            assert!(demand.wants_vsync(drawable, now));
++            assert_eq!(demand.on_vsync(drawable, false, now), DRAW);
++        }
++        demand.set_gated(true);
++        assert_eq!(demand.on_vsync(true, false, now), IDLE);
++    }
++
++    #[test]
++    fn a_deferred_frame_waits_for_its_deadline() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        demand.defer_until(now + ms(30));
++        assert_eq!(demand.deferred_until(true), Some(now + ms(30)));
++        assert!(!demand.wants_vsync(true, now + ms(7)));
++        assert_eq!(demand.on_vsync(true, false, now + ms(7)), IDLE);
++        // Effect flushes keep scheduling the throttled (still dirty) window.
++        demand.schedule();
++        assert_eq!(demand.on_vsync(true, false, now + ms(14)), IDLE);
++        // A safety frame reaches it without consuming the deferred frame.
++        assert_eq!(demand.on_vsync(true, true, now + ms(21)), SAFETY);
++        // Due within the pacer's tolerance.
++        assert!(demand.wants_vsync(true, now + ms(29)));
++        assert_eq!(demand.on_vsync(true, false, now + ms(29)), DRAW);
++        assert_eq!(demand.deferred_until(true), None);
++    }
++
++    #[test]
++    fn gpuis_deferral_replaces_the_demand_it_deferred() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        // The flush at the start of the frame request re-schedules the
++        // window, then GPUI defers the frame: it must not come back next vsync.
++        demand.schedule();
++        demand.defer_until(now + ms(30));
++        assert_eq!(demand.on_vsync(true, false, now + ms(7)), IDLE);
++        // New demand afterwards (activation, a notify) overrides the deferral.
++        demand.request();
++        assert_eq!(demand.on_vsync(true, false, now + ms(14)), DRAW);
++    }
++
++    #[test]
++    fn a_backend_poll_never_delays_a_due_or_earlier_frame() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        demand.request();
++        demand.request_after(now + ms(30));
++        assert_eq!(demand.on_vsync(true, false, now + ms(7)), DRAW);
++        demand.defer_until(now + ms(40));
++        demand.request_after(now + ms(60));
++        assert_eq!(demand.deferred_until(true), Some(now + ms(40)));
++        demand.request_after(now + ms(20));
++        assert_eq!(demand.deferred_until(true), Some(now + ms(20)));
++    }
++
++    /// The interleaving that froze animating windows: the frame re-arms its
++    /// demand while it is drawn, the vsync thread consumes that demand and
++    /// invalidates the window before the draw returns. The invalidation must
++    /// survive, or the window waits for the safety frame (GPUI stays dirty,
++    /// so its waker does not fire again).
++    #[test]
++    fn an_invalidation_during_a_draw_is_not_erased() {
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        demand.on_vsync(true, false, now);
++        demand.request();
++        assert_eq!(demand.on_vsync(true, false, now), DRAW);
++        // The window's update region, as Win32 keeps it.
++        let mut update_region = true;
++
++        let region = std::cell::Cell::new(update_region);
++        serve_paint(
++            || region.set(false),
++            || {
++                // The frame keeps animating: GPUI re-arms the demand.
++                demand.request();
++                // A vsync lands before the draw returns.
++                if demand.on_vsync(true, false, now + ms(7)).invalidate {
++                    region.set(true);
++                }
++            },
++        );
++        update_region = region.get();
++        assert!(update_region, "the next WM_PAINT must still come");
++        assert!(
++            !demand.wants_vsync(true, now + ms(7)),
++            "and it serves the demand"
++        );
++    }
++
++    #[test]
++    fn the_thread_waits_out_the_grace_then_sleeps_until_the_next_deadline() {
++        let start = Instant::now();
++        let mut schedule = VSyncSchedule::new(start);
++        assert!(!schedule.take_safety_frame(start + ms(7)));
++        assert_eq!(
++            schedule.after_vsync(start + ms(7), true, false, None),
++            AfterVSync::Tick
++        );
++        // A 10 fps animation stays inside the grace: the thread keeps ticking.
++        assert_eq!(
++            schedule.after_vsync(start + ms(100), false, false, None),
++            AfterVSync::Tick
++        );
++        assert_eq!(
++            schedule.after_vsync(start + ms(107), true, false, None),
++            AfterVSync::Tick
++        );
++        // After the grace it sleeps until the safety frame...
++        let late = start + ms(107) + VSYNC_GRACE;
++        assert_eq!(
++            schedule.after_vsync(late, false, false, None),
++            AfterVSync::Sleep(start + SAFETY_FRAME_INTERVAL)
++        );
++        // ...or the earlier deferred frame.
++        assert_eq!(
++            schedule.after_vsync(late, false, false, Some(late + ms(400))),
++            AfterVSync::Sleep(late + ms(400))
++        );
++        // A device-loss recovery keeps it ticking.
++        assert_eq!(
++            schedule.after_vsync(late + ms(500), false, true, None),
++            AfterVSync::Tick
++        );
++        assert!(schedule.take_safety_frame(start + SAFETY_FRAME_INTERVAL));
++        assert!(!schedule.take_safety_frame(start + SAFETY_FRAME_INTERVAL + ms(7)));
++    }
++
++    #[test]
++    fn demand_after_a_pause_paints_at_once_and_is_paced_after_that() {
++        set_vsync_interval(ms(7));
++        let now = Instant::now();
++        let demand = FrameDemand::new();
++        // The first frame of a new window paints at once and takes the demand.
++        assert!(demand.take_for_immediate_paint(now));
++        assert_eq!(demand.on_vsync(true, false, now), IDLE);
++        demand.painting(now);
++        // Within a refresh period of that paint, new demand waits for the
++        // vsync thread.
++        demand.request();
++        assert!(!demand.take_for_immediate_paint(now + ms(3)));
++        assert_eq!(demand.on_vsync(true, false, now + ms(7)), DRAW);
++        demand.painting(now + ms(7));
++        // After a pause it paints at once again.
++        demand.request();
++        assert!(demand.take_for_immediate_paint(now + ms(500)));
++        assert!(
++            !demand.take_for_immediate_paint(now + ms(500)),
++            "demand is taken once"
++        );
++        // Not for a deferred frame, a hidden window or an ungated one.
++        demand.defer_until(now + ms(530));
++        assert!(!demand.take_for_immediate_paint(now + ms(510)));
++        demand.request();
++        demand.set_minimized(true);
++        assert!(!demand.take_for_immediate_paint(now + ms(510)));
++        demand.set_minimized(false);
++        demand.set_gated(false);
++        assert!(!demand.take_for_immediate_paint(now + ms(510)));
++    }
++
++    /// One test, because the sleep state is process-wide (one vsync thread).
++    #[test]
++    fn the_vsync_thread_sleeps_until_a_request() {
++        let registration = register_vsync_thread();
++
++        let started = Instant::now();
++        sleep_until_demand(registration, started + Duration::from_secs(10), || true);
++        assert!(
++            started.elapsed() < Duration::from_secs(5),
++            "pending demand must not park the thread"
++        );
++
++        // A stopped thread still winding down cannot take the sleeping mark
++        // of the current one, so requests keep reaching the current thread.
++        VSYNC_SLEEP.sleeping.store(registration, Ordering::SeqCst);
++        let started = Instant::now();
++        sleep_until_demand(
++            registration + 1000,
++            started + Duration::from_secs(10),
++            || false,
++        );
++        assert!(started.elapsed() < Duration::from_secs(5));
++        assert_eq!(VSYNC_SLEEP.sleeping.load(Ordering::SeqCst), registration);
++        VSYNC_SLEEP.sleeping.store(0, Ordering::SeqCst);
++
++        let demand = std::sync::Arc::new(FrameDemand::new());
++        demand.on_vsync(true, false, Instant::now());
++        let requester = std::thread::spawn({
++            let demand = demand.clone();
++            move || {
++                std::thread::sleep(Duration::from_millis(20));
++                demand.request();
++            }
++        });
++        let started = Instant::now();
++        let deadline = started + Duration::from_secs(10);
++        // `park_timeout` may return spuriously; the vsync loop just re-checks.
++        while !demand.wants_vsync(true, Instant::now()) && Instant::now() < deadline {
++            sleep_until_demand(registration, deadline, || {
++                demand.wants_vsync(true, Instant::now())
++            });
++        }
++        assert!(
++            started.elapsed() < Duration::from_secs(5),
++            "a request must wake the sleeping thread"
++        );
++        requester.join().unwrap();
++    }
+ }
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index f21663eba3..d181647b6d 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -55,6 +55,9 @@ pub struct WindowsWindowState {
+ 
+     pub callbacks: Callbacks,
+     pub frame_signal: Arc<PlatformFrameSignal>,
++    /// Shared with the vsync thread, which invalidates the window only while it
++    /// has demand (see [`FrameDemand`]).
++    pub(crate) frame_demand: Arc<FrameDemand>,
+     pub input_handler: Cell<Option<PlatformInputHandler>>,
+     pub ime_enabled: Cell<bool>,
+     pub pending_surrogate: Cell<Option<u16>>,
+@@ -157,8 +160,10 @@ impl WindowsWindowState {
+         let fullscreen = None;
+         let initial_placement = None;
+ 
+-        let direct_manipulation = DirectManipulationHandler::new(hwnd, scale_factor)
+-            .context("initializing Direct Manipulation")?;
++        let frame_demand = Arc::new(FrameDemand::new());
++        let direct_manipulation =
++            DirectManipulationHandler::new(hwnd, scale_factor, frame_demand.clone())
++                .context("initializing Direct Manipulation")?;
+ 
+         Ok(Self {
+             origin: Cell::new(origin),
+@@ -172,6 +177,7 @@ impl WindowsWindowState {
+             min_size,
+             callbacks,
+             frame_signal: Arc::new(PlatformFrameSignal::new()),
++            frame_demand,
+             input_handler: Cell::new(input_handler),
+             ime_enabled: Cell::new(true),
+             pending_surrogate: Cell::new(pending_surrogate),
+@@ -981,6 +987,29 @@ impl PlatformWindow for WindowsWindow {
+         self.state.callbacks.request_frame.set(Some(callback));
+     }
+ 
++    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
++        let frame_demand = self.state.frame_demand.clone();
++        let hwnd = self.0.hwnd;
++        Some(Rc::new(move || {
++            frame_demand.request();
++            paint_now_if_idle(hwnd, &frame_demand);
++        }))
++    }
++
++    fn schedule_frame(&self) {
++        self.state.frame_demand.schedule();
++        paint_now_if_idle(self.0.hwnd, &self.state.frame_demand);
++    }
++
++    fn schedule_frame_after(&self, not_before: Instant) -> bool {
++        self.state.frame_demand.defer_until(not_before);
++        true
++    }
++
++    fn set_frame_demand_gating(&self, enabled: bool) {
++        self.state.frame_demand.set_gated(enabled);
++    }
++
+     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
+         self.state.callbacks.input.set(Some(callback));
+     }
+@@ -1043,11 +1072,20 @@ impl PlatformWindow for WindowsWindow {
+     }
+ 
+     fn draw(&self, scene: &Scene) {
+-        self.state
+-            .renderer
+-            .borrow_mut()
++        let mut renderer = self.state.renderer.borrow_mut();
++        if renderer
+             .draw(scene, self.state.background_appearance.get())
+-            .log_err();
++            .log_err()
++            .is_none()
++            && renderer.device_removed()
++        {
++            // Start recovery now rather than when the vsync thread next checks
++            // the device, which may be a second away while it sleeps.
++            self.state
++                .invalidate_devices
++                .store(true, std::sync::atomic::Ordering::Release);
++            self.state.frame_demand.request();
++        }
+     }
+ 
+     #[cfg(feature = "test-support")]
+@@ -1775,3 +1813,12 @@ mod tests {
+         );
+     }
+ }
++
++/// Invalidates the window now when demand arrives after a pause (see
++/// [`FrameDemand::take_for_immediate_paint`]), so the frame is drawn as soon
++/// as the UI thread is idle rather than at the next vsync.
++fn paint_now_if_idle(hwnd: HWND, frame_demand: &FrameDemand) {
++    if frame_demand.take_for_immediate_paint(std::time::Instant::now()) {
++        unsafe { InvalidateRect(Some(hwnd), None, false).ok().log_err() };
++    }
++}
+-- 
+2.56.1.windows.1
+

@@ -225,6 +225,19 @@ flowchart TD
   transformation: the window advances its alpha in the presented scene, at
   most 25 times a second, without rendering a view, and presents those
   frames whole alongside the patched ones.
+- **Frames on demand (Windows).** The fork's vsync thread sends a window a
+  `WM_PAINT` only when GPUI has frame demand for it (a dirty view, a
+  next-frame callback, a patched frame waiting to be presented, a running
+  scene animation) or the backend needs one (resize, restore, show,
+  activation, a deferred draw, device recovery, a touchpad gesture). A frame
+  the inactive-window cap or a scene animation's interval defers is held
+  until it is due instead of retried every vsync. Every second each visible
+  window gets a safety frame, so a demand source that bypasses GPUI's
+  notify/`request_animation_frame`/patch paths shows up as an update in
+  one-second steps rather than never; anything that changes on screen must go
+  through one of those paths. `ECHO_FRAME_DEMAND_GATING=0` restores a frame
+  request on every vsync. Details: `docs/GPUI_FORK.md`, "Frames on demand on
+  Windows".
 - **Async layout** (`canvas_renderer/async_layout.rs`) is one process-wide
   bounded queue (1,024 jobs, 2-6 workers) shared by all splits, fenced by a
   per-split generation/epoch so stale jobs are discarded rather than

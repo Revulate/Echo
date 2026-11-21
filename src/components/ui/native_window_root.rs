@@ -28,9 +28,20 @@ pub fn open_native_window<V: 'static + Render>(
         window.set_patch_present_damage(
             crate::components::chat::canvas_renderer::painter::patch_present_damage_enabled(),
         );
+        window.set_frame_demand_gating(frame_demand_gating_enabled());
         let view = build_root_view(window, cx);
         cx.new(|cx| NativeWindowRoot::new(view, window, cx))
     })
+}
+
+/// Whether the platform asks a window for a frame only while it has frame
+/// demand (`Window::set_frame_demand_gating`). On by default; on Windows,
+/// `ECHO_FRAME_DEMAND_GATING=0` restores a frame request on every vsync for
+/// every window. Other platforms ignore it. Read once.
+fn frame_demand_gating_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| echo_core::env::flag_or("ECHO_FRAME_DEMAND_GATING", true));
+    *ENABLED
 }
 
 /// A cache-owning native-window root that renders an arbitrary Echo view.

@@ -11,7 +11,7 @@ plain pinned Zed revision.
   `gpui_platform` and `reqwest_client` in `[workspace.dependencies]`; every
   workspace member inherits those three dependencies from there.
 - Patch series and expected source tree: `scripts/gpui-fork-patches.txt` lists
-  the patch files in `patches/` in application order and records the
+  the patch files in `patches/` (30 files, 31 commits) in application order and records the
   `fork-tree` the series must produce. The patch files are the source of
   record, so the fork is reconstructible from this repository plus the pinned
   upstream revision. The sections below describe each patch.
@@ -532,6 +532,155 @@ re-rendered. The patch keeps the finished nodes of each frame, and
 current parent, together with node bounds, focus registrations and (moved) action
 listeners. Nothing changes while accessibility is inactive. Upstream Zed has the
 same bug, so this patch is a candidate to upstream.
+
+### Frames on demand on Windows (`gpui-windows-frame-demand.patch`)
+
+Upstream's Windows backend invalidated every window on every vsync, so each
+window got a `WM_PAINT` and ran GPUI's frame callback at the display rate even
+when nothing was dirty: an idle, unfocused Echo kept the VSyncProvider thread
+and the main thread awake at the refresh rate all day.
+
+Design:
+
+- GPUI already reports frame demand for macOS and the web: the frame waker
+  (`WindowInvalidator::platform_waker`) fires when a window first becomes
+  dirty, and `PlatformWindow::schedule_frame` is called for next-frame
+  callbacks, patched frames waiting to be presented, running scene animations
+  and, at the end of every effect flush, for each window that still has
+  demand (the patch adds running scene animations to that flush condition).
+  The Windows backend now implements both: they set a per-window
+  `FrameDemand` (`crates/gpui_windows/src/vsync.rs`), and the vsync thread
+  invalidates a window only when it has demand that is due, consuming it.
+- A frame that GPUI's frame-rate throttle defers (inactive-window cap, low
+  power, thermal, a scene animation's interval) is handed to the platform with
+  its deadline (`PlatformWindow::schedule_frame_after`, false by default so
+  other platforms keep retrying). Windows holds it until then instead of
+  re-requesting every vsync. The deadline replaces the demand GPUI just
+  deferred; later demand (a notify, activation, the start of high-rate input,
+  which lifts the cap) makes the frame due at once.
+- The backend adds demand where it needs a frame itself: a draw deferred by
+  re-entrancy (and GPUI's own re-entrant deferral, which now wakes the frame
+  source), `WM_SIZE` (resize, restore, DPI), `WM_SHOWWINDOW`, activation, a
+  renderer resize failure, device-loss recovery, and a draw or present that
+  fails because the device was removed (which also starts recovery at once).
+  Direct Manipulation (touchpad) only advances a gesture when it is updated
+  from a draw: the viewport's status handler requests every vsync while the
+  gesture runs or coasts, and the window polls at about 30 Hz for a second
+  after a contact and for 250 ms after the gesture ends.
+- `draw_window` validates the window's update region before it draws, so an
+  invalidation the vsync thread issues during the draw (for demand the frame
+  itself re-armed) produces another `WM_PAINT` instead of being erased.
+- Hidden and minimized windows keep their demand without being invalidated,
+  and their requests do not wake the vsync thread; showing or restoring
+  requests a frame.
+- The vsync thread keeps waiting for vsyncs for 250 ms after it last delivered
+  a frame (covering animation and typing gaps), then parks until a request,
+  the next deferred frame or the next safety frame. Woken by a request, it
+  invalidates at once rather than first waiting on `DwmFlush`.
+- Demand that arrives on the UI thread when the window has not painted for a
+  refresh period is painted at once (the frame waker and `schedule_frame` call
+  `InvalidateRect` themselves), as with a request on every vsync, where a
+  `WM_PAINT` was nearly always pending. Otherwise the vsync thread paces the
+  window, so it still draws at most about once per refresh period.
+
+Safety frame: every second each visible window is invalidated anyway. A demand
+source that bypasses the paths above therefore shows up as an update in
+one-second steps rather than a frozen window, and the same deadline bounds how
+late a parked thread notices a lost device or runs the hardware-adapter probe.
+It costs one `WM_PAINT` per visible window per second.
+
+Opt-out: `Window::set_frame_demand_gating(false)` restores a request on every
+vsync for that window and keeps the thread ticking while such a window exists.
+Echo calls it for every native window from `ECHO_FRAME_DEMAND_GATING`
+(`src/components/ui/native_window_root.rs`); `0` restores per-vsync frames.
+
+Measured in the fork with debug builds of its examples on one machine (143 Hz
+display), per-thread context switches from `NtQuerySystemInformation`, ABBA:
+
+- `hello_world`, idle, visible and unfocused, 60 s: main thread 369 and 156
+  switches/s and VSyncProvider 204 and 169/s before; 1.2 and 1.2/s and 2.6 and
+  2.6/s after.
+- `frame_demand --animate`, unfocused (33 ms inactive cap), 30 s: main 188 and
+  183/s without the deadline, 97 and 97/s with it. VSyncProvider stays at about
+  175/s while frames keep coming (the 250 ms wait).
+- Timer notify to render (`frame_demand --fps N --report 20`, focused, mean
+  ms per run): at 2 Hz, where the thread parks between frames, 6.8 and 6.5 with
+  the first version of the patch, 3.9 and 4.1 with per-vsync frames, 0.15 and
+  0.16 now; at 20 Hz 5.2 and 4.8, 4.4 and 3.7, and 4.2 and 3.9.
+
+Measured in Echo, one dist binary, `ECHO_FRAME_DEMAND_GATING` unset (on) against
+`0` (off), isolated profiles, ABBA, 240 s per run after 35 s of settling, the
+window visible and unfocused unless stated; per run, main-thread and
+VSyncProvider context switches per second and process cycles per minute:
+
+| Scenario | on | off |
+| --- | --- | --- |
+| Idle, one quiet split, nothing animating | main 6.6 / 6.5, vsync 2.8 / 2.9, 1.18 / 1.20 G | main 162.6 / 162.7, vsync 218.8 / 218.7, 2.72 / 2.69 G |
+| One animated emote visible | main 99.7 / 96.5, vsync 201.9 / 204.5, 12.6 / 12.7 G | main 217.8 / 217.0, vsync 207.1 / 210.3, 14.9 / 15.2 G |
+| Hidden (SW_HIDE, as the tray does), three busy splits at 10 messages/s | main 49.6 / 51.4, vsync 2.8 / 2.2, 2.17 / 2.50 G | main 51.5 / 54.4, vsync 175.8 / 154.6, 2.99 / 2.85 G |
+
+The reconnect logo pulse (a scene animation at 25 fps), unfocused, 30 s:
+main 73 and 88/s on against 183/s off, with the logo still changing about 26
+times a second. Keystroke in the focused composer to its pixels changing on
+screen, 90 keys after 1.5-2.5 s of idle and 180 keys at 110 ms intervals per
+setting over three ABBA runs: median 13.4 ms and p95 19.4 ms on against 14.0
+and 20.3 ms off after idle, 12.5 and 16.3 ms against 15.1 and 23.0 ms while
+typing. Without the immediate paint above, the first keystroke after idle was
+slower than off (median 15.6 against 14.6 ms, p95 24.9 against 20.1 ms).
+Animated emotes, hover states, tooltips, caret blink, smooth scroll, divider
+drag, resize, minimize and restore (also twice), and the settings, channel
+popup, user card and emote picker windows were checked on the same binary
+with screen captures; none showed one-second steps, and animation patches had
+no rejections.
+
+A window hidden with `ShowWindow(SW_HIDE)` and shown again by another process
+(`SW_SHOW` from outside Echo) keeps its emote animations stopped, with gating
+on and off alike: GPUI reports the visibility change from `WM_SHOWWINDOW`,
+before the window is visible, and when the report runs before the show
+completes, Echo's canvases never hear that the window is visible again. Echo's
+own tray and activation paths show the window from its UI thread, where the
+report runs after the show; that path was not driven here.
+
+Unit tests (`vsync::tests`, `animated_image_patch_tests::a_patch_wakes_the_frame_source`)
+cover the demand transitions, deferred frames and which requests override
+them, hidden and restored windows, an invalidation landing during a draw, the
+thread's wait, sleep and safety-frame schedule, the sleeping mark across a
+thread restart, and a request waking the parked thread. The `frame_demand`
+example (`--tick`, `--fps`, `--animate`, `--no-gating`, `--report`) exercises
+it on a real window.
+
+Not verified on hardware: a precision touchpad (Direct Manipulation status
+timing, tap cost, the transform reset), IME composition, OLE drag and drop,
+monitors with different DPI or refresh rates, display and system sleep, a GPU
+reset (TDR), and RDP.
+
+### Presents after high-rate input on Apple platforms only (`gpui-high-rate-input-present-apple-only.patch`)
+
+Upstream's `InputRateTracker` presents the unchanged frame on every frame
+request for a second after high-rate input (six invalidating inputs within
+100 ms). It exists for ProMotion displays, which lower their refresh rate when
+an app stops presenting (zed#7305, #7347, #45369). With per-vsync frame
+requests on Windows that meant a present every vsync for a second after the
+pointer moved over hover-sensitive content. The presents are now limited to
+macOS and iOS (which also turns them off for the web backend). High-rate input
+still lifts the inactive-window frame cap everywhere. No effect on presentation
+is expected with GPUI's default DirectComposition swap chain or on Linux;
+untested are NVIDIA windowed G-SYNC with `GPUI_DISABLE_DIRECT_COMPOSITION`,
+Windows 11 dynamic refresh rate, and fullscreen VRR on Linux. Not measured
+separately.
+
+### Ring as the only TLS provider (`gpui-http-client-tls-ring-only.patch`)
+
+`http_client_tls` took rustls with its default features and installed the
+AWS-LC provider when none was installed, which linked AWS-LC next to ring (used
+by zed-reqwest and by Echo). The workspace `rustls` dependency is now
+`default-features = false`, `http_client_tls` enables `ring`, `std`, `tls12`
+and `logging`, and it installs ring under the same rule (only when no provider
+is installed). What is lost is post-quantum key exchange (X25519MLKEM768,
+AWS-LC only), and only where this function's install took effect; Echo
+installs ring at start-up, before any client is built, so its handshakes are
+unchanged. `aws-lc-rs`, `aws-lc-sys`, `cmake` and `fs_extra` left Echo's
+lockfile.
 
 ### Upstream features Echo relies on
 

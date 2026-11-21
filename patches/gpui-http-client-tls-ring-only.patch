@@ -1,0 +1,92 @@
+From 05c3050eaf9844dcebc664c06ff013f632324074 Mon Sep 17 00:00:00 2001
+From: Revulate <76570121+Revulate@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:59:58 -0700
+Subject: [PATCH] build(http_client_tls): use ring as the only rustls crypto
+ provider
+
+`http_client_tls` took the workspace `rustls` dependency with its default
+features, which enable the `aws_lc_rs` provider (and
+`prefer-post-quantum`), and `tls_config()` installed
+`rustls::crypto::aws_lc_rs::default_provider()` as the process default
+unless one was already installed. That linked AWS-LC (`aws-lc-rs`,
+`aws-lc-sys`) into every app that uses `reqwest_client`, next to ring,
+which zed-reqwest already uses (`__rustls-ring`: hyper-rustls and
+tokio-rustls with `ring`).
+
+The workspace `rustls` dependency is now `default-features = false`
+(`http_client_tls` is its only user), and `http_client_tls` enables
+`ring`, `std`, `tls12` and `logging`, the default set minus the AWS-LC
+provider and post-quantum preference. `tls_config()` installs
+`rustls::crypto::ring::default_provider()` with the same rule as
+before: only when no process default is installed, ignoring the error
+otherwise. The platform verifier and the bundled-webpki-roots fallback
+both build on that default provider, as before.
+
+What is lost: post-quantum (X25519MLKEM768) key exchange, which rustls
+offers only with the AWS-LC provider, and only where this function's
+`install_default` actually took effect, i.e. in an app that had not
+installed a provider of its own. An app that installs its provider first
+(Echo installs ring at startup, before any client is built) never ran
+with AWS-LC as the active provider, so its handshakes are unchanged; it
+only stops linking AWS-LC.
+
+`cargo tree -e features -i aws-lc-rs` and `-i aws-lc-sys` over gpui,
+gpui_platform, gpui_windows, gpui_linux, gpui_wgpu and reqwest_client now
+find neither package for x86_64-pc-windows-msvc or
+x86_64-unknown-linux-gnu; rustls is built with logging, ring, std and
+tls12 only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.toml                                    | 2 +-
+ crates/http_client_tls/Cargo.toml             | 2 +-
+ crates/http_client_tls/src/http_client_tls.rs | 8 ++++----
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index f4da0424f0..8a539e6d58 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -882,7 +882,7 @@ jupyter-zmq-client = { version = "3.0.0", default-features = false, features = [
+ rust-embed = { version = "8.11", features = ["include-exclude", "compression"] }
+ rustc-hash = "2.1.0"
+ rustix = { version = "1.1", features = ["fs"] }
+-rustls = "0.23.26"
++rustls = { version = "0.23.26", default-features = false }
+ rustls-platform-verifier = "0.7"
+ # WARNING: If you change this, you must also publish a new version of zed-scap to crates.io
+ scap = { git = "https://github.com/zed-industries/scap", rev = "b5c86ec58dd4b6b7732bf6ac8be03d6b1f190a82", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
+diff --git a/crates/http_client_tls/Cargo.toml b/crates/http_client_tls/Cargo.toml
+index eff587844b..77d5e719be 100644
+--- a/crates/http_client_tls/Cargo.toml
++++ b/crates/http_client_tls/Cargo.toml
+@@ -15,6 +15,6 @@ test = false
+ 
+ [dependencies]
+ log = { workspace = true, features = ["serde"] }
+-rustls.workspace = true
++rustls = { workspace = true, features = ["logging", "ring", "std", "tls12"] }
+ rustls-platform-verifier.workspace = true
+ webpki-roots.workspace = true
+diff --git a/crates/http_client_tls/src/http_client_tls.rs b/crates/http_client_tls/src/http_client_tls.rs
+index 2e43ac29b2..32f5643214 100644
+--- a/crates/http_client_tls/src/http_client_tls.rs
++++ b/crates/http_client_tls/src/http_client_tls.rs
+@@ -8,10 +8,10 @@ static TLS_CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
+ pub fn tls_config() -> ClientConfig {
+     TLS_CONFIG
+         .get_or_init(|| {
+-            // rustls uses the `aws_lc_rs` provider by default
+-            // This only errors if the default provider has already
+-            // been installed. We can ignore this `Result`.
+-            rustls::crypto::aws_lc_rs::default_provider()
++            // Install ring as the process-wide provider unless the app
++            // installed one first. This only errors if a default provider has
++            // already been installed. We can ignore this `Result`.
++            rustls::crypto::ring::default_provider()
+                 .install_default()
+                 .ok();
+ 
+-- 
+2.56.1.windows.1
+
