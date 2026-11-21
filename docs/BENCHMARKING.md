@@ -158,7 +158,7 @@ CSV or log trace into a structured summary inside a run directory.
 
 - Criterion benches in `benches/`: `cargo bench --bench layout_bench`
   (layout, height tree, scroll markers), `--bench parse_bench` (message-ingest
-  parsing: emote tags, slot parsing, structure hashing) and
+  parsing: emote tags, slot parsing, structure hashing, filter evaluation) and
   `--bench loading_bench` (image decode, GPU format conversion, disk cache). Check one at a time with `cargo check -p echo_gpui --bench <name>`;
   `--benches` also selects the root libtest target.
 - Standalone benchmark tools registered as `benchmark` in
@@ -166,6 +166,12 @@ CSV or log trace into a structured summary inside a run directory.
   `-p search-bench` and `-p provider-index-bench`. `tools/gpui-scene-bench`
   is a Criterion bench of the production-shaped GPUI chat scene in a real
   native window (`cargo bench -p gpui-scene-bench`).
+- Those four benches start by isolating their process
+  (`storage_roots::isolate_bench_process`): they keep an
+  `ECHO_BENCH_PROFILE_ROOT` the caller set, otherwise use their own directory
+  in the temp directory (`echo-<name>-bench-profile`, left in place), and
+  stop unless every storage root is inside it, since they read settings and
+  can start the image loader (`parse_bench`'s filter bench writes settings).
 - `evaluate-provider-index-diff.py` models the incremental provider-index update
   in Python and checks it against a full rebuild.
 

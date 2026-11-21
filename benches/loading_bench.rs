@@ -5,7 +5,7 @@
 
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use echo_gpui::cache::budget::BudgetManager;
 use echo_gpui::cache::disk_layer::DiskLayer;
 use echo_gpui::cache::stats::CacheStats;
@@ -164,4 +164,12 @@ criterion_group!(
     bench_animated_decode,
     bench_disk_cache_io
 );
-criterion_main!(benches);
+/// Isolate the process before anything can read Echo's storage: settings
+/// getters and the image loader reached from here must never use the normal
+/// profile.
+fn main() {
+    // SAFETY: first in `main`, before criterion or Echo start any thread.
+    unsafe { echo_gpui::storage_roots::isolate_bench_process("echo-loading-bench-profile") };
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

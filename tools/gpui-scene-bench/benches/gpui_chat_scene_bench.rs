@@ -170,4 +170,19 @@ gpui::bench_group!(
     chat_scene_dense_emotes,
     chat_scene_scroll_translation
 );
-gpui::bench_main!(benches);
+
+// gpui::bench_main!(benches) with an isolation step first: the scenes start
+// Echo's image loader and read its settings, which must never use the
+// normal profile.
+#[global_allocator]
+static GPUI_BENCH_ALLOCATOR: gpui::CountingAllocator<std::alloc::System> =
+    gpui::CountingAllocator::new(std::alloc::System);
+
+fn main() {
+    // SAFETY: first in `main`, before criterion, GPUI or Echo start any thread.
+    unsafe { echo_gpui::storage_roots::isolate_bench_process("echo-gpui-scene-bench-profile") };
+    benches();
+    criterion::Criterion::default()
+        .configure_from_args()
+        .final_summary();
+}

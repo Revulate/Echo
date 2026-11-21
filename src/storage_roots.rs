@@ -131,6 +131,53 @@ fn profile_variable_set() -> bool {
     profile_variable().is_some()
 }
 
+/// Isolate a bench or tool process that links Echo's library: use the
+/// caller's `ECHO_BENCH_PROFILE_ROOT` when it is set (a script's profile is
+/// kept, not overridden), else `<temp dir>/<default_dir>`; resolve the roots
+/// and panic unless the profile is in use and every root is inside it.
+/// Returns the profile directory, which is left in place.
+///
+/// # Safety
+///
+/// It may set an environment variable, so call it first in `main`, before
+/// any other thread that could read the environment starts.
+pub unsafe fn isolate_bench_process(default_dir: &str) -> PathBuf {
+    let profile = match echo_core::env::os_value(PROFILE_ROOT_ENV) {
+        Some(profile) => PathBuf::from(profile),
+        None => {
+            let profile = env::temp_dir().join(default_dir);
+            // SAFETY: the caller guarantees no other thread reads the
+            // environment yet.
+            unsafe { env::set_var(PROFILE_ROOT_ENV, &profile) };
+            profile
+        }
+    };
+    if let Err(error) = initialize() {
+        panic!("bench profile '{}': {error}", profile.display());
+    }
+    assert_eq!(
+        profile_root().as_deref(),
+        Some(profile.as_path()),
+        "the bench must run on its own profile"
+    );
+    for root in [
+        config_root(),
+        data_root(),
+        cache_root(),
+        log_root(),
+        runtime_root(),
+    ] {
+        let root = root.expect("an isolated profile has every root");
+        assert!(
+            root.starts_with(&profile),
+            "storage root '{}' is outside the bench profile '{}'",
+            root.display(),
+            profile.display()
+        );
+    }
+    profile
+}
+
 /// Whether this process is isolated from the user's normal Echo storage.
 pub fn is_isolated() -> bool {
     profile_roots().is_some()

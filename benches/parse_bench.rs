@@ -121,37 +121,6 @@ fn bench_structure_hash(c: &mut Criterion) {
 /// Id prefix of the filter rules this bench creates; it removes no others.
 const BENCH_FILTER_PREFIX: &str = "bench-regex-";
 
-/// Point Echo's storage at a profile in the temp directory before anything
-/// can read settings, and stop unless every root is inside it. The filter
-/// bench writes settings, so it must never run against the normal profile.
-fn isolate_profile() -> std::path::PathBuf {
-    let profile = std::env::temp_dir().join("echo-parse-bench-profile");
-    // SAFETY: called first in `main`, before criterion or Echo start any
-    // thread that reads the environment.
-    unsafe { std::env::set_var("ECHO_BENCH_PROFILE_ROOT", &profile) };
-    storage_roots::initialize().expect("isolated bench profile initializes");
-    assert_eq!(
-        storage_roots::profile_root().as_deref(),
-        Some(profile.as_path()),
-        "the bench must run on its temp profile"
-    );
-    for root in [
-        storage_roots::config_root(),
-        storage_roots::data_root(),
-        storage_roots::cache_root(),
-        storage_roots::log_root(),
-    ] {
-        let root = root.expect("an isolated profile has every root");
-        assert!(
-            root.starts_with(&profile),
-            "storage root '{}' is outside the bench profile '{}'",
-            root.display(),
-            profile.display()
-        );
-    }
-    profile
-}
-
 /// Make the bench's own rules `count` enabled regex Hide rules, leaving any
 /// other rule in the (isolated) settings alone.
 fn set_regex_filters(count: usize) {
@@ -211,7 +180,8 @@ criterion_group!(
 );
 
 fn main() {
-    isolate_profile();
+    // SAFETY: first in `main`, before criterion or Echo start any thread.
+    unsafe { storage_roots::isolate_bench_process("echo-parse-bench-profile") };
     benches();
     Criterion::default().configure_from_args().final_summary();
 }
