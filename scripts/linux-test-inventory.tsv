@@ -533,6 +533,7 @@ root_test	src/backend/history_cache.rs	history_v3_rejects_trailing_payload_bytes
 root_test	src/backend/history_cache.rs	history_v4_rejects_corrupt_payload
 root_test	src/backend/history_cache.rs	history_v4_round_trip_preserves_current_message_fields
 root_test	src/backend/history_cache.rs	history_v5_rejects_trailing_payload_bytes
+root_test	src/backend/history_cache.rs	history_writer_skips_an_unchanged_buffer_and_writes_after_a_change
 root_test	src/backend/history_cache.rs	live_history_dirty_channels_are_coalesced_per_flush_window
 root_test	src/backend/history_cache.rs	live_history_empty_snapshot_removes_stale_file
 root_test	src/backend/history_cache.rs	live_history_flush_deadline_is_not_postponed_by_continuous_wakes
@@ -958,7 +959,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	463
+summary	root_tests	464
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20

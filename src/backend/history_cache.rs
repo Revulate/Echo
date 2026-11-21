@@ -818,20 +818,55 @@ fn persist_buffered_channel_history(channel: &str) -> bool {
         return false;
     };
     let clear_after_ms = HISTORY_CACHE_CLEAR_AFTER_MS.load(Ordering::Relaxed);
-    let (version, rows) = {
-        let Some(buffer) = CHAT_MESSAGES.get(channel) else {
-            return false;
-        };
-        let version = buffer.version();
-        if PERSISTED_HISTORY_VERSIONS.lock_or_recover().get(channel) == Some(&version) {
-            return false;
-        }
-        let rows = newest_persisted_history_rows(buffer.iter_recent(usize::MAX), clear_after_ms);
-        (version, rows)
+    let Some(buffer) = CHAT_MESSAGES.get(channel) else {
+        return false;
     };
-    let written = write_channel_history(&history_dir, channel, &rows);
+    let pending = rows_to_persist(
+        &PERSISTED_HISTORY_VERSIONS,
+        channel,
+        &buffer,
+        clear_after_ms,
+    );
+    drop(buffer);
+    pending.is_some_and(|(version, rows)| {
+        write_recorded(
+            &PERSISTED_HISTORY_VERSIONS,
+            &history_dir,
+            channel,
+            version,
+            &rows,
+        )
+    })
+}
+
+/// The version and kept rows of `buffer` when its cache file does not
+/// already hold that version. Called under the buffer's shard guard.
+fn rows_to_persist(
+    persisted: &Mutex<FxHashMap<String, u64>>,
+    channel: &str,
+    buffer: &crate::state::MessageBuffer,
+    clear_after_ms: i64,
+) -> Option<(u64, Vec<ChatMessage>)> {
+    let version = buffer.version();
+    if persisted.lock_or_recover().get(channel) == Some(&version) {
+        return None;
+    }
+    let rows = newest_persisted_history_rows(buffer.iter_recent(usize::MAX), clear_after_ms);
+    Some((version, rows))
+}
+
+/// Write `rows` and, when the file now holds them, record `version` as
+/// persisted for `channel`. A failed write records nothing.
+fn write_recorded(
+    persisted: &Mutex<FxHashMap<String, u64>>,
+    history_dir: &Path,
+    channel: &str,
+    version: u64,
+    rows: &[ChatMessage],
+) -> bool {
+    let written = write_channel_history(history_dir, channel, rows);
     if written {
-        PERSISTED_HISTORY_VERSIONS
+        persisted
             .lock_or_recover()
             .insert(channel.to_string(), version);
     }
@@ -1242,6 +1277,68 @@ mod tests {
             vec!["live".to_string()]
         );
         worker.join().expect("history writer should stop");
+    }
+
+    #[test]
+    fn history_writer_skips_an_unchanged_buffer_and_writes_after_a_change() {
+        // A temporary directory, a local buffer and a local record: nothing
+        // here reads settings or Echo's storage roots.
+        let directory = tempfile::tempdir().expect("temporary history directory should exist");
+        let persisted = Mutex::new(FxHashMap::default());
+        let row = |id: &str, timestamp: i64| ChatMessage {
+            id: Arc::from(id),
+            channel: Arc::from("example"),
+            content: Arc::from("hello"),
+            timestamp,
+            ..Default::default()
+        };
+        let mut buffer = crate::state::MessageBuffer::new(50);
+        buffer.push(row("a", 1));
+        let path = directory.path().join("example.bin.zst");
+
+        let (version, rows) = rows_to_persist(&persisted, "example", &buffer, 0)
+            .expect("a buffer never written must be written");
+        assert!(write_recorded(
+            &persisted,
+            directory.path(),
+            "example",
+            version,
+            &rows
+        ));
+        assert_eq!(read_stored_history_file(&path).unwrap().len(), 1);
+
+        // Unchanged: nothing to write, even after the file was replaced.
+        std::fs::write(&path, b"sentinel").unwrap();
+        assert!(rows_to_persist(&persisted, "example", &buffer, 0).is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+
+        // Any change (here a deletion flag, which also drops the row from the
+        // file) makes the next pass write.
+        buffer.push(row("b", 2));
+        assert!(buffer.update_by_id("a", |message| message.flags.is_deleted = true));
+        let (version, rows) = rows_to_persist(&persisted, "example", &buffer, 0)
+            .expect("a changed buffer must be written");
+        assert_eq!(rows.len(), 1);
+        assert!(write_recorded(
+            &persisted,
+            directory.path(),
+            "example",
+            version,
+            &rows
+        ));
+        let stored = read_stored_history_file(&path).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "b");
+        assert!(rows_to_persist(&persisted, "example", &buffer, 0).is_none());
+
+        // A failed write records nothing, so the next pass tries again.
+        let missing = directory.path().join("missing");
+        buffer.push(row("c", 3));
+        let (version, rows) = rows_to_persist(&persisted, "example", &buffer, 0).unwrap();
+        assert!(!write_recorded(
+            &persisted, &missing, "example", version, &rows
+        ));
+        assert!(rows_to_persist(&persisted, "example", &buffer, 0).is_some());
     }
 
     #[test]
