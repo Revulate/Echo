@@ -2,7 +2,7 @@
 
 use super::message_delta::{
     FrontDrop, MessageDeltaPlan, Reshape, UpdateKind, first_trailing_new_row,
-    remap_after_front_drop,
+    next_new_message_boundary, remap_after_front_drop,
 };
 use super::*;
 
@@ -504,17 +504,15 @@ impl CanvasMessageList {
         }
         self.message_state.pending_new_message_count = pending;
 
-        let retained_boundary_successor = previous_boundary_index.and_then(|boundary_index| {
-            self.message_model
-                .messages
-                .iter()
-                .skip(boundary_index.saturating_add(1))
-                .find_map(|message| {
-                    self.get_message_index(&message.id)
-                        .is_some()
-                        .then(|| SharedString::from(message.id.clone()))
-                })
-        });
+        let next_boundary = next_new_message_boundary(
+            self.message_state.new_message_boundary_id.as_ref(),
+            previous_boundary_index,
+            &self.message_model.messages,
+            |id| self.get_message_index(id).is_some(),
+            was_scrolled_away,
+            first_new_message_id,
+        );
+        self.message_state.new_message_boundary_id = next_boundary;
 
         self.message_model.messages = messages;
         self.restore_viewport_anchor_after_message_replacement(retained_viewport_anchor);
@@ -523,20 +521,6 @@ impl CanvasMessageList {
             .selection
             .remap_message_indices(|message_id| message_model.get_message_index(message_id));
         self.message_state.last_message_count = new_count;
-
-        let existing_boundary_is_retained = self
-            .message_state
-            .new_message_boundary_id
-            .as_ref()
-            .is_some_and(|id| self.get_message_index(id.as_ref()).is_some());
-        if !was_scrolled_away {
-            self.message_state.new_message_boundary_id = None;
-        } else if !existing_boundary_is_retained {
-            self.message_state.new_message_boundary_id =
-                retained_boundary_successor.or_else(|| {
-                    first_new_message_id.filter(|id| self.get_message_index(id.as_ref()).is_some())
-                });
-        }
 
         const STATUS_PRUNE_HEADROOM: usize = 512;
         let should_prune_statuses = (content_changed && new_count <= old_count)

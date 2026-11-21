@@ -173,6 +173,37 @@ pub(super) fn first_trailing_new_row(
     (start < next.len()).then_some(start)
 }
 
+/// The "New messages" boundary after a sync. `boundary` is the current one
+/// and `boundary_old_index` its row in `old_rows`, the rows before the sync;
+/// `kept` tells whether an id is among the new rows; `first_new` is the first
+/// row the sync added after the rows the split had. A split following live
+/// chat has none. A scrolled-away split keeps a boundary that survived, else
+/// moves it to the next old row that survived, else to the first new row.
+pub(super) fn next_new_message_boundary(
+    boundary: Option<&SharedString>,
+    boundary_old_index: Option<usize>,
+    old_rows: &[Arc<ChatMessage>],
+    kept: impl Fn(&str) -> bool,
+    was_scrolled_away: bool,
+    first_new: Option<SharedString>,
+) -> Option<SharedString> {
+    if !was_scrolled_away {
+        return None;
+    }
+    if let Some(boundary) = boundary.filter(|id| kept(id.as_ref())) {
+        return Some(boundary.clone());
+    }
+    boundary_old_index
+        .and_then(|index| {
+            old_rows
+                .iter()
+                .skip(index.saturating_add(1))
+                .find(|message| kept(message.id.as_ref()))
+                .map(|message| SharedString::from(message.id.clone()))
+        })
+        .or_else(|| first_new.filter(|id| kept(id.as_ref())))
+}
+
 /// The rows of `rows`, ordered by row index, that survive dropping the first
 /// `dropped` rows of the list, with their indices shifted to match.
 pub(super) fn remap_after_front_drop<T: Clone>(
@@ -239,6 +270,79 @@ mod tests {
         assert_eq!(first_trailing_new_row(&rows(&["b", "x", "c"]), known), None);
         assert_eq!(first_trailing_new_row(&rows(&["x", "y"]), known), Some(0));
         assert_eq!(first_trailing_new_row(&rows(&[]), known), None);
+    }
+
+    /// The boundary a sync from `old` to `new` leaves on a split scrolled
+    /// away with `boundary`, taking the new rows the way `apply_messages`
+    /// does on its rebuild path (the rows after the last one it had).
+    fn boundary_after_rebuild(
+        old: &[&str],
+        new: &[&str],
+        boundary: Option<&str>,
+    ) -> Option<String> {
+        let old_rows = rows(old);
+        let new_rows = rows(new);
+        let old_has = |id: &str| old.contains(&id);
+        let new_has = |id: &str| new.contains(&id);
+        let first_new = first_trailing_new_row(&new_rows, old_has)
+            .map(|index| SharedString::from(new_rows[index].id.clone()));
+        let boundary = boundary.map(SharedString::from);
+        let boundary_old_index = boundary
+            .as_ref()
+            .and_then(|id| old.iter().position(|old_id| *old_id == id.as_ref()));
+        next_new_message_boundary(
+            boundary.as_ref(),
+            boundary_old_index,
+            &old_rows,
+            new_has,
+            true,
+            first_new,
+        )
+        .map(|id| id.to_string())
+    }
+
+    #[test]
+    fn a_rebuild_while_scrolled_away_marks_the_rows_after_the_last_kept_one() {
+        // A catch-up that removed a middle row and appended two: the first
+        // appended row becomes the boundary, as the append alone would.
+        assert_eq!(
+            boundary_after_rebuild(&["a", "b", "c"], &["a", "c", "x", "y"], None).as_deref(),
+            Some("x")
+        );
+        // The whole buffer turned over: the boundary is the first row.
+        assert_eq!(
+            boundary_after_rebuild(&["a", "b"], &["x", "y"], None).as_deref(),
+            Some("x")
+        );
+        // A boundary that survived stays; one that left moves to the next
+        // old row that survived, before any new row.
+        assert_eq!(
+            boundary_after_rebuild(&["a", "b", "c"], &["a", "b", "c", "x"], Some("b")).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            boundary_after_rebuild(&["a", "b", "c", "d"], &["a", "d", "x"], Some("b")).as_deref(),
+            Some("d")
+        );
+        assert_eq!(
+            boundary_after_rebuild(&["a", "b"], &["a", "x"], Some("b")).as_deref(),
+            Some("x")
+        );
+        // Nothing new: no boundary.
+        assert_eq!(boundary_after_rebuild(&["a", "b"], &["a"], None), None);
+        // Following live chat never has one.
+        let old_rows = rows(&["a"]);
+        assert_eq!(
+            next_new_message_boundary(
+                Some(&SharedString::from("a")),
+                Some(0),
+                &old_rows,
+                |_| true,
+                false,
+                Some(SharedString::from("x")),
+            ),
+            None
+        );
     }
 
     #[test]
