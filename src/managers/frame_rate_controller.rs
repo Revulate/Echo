@@ -2,8 +2,8 @@
 //!
 //! This module provides invisible, automatic frame rate optimization:
 //! - 16ms (60fps) after recent user interaction (scrolling, clicking, typing)
-//! - 33ms (30fps) when visible animations are active
-//! - 100ms (10fps) when recently active but idle
+//! - 100ms (10fps) when visible animations are active (the canvases drive
+//!   their own animation frames) or when recently active but idle
 //! - 500ms (2fps) when in deep idle (no activity for 2+ seconds)
 //! - 1000ms (1fps) when in true idle (no visible animations, no activity for 5+ seconds)
 //!
@@ -61,10 +61,10 @@ static MODE_CACHE_TIME_MS: AtomicU64 = AtomicU64::new(0);
 
 /// How long to cache the mode calculation (ms)
 /// Avoid recalculating mode every poll cycle.
-/// Kept at one 60fps frame so Animating-mode recognition does not lag by up to a
-/// full 50ms after animations become visible (which would otherwise stall the
-/// first animation frame). The cache is invalidated immediately on activity, so
-/// this only bounds the worst-case staleness when no activity event fires.
+/// One 60fps frame: the cache is invalidated immediately on activity, so this
+/// only bounds how stale the mode the loops read can be when no activity
+/// event fires. Animation frames do not depend on it; the canvases' own wakers
+/// drive them.
 const MODE_CACHE_DURATION_MS: u64 = 16;
 
 /// Keep-alive duration in milliseconds (full 60fps responsiveness after user input)
