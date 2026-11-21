@@ -135,7 +135,13 @@ These are set by the scripts under `scripts/bench/`; see
 
 - `ECHO_BENCH_PROFILE_ROOT` (an absolute path) isolates every config, data,
   cache, log and keyring path under one directory (`src/storage_roots.rs`).
-  Use it for any experiment that must not touch real user state.
+  Use it for any experiment that must not touch real user state. The roots
+  are resolved from it on the first path lookup, so a bench or tool that sets
+  it before using Echo's library is isolated even without calling
+  `storage_roots::initialize()`; an unusable value, or setting it after a
+  lookup already resolved the normal roots, panics instead of falling back.
+  The library's own unit tests always run on a per-process profile in the
+  temp directory.
 - `ECHO_BENCH_OFFLINE` (boolean) keeps Echo's own background network lanes
   disabled. It is honored only together with `ECHO_BENCH_PROFILE_ROOT`.
 - `ECHO_BENCH_ALLOW_MULTI_INSTANCE` (boolean) skips the single-instance check.

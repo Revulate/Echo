@@ -7,7 +7,7 @@
 //! integrations that inspect another application's data are disabled by their
 //! callers while a profile is active.
 
-use std::{env, fs, io, path::PathBuf, sync::OnceLock};
+use std::{env, ffi::OsString, fs, io, path::PathBuf, sync::OnceLock};
 
 pub(crate) const PROFILE_ROOT_ENV: &str = "ECHO_BENCH_PROFILE_ROOT";
 
@@ -50,22 +50,17 @@ impl ProfileRoots {
     }
 }
 
-static PROFILE_ROOTS: OnceLock<Option<ProfileRoots>> = OnceLock::new();
+/// The profile resolved from `ECHO_BENCH_PROFILE_ROOT` on first use: `None`
+/// when the variable is unset, an error when it names an unusable profile.
+static PROFILE_ROOTS: OnceLock<Result<Option<ProfileRoots>, String>> = OnceLock::new();
 
-/// Resolve the optional isolated profile before normal application startup
-/// and create its directories.
-///
-/// A configured profile root is required to be absolute. This fails closed:
-/// an invalid profile cannot fall through to a user's normal settings,
-/// tokens, or caches.
-pub fn initialize() -> Result<(), String> {
-    let roots = PROFILE_ROOTS.get_or_init(|| {
-        let raw = echo_core::env::os_value(PROFILE_ROOT_ENV)?;
-        Some(ProfileRoots::from_profile(PathBuf::from(raw)))
-    });
-    let Some(roots) = roots.as_ref() else {
-        return Ok(());
+/// Resolve a profile from the variable's value: validate it and create its
+/// directories.
+fn resolve_profile_roots(raw: Option<OsString>) -> Result<Option<ProfileRoots>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
     };
+    let roots = ProfileRoots::from_profile(PathBuf::from(raw));
     if !roots.profile.is_absolute() {
         return Err(format!("{PROFILE_ROOT_ENV} must be an absolute path"));
     }
@@ -74,20 +69,89 @@ pub fn initialize() -> Result<(), String> {
             "failed to create benchmark profile roots under '{}': {error}",
             roots.profile.display()
         )
+    })?;
+    Ok(Some(roots))
+}
+
+/// The roots every path lookup uses, given the resolution and whether the
+/// variable is set now. A profile that could not be resolved, or a variable
+/// set after the roots were resolved without it, is an error: the paths
+/// would otherwise be the user's normal ones while the process believes it
+/// is isolated.
+fn roots_in_use(
+    resolved: &Result<Option<ProfileRoots>, String>,
+    variable_set_now: bool,
+) -> Result<Option<&ProfileRoots>, String> {
+    match resolved {
+        Err(error) => Err(error.clone()),
+        Ok(None) if variable_set_now => Err(format!(
+            "{PROFILE_ROOT_ENV} was set after Echo's storage roots were resolved without it"
+        )),
+        Ok(roots) => Ok(roots.as_ref()),
+    }
+}
+
+/// Resolve the optional isolated profile before normal application startup
+/// and create its directories.
+///
+/// A configured profile root is required to be absolute. This fails closed:
+/// an invalid profile cannot fall through to a user's normal settings,
+/// tokens, or caches. Every path lookup resolves the profile the same way on
+/// first use, so a library user (a bench, test or tool) that sets the
+/// variable without calling this is isolated too; calling it first only
+/// turns a bad profile into an error instead of a panic.
+pub fn initialize() -> Result<(), String> {
+    roots_in_use(resolved_profile_roots(), profile_variable_set()).map(|_| ())
+}
+
+fn resolved_profile_roots() -> &'static Result<Option<ProfileRoots>, String> {
+    PROFILE_ROOTS.get_or_init(|| resolve_profile_roots(profile_variable()))
+}
+
+#[cfg(not(test))]
+fn profile_variable() -> Option<OsString> {
+    echo_core::env::os_value(PROFILE_ROOT_ENV)
+}
+
+/// The library's own tests always run on a profile of their own in the temp
+/// directory (one per test process, left behind), so no test can read or
+/// write the user's normal settings, caches or history.
+#[cfg(test)]
+fn profile_variable() -> Option<OsString> {
+    echo_core::env::os_value(PROFILE_ROOT_ENV).or_else(|| {
+        Some(
+            env::temp_dir()
+                .join(format!("echo-lib-test-profile-{}", std::process::id()))
+                .into_os_string(),
+        )
     })
+}
+
+fn profile_variable_set() -> bool {
+    profile_variable().is_some()
 }
 
 /// Whether this process is isolated from the user's normal Echo storage.
 pub fn is_isolated() -> bool {
-    profile_roots().is_some() || echo_core::env::os_value(PROFILE_ROOT_ENV).is_some()
+    profile_roots().is_some()
 }
 
 pub fn profile_root() -> Option<PathBuf> {
     profile_roots().map(|roots| roots.profile.clone())
 }
 
+/// The isolated profile's roots, `None` for normal storage.
+///
+/// # Panics
+///
+/// When `ECHO_BENCH_PROFILE_ROOT` names an unusable profile, or was set after
+/// the roots were resolved without it: no path may then fall back to the
+/// user's normal storage.
 pub(crate) fn profile_roots() -> Option<&'static ProfileRoots> {
-    PROFILE_ROOTS.get().and_then(Option::as_ref)
+    match roots_in_use(resolved_profile_roots(), profile_variable_set()) {
+        Ok(roots) => roots,
+        Err(error) => panic!("{error}; refusing to use the normal Echo storage"),
+    }
 }
 pub fn config_root() -> Option<PathBuf> {
     profile_roots()
@@ -190,5 +254,68 @@ pub fn profiling_artifact_path(name: &str) -> PathBuf {
         log_root().unwrap_or_else(|| PathBuf::from(".")).join(name)
     } else {
         PathBuf::from(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn temp_profile(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "echo-storage-roots-test-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn the_library_tests_run_on_their_own_temp_profile() {
+        let profile = profile_root().expect("tests are isolated");
+        assert!(
+            profile.starts_with(env::temp_dir()),
+            "{}",
+            profile.display()
+        );
+        assert!(config_root().is_some_and(|root| root.starts_with(&profile)));
+    }
+
+    #[test]
+    fn an_unset_variable_resolves_to_normal_storage() {
+        let resolved = resolve_profile_roots(None);
+        assert!(matches!(resolved, Ok(None)));
+        assert!(matches!(roots_in_use(&resolved, false), Ok(None)));
+    }
+
+    #[test]
+    fn a_variable_set_before_first_use_isolates_every_root() {
+        let profile = temp_profile("lazy");
+        let resolved = resolve_profile_roots(Some(profile.clone().into_os_string()));
+        let roots = roots_in_use(&resolved, true)
+            .expect("an absolute profile resolves")
+            .expect("the profile is in use");
+        for root in [&roots.config, &roots.data, &roots.cache, &roots.logs] {
+            assert!(
+                root.starts_with(&profile) && root.is_dir(),
+                "{}",
+                root.display()
+            );
+        }
+        fs::remove_dir_all(&profile).expect("temporary profile removes");
+    }
+
+    #[test]
+    fn a_variable_set_after_resolution_without_it_is_refused() {
+        let resolved = resolve_profile_roots(None);
+        let error = roots_in_use(&resolved, true).expect_err("must not fall back");
+        assert!(error.contains(PROFILE_ROOT_ENV), "{error}");
+    }
+
+    #[test]
+    fn a_relative_profile_is_refused_on_every_lookup() {
+        let resolved = resolve_profile_roots(Some(OsString::from("relative-profile")));
+        assert!(roots_in_use(&resolved, true).is_err());
+        assert!(roots_in_use(&resolved, false).is_err());
+        assert!(!PathBuf::from("relative-profile").exists());
     }
 }
