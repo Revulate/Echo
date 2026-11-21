@@ -53,6 +53,10 @@ const PENDING_UI_WAKE_MIN_SPACING: Duration = Duration::from_millis(4);
 const PENDING_UI_REAUTH_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_UI_SETTINGS_INTERVAL: Duration = Duration::from_millis(250);
 const PENDING_UI_ORPHAN_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often splits in hidden tabs take the latest snapshot. They skip the
+/// per-drain syncs, so this bounds how long a hidden canvas keeps rows its
+/// channel has already evicted.
+const PENDING_UI_HIDDEN_CATCH_UP_INTERVAL: Duration = Duration::from_secs(30);
 /// How often a visible Live now list asks whether its data has expired. The
 /// list's own TTL decides whether that turns into a Helix request.
 const PENDING_UI_FOLLOWED_LIVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -600,6 +604,7 @@ impl EchoApp {
                 echo_core::instant_ago(PENDING_UI_SETTINGS_INTERVAL).unwrap_or_else(Instant::now);
             let mut last_orphan_prune = echo_core::instant_ago(PENDING_UI_ORPHAN_PRUNE_INTERVAL)
                 .unwrap_or_else(Instant::now);
+            let mut last_hidden_catch_up = Instant::now();
             let mut last_followed_live_check =
                 echo_core::instant_ago(PENDING_UI_FOLLOWED_LIVE_INTERVAL)
                     .unwrap_or_else(Instant::now);
@@ -663,6 +668,13 @@ impl EchoApp {
                         {
                             last_orphan_prune = now;
                             needs_notify |= app.prune_orphaned_chat_views(cx);
+                        }
+
+                        if now.duration_since(last_hidden_catch_up)
+                            >= PENDING_UI_HIDDEN_CATCH_UP_INTERVAL
+                        {
+                            last_hidden_catch_up = now;
+                            app.catch_up_hidden_splits(cx);
                         }
 
                         if needs_notify {
@@ -2524,6 +2536,22 @@ impl EchoApp {
     /// Zed keeps inactive pane entities behind cached GPUI boundaries; Echo
     /// should do the same for tabbed chat splits so switching tabs does not
     /// discard per-split height trees, scroll state, hitboxes, and layout caches.
+    /// Let every split in a hidden tab take the latest snapshot, and report
+    /// the rows those canvases held beforehand to the memory breakdown. A
+    /// hidden canvas draws nothing, so nothing needs a repaint.
+    fn catch_up_hidden_splits(&mut self, cx: &mut Context<Self>) {
+        let mut held_rows = 0;
+        for chat_view in self.chat_views.values() {
+            chat_view.update(cx, |view, cx| {
+                if let Some(rows) = view.hidden_canvas_rows(cx) {
+                    held_rows += rows;
+                    view.catch_up_hidden_split(cx);
+                }
+            });
+        }
+        crate::backend::memory_report::set_hidden_canvas_rows(held_rows);
+    }
+
     fn prune_orphaned_chat_views(&mut self, cx: &mut Context<Self>) -> bool {
         let valid_ids = self.valid_leaf_split_ids(cx);
 

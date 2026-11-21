@@ -373,6 +373,16 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> bool {
         let messages = chat_state.read(cx).messages.clone();
+        self.sync_messages(messages, cx)
+    }
+
+    /// Sync the canvas to `messages`, unless it is a history prepend an
+    /// inactive split defers.
+    fn sync_messages(
+        &mut self,
+        messages: Arc<Vec<Arc<ChatMessage>>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.defer_inactive_history_prepend_if_needed(&messages, cx) {
             return false;
         }
@@ -388,15 +398,26 @@ impl ChatView {
     }
 
     /// Give a split in a hidden tab the snapshot it skipped while hidden, as
-    /// one sync. Call it before the split is shown, and before acting on its
-    /// rows (a message jump). Still hidden, the sync reveals every row
-    /// instead of pacing them. Returns whether the canvas changed.
+    /// one sync. Call it before the split is shown, before acting on its rows
+    /// (a message jump), and from EchoApp's periodic hidden-split pass, which
+    /// bounds how long a hidden canvas keeps rows the channel has evicted.
+    /// Still hidden, the sync reveals every row instead of pacing them. It
+    /// reads the rows as render does (`get_messages`, which honours a pending
+    /// blocked-user reconcile and revoked visibility), so a jump cannot land
+    /// on a row the next render removes. Returns whether the canvas changed.
     pub fn catch_up_hidden_split(&mut self, cx: &mut Context<Self>) -> bool {
         if self.canvas_list.read(cx).is_tab_visible() {
             return false;
         }
-        let chat_state = self.chat_state.clone();
-        self.sync_latest_messages(&chat_state, cx)
+        let messages = self.get_messages(cx);
+        self.sync_messages(messages, cx)
+    }
+
+    /// Rows this split's canvas holds while its tab is hidden, `None` when
+    /// the tab is shown.
+    pub fn hidden_canvas_rows(&self, cx: &App) -> Option<usize> {
+        let canvas = self.canvas_list.read(cx);
+        (!canvas.is_tab_visible()).then(|| canvas.source_messages().len())
     }
 
     /// Record the newest message as this split's last read position.

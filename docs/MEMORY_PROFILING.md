@@ -38,7 +38,9 @@ channels keep for a quick reopen (`closed_catalogs`, `closed_catalog_emotes`,
 `closed_catalog_kb`; dropped 10 minutes after the close or past 32), the
 message-id deduplicators (`dedup_kb`), and on the UI side the rows in the
 channels' chat snapshots (`ui_snapshot_rows`, a count: those rows are mostly
-shared with the backend buffers) and the events waiting in their observer
+shared with the backend buffers), the rows the canvases of splits in hidden
+tabs held before their last 30 s catch-up (`hidden_canvas_rows`, including
+rows their channels had evicted) and the events waiting in their observer
 queues (`observer_queued_events`). `accounted_mb` sums decoded media, the
 layout-cache estimate, buffered chat rows, the emote maps, closed catalogs,
 the deduplicators and name-paint composites; `unaccounted_mb` is the working

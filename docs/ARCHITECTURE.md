@@ -182,7 +182,9 @@ flowchart TD
   publish to the next. Each split's `ChatView` then syncs its
   `CanvasMessageList`; a split in a hidden tab skips these syncs and takes
   the latest snapshot in one sync when it is shown, prewarmed from a tab
-  hover, or targeted by a message jump (`ChatView::catch_up_hidden_split`).
+  hover, targeted by a message jump, or every 30 s from EchoApp's pending-UI
+  pass, which bounds how long it keeps rows its channel has evicted
+  (`ChatView::catch_up_hidden_split`).
   While a split follows live chat, paced reveal
   (`echo_core::reveal_pacer`) holds the newest rows back; a sync whose
   visible rows are the shown ones, row for row by pointer, keeps the list the

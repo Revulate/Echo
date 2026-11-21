@@ -22,6 +22,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const LAYOUT_ENTRY_BYTES_ESTIMATE: usize = 5_300;
 
 static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+/// Rows the canvases of splits in hidden tabs held at EchoApp's last
+/// hidden-split catch-up pass (every 30 s), before they caught up: rows a
+/// hidden canvas keeps after its channel evicted them are counted here.
+static HIDDEN_CANVAS_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// Record the rows hidden canvases held, for the next breakdown.
+pub fn set_hidden_canvas_rows(rows: usize) {
+    HIDDEN_CANVAS_ROWS.store(rows as u64, Ordering::Relaxed);
+}
 fn interval_secs() -> u64 {
     echo_core::env::parsed("ECHO_MEM_REPORT_SECS").unwrap_or(0)
 }
@@ -226,6 +235,7 @@ pub fn log_memory_breakdown(ui: UiMemoryCounts) {
         closed_catalog_kb = closed_catalog_bytes / 1024,
         dedup_kb = dedup_bytes / 1024,
         ui_snapshot_rows = ui.snapshot_rows,
+        hidden_canvas_rows = HIDDEN_CANVAS_ROWS.load(Ordering::Relaxed),
         observer_queued_events = ui.observer_queued_events,
         accounted_mb = accounted / 1_048_576,
         unaccounted_mb = ws_bytes.saturating_sub(accounted) / 1_048_576,
