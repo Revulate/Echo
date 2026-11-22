@@ -144,7 +144,7 @@ fn valid_through_log(
     .then_some(latest)
 }
 
-use super::layout::{CanvasMessageLayout, LayoutCacheKey, LayoutSegment};
+use super::layout::{CanvasMessageLayout, HitboxKind, LayoutCacheKey, LayoutSegment};
 
 static LAST_INVALIDATION_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -420,23 +420,28 @@ impl GlobalLayoutCache {
         self.layouts.clear();
     }
 
-    /// Evict only the layouts that contain an embed preview segment.
+    /// Evict only the layouts that contain an embed preview segment or a link.
     ///
     /// Embed display-mode settings only change how messages with embeds are laid out,
     /// so wiping the entire cache forces every split to reflow plain text/image content
     /// for no reason. This retains all non-embed layouts and removes just the ones whose
     /// geometry depends on embed settings, leaving them to rebuild on next render.
+    /// A row with links but no card counts: its card may have been held back as a
+    /// duplicate of another link's picture, and the setting can release it.
     pub fn clear_embed_layouts(&self) {
         let embed_keys: Vec<LayoutCacheKey> = self
             .layouts
             .iter()
             .filter(|entry| {
-                entry
-                    .value()
-                    .layout
+                let layout = &entry.value().layout;
+                layout
                     .segments
                     .iter()
                     .any(|segment| matches!(segment, LayoutSegment::EmbedPreview { .. }))
+                    || layout
+                        .hitbox_regions
+                        .iter()
+                        .any(|region| matches!(region.kind, HitboxKind::Url { .. }))
             })
             .map(|entry| entry.key().clone())
             .collect();

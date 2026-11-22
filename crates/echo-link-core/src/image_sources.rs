@@ -285,6 +285,28 @@ pub fn card_picture_key(url: &str) -> String {
     format!("url:{parsed}")
 }
 
+/// Whether a link keeps its claim on `picture_key` (its [`card_picture_key`]),
+/// so a later link to that picture in the same message gets no card.
+///
+/// `card_image` is `None` while the link's card metadata is pending (the claim
+/// holds, so the later card never appears and then vanishes), and once it has
+/// resolved, the image the card shows, if any. A card without an image gives
+/// the picture up. A Twitch channel or YouTube link keeps it only when its card
+/// really shows that picture: a channel card that fell back to the avatar
+/// (no stream yet, a failed lookup, the public page) must not hide the
+/// stream frame a later preview link shows.
+pub fn link_keeps_picture_claim(picture_key: &str, card_image: Option<Option<&str>>) -> bool {
+    match card_image {
+        None => true,
+        Some(None) => false,
+        Some(Some(image)) => {
+            let names_a_family =
+                picture_key.starts_with("twitch-live:") || picture_key.starts_with("youtube:");
+            !names_a_family || card_picture_key(image) == picture_key
+        }
+    }
+}
+
 /// The video id of an `i.ytimg.com`/`img.youtube.com` `/vi/<id>/<file>` (or
 /// `/vi_webp/`) thumbnail.
 fn youtube_thumbnail_video_id(url: &Url) -> Option<String> {
@@ -378,6 +400,53 @@ mod tests {
             card_picture_key("twitch.tv/somechannel"),
             "twitch-live:somechannel"
         );
+    }
+
+    #[test]
+    fn a_channel_link_keeps_its_claim_only_while_its_card_could_show_the_stream() {
+        let key = card_picture_key(LIVE_LINE);
+        // Pending: the claim holds, so the later preview card never flickers in.
+        assert!(link_keeps_picture_claim(&key, None));
+        // Resolved to the live preview (any size): it keeps the claim.
+        assert!(link_keeps_picture_claim(
+            &key,
+            Some(Some(
+                "https://static-cdn.jtvnw.net/previews-ttv/live_user_somechannel-640x360.jpg"
+            ))
+        ));
+        // Resolved to the avatar (no stream yet, lookup failed, public page):
+        // the later link's stream frame gets its card.
+        assert!(!link_keeps_picture_claim(
+            &key,
+            Some(Some(
+                "https://static-cdn.jtvnw.net/jtv_user_pictures/abc-profile_image-300x300.png"
+            ))
+        ));
+        // Failed or imageless card.
+        assert!(!link_keeps_picture_claim(&key, Some(None)));
+        // Another channel's preview is not this channel's picture.
+        assert!(!link_keeps_picture_claim(
+            &key,
+            Some(Some(
+                "https://static-cdn.jtvnw.net/previews-ttv/live_user_otherchannel-640x360.jpg"
+            ))
+        ));
+    }
+
+    #[test]
+    fn other_links_keep_their_claim_while_their_card_has_an_image() {
+        let page = card_picture_key("https://example.com/article");
+        assert!(link_keeps_picture_claim(&page, None));
+        assert!(link_keeps_picture_claim(
+            &page,
+            Some(Some("https://example.com/og.jpg"))
+        ));
+        assert!(!link_keeps_picture_claim(&page, Some(None)));
+        let video = card_picture_key("https://youtu.be/dQw4w9WgXcQ");
+        assert!(link_keeps_picture_claim(
+            &video,
+            Some(Some("https://img.youtube.com/vi/dQw4w9WgXcQ/mqdefault.jpg"))
+        ));
     }
 
     #[test]

@@ -13,7 +13,7 @@ mod providers;
 
 pub use image_sources::{
     TWITCH_LIVE_PREVIEW_FULL_SIZE, card_picture_key, full_size_image_candidates,
-    twitch_live_preview_url,
+    link_keeps_picture_claim, twitch_live_preview_url,
 };
 pub use providers::{
     SpotifyResourceKind, SteamAppSource, parse_spotify_resource_url, parse_steam_app_url,

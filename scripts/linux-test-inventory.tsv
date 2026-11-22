@@ -70,9 +70,11 @@ emote_core_test	crates/echo-emote-core/src/model.rs	smallest_copies_and_other_me
 emote_core_test	crates/echo-emote-core/src/twitch_dimensions.rs	known_legacy_geometry_matches_twitch_assets
 emote_core_test	crates/echo-emote-core/src/twitch_dimensions.rs	legacy_heart_density_keeps_its_non_integer_exception
 emote_core_test	crates/echo-emote-core/src/twitch_dimensions.rs	modern_emotes_use_the_standard_geometry
+link_core_test	crates/echo-link-core/src/image_sources.rs	a_channel_link_keeps_its_claim_only_while_its_card_could_show_the_stream
 link_core_test	crates/echo-link-core/src/image_sources.rs	different_logins_and_unrelated_images_stay_apart
 link_core_test	crates/echo-link-core/src/image_sources.rs	discord_media_proxy_drops_only_the_resize_parameters
 link_core_test	crates/echo-link-core/src/image_sources.rs	identical_links_share_a_key_and_different_pictures_do_not
+link_core_test	crates/echo-link-core/src/image_sources.rs	other_links_keep_their_claim_while_their_card_has_an_image
 link_core_test	crates/echo-link-core/src/image_sources.rs	sized_and_template_previews_match_the_channel_in_either_order
 link_core_test	crates/echo-link-core/src/image_sources.rs	spotify_cover_and_artist_art_try_larger_renditions
 link_core_test	crates/echo-link-core/src/image_sources.rs	the_bots_live_line_names_one_picture_twice
@@ -1001,7 +1003,7 @@ summary	cache_policy_tests	20
 summary	chat_render_tests	28
 summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
-summary	link_core_tests	36
+summary	link_core_tests	38
 summary	media_cache_tests	54
 summary	core_tests	249
 summary	render_core_tests	46

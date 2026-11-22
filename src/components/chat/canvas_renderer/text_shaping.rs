@@ -142,17 +142,22 @@ fn advance_before_text_like(builder: &mut LayoutBuilder<'_>) {
     }
 }
 
-/// Whether a link's card shows, or will show once its metadata arrives, an
-/// image: its provider is enabled and its metadata is pending or has one.
-fn link_card_can_show_picture(
+/// Whether a link claims `picture` for its message: its provider is enabled
+/// and its card, pending or resolved, shows that picture
+/// (`link_keeps_picture_claim`).
+fn link_claims_card_picture(
     url: &str,
+    picture: &str,
     metadata: Option<&crate::backend::link_types::EmbedMetadata>,
 ) -> bool {
     let classified = crate::backend::link_types::classify_link(url);
     crate::backend::settings::is_embed_classification_enabled(
         classified.provider,
         classified.content_kind,
-    ) && metadata.is_none_or(|metadata| metadata.thumbnail_url.is_some())
+    ) && crate::backend::link_types::link_keeps_picture_claim(
+        picture,
+        metadata.map(|metadata| metadata.thumbnail_url.as_deref()),
+    )
 }
 
 /// Add spacing before link-like content (URL / mention) so it behaves like text boundaries.
@@ -944,7 +949,8 @@ pub fn build_message_layout(
                 // decision uses the URLs, not which metadata arrived first,
                 // so the kept card never changes; an earlier link claims its
                 // picture while its metadata is pending and releases it only
-                // if its card turns out to have no image.
+                // if its card turns out not to show it. That release arrives
+                // with the link's metadata, which rebuilds the row.
                 let card_picture = crate::backend::link_types::card_picture_key(url);
                 let duplicate_picture = claimed_card_pictures.contains(&card_picture);
                 if !duplicate_picture
@@ -957,7 +963,7 @@ pub fn build_message_layout(
                         }
                         crate::backend::settings::EmbedDisplayMode::Always => true,
                     }
-                    && link_card_can_show_picture(url, metadata_opt.as_ref())
+                    && link_claims_card_picture(url, &card_picture, metadata_opt.as_ref())
                 {
                     claimed_card_pictures.push(card_picture);
                 }
