@@ -707,8 +707,11 @@ observer (`observe_window_visibility`) and the `on_system_sleep` hook.
 3. Regenerate each patch file from its rebased commit with
    `git format-patch -1 <commit> --stdout > <echo>/patches/<name>.patch`
    (`gpui-paint-fork.patch` holds two commits:
-   `git format-patch <new-rev>..<second-commit> --stdout`). Update
-   `scripts/gpui-fork-patches.txt` if the series layout changes.
+   `git format-patch <new-rev>..<second-commit> --stdout`). `git format-patch`
+   writes the fork commit's author into each `From:` header; the patch files are
+   public, so set that header to the GitHub noreply identity before committing
+   (the fork tree, which is all the setup scripts verify, does not depend on
+   it). Update `scripts/gpui-fork-patches.txt` if the series layout changes.
 4. Set `fork-tree` in `scripts/gpui-fork-patches.txt` to the rebased fork's
    `git rev-parse 'HEAD^{tree}'`, and update the `$PinnedRev` and
    `$ExpectedForkTree` literals in `scripts/setup-gpui-fork.ps1` (the release
