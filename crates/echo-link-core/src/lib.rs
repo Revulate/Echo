@@ -7,9 +7,13 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
+mod image_sources;
 pub mod image_uploader;
 mod providers;
 
+pub use image_sources::{
+    TWITCH_LIVE_PREVIEW_FULL_SIZE, full_size_image_candidates, twitch_live_preview_url,
+};
 pub use providers::{
     SpotifyResourceKind, SteamAppSource, parse_spotify_resource_url, parse_steam_app_url,
     valid_steam_app_id,

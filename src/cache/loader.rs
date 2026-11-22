@@ -548,7 +548,7 @@ fn build_embed_thumbnail_http_client() -> reqwest::Client {
         })
 }
 
-fn media_http_client_builder() -> reqwest::ClientBuilder {
+pub(super) fn media_http_client_builder() -> reqwest::ClientBuilder {
     crate::backend::http::with_http2_keep_alive(crate::backend::http::client_builder())
         .read_timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .timeout(std::time::Duration::from_secs(REQUEST_TOTAL_TIMEOUT_SECS))

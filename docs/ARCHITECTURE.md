@@ -131,6 +131,7 @@ flowchart TD
   backend initialization, before the first window; the disk layer's lookups
   wait up to 1 s for its persisted index to load, and its index writes wait
   for the load to finish. `loader.rs` (loading and off-thread decode), `uri_layer.rs`,
+  `inspector_image.rs` (the image preview window's full-size load),
   `native_sizes.rs` and `animation_source.rs` are implemented here; the
   memory, disk and frame layers and the warming tracker come from
   `crates/echo-media-cache`, and the budgets, stats and preload plans from
@@ -269,6 +270,18 @@ flag, window handle and pending-open state in a static
 `components::ui::SingletonWindow` (`src/components/ui/singleton_window.rs`).
 When the stored handle has gone stale, the popout runs its close bookkeeping
 and opens a new window.
+
+The media inspector (the "Image preview" window opened from a link card's
+image) does not use the URI image cache: it shows the card's image at full
+resolution, which the chat image caches never keep. `cache/inspector_image.rs`
+downloads the best rendition the link offers (the original behind a known
+thumbnail URL family, `echo_link_core::full_size_image_candidates`, then the
+card's own image URL) through the link-preview fetch policy, and
+`echo_media_cache::full_resolution` decodes it under its own bounds (16384 px
+per source axis and 256 MiB of decoder allocation; the shown bitmap at most
+8192 px per axis and 32 Mi pixels, plus half-size copies the window paints from
+when it shows the image smaller). The window holds that one image, outside the
+chat's budgets, and releases it when it closes or shows another.
 
 ## Design boundaries
 

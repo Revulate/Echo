@@ -138,9 +138,9 @@ const MAX_ANIMATION_COMPRESSED_SOURCE_BYTES: usize = 20 * 1024 * 1024;
 /// emote tooltip frame (236 px wide); 768 px covers either at 300% DPI.
 /// Provider emote and badge copies (≤ 128 px tall, picker aspect cap 4:1, so
 /// ≤ 512 px wide at 4x) stay below it, so layout that derives logical emote
-/// size from decoded dimensions is unaffected. The large inspector window
-/// loads through GPUI's URI image path, not this decoder. One decoded copy is
-/// bounded to ≤ ~2.4 MB.
+/// size from decoded dimensions is unaffected. The image preview window
+/// decodes originals through [`crate::full_resolution`], not this decoder.
+/// One decoded copy is bounded to ≤ ~2.4 MB.
 const MAX_STATIC_IMAGE_EDGE: u32 = 768;
 
 /// Pre-downscale decoder ceilings for static sources, so a decompression bomb

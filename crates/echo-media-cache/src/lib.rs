@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 pub mod decode;
 pub mod disk;
 pub mod frames;
+pub mod full_resolution;
 pub mod memory;
 pub mod persist;
 pub mod registry;

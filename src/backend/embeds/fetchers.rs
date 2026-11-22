@@ -475,6 +475,20 @@ impl EmbedFetcher {
             return self.create_image_embed(link_info);
         };
         let (content_type, content_length) = response_content_headers(&response);
+        if content_type.as_deref().is_some_and(is_html_content_type) {
+            // A page whose path merely ends in an image extension, such as a
+            // wiki's `File:Photo.jpg` page: preview it from its OpenGraph tags.
+            return self
+                .fetch_generic(&LinkInfo {
+                    link_type: LinkType::Generic,
+                    // Not the "Image" label the extension earned it.
+                    provider_name: crate::backend::link_types::provider_name_for_url(
+                        &link_info.url,
+                    ),
+                    ..link_info.clone()
+                })
+                .await;
+        }
         let mut metadata = self.create_image_embed(link_info);
         metadata.content_type = content_type;
         metadata.content_length = content_length;

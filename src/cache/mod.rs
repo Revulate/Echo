@@ -12,6 +12,7 @@ mod animation_source;
 pub mod budget;
 pub mod disk_layer;
 pub mod frame_layer;
+pub mod inspector_image;
 pub mod loader;
 pub mod native_sizes;
 pub mod service;

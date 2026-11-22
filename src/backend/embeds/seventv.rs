@@ -248,7 +248,14 @@ fn join_cdn_path(base: &str, file: &str) -> Option<String> {
     if file.is_empty() || file.split('/').any(|part| part == "..") {
         return None;
     }
-    Url::parse(base).ok()?.join(file).ok().and_then(|url| {
+    // `host.url` names the emote's directory without a trailing slash; joining
+    // onto it as-is would replace the emote id with the file name.
+    let base = if base.ends_with('/') {
+        Url::parse(base).ok()?
+    } else {
+        Url::parse(&format!("{base}/")).ok()?
+    };
+    base.join(file).ok().and_then(|url| {
         let url = url.to_string();
         normalize_seventv_url(&url, CDN_BASE)
     })
@@ -296,4 +303,48 @@ struct SevenTvUserResponse {
     username: Option<String>,
     #[serde(default)]
     avatar_url: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn host(url: &str, files: &[&str]) -> Option<SevenTvHost> {
+        Some(SevenTvHost {
+            url: url.to_string(),
+            files: files
+                .iter()
+                .map(|name| SevenTvFile {
+                    name: (*name).to_string(),
+                    format: name.rsplit('.').next().unwrap_or_default().to_uppercase(),
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn emote_thumbnail_keeps_the_emote_id_and_picks_the_4x_file() {
+        let id = "01GAZ199Z8000FEWHS6AT5QZV0";
+        let expected = Some(format!("https://cdn.7tv.app/emote/{id}/4x.webp"));
+        // 7TV's API gives a scheme-relative directory without a trailing slash.
+        assert_eq!(
+            emote_thumbnail(
+                &host(
+                    &format!("//cdn.7tv.app/emote/{id}"),
+                    &["1x.webp", "2x.webp", "4x.webp", "4x.avif"]
+                ),
+                id
+            ),
+            expected
+        );
+        assert_eq!(
+            emote_thumbnail(
+                &host(&format!("//cdn.7tv.app/emote/{id}/"), &["4x.webp"]),
+                id
+            ),
+            expected
+        );
+        assert_eq!(emote_thumbnail(&None, id), expected);
+    }
 }
