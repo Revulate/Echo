@@ -201,7 +201,7 @@ checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
 name = "animated-transparency-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo_gpui",
  "gif",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "animation-decode-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo_gpui",
  "zstd",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "badge-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -788,7 +788,7 @@ checksum = "cd17eb909a8c6a894926bfcc3400a4bb0e732f5a57d37b1f14e8b29e329bace8"
 
 [[package]]
 name = "cache-preload-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-cache-policy",
 ]
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "chatters-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "serde",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "check-support"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "tracing",
 ]
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "cold-emote-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo_gpui",
 ]
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "command-inventory-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
 ]
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "cosmetics-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-cosmetics-core",
@@ -1453,7 +1453,7 @@ checksum = "53c8b0c71f20772d107295dbd582d16a4de9cc1b57cc51f2915305c7a7b37996"
 
 [[package]]
 name = "custom-command-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -1493,7 +1493,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "deleted-message-check"
-version = "0.9.38"
+version = "1.1.0"
 
 [[package]]
 name = "deranged"
@@ -1672,14 +1672,14 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "echo-autocomplete-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "echo-cache-policy"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "ahash",
  "dashmap",
@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "echo-chat-render"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "dashmap",
  "echo-core",
@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "echo-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "dashmap",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "echo-cosmetics-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1734,14 +1734,14 @@ dependencies = [
 
 [[package]]
 name = "echo-emote-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "echo-link-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "http",
  "regex",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "echo-media-cache"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "ahash",
  "blake3",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "echo-render-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-core",
  "lru",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "echo-text-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "emojis",
  "serde",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "echo-update-core"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "base64 0.23.1",
  "ring",
@@ -1807,14 +1807,14 @@ dependencies = [
 
 [[package]]
 name = "echo-version"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-update-core",
 ]
 
 [[package]]
 name = "echo_gpui"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "ahash",
  "arboard",
@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "embed-thumbnail-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "serde",
@@ -1934,7 +1934,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "emoji-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "emote-picker-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -1962,14 +1962,14 @@ dependencies = [
 
 [[package]]
 name = "emote-provider-visibility-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-emote-core",
 ]
 
 [[package]]
 name = "emote-quality-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-emote-core",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "event-text-check"
-version = "0.9.38"
+version = "1.1.0"
 
 [[package]]
 name = "extended"
@@ -2112,7 +2112,7 @@ checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
 name = "fakemsg-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "twitch-irc",
@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "filter-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-format-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo_gpui",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-image-retry-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "futures",
  "gpui",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-scene-bench"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "criterion",
  "echo_gpui",
@@ -3074,7 +3074,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helix-command-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "serde_json",
@@ -3095,14 +3095,14 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "highlight-priority-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-core",
 ]
 
 [[package]]
 name = "history-filter-check"
-version = "0.9.38"
+version = "1.1.0"
 
 [[package]]
 name = "hkdf"
@@ -3666,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "layout-persistence-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "dirs 7.0.0",
@@ -3730,7 +3730,7 @@ checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 
 [[package]]
 name = "link-open-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "open",
@@ -3769,7 +3769,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local-command-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
 ]
@@ -3918,7 +3918,7 @@ dependencies = [
 
 [[package]]
 name = "message-retention-check"
-version = "0.9.38"
+version = "1.1.0"
 
 [[package]]
 name = "mimalloc"
@@ -3984,7 +3984,7 @@ dependencies = [
 
 [[package]]
 name = "mod-button-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "serde",
@@ -4587,7 +4587,7 @@ dependencies = [
 
 [[package]]
 name = "observer-overflow-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -5092,11 +5092,11 @@ dependencies = [
 
 [[package]]
 name = "profile-log-check"
-version = "0.9.38"
+version = "1.1.0"
 
 [[package]]
 name = "profile-summary-check"
-version = "0.9.38"
+version = "1.1.0"
 
 [[package]]
 name = "profiling"
@@ -5152,7 +5152,7 @@ dependencies = [
 
 [[package]]
 name = "provider-index-bench"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo_gpui",
 ]
@@ -5177,7 +5177,7 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-switch-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-core",
@@ -5521,7 +5521,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "render-unit-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "smallvec",
@@ -5591,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "resource-bench"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-core",
  "smallvec",
@@ -5941,7 +5941,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scroll-marker-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-core",
 ]
@@ -5954,7 +5954,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search-bench"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-core",
 ]
@@ -5984,7 +5984,7 @@ dependencies = [
 
 [[package]]
 name = "selection-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-render-core",
@@ -6202,7 +6202,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "similarity-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-text-core",
@@ -6302,7 +6302,7 @@ dependencies = [
 
 [[package]]
 name = "sound-event-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "echo-core",
 ]
@@ -6357,7 +6357,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streamer-mode-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "dirs 7.0.0",
@@ -6694,7 +6694,7 @@ dependencies = [
 
 [[package]]
 name = "theme-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "serde",
@@ -7200,7 +7200,7 @@ dependencies = [
 
 [[package]]
 name = "twitch-command-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
 ]
@@ -7328,7 +7328,7 @@ checksum = "7dbe8d477efbc6c70a1dea1f9f1e0482168983a9147dee6b3a619f666f3aeac6"
 
 [[package]]
 name = "upload-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "echo-link-core",
@@ -7360,7 +7360,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "usernotice-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
 ]
@@ -7933,7 +7933,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-check"
-version = "0.9.38"
+version = "1.1.0"
 dependencies = [
  "check-support",
  "dashmap",
