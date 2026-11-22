@@ -23,6 +23,9 @@ const SUBTITLE_MAX_LEN: usize = 100;
 #[derive(Clone, Debug, PartialEq)]
 pub struct TwitchEmbedResult {
     pub thumbnail_url: Option<String>,
+    /// The full-size image behind `thumbnail_url`, which the image preview
+    /// window opens; `None` leaves the card's thumbnail opening the link.
+    pub image_url: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub subtitle: Option<String>,
@@ -37,6 +40,13 @@ impl TwitchEmbedResult {
         self,
         link_info: crate::backend::link_types::LinkInfo,
     ) -> crate::backend::link_types::EmbedMetadata {
+        let media = self
+            .image_url
+            .map(|source_url| crate::backend::link_types::MediaAsset {
+                kind: crate::backend::link_types::MediaKind::Image,
+                source_url,
+                poster_url: self.thumbnail_url.clone(),
+            });
         crate::backend::link_types::EmbedMetadata {
             link_info,
             thumbnail_url: self.thumbnail_url,
@@ -46,7 +56,7 @@ impl TwitchEmbedResult {
             duration: self.duration,
             content_type: None,
             content_length: None,
-            media: None,
+            media,
             state: self.state,
         }
     }
@@ -63,6 +73,7 @@ pub fn fetch_clip(clip_slug: &str) -> TwitchEmbedResult {
         thumbnail_url: Some(format!(
             "https://clips-media-assets2.twitch.tv/{clip_slug}-preview-480x272.jpg"
         )),
+        image_url: None,
         title: None,
         description: None,
         subtitle: Some("Twitch Clip".to_string()),
@@ -87,6 +98,7 @@ pub async fn fetch_vod(original_url: &str, vod_id: &str) -> TwitchEmbedResult {
         let author = non_empty(video.author_name).or_else(|| non_empty(video.author_login));
         return TwitchEmbedResult {
             thumbnail_url: video.thumbnail_url.and_then(non_empty),
+            image_url: None,
             title: bounded_opt(Some(video.title), TITLE_MAX_LEN),
             description: bounded_opt(video.description, DESCRIPTION_MAX_LEN),
             subtitle: author.and_then(|value| bounded_opt(Some(value), SUBTITLE_MAX_LEN)),
@@ -147,15 +159,28 @@ pub async fn fetch_channel(original_url: &str, channel_login: &str) -> TwitchEmb
             (_, Some(game), None) => Some(game),
             _ => Some("Twitch".to_string()),
         };
-        let poster = stream
+        let stream_template = stream
             .as_ref()
-            .and_then(|stream| stream.thumbnail_url.as_deref())
-            .and_then(render_stream_thumbnail)
-            .or_else(|| {
-                profile
-                    .as_ref()
-                    .and_then(|profile| profile.profile_image_url.clone())
-            });
+            .and_then(|stream| stream.thumbnail_url.as_deref());
+        let profile_image = profile
+            .as_ref()
+            .and_then(|profile| profile.profile_image_url.clone());
+        // The card shows the stream at 640x360; its image preview opens the
+        // same frame at the template's largest size.
+        let (poster, image_url) = match stream_template
+            .and_then(|template| render_stream_thumbnail(template, (640, 360)))
+        {
+            Some(poster) => (
+                Some(poster),
+                stream_template.and_then(|template| {
+                    render_stream_thumbnail(
+                        template,
+                        crate::backend::link_types::TWITCH_LIVE_PREVIEW_FULL_SIZE,
+                    )
+                }),
+            ),
+            None => (profile_image.clone(), profile_image),
+        };
         let description = profile
             .as_ref()
             .and_then(|profile| profile.description.clone())
@@ -163,6 +188,7 @@ pub async fn fetch_channel(original_url: &str, channel_login: &str) -> TwitchEmb
 
         return TwitchEmbedResult {
             thumbnail_url: poster.and_then(non_empty),
+            image_url: image_url.and_then(non_empty),
             title: title.and_then(|value| bounded_opt(Some(value), TITLE_MAX_LEN)),
             description: bounded_opt(description, DESCRIPTION_MAX_LEN),
             subtitle: subtitle.and_then(|value| bounded_opt(Some(value), SUBTITLE_MAX_LEN)),
@@ -219,6 +245,7 @@ async fn fetch_open_graph(original_url: &str) -> Option<TwitchEmbedResult> {
     (title.is_some() || thumbnail_url.is_some() || description.is_some()).then(|| {
         TwitchEmbedResult {
             thumbnail_url: thumbnail_url.and_then(non_empty),
+            image_url: None,
             title: bounded_opt(title, TITLE_MAX_LEN),
             description: bounded_opt(description, DESCRIPTION_MAX_LEN),
             subtitle: bounded_opt(subtitle, SUBTITLE_MAX_LEN),
@@ -228,12 +255,12 @@ async fn fetch_open_graph(original_url: &str) -> Option<TwitchEmbedResult> {
     })
 }
 
-fn render_stream_thumbnail(template: &str) -> Option<String> {
+fn render_stream_thumbnail(template: &str, (width, height): (u32, u32)) -> Option<String> {
     let template = template.trim();
     (!template.is_empty()).then(|| {
         template
-            .replace("{width}", "640")
-            .replace("{height}", "360")
+            .replace("{width}", &width.to_string())
+            .replace("{height}", &height.to_string())
     })
 }
 
@@ -281,6 +308,7 @@ fn non_empty(value: String) -> Option<String> {
 fn basic(subtitle: &str) -> TwitchEmbedResult {
     TwitchEmbedResult {
         thumbnail_url: None,
+        image_url: None,
         title: None,
         description: None,
         subtitle: Some(subtitle.to_string()),
@@ -292,6 +320,7 @@ fn basic(subtitle: &str) -> TwitchEmbedResult {
 fn failed() -> TwitchEmbedResult {
     TwitchEmbedResult {
         thumbnail_url: None,
+        image_url: None,
         title: None,
         description: None,
         subtitle: None,

@@ -142,6 +142,19 @@ fn advance_before_text_like(builder: &mut LayoutBuilder<'_>) {
     }
 }
 
+/// Whether a link's card shows, or will show once its metadata arrives, an
+/// image: its provider is enabled and its metadata is pending or has one.
+fn link_card_can_show_picture(
+    url: &str,
+    metadata: Option<&crate::backend::link_types::EmbedMetadata>,
+) -> bool {
+    let classified = crate::backend::link_types::classify_link(url);
+    crate::backend::settings::is_embed_classification_enabled(
+        classified.provider,
+        classified.content_kind,
+    ) && metadata.is_none_or(|metadata| metadata.thumbnail_url.is_some())
+}
+
 /// Add spacing before link-like content (URL / mention) so it behaves like text boundaries.
 #[inline]
 fn advance_before_link_like(builder: &mut LayoutBuilder<'_>) {
@@ -747,6 +760,9 @@ pub fn build_message_layout(
         u32,
         crate::backend::link_types::EmbedMetadata,
     )> = Vec::new();
+    // Pictures an earlier link of this message shows, or will show once its
+    // metadata arrives: a later link to the same picture gets no card.
+    let mut claimed_card_pictures: Vec<String> = Vec::new();
     let upload_success_url = match msg.flags.system_type.as_ref() {
         Some(crate::backend::models::SystemMessageType::UploadSuccess { url, .. }) => {
             Some(url.as_str())
@@ -922,7 +938,31 @@ pub fn build_message_layout(
                             metadata_opt.is_some()
                         }
                     };
+                // One card per picture: a later link to a picture an earlier
+                // link's card shows (the bot's `-p` line names the channel
+                // and then its stream preview) stays a plain link. The
+                // decision uses the URLs, not which metadata arrived first,
+                // so the kept card never changes; an earlier link claims its
+                // picture while its metadata is pending and releases it only
+                // if its card turns out to have no image.
+                let card_picture = crate::backend::link_types::card_picture_key(url);
+                let duplicate_picture = claimed_card_pictures.contains(&card_picture);
+                if !duplicate_picture
+                    && !hide_link_url
+                    && !suppress_rich_preview
+                    && match embed_mode {
+                        crate::backend::settings::EmbedDisplayMode::None => false,
+                        crate::backend::settings::EmbedDisplayMode::Click => {
+                            is_embed_expanded_state(&msg.id, embed_id, url)
+                        }
+                        crate::backend::settings::EmbedDisplayMode::Always => true,
+                    }
+                    && link_card_can_show_picture(url, metadata_opt.as_ref())
+                {
+                    claimed_card_pictures.push(card_picture);
+                }
                 if should_show_preview
+                    && !duplicate_picture
                     && deferred_embeds.len() < MAX_EMBEDS_PER_MESSAGE
                     && let Some(metadata) = metadata_opt
                 {

@@ -236,9 +236,165 @@ fn youtube_larger(url: &Url) -> Vec<String> {
         .collect()
 }
 
+/// Which picture a link's preview card would show, as far as the link itself
+/// says, so two links in one message that would show the same picture get one
+/// card. Links of the same picture share a key:
+///
+/// - a Twitch channel link and a live preview image of that channel, at any
+///   size, in the `{width}x{height}` template form, or with a query;
+/// - a YouTube video link and that video's thumbnail images;
+/// - otherwise only the same URL (ignoring a fragment).
+///
+/// The key depends on the URL alone, never on fetched metadata, so which card
+/// a message keeps cannot change as metadata arrives.
+pub fn card_picture_key(url: &str) -> String {
+    let trimmed = url.trim();
+    let with_scheme;
+    let url = if trimmed.contains("://") {
+        trimmed
+    } else {
+        with_scheme = format!("https://{trimmed}");
+        &with_scheme
+    };
+    let link = crate::get_link_type(url);
+    match link.link_type {
+        crate::LinkType::TwitchChannel => {
+            if let Some(login) = link.channel_login {
+                return format!("twitch-live:{}", login.to_ascii_lowercase());
+            }
+        }
+        crate::LinkType::YouTube => {
+            if let Some(video_id) = link.video_id {
+                return format!("youtube:{video_id}");
+            }
+        }
+        _ => {}
+    }
+    let Ok(mut parsed) = Url::parse(url) else {
+        return format!("url:{trimmed}");
+    };
+    if let Some(preview) = parse_twitch_live_preview(&parsed) {
+        return format!("twitch-live:{}", preview.login.to_ascii_lowercase());
+    }
+    if let Some(video_id) = youtube_thumbnail_video_id(&parsed) {
+        return format!("youtube:{video_id}");
+    }
+    parsed.set_fragment(None);
+    format!("url:{parsed}")
+}
+
+/// The video id of an `i.ytimg.com`/`img.youtube.com` `/vi/<id>/<file>` (or
+/// `/vi_webp/`) thumbnail.
+fn youtube_thumbnail_video_id(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host != "i.ytimg.com" && host != "img.youtube.com" {
+        return None;
+    }
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    match segments.as_slice() {
+        ["vi" | "vi_webp", video_id, _file] if !video_id.is_empty() => {
+            Some((*video_id).to_string())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LIVE_LINE: &str = "https://twitch.tv/somechannel";
+    const LIVE_PREVIEW: &str =
+        "https://static-cdn.jtvnw.net/previews-ttv/live_user_somechannel-1920x1080.jpg";
+
+    #[test]
+    fn the_bots_live_line_names_one_picture_twice() {
+        // `-p somechannel` for a live channel: the channel link first, the
+        // stream's 1080p preview last.
+        assert_eq!(card_picture_key(LIVE_LINE), card_picture_key(LIVE_PREVIEW));
+        assert_eq!(
+            card_picture_key("twitch.tv/somechannel"),
+            card_picture_key(LIVE_PREVIEW)
+        );
+    }
+
+    #[test]
+    fn sized_and_template_previews_match_the_channel_in_either_order() {
+        for preview in [
+            "https://static-cdn.jtvnw.net/previews-ttv/live_user_somechannel-640x360.jpg",
+            "https://static-cdn.jtvnw.net/previews-ttv/live_user_SomeChannel-{width}x{height}.jpg",
+            "https://static-cdn.jtvnw.net/previews-ttv/live_user_somechannel-1280x720.jpg?t=1700000000",
+        ] {
+            assert_eq!(
+                card_picture_key(preview),
+                card_picture_key(LIVE_PREVIEW),
+                "{preview}"
+            );
+            assert_eq!(
+                card_picture_key(LIVE_LINE),
+                card_picture_key(preview),
+                "{preview}"
+            );
+        }
+        assert_eq!(
+            card_picture_key("https://www.twitch.tv/SomeChannel"),
+            card_picture_key(LIVE_LINE)
+        );
+    }
+
+    #[test]
+    fn different_logins_and_unrelated_images_stay_apart() {
+        assert_ne!(
+            card_picture_key("https://twitch.tv/otherchannel"),
+            card_picture_key(LIVE_PREVIEW)
+        );
+        assert_ne!(
+            card_picture_key(LIVE_LINE),
+            card_picture_key("https://upload.wikimedia.org/wikipedia/commons/b/b6/Cat.jpg")
+        );
+        // A clip or VOD is not the channel's live picture.
+        assert_ne!(
+            card_picture_key("https://www.twitch.tv/videos/123456"),
+            card_picture_key(LIVE_LINE)
+        );
+    }
+
+    #[test]
+    fn identical_links_share_a_key_and_different_pictures_do_not() {
+        let cat = "https://upload.wikimedia.org/wikipedia/commons/b/b6/Cat.jpg";
+        assert_eq!(card_picture_key(cat), card_picture_key(cat));
+        assert_eq!(
+            card_picture_key(cat),
+            card_picture_key(&format!("{cat}#top"))
+        );
+        assert_ne!(
+            card_picture_key(cat),
+            card_picture_key("https://upload.wikimedia.org/wikipedia/commons/2/2c/Earth.gif")
+        );
+        // The offline line has one link: nothing to pair it with.
+        assert_eq!(
+            card_picture_key("twitch.tv/somechannel"),
+            "twitch-live:somechannel"
+        );
+    }
+
+    #[test]
+    fn youtube_videos_and_their_thumbnails_share_a_key() {
+        let video = card_picture_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(card_picture_key("https://youtu.be/dQw4w9WgXcQ"), video);
+        assert_eq!(
+            card_picture_key("https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"),
+            video
+        );
+        assert_eq!(
+            card_picture_key("https://img.youtube.com/vi/dQw4w9WgXcQ/mqdefault.jpg"),
+            video
+        );
+        assert_ne!(
+            card_picture_key("https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg"),
+            video
+        );
+    }
 
     #[test]
     fn wikimedia_thumbnail_maps_to_the_original_upload() {
