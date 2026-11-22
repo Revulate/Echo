@@ -23,12 +23,27 @@
 //!   copies down to [`MIN_LEVEL_EDGE`], and the window paints the smallest one
 //!   that is still at least as large as the area it fills. The chain adds at
 //!   most a third to the shown bitmap's size.
-//! - Animation (GIF, animated WebP): every frame at its native size while the
-//!   frames together stay within [`MAX_ANIMATION_BYTES`] and
-//!   [`MAX_ANIMATION_FRAMES`]; a larger animation is shown as its first frame.
+//! - Animation (GIF, animated WebP): every frame at its native size while each
+//!   frame is at most [`MAX_ANIMATION_FRAME_BYTES`] and the frames together stay
+//!   within [`MAX_ANIMATION_BYTES`] and [`MAX_ANIMATION_FRAMES`]; a larger
+//!   animation is shown as its first frame.
+//!
+//! Peak memory of one decode, besides the compressed body (at most 32 MiB):
+//!
+//! - Still: the decoded source (at most [`MAX_DECODE_ALLOC_BYTES`], 256 MiB)
+//!   plus one 8-bit RGBA copy at the shown size (at most 128 MiB), so at most
+//!   384 MiB. Every reduction is an integer box filter
+//!   (`imageops::thumbnail`), which allocates only its output: `resize_exact`
+//!   would build a 32-bit float image of source width by new height (16 bytes
+//!   a pixel) beside the source, over 1 GiB for an 8192x8192 PNG. The source is
+//!   dropped as soon as its reduced or converted copy exists, and each
+//!   half-size copy is made from the RGBA level above it.
+//! - Animation: the frames kept so far (at most 128 MiB) plus the decoder's
+//!   own canvas and frame buffers and the next frame, each at most
+//!   [`MAX_ANIMATION_FRAME_BYTES`]: about 224 MiB at worst.
 
 use gpui::RenderImage;
-use image::{AnimationDecoder, DynamicImage, Frame, ImageDecoder, ImageFormat, ImageReader};
+use image::{AnimationDecoder, Frame, ImageDecoder, ImageFormat, ImageReader};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -42,6 +57,8 @@ pub const MAX_SHOWN_EDGE: u32 = 8_192;
 pub const MAX_SHOWN_PIXELS: u64 = 32 * 1024 * 1024;
 /// Largest total BGRA size of an animation's frames.
 pub const MAX_ANIMATION_BYTES: u64 = 128 * 1024 * 1024;
+/// Largest BGRA size of one animation frame (4096x2048, for example).
+pub const MAX_ANIMATION_FRAME_BYTES: u64 = 32 * 1024 * 1024;
 /// Most frames kept from one animation.
 pub const MAX_ANIMATION_FRAMES: usize = 1024;
 /// The reduced-copy chain stops once a copy's longest edge is at most this.
@@ -148,21 +165,24 @@ pub fn decode_full_resolution(bytes: &[u8]) -> Result<FullResolutionImage, FullR
         _ => FullResolutionError::Corrupt,
     })?;
     let shown = shown_size(decoded.width(), decoded.height());
-    let decoded = if shown == (decoded.width(), decoded.height()) {
+    // Reduce in the source's own pixel type, so a large RGB photo is never
+    // widened to RGBA at full size, then let the source go before anything
+    // else is allocated (see the peak in the module docs).
+    let reduced = if shown == (decoded.width(), decoded.height()) {
         decoded
     } else {
-        // Downscale in the source's own pixel type, so a large RGB photo is
-        // never widened to RGBA at full size first.
-        decoded.resize_exact(shown.0, shown.1, image::imageops::FilterType::CatmullRom)
+        let reduced = decoded.thumbnail_exact(shown.0, shown.1);
+        drop(decoded);
+        reduced
     };
     let mut levels = Vec::new();
-    let mut level = decoded;
+    let mut level = reduced.into_rgba8();
     loop {
         let next = (level.width().max(level.height()) > MIN_LEVEL_EDGE).then(|| {
-            level.resize_exact(
+            image::imageops::thumbnail(
+                &level,
                 (level.width() / 2).max(1),
                 (level.height() / 2).max(1),
-                image::imageops::FilterType::Triangle,
             )
         });
         levels.push(Arc::new(RenderImage::new(vec![bgra_frame(level)])));
@@ -211,12 +231,19 @@ fn decode_animation(bytes: &[u8], format: ImageFormat, width: u32, height: u32) 
 }
 
 fn collect_frames(frames: image::Frames<'_>, width: u32, height: u32) -> Animation {
-    if width.max(height) > MAX_SHOWN_EDGE {
+    let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    if width.max(height) > MAX_SHOWN_EDGE || frame_bytes > MAX_ANIMATION_FRAME_BYTES {
         return Animation::OverCaps;
     }
-    let frame_bytes = u64::from(width) * u64::from(height) * 4;
     let mut collected = Vec::new();
     for frame in frames {
+        // Checked before this frame joins the kept ones, so the kept frames
+        // never exceed the caps; the frame just decoded is the one extra.
+        if collected.len() >= MAX_ANIMATION_FRAMES
+            || frame_bytes.saturating_mul(collected.len() as u64 + 1) > MAX_ANIMATION_BYTES
+        {
+            return Animation::OverCaps;
+        }
         let Ok(frame) = frame else {
             // A broken frame mid-stream: show the first frame as a still
             // rather than loop a partial animation.
@@ -226,10 +253,6 @@ fn collect_frames(frames: image::Frames<'_>, width: u32, height: u32) -> Animati
                 Animation::OverCaps
             };
         };
-        let next_total = frame_bytes.saturating_mul(collected.len() as u64 + 1);
-        if collected.len() >= MAX_ANIMATION_FRAMES || next_total > MAX_ANIMATION_BYTES {
-            return Animation::OverCaps;
-        }
         if frame.buffer().dimensions() != (width, height) {
             return Animation::Still;
         }
@@ -245,8 +268,7 @@ fn collect_frames(frames: image::Frames<'_>, width: u32, height: u32) -> Animati
     }
 }
 
-fn bgra_frame(image: DynamicImage) -> Frame {
-    let mut buffer = image.into_rgba8();
+fn bgra_frame(mut buffer: image::RgbaImage) -> Frame {
     crate::decode::convert_to_gpu_format_in_place(&mut buffer);
     Frame::new(buffer)
 }
@@ -254,7 +276,7 @@ fn bgra_frame(image: DynamicImage) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{Delay, RgbaImage};
+    use image::{Delay, DynamicImage, RgbaImage};
 
     fn encode(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
@@ -345,5 +367,142 @@ mod tests {
         assert_eq!(decoded.levels[0].frame_count(), 3);
         assert_eq!(decoded.shown_size, (40, 30));
         assert!(!decoded.animation_reduced_to_still);
+    }
+
+    fn gif(width: u32, height: u32, frames: usize) -> Vec<u8> {
+        let frames = (0..frames).map(|index| {
+            let mut buffer = RgbaImage::new(width, height);
+            buffer.put_pixel(index as u32 % width, 0, image::Rgba([255, 0, 0, 255]));
+            Frame::from_parts(buffer, 0, 0, Delay::from_numer_denom_ms(20, 1))
+        });
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(&mut bytes, 30);
+            encoder.encode_frames(frames).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn an_animation_over_its_caps_shows_its_first_frame() {
+        let decoded = decode_full_resolution(&gif(4, 3, MAX_ANIMATION_FRAMES + 1)).unwrap();
+        assert!(decoded.animation_reduced_to_still);
+        assert_eq!(decoded.frame_count, 1);
+        assert_eq!(decoded.levels[0].frame_count(), 1);
+        assert_eq!(decoded.shown_size, (4, 3));
+    }
+
+    /// Bytes allocated on the measuring thread, counted only inside
+    /// [`peak_allocation`]. The decoder runs on the calling thread, so tests
+    /// running in parallel do not disturb the count.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNTING: Cell<bool> = const { Cell::new(false) };
+            static CURRENT: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        fn record(delta: isize) {
+            let _ = COUNTING.try_with(|counting| {
+                if counting.get() {
+                    let current = CURRENT.get() + delta;
+                    CURRENT.set(current);
+                    PEAK.set(PEAK.get().max(current));
+                }
+            });
+        }
+
+        pub struct ThreadCountingAllocator;
+
+        // SAFETY: every call forwards to `System` unchanged; the bookkeeping
+        // only touches allocation-free thread-local cells.
+        unsafe impl GlobalAlloc for ThreadCountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let pointer = unsafe { System.alloc(layout) };
+                if !pointer.is_null() {
+                    record(layout.size() as isize);
+                }
+                pointer
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let pointer = unsafe { System.alloc_zeroed(layout) };
+                if !pointer.is_null() {
+                    record(layout.size() as isize);
+                }
+                pointer
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(pointer, layout) };
+                record(-(layout.size() as isize));
+            }
+
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                let moved = unsafe { System.realloc(pointer, layout, size) };
+                if !moved.is_null() {
+                    record(size as isize - layout.size() as isize);
+                }
+                moved
+            }
+        }
+
+        /// Run `work` and return its result with the most bytes it held at once.
+        pub fn peak_allocation<T>(work: impl FnOnce() -> T) -> (T, usize) {
+            CURRENT.set(0);
+            PEAK.set(0);
+            COUNTING.set(true);
+            let result = work();
+            COUNTING.set(false);
+            (result, PEAK.get().max(0) as usize)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: counting::ThreadCountingAllocator = counting::ThreadCountingAllocator;
+
+    const MIB: usize = 1024 * 1024;
+
+    #[test]
+    fn decoding_stays_within_the_stated_peak() {
+        // A one-colour 8192x8192 PNG is about 1 MiB on disk and anyone can
+        // link it: 256 MiB decoded, shown at 5792x5792 (128 MiB). The bound
+        // is the decoded source plus one shown-size RGBA copy (384 MiB), with
+        // a little room for the decoder's own buffers.
+        let png = encode(
+            &DynamicImage::ImageRgba8(RgbaImage::new(8192, 8192)),
+            ImageFormat::Png,
+        );
+        let (decoded, peak) = counting::peak_allocation(|| decode_full_resolution(&png).unwrap());
+        assert_eq!(decoded.shown_size, (5792, 5792));
+        assert!(peak <= 400 * MIB, "8192x8192 peak {} MiB", peak / MIB);
+        drop(decoded);
+
+        // An RGB photo at the shown-pixel cap keeps its size; its RGBA copy and
+        // reduced copies must not stack on the source.
+        let jpeg = encode(
+            &DynamicImage::ImageRgb8(image::RgbImage::new(4400, 4600)),
+            ImageFormat::Jpeg,
+        );
+        let (decoded, peak) = counting::peak_allocation(|| decode_full_resolution(&jpeg).unwrap());
+        assert_eq!(decoded.shown_size, (4400, 4600));
+        assert!(peak <= 200 * MIB, "4400x4600 peak {} MiB", peak / MIB);
+    }
+
+    #[test]
+    fn a_large_animation_stays_within_the_stated_peak() {
+        // 16 frames of 1024x1024 (4 MiB each) fill half the animation budget.
+        let bytes = gif(1024, 1024, 16);
+        let (decoded, peak) = counting::peak_allocation(|| decode_full_resolution(&bytes).unwrap());
+        assert_eq!(decoded.frame_count, 16);
+        // The kept frames (64 MiB) plus a few frame-sized decoder buffers.
+        assert!(
+            peak <= 64 * MIB + 5 * 4 * MIB,
+            "animation peak {} MiB",
+            peak / MIB
+        );
     }
 }

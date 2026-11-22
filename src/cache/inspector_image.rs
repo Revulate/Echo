@@ -8,7 +8,8 @@
 //!
 //! Every request goes through the link-preview fetch policy: public addresses
 //! only, after DNS and on every redirect. Loads run one at a time, and a load
-//! whose window no longer wants it stops before its next request or decode.
+//! whose window no longer wants it (closed, or pointed at another image) stops
+//! at once, mid-download included, so it never holds up the next one.
 
 use echo_media_cache::full_resolution::{FullResolutionError, FullResolutionImage};
 use std::sync::LazyLock;
@@ -64,9 +65,9 @@ pub enum InspectorLoadError {
 pub fn load(
     candidates: Vec<String>,
 ) -> oneshot::Receiver<Result<InspectorImage, InspectorLoadError>> {
-    let (sender, receiver) = oneshot::channel();
+    let (mut sender, receiver) = oneshot::channel();
     crate::backend::bridge::get_runtime().spawn(async move {
-        let Ok(_slot) = LOAD_SLOT.acquire().await else {
+        let Some(Ok(_slot)) = unless_abandoned(&mut sender, LOAD_SLOT.acquire()).await else {
             return;
         };
         let mut result = Err(InspectorLoadError::Network);
@@ -74,10 +75,12 @@ pub fn load(
             if sender.is_closed() {
                 return;
             }
-            result = load_one(url, &sender).await.map(|decoded| InspectorImage {
-                decoded,
-                candidate_index,
-            });
+            result = load_one(url, &mut sender)
+                .await
+                .map(|decoded| InspectorImage {
+                    decoded,
+                    candidate_index,
+                });
             if result.is_ok() {
                 break;
             }
@@ -89,7 +92,7 @@ pub fn load(
 
 async fn load_one<T>(
     url: &str,
-    sender: &oneshot::Sender<T>,
+    sender: &mut oneshot::Sender<T>,
 ) -> Result<FullResolutionImage, InspectorLoadError> {
     let host = url::Url::parse(url)
         .ok()
@@ -98,12 +101,15 @@ async fn load_one<T>(
     if !crate::backend::embeds::fetchers::is_public_fetch_url(url) {
         return Err(InspectorLoadError::Blocked);
     }
-    let bytes = fetch(url).await.inspect_err(|error| {
+    // A dropped receiver ends the download here rather than at the 60 s
+    // deadline, releasing the load slot for the image the user wants now.
+    let Some(bytes) = unless_abandoned(sender, fetch(url)).await else {
+        crate::log_cache!(debug, host = %host, "Image preview download abandoned");
+        return Err(InspectorLoadError::Network);
+    };
+    let bytes = bytes.inspect_err(|error| {
         crate::log_cache!(debug, host = %host, ?error, "Image preview download failed");
     })?;
-    if sender.is_closed() {
-        return Err(InspectorLoadError::Network);
-    }
     let decoded = tokio::task::spawn_blocking(move || {
         echo_media_cache::full_resolution::decode_full_resolution(&bytes)
     })
@@ -124,6 +130,18 @@ async fn load_one<T>(
         Err(error) => crate::log_cache!(debug, host = %host, ?error, "Image preview decode failed"),
     }
     decoded
+}
+
+/// `work`'s output, or `None` as soon as `sender`'s receiver is dropped: the
+/// window closed or moved on to another image.
+async fn unless_abandoned<T, R>(
+    sender: &mut oneshot::Sender<T>,
+    work: impl std::future::Future<Output = R>,
+) -> Option<R> {
+    tokio::select! {
+        output = work => Some(output),
+        () = sender.closed() => None,
+    }
 }
 
 async fn fetch(url: &str) -> Result<Vec<u8>, InspectorLoadError> {
@@ -153,4 +171,31 @@ async fn fetch(url: &str) -> Result<Vec<u8>, InspectorLoadError> {
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn a_superseded_load_stops_waiting_at_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // A download that never finishes, like a trickling server, ends as
+            // soon as the window drops its receiver.
+            let (mut sender, receiver) = oneshot::channel::<()>();
+            let waiting = unless_abandoned(&mut sender, std::future::pending::<()>());
+            drop(receiver);
+            let outcome = tokio::time::timeout(Duration::from_secs(1), waiting).await;
+            assert_eq!(outcome, Ok(None));
+
+            // Work that finishes while the receiver is alive keeps its output.
+            let (mut sender, _receiver) = oneshot::channel::<()>();
+            assert_eq!(unless_abandoned(&mut sender, async { 7 }).await, Some(7));
+        });
+    }
 }

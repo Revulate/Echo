@@ -651,6 +651,7 @@ root_test	src/backend/ui_actions.rs	filled_queues_and_requeued_jumps_wake_the_pe
 root_test	src/bench/mod.rs	lightweight_offline_mode_requires_an_isolated_profile
 root_test	src/bench/mod.rs	offline_and_live_benchmarks_reject_outbound_user_actions
 root_test	src/cache/animation_source.rs	frame_reads_reuse_a_context_and_match_bulk_decompress
+root_test	src/cache/inspector_image.rs	a_superseded_load_stops_waiting_at_once
 root_test	src/cache/native_sizes.rs	bounded_insertion_evicts_oldest
 root_test	src/cache/native_sizes.rs	encoding_round_trips_and_rejects_truncation
 root_test	src/components/chat/canvas_renderer/async_layout.rs	fenced_ready_layout_stays_fenced
@@ -939,8 +940,11 @@ media_cache_test	crates/echo-media-cache/src/frames.rs	stable_frame_reports_the_
 media_cache_test	crates/echo-media-cache/src/frames.rs	test_animation_time
 media_cache_test	crates/echo-media-cache/src/frames.rs	test_frame_layer_basic
 media_cache_test	crates/echo-media-cache/src/frames.rs	two_frame_seam_probe_never_jumps_to_early_frame_zero
+media_cache_test	crates/echo-media-cache/src/full_resolution.rs	a_large_animation_stays_within_the_stated_peak
 media_cache_test	crates/echo-media-cache/src/full_resolution.rs	a_large_still_decodes_at_its_native_size
+media_cache_test	crates/echo-media-cache/src/full_resolution.rs	an_animation_over_its_caps_shows_its_first_frame
 media_cache_test	crates/echo-media-cache/src/full_resolution.rs	animated_gifs_keep_every_frame_at_native_size
+media_cache_test	crates/echo-media-cache/src/full_resolution.rs	decoding_stays_within_the_stated_peak
 media_cache_test	crates/echo-media-cache/src/full_resolution.rs	decompression_bombs_are_refused_before_decoding
 media_cache_test	crates/echo-media-cache/src/full_resolution.rs	non_images_are_rejected
 media_cache_test	crates/echo-media-cache/src/full_resolution.rs	shown_size_never_upscales_and_fits_both_caps
@@ -990,7 +994,7 @@ chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_force_
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_growth_respects_hysteresis_threshold
 chat_render_test	crates/echo-chat-render/src/width_bucket.rs	width_bucket_shrink_respects_hysteresis_threshold
 summary	contract_tools	38
-summary	root_tests	468
+summary	root_tests	469
 summary	cache_preload_tool_tests	1
 summary	autocomplete_core_tests	30
 summary	cache_policy_tests	20
@@ -998,7 +1002,7 @@ summary	chat_render_tests	28
 summary	cosmetics_core_tests	6
 summary	emote_core_tests	15
 summary	link_core_tests	36
-summary	media_cache_tests	51
+summary	media_cache_tests	54
 summary	core_tests	249
 summary	render_core_tests	46
 summary	text_core_tests	26

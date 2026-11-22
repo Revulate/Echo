@@ -223,10 +223,12 @@ fn youtube_larger(url: &Url) -> Vec<String> {
     let Some(["vi", video_id, file]) = segments.as_deref() else {
         return Vec::new();
     };
-    if !matches!(
-        *file,
-        "default.jpg" | "mqdefault.jpg" | "hqdefault.jpg" | "sddefault.jpg"
-    ) {
+    if !crate::is_youtube_video_id(video_id)
+        || !matches!(
+            *file,
+            "default.jpg" | "mqdefault.jpg" | "hqdefault.jpg" | "sddefault.jpg"
+        )
+    {
         return Vec::new();
     }
     ["maxresdefault.jpg", "sddefault.jpg", "hqdefault.jpg"]
@@ -531,6 +533,13 @@ mod tests {
             full_size_image_candidates("https://i.ytimg.com/vi/dQw4w9WgXcQ/sddefault.jpg"),
             vec!["https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg".to_string()]
         );
+        // Only a real 11-character video id is copied into a candidate URL.
+        for source in [
+            "https://i.ytimg.com/vi/short/mqdefault.jpg",
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ%2F..%2Fx/mqdefault.jpg",
+        ] {
+            assert!(full_size_image_candidates(source).is_empty(), "{source}");
+        }
     }
 
     #[test]

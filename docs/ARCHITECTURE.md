@@ -280,8 +280,13 @@ card's own image URL) through the link-preview fetch policy, and
 `echo_media_cache::full_resolution` decodes it under its own bounds (16384 px
 per source axis and 256 MiB of decoder allocation; the shown bitmap at most
 8192 px per axis and 32 Mi pixels, plus half-size copies the window paints from
-when it shows the image smaller). The window holds that one image, outside the
-chat's budgets, and releases it when it closes or shows another.
+when it shows the image smaller). Every reduction is an integer box filter that
+allocates only its output, and the source is dropped once its reduced copy
+exists, so one decode peaks at the decoded source plus one shown-size RGBA copy:
+at most 384 MiB for a still (measured 383 MiB for an 8192x8192 PNG) and about
+224 MiB for an animation, besides the compressed body. The window holds that one
+image, outside the chat's budgets, and releases it when it closes or shows
+another.
 
 ## Design boundaries
 
